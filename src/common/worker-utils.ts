@@ -1,4 +1,5 @@
 import type { ServerOptions, Server } from "srvx";
+import type { Hooks } from "crossws";
 import type { UpgradeContext } from "../types.ts";
 
 export interface AppEntryIPCContext {
@@ -14,6 +15,7 @@ export interface AppEntryIPC {
 export interface AppEntry {
   fetch: ServerOptions["fetch"];
   upgrade?: (context: UpgradeContext) => void;
+  websocket?: Partial<Hooks>;
   middleware?: ServerOptions["middleware"];
   plugins?: ServerOptions["plugins"];
   ipc?: AppEntryIPC;

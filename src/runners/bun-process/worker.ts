@@ -1,4 +1,5 @@
 import { serve } from "srvx";
+import { plugin as wsPlugin } from "crossws/server";
 import { resolveEntry, reloadEntryModule, parseServerAddress } from "../../common/worker-utils.ts";
 
 const data = JSON.parse(process.env.ENV_RUNNER_DATA || "{}");
@@ -11,7 +12,10 @@ const server = serve({
   silent: true,
   fetch: (request) => entry.fetch(request),
   middleware: entry.middleware,
-  plugins: entry.plugins,
+  plugins: [
+    ...(entry.plugins || []),
+    ...(entry.websocket ? [wsPlugin(entry.websocket)] : []),
+  ],
   gracefulShutdown: false,
 });
 

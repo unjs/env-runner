@@ -375,8 +375,19 @@ export default {
   fetch(request: Request) {
     return new Response("Hello!");
   },
+  websocket: {
+    // Optional: crossws WebSocket hooks (recommended)
+    open(peer) {
+      peer.send("Welcome!");
+    },
+    message(peer, message) {
+      peer.send(`Echo: ${message.text()}`);
+    },
+    close(peer, details) {},
+    error(peer, error) {},
+  },
   upgrade(context) {
-    // Optional: handle WebSocket upgrade requests (Node.js only)
+    // Optional: raw WebSocket upgrade handler (Node.js only)
     // context.node gives { req, socket, head }
   },
   middleware: [], // Optional srvx middleware

@@ -41,7 +41,7 @@ src/
 - **`src/vite.ts`** — Vite Environment API helpers: `createViteHotChannel()` (host-side HotChannel from runner RPC hooks) and `createViteTransport()` (worker-side ModuleRunner transport)
 - **`src/types.ts`** — Core interfaces: `EnvRunner`, `WorkerAddress`, `WorkerHooks`, `RunnerRPCHooks`, `RPCOptions`
 - **`src/common/base-runner.ts`** — `BaseEnvRunner` abstract class + `EnvRunnerData`: shared logic for all runners (fetch proxy with exponential backoff, upgrade, message dispatch, graceful shutdown, socket cleanup)
-- **`src/common/worker-utils.ts`** — Shared utilities for built-in workers: `AppEntry` interface (with optional `upgrade` and `ipc` hooks), `AppEntryIPC`/`AppEntryIPCContext` types, `resolveEntry()` to dynamically import user entry, `parseServerAddress()` to extract host/port from srvx server, `reloadEntryModule()` for cache-busted re-import with IPC teardown/re-init
+- **`src/common/worker-utils.ts`** — Shared utilities for built-in workers: `AppEntry` interface (with optional `websocket`, `upgrade`, and `ipc` hooks), `AppEntryIPC`/`AppEntryIPCContext` types, `resolveEntry()` to dynamically import user entry, `parseServerAddress()` to extract host/port from srvx server, `reloadEntryModule()` for cache-busted re-import with IPC teardown/re-init
 - **`src/runners/node-worker/runner.ts`** — `NodeWorkerEnvRunner` extends `BaseEnvRunner`: spawns Node.js Worker threads, data via `workerData`
 - **`src/runners/node-worker/worker.ts`** — Built-in srvx worker: reads `data.entry` from `workerData`, starts srvx server, reports address via `parentPort`
 - **`src/runners/node-process/runner.ts`** — `NodeProcessEnvRunner` extends `BaseEnvRunner`: spawns a child process via `fork()`, supports custom `execArgv`
@@ -139,7 +139,8 @@ export default {
   fetch(request: Request): Response | Promise<Response> {
     return new Response("Hello!");
   },
-  upgrade?: (context: { node: { req: IncomingMessage, socket: Socket, head: Buffer } }) => void,  // Optional WebSocket upgrade handler (Node.js only)
+  websocket?: Partial<Hooks>,  // Optional crossws WebSocket hooks (recommended)
+  upgrade?: (context: { node: { req: IncomingMessage, socket: Socket, head: Buffer } }) => void,  // Optional raw WebSocket upgrade handler (Node.js only)
   middleware?: [],  // Optional srvx middleware
   plugins?: [],     // Optional srvx plugins
   ipc?: {
@@ -149,6 +150,8 @@ export default {
   },
 };
 ```
+
+The `websocket` property uses [crossws](https://crossws.h3.dev) hooks for cross-platform WebSocket support. Each built-in worker adds the crossws srvx plugin when `websocket` is defined. Node.js workers use `crossws/server/node`, while bun/deno workers use `crossws/server` (auto-selects runtime). The `upgrade` property is a lower-level alternative for raw Node.js socket access.
 
 The `ipc` property enables bidirectional messaging between the entry and the runner:
 
@@ -181,7 +184,7 @@ const runner2 = new NodeProcessEnvRunner({
 
 1. Worker receives `data.entry` path (via `workerData` or `ENV_RUNNER_DATA`)
 2. Dynamically imports the user's entry module (`resolveEntry()`)
-3. Starts a srvx server with `port: 0` on `127.0.0.1`
+3. Starts a srvx server with `port: 0` on `127.0.0.1`, adding crossws srvx plugin if `entry.websocket` is defined
 4. Wires `entry.upgrade()` to the underlying Node.js HTTP server's `upgrade` event (if defined)
 5. Calls `entry.ipc.onOpen()` with `{ sendMessage }` if IPC hooks are defined
 6. Reports `{ address: { host, port } }` via IPC
@@ -225,7 +228,8 @@ const runner2 = new NodeProcessEnvRunner({
 - Test app fixture in `test/fixtures/app-rpc.mjs` — Entry with RPC handler for `rpc()` method tests
 - Test fixture in `test/fixtures/worker-do.mjs` — Worker with Durable Object export + IPC for miniflare tests
 - Test fixture in `test/fixtures/app-upgrade.mjs` — Entry with WebSocket upgrade handler for upgrade tests
-- Tests cover: lifecycle, fetch (GET/POST), WebSocket upgrade, messaging, hooks, graceful close, inspect output, manager hot-reload, message queueing, miniflare hot-reload, waitForReady, vite helpers
+- Test fixture in `test/fixtures/app-websocket.mjs` — Entry with crossws WebSocket hooks for websocket tests
+- Tests cover: lifecycle, fetch (GET/POST), WebSocket upgrade, crossws websocket, messaging, hooks, graceful close, inspect output, manager hot-reload, message queueing, miniflare hot-reload, waitForReady, vite helpers
 
 ## Scripts
 
@@ -239,6 +243,7 @@ const runner2 = new NodeProcessEnvRunner({
 
 ## Dependencies
 
+- `crossws` — Cross-platform WebSocket hooks (used by built-in workers for `websocket` entry key)
 - `httpxy` — HTTP/WebSocket proxy
 - `srvx` — Universal server framework (used by built-in workers)
 - `std-env` — Environment detection (isCI, isTest)

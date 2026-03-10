@@ -8,6 +8,9 @@ importers:
 
   .:
     dependencies:
+      crossws:
+        specifier: ^0.4.4
+        version: 0.4.4(srvx@0.11.9)
       httpxy:
         specifier: ^0.3.1
         version: 0.3.1
@@ -1255,6 +1258,14 @@ packages:
   cookie@1.1.1:
     resolution: {integrity: sha512-ei8Aos7ja0weRpFzJnEA9UHJ/7XQmqglbRwnf2ATjcB9Wq874VKH9kfjjirM6UhU2/E5fFYadylyhFldcqSidQ==}
     engines: {node: '>=18'}
+
+  crossws@0.4.4:
+    resolution: {integrity: sha512-w6c4OdpRNnudVmcgr7brb/+/HmYjMQvYToO/oTrprTwxRUiom3LYWU1PMWuD006okbUWpII1Ea9/+kwpUfmyRg==}
+    peerDependencies:
+      srvx: '>=0.7.1'
+    peerDependenciesMeta:
+      srvx:
+        optional: true
 
   default-browser-id@5.0.1:
     resolution: {integrity: sha512-x1VCxdX4t+8wVfd1so/9w+vQ4vx7lKd2Qp5tDRutErwmR85OgmfX7RlLRMWafRMY7hbEiXIbudNrjOAPa/hL8Q==}
@@ -2598,6 +2609,10 @@ snapshots:
   convert-gitmoji@0.1.5: {}
 
   cookie@1.1.1: {}
+
+  crossws@0.4.4(srvx@0.11.9):
+    optionalDependencies:
+      srvx: 0.11.9
 
   default-browser-id@5.0.1: {}
 

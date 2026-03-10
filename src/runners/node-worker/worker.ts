@@ -1,5 +1,6 @@
 import { parentPort, workerData } from "node:worker_threads";
 import { serve } from "srvx";
+import { plugin as wsPlugin } from "crossws/server/node";
 import { resolveEntry, reloadEntryModule, parseServerAddress } from "../../common/worker-utils.ts";
 
 const data = workerData || {};
@@ -12,7 +13,10 @@ const server = serve({
   silent: true,
   fetch: (request) => entry.fetch(request),
   middleware: entry.middleware,
-  plugins: entry.plugins,
+  plugins: [
+    ...(entry.plugins || []),
+    ...(entry.websocket ? [wsPlugin(entry.websocket)] : []),
+  ],
   gracefulShutdown: false,
 });
 
