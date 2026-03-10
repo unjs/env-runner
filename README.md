@@ -7,7 +7,7 @@
 
 <!-- /automd -->
 
-Generic environment runner for JavaScript runtimes. Run your server apps across Node.js worker threads, child processes, Bun, Cloudflare Workers (via miniflare), or in-process — with hot-reload, WebSocket proxying, and bidirectional messaging.
+Generic environment runner for JavaScript runtimes. Run your server apps across Node.js worker threads, child processes, Bun, Deno, Cloudflare Workers (via miniflare), or in-process — with hot-reload, WebSocket proxying, and bidirectional messaging.
 
 ## Usage
 
@@ -34,12 +34,12 @@ npx env-runner app.ts
 
 **Flags:**
 
-| Flag              | Description                                                                       | Default        |
-| ----------------- | --------------------------------------------------------------------------------- | -------------- |
-| `--runner <name>` | Runner to use (`node-worker`, `node-process`, `bun-process`, `self`, `miniflare`) | `node-process` |
-| `--port <port>`   | Port to listen on                                                                 | `3000`         |
-| `--host <host>`   | Host to bind to                                                                   | `localhost`    |
-| `-w, --watch`     | Watch entry file for changes and auto-reload                                      |                |
+| Flag              | Description                                                                                       | Default        |
+| ----------------- | ------------------------------------------------------------------------------------------------- | -------------- |
+| `--runner <name>` | Runner to use (`node-worker`, `node-process`, `bun-process`, `deno-process`, `self`, `miniflare`) | `node-process` |
+| `--port <port>`   | Port to listen on                                                                                 | `3000`         |
+| `--host <host>`   | Host to bind to                                                                                   | `localhost`    |
+| `-w, --watch`     | Watch entry file for changes and auto-reload                                                      |                |
 
 ### Server (`EnvServer`)
 
@@ -117,6 +117,7 @@ Use runners directly for lower-level control:
 import { NodeWorkerEnvRunner } from "env-runner/runners/node-worker";
 import { NodeProcessEnvRunner } from "env-runner/runners/node-process";
 import { BunProcessEnvRunner } from "env-runner/runners/bun-process";
+import { DenoProcessEnvRunner } from "env-runner/runners/deno-process";
 import { SelfEnvRunner } from "env-runner/runners/self";
 import { MiniflareEnvRunner } from "env-runner/runners/miniflare";
 ```
@@ -155,6 +156,7 @@ await runner.close();
 | `NodeWorkerEnvRunner`  | Worker thread                  | `workerData` / `parentPort`         |
 | `NodeProcessEnvRunner` | Child process (`fork`)         | `ENV_RUNNER_DATA` / `process.send`  |
 | `BunProcessEnvRunner`  | Bun or Node.js process         | `Bun.spawn` IPC or `fork()`         |
+| `DenoProcessEnvRunner` | Deno process                   | `deno run` with IPC channel         |
 | `SelfEnvRunner`        | In-process                     | In-memory channel                   |
 | `MiniflareEnvRunner`   | Cloudflare Workers (miniflare) | `serviceBindings` + `dispatchFetch` |
 

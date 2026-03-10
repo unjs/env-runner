@@ -1,12 +1,26 @@
+import { execFileSync } from "node:child_process";
 import { inspect } from "node:util";
 import { fileURLToPath } from "node:url";
 import { resolve, dirname } from "node:path";
 import { describe, expect, it, afterEach } from "vitest";
 import type { EnvRunner } from "../src/index.ts";
 
+function hasRuntime(cmd: string): boolean {
+  try {
+    execFileSync(cmd, ["--version"], { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const hasBun = hasRuntime("bun");
+const hasDeno = hasRuntime("deno");
+
 import { NodeWorkerEnvRunner } from "../src/runners/node-worker/runner.ts";
 import { NodeProcessEnvRunner } from "../src/runners/node-process/runner.ts";
 import { BunProcessEnvRunner } from "../src/runners/bun-process/runner.ts";
+import { DenoProcessEnvRunner } from "../src/runners/deno-process/runner.ts";
 import { SelfEnvRunner } from "../src/runners/self/runner.ts";
 import { MiniflareEnvRunner } from "../src/runners/miniflare/runner.ts";
 
@@ -25,6 +39,12 @@ const runners = [
   {
     name: "BunProcessEnvRunner",
     create: (opts: any) => new BunProcessEnvRunner(opts),
+    skip: !hasBun,
+  },
+  {
+    name: "DenoProcessEnvRunner",
+    create: (opts: any) => new DenoProcessEnvRunner(opts),
+    skip: !hasDeno,
   },
   {
     name: "SelfEnvRunner",
@@ -39,13 +59,14 @@ const runners = [
 ];
 
 for (const runnerDef of runners) {
-  const { name, create, entry, skipWorkerEntry, extraOpts } = {
+  const { name, create, entry, skip, skipWorkerEntry, extraOpts } = {
     entry: appEntry,
+    skip: false,
     skipWorkerEntry: false,
     extraOpts: {} as Record<string, unknown>,
     ...runnerDef,
   };
-  describe(name, () => {
+  describe.skipIf(skip)(name, () => {
     let runner: EnvRunner | undefined;
 
     const opts = (testName: string, extra?: Record<string, unknown>) => ({

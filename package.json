@@ -20,6 +20,8 @@
     "./runners/node-process/worker": "./dist/runners/node-process/worker.mjs",
     "./runners/bun-process": "./dist/runners/bun-process/runner.mjs",
     "./runners/bun-process/worker": "./dist/runners/bun-process/worker.mjs",
+    "./runners/deno-process": "./dist/runners/deno-process/runner.mjs",
+    "./runners/deno-process/worker": "./dist/runners/deno-process/worker.mjs",
     "./runners/self": "./dist/runners/self/runner.mjs",
     "./runners/miniflare": "./dist/runners/miniflare/runner.mjs"
   },

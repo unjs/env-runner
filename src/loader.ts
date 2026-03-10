@@ -1,7 +1,13 @@
 import type { WorkerHooks, EnvRunner } from "./types.ts";
 import type { EnvRunnerData } from "./common/base-runner.ts";
 
-export type RunnerName = "node-worker" | "node-process" | "bun-process" | "self" | "miniflare";
+export type RunnerName =
+  | "node-worker"
+  | "node-process"
+  | "bun-process"
+  | "deno-process"
+  | "self"
+  | "miniflare";
 
 export interface LoadRunnerOptions {
   name: string;
@@ -18,6 +24,8 @@ const loaders: Record<RunnerName, () => Promise<RunnerConstructor>> = {
   "node-process": () =>
     import("env-runner/runners/node-process").then((m) => m.NodeProcessEnvRunner),
   "bun-process": () => import("env-runner/runners/bun-process").then((m) => m.BunProcessEnvRunner),
+  "deno-process": () =>
+    import("env-runner/runners/deno-process").then((m) => m.DenoProcessEnvRunner),
   self: () => import("env-runner/runners/self").then((m) => m.SelfEnvRunner),
   miniflare: () => import("env-runner/runners/miniflare").then((m) => m.MiniflareEnvRunner),
 };

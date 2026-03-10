@@ -23,6 +23,9 @@ src/
 │   ├── bun-process/
 │   │   ├── runner.ts        # BunProcessEnvRunner
 │   │   └── worker.ts        # Built-in srvx worker (Bun/Node.js)
+│   ├── deno-process/
+│   │   ├── runner.ts        # DenoProcessEnvRunner
+│   │   └── worker.ts        # Built-in srvx worker (Deno)
 │   ├── self/
 │   │   └── runner.ts        # SelfEnvRunner (in-process, no worker)
 │   └── miniflare/
@@ -44,9 +47,11 @@ src/
 - **`src/runners/node-process/worker.ts`** — Built-in srvx worker: reads `data.entry` from `ENV_RUNNER_DATA`, starts srvx server, reports address via `process.send()`
 - **`src/runners/bun-process/runner.ts`** — `BunProcessEnvRunner` extends `BaseEnvRunner`: uses `Bun.spawn()` with IPC when under Bun, falls back to Node.js `fork()` otherwise
 - **`src/runners/bun-process/worker.ts`** — Built-in srvx worker: same as node-process worker (works on both Bun and Node.js)
+- **`src/runners/deno-process/runner.ts`** — `DenoProcessEnvRunner` extends `BaseEnvRunner`: spawns a `deno run --allow-all` child process with IPC via Node.js `spawn()`. Data passed via `ENV_RUNNER_DATA` env var (JSON). Supports custom `execArgv`
+- **`src/runners/deno-process/worker.ts`** — Built-in srvx worker: same as node-process worker (works on Deno via Node.js compat)
 - **`src/runners/self/runner.ts`** — `SelfEnvRunner` extends `BaseEnvRunner`: runs entry code in the same process using an in-memory channel registry on `process.__envRunners`
 - **`src/runners/miniflare/runner.ts`** — `MiniflareEnvRunner` extends `BaseEnvRunner`: runs entry in Cloudflare Workers runtime via miniflare. Overrides `fetch()` to use `mf.dispatchFetch()`. Requires `miniflare` peer dependency
-- **`src/loader.ts`** — `loadRunner(name, opts)`: dynamic loader that imports a runner by name (`node-worker` | `node-process` | `bun-process` | `self` | `miniflare`) and returns an `EnvRunner` instance
+- **`src/loader.ts`** — `loadRunner(name, opts)`: dynamic loader that imports a runner by name (`node-worker` | `node-process` | `bun-process` | `deno-process` | `self` | `miniflare`) and returns an `EnvRunner` instance
 - **`src/manager.ts`** — `RunnerManager`: proxy manager for hot-reload, message queueing, and listener forwarding across runner swaps
 - **`src/server.ts`** — `EnvServer` extends `RunnerManager`: high-level API combining runner loading, watch mode (`fs.watch` with 100ms debounce), and auto-reload on file changes. Supports `watch` and `watchPaths` options
 - **`src/cli.ts`** — CLI entry point: `env-runner <entry> [--runner] [--port] [--host] [-w/--watch]`
@@ -76,6 +81,10 @@ Uses `child_process.fork()`. Entry communicates via `process.send()` / `process.
 ### BunProcessEnvRunner
 
 Dual-runtime: uses `Bun.spawn()` with IPC callback when running under Bun, falls back to Node.js `child_process.fork()` otherwise. Data passed via `ENV_RUNNER_DATA` env var (JSON). Supports custom `execArgv`.
+
+### DenoProcessEnvRunner
+
+Spawns a Deno child process via Node.js `child_process.spawn()` with `deno run --allow-all --node-modules-dir=auto` and an IPC channel (`stdio: ["pipe", "pipe", "pipe", "ipc"]`). Data passed via `ENV_RUNNER_DATA` env var (JSON). Supports custom `execArgv`. Uses the same worker as node-process (Deno's Node.js compatibility layer handles `process.send()`/`process.on("message")`).
 
 ### SelfEnvRunner
 
@@ -170,6 +179,7 @@ const runner2 = new NodeProcessEnvRunner({
 | `env-runner/runners/node-worker/worker` (default)  | `NodeWorkerEnvRunner`  |
 | `env-runner/runners/node-process/worker` (default) | `NodeProcessEnvRunner` |
 | `env-runner/runners/bun-process/worker` (default)  | `BunProcessEnvRunner`  |
+| `env-runner/runners/deno-process/worker` (default) | `DenoProcessEnvRunner` |
 | _(no worker)_                                      | `SelfEnvRunner`        |
 | _(generated wrapper script)_                       | `MiniflareEnvRunner`   |
 
@@ -182,13 +192,15 @@ const runner2 = new NodeProcessEnvRunner({
 - `env-runner/runners/node-process/worker` (`./runners/node-process/worker`) — Built-in srvx worker for Node.js child process
 - `env-runner/runners/bun-process` (`./runners/bun-process`) — Direct import of `BunProcessEnvRunner`
 - `env-runner/runners/bun-process/worker` (`./runners/bun-process/worker`) — Built-in srvx worker for Bun/Node.js process
+- `env-runner/runners/deno-process` (`./runners/deno-process`) — Direct import of `DenoProcessEnvRunner`
+- `env-runner/runners/deno-process/worker` (`./runners/deno-process/worker`) — Built-in srvx worker for Deno process
 - `env-runner/runners/self` (`./runners/self`) — Direct import of `SelfEnvRunner`
 - `env-runner/runners/miniflare` (`./runners/miniflare`) — Direct import of `MiniflareEnvRunner`
 
 ## Testing
 
 - Tests use vitest: `pnpm vitest run`
-- **`test/runners.test.ts`** — Parameterized test suite for all three IPC-based runner implementations (NodeWorker, NodeProcess, BunProcess)
+- **`test/runners.test.ts`** — Parameterized test suite for all IPC-based runner implementations (NodeWorker, NodeProcess, BunProcess, DenoProcess). Runners requiring specific runtimes (bun, deno) are auto-skipped when the runtime is not available
 - **`test/manager.test.ts`** — Tests for `RunnerManager` lifecycle, hot-reload, message queueing, hook forwarding
 - Test app fixture in `test/fixtures/app.ts` — Minimal `export default { fetch }` entry for worker tests
 - Tests cover: lifecycle, fetch (GET/POST), messaging, hooks, graceful close, inspect output, manager hot-reload, message queueing
