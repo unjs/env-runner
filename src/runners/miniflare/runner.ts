@@ -115,7 +115,17 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
       return new Response("miniflare env runner is unavailable", { status: 503 });
     }
     const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
-    return this.#miniflare.dispatchFetch(url, init) as Promise<Response>;
+    const res = await this.#miniflare.dispatchFetch(url, init);
+    // workerd returns a Response from a different realm — convert to a standard Response
+    // so that `instanceof Response` checks work in the caller's context.
+    if (res instanceof Response) {
+      return res;
+    }
+    return new Response(res.body, {
+      status: res.status,
+      statusText: res.statusText,
+      headers: res.headers,
+    });
   }
 
   sendMessage(message: unknown) {
