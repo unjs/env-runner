@@ -40,15 +40,15 @@ const envServer = new EnvServer({
   watch: values.watch,
 });
 
-envServer.onReady = (_runner, address) => {
+envServer.onReady((_runner, address) => {
   console.log(
     `\x1B[2m➜ Worker ready on ${address?.host}:${address?.port || address?.socketPath}\x1B[0m`,
   );
-};
+});
 
-envServer.onReload = () => {
+envServer.onReload(() => {
   console.log(`\x1B[2m↻ Reloading...\x1B[0m`);
-};
+});
 
 await envServer.start();
 

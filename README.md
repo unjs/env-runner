@@ -56,13 +56,13 @@ const envServer = new EnvServer({
   watchPaths: ["./src"],
 });
 
-envServer.onReady = (_runner, address) => {
+envServer.onReady((_runner, address) => {
   console.log(`Worker ready on ${address?.host}:${address?.port}`);
-};
+});
 
-envServer.onReload = () => {
+envServer.onReload(() => {
   console.log("Reloaded!");
-};
+});
 
 await envServer.start();
 
@@ -81,9 +81,9 @@ import { RunnerManager, NodeProcessEnvRunner } from "env-runner";
 
 const manager = new RunnerManager();
 
-manager.onReady = (_runner, address) => {
+manager.onReady((_runner, address) => {
   console.log("Ready:", address);
-};
+});
 
 // Load initial runner
 const runner = new NodeProcessEnvRunner({

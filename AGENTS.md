@@ -115,7 +115,9 @@ Proxy manager wrapping a runner with hot-reload support:
 - `reload(runner)` — Swaps active runner, closes old one, preserves listeners
 - Message queueing — `sendMessage()` queues when runner not ready, auto-flushes on ready
 - Listener forwarding — `onMessage()`/`offMessage()` persist across runner swaps
-- Hook wrapping — Detects unexpected runner exits, forwards `onReady()`/`onClose()` hooks
+- Hook wrapping — Detects unexpected runner exits, forwards `onReady()`/`onClose()` multi-listener hooks (Set-based, mirrors `onMessage`/`offMessage` pattern)
+- `onClose(listener)`/`offClose(listener)` — Multi-listener close events
+- `onReady(listener)`/`offReady(listener)` — Multi-listener ready events
 - Returns 503 from `fetch()`/`upgrade()` when no runner is active
 
 ### EnvServer
@@ -126,7 +128,7 @@ High-level API extending `RunnerManager` with runner loading and file watching:
 - `close()` — Stops watchers and closes the runner
 - `watch: true` — Watches the entry file using `fs.watch()` with 100ms debounce; on change, creates a new runner and calls `reload()`
 - `watchPaths` — Additional directories/files to watch (supports `recursive: true`)
-- `onReload` hook — Called after a successful watch-triggered reload
+- `onReload(listener)`/`offReload(listener)` — Multi-listener reload events (Set-based)
 
 ## Built-in Workers
 

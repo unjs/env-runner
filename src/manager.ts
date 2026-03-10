@@ -16,6 +16,8 @@ export class RunnerManager implements EnvRunner {
   private _messageListeners = new Set<RunnerMessageListener>();
   private _closed = false;
   private _reloading = false;
+  private _closeListeners = new Set<(runner: EnvRunner, cause?: unknown) => void>();
+  private _readyListeners = new Set<(runner: EnvRunner, address?: WorkerAddress) => void>();
 
   constructor(runner?: EnvRunner) {
     if (runner) {
@@ -141,8 +143,21 @@ export class RunnerManager implements EnvRunner {
 
   // #region Hooks (forwarded to active runner)
 
-  onClose?: (runner: EnvRunner, cause?: unknown) => void;
-  onReady?: (runner: EnvRunner, address?: WorkerAddress) => void;
+  onClose(listener: (runner: EnvRunner, cause?: unknown) => void) {
+    this._closeListeners.add(listener);
+  }
+
+  offClose(listener: (runner: EnvRunner, cause?: unknown) => void) {
+    this._closeListeners.delete(listener);
+  }
+
+  onReady(listener: (runner: EnvRunner, address?: WorkerAddress) => void) {
+    this._readyListeners.add(listener);
+  }
+
+  offReady(listener: (runner: EnvRunner, address?: WorkerAddress) => void) {
+    this._readyListeners.delete(listener);
+  }
 
   // #endregion
 
@@ -152,7 +167,7 @@ export class RunnerManager implements EnvRunner {
     // Detect ready state from address message
     if (message?.address) {
       this._flushQueue();
-      this.onReady?.(this, message.address);
+      for (const fn of this._readyListeners) fn(this, message.address);
     }
   };
 
@@ -173,7 +188,7 @@ export class RunnerManager implements EnvRunner {
       await originalClose();
       if (this._runner === runner) {
         this._runner = undefined;
-        this.onClose?.(this);
+        for (const fn of this._closeListeners) fn(this);
       }
     };
 

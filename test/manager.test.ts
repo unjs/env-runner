@@ -92,7 +92,7 @@ describe("RunnerManager", () => {
     await waitForReady(manager);
 
     const closed = new Promise<void>((resolve) => {
-      manager!.onClose = () => resolve();
+      manager!.onClose(() => resolve());
     });
 
     // Close the underlying runner directly to simulate unexpected exit
@@ -107,7 +107,7 @@ describe("RunnerManager", () => {
     manager = new RunnerManager();
 
     const ready = new Promise<void>((resolve) => {
-      manager!.onReady = () => resolve();
+      manager!.onReady(() => resolve());
     });
 
     await manager.reload(runner);

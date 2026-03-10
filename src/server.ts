@@ -28,11 +28,19 @@ export class EnvServer extends RunnerManager {
   private _opts: EnvServerOptions;
   private _watchers: FSWatcher[] = [];
   private _reloadTimeout: ReturnType<typeof setTimeout> | undefined;
+  private _reloadListeners = new Set<() => void>();
 
   runner: Awaited<ReturnType<typeof loadRunner>> | null = null;
 
-  /** Called when the runner is reloaded due to a file change. */
-  onReload?: () => void;
+  /** Register a listener called when the runner is reloaded due to a file change. */
+  onReload(listener: () => void) {
+    this._reloadListeners.add(listener);
+  }
+
+  /** Remove a previously registered reload listener. */
+  offReload(listener: () => void) {
+    this._reloadListeners.delete(listener);
+  }
 
   constructor(opts: EnvServerOptions) {
     super();
@@ -93,7 +101,7 @@ export class EnvServer extends RunnerManager {
       try {
         this.runner = await this._createRunner();
         await this.reload(this.runner);
-        this.onReload?.();
+        for (const fn of this._reloadListeners) fn();
       } catch (error) {
         console.error("Failed to reload runner:", error);
       }

@@ -59,7 +59,7 @@ export interface RPCOptions {
 }
 
 /** Core runner interface combining lifecycle hooks, RPC, and request proxying. */
-export interface EnvRunner extends WorkerHooks, RunnerRPCHooks {
+export interface EnvRunner extends RunnerRPCHooks {
   /** Whether the worker is ready to accept requests. */
   readonly ready: boolean;
 
