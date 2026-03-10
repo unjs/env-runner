@@ -90,17 +90,6 @@ export class VercelEnvRunner extends BaseEnvRunner {
     if (!this.#worker) {
       return;
     }
-    await this._requestGracefulShutdown(
-      () => this.#worker!.postMessage({ event: "shutdown" }),
-      (resolve) => {
-        this.#worker?.on("message", (message) => {
-          if (message.event === "exit") {
-            resolve();
-          }
-        });
-      },
-      () => Boolean(this.#worker?._exitCode),
-    );
     this.#worker.removeAllListeners();
     await this.#worker.terminate().catch((error) => {
       console.error(error);
