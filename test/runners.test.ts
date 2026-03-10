@@ -501,6 +501,18 @@ for (const { name, create, skip } of rpcRunners) {
       // "slow" handler responds after 2s, so a 100ms timeout should fire first
       await expect(runner.rpc("slow", undefined, { timeout: 100 })).rejects.toThrow("timed out");
     });
+
+    it("handles concurrent rpc calls", async () => {
+      runner = create({ name: "test-rpc-concurrent", data: { entry: appRpcEntry } });
+      await runner.waitForReady();
+
+      const results = await Promise.all([
+        runner.rpc<string>("greet", "a"),
+        runner.rpc<string>("greet", "b"),
+        runner.rpc<string>("greet", "c"),
+      ]);
+      expect(results).toEqual(["hello a", "hello b", "hello c"]);
+    });
   });
 }
 
