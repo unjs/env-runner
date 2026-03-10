@@ -26,3 +26,4 @@ export {
   type MiniflareEnvRunnerOptions,
   MiniflareEnvRunner,
 } from "./runners/miniflare/runner.ts";
+export { VercelEnvRunner } from "./runners/vercel/runner.ts";

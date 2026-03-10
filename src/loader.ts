@@ -7,7 +7,8 @@ export type RunnerName =
   | "bun-process"
   | "deno-process"
   | "self"
-  | "miniflare";
+  | "miniflare"
+  | "vercel";
 
 export interface LoadRunnerOptions {
   name: string;
@@ -28,6 +29,7 @@ const loaders: Record<RunnerName, () => Promise<RunnerConstructor>> = {
     import("env-runner/runners/deno-process").then((m) => m.DenoProcessEnvRunner),
   self: () => import("env-runner/runners/self").then((m) => m.SelfEnvRunner),
   miniflare: () => import("env-runner/runners/miniflare").then((m) => m.MiniflareEnvRunner),
+  vercel: () => import("env-runner/runners/vercel").then((m) => m.VercelEnvRunner),
 };
 
 export async function loadRunner(runner: RunnerName, opts: LoadRunnerOptions): Promise<EnvRunner> {
