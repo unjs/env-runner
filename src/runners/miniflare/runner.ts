@@ -310,17 +310,21 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
           }
           // Bare specifier (npm package) — resolve via Node module resolution
           else if (cleanRaw && !cleanRaw.startsWith(".") && !cleanRaw.startsWith("/")) {
+            // Resolve relative to the referrer's real path when available
+            const referrerKey = referrer.startsWith("/") ? referrer.slice(1) : referrer;
+            const referrerReal = modulePathMap.get(referrerKey);
+            const contextRequire = referrerReal ? createRequire(referrerReal) : _require;
             // For node:* builtins not natively supported by workerd, use unenv polyfill
             if (cleanRaw.startsWith("node:")) {
               const nodeName = cleanRaw.slice(5);
               try {
-                resolvedPath = _require.resolve(`unenv/node/${nodeName}`);
+                resolvedPath = contextRequire.resolve(`unenv/node/${nodeName}`);
               } catch {
                 return new Response(null, { status: 404 });
               }
             } else {
               try {
-                resolvedPath = _require.resolve(cleanRaw);
+                resolvedPath = contextRequire.resolve(cleanRaw);
               } catch {
                 return new Response(null, { status: 404 });
               }
@@ -411,7 +415,8 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
     });
     const ws = initRes.webSocket;
     if (!ws) {
-      throw new Error("Failed to establish WebSocket IPC channel");
+      const body = await initRes.text().catch(() => "");
+      throw new Error(`Failed to establish WebSocket IPC channel (${initRes.status}: ${body})`);
     }
     ws.accept();
     this.#ws = ws;
