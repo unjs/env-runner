@@ -13,10 +13,7 @@ const server = serve({
   silent: true,
   fetch: (request) => entry.fetch(request),
   middleware: entry.middleware,
-  plugins: [
-    ...(entry.plugins || []),
-    ...(entry.websocket ? [wsPlugin(entry.websocket)] : []),
-  ],
+  plugins: [...(entry.plugins || []), ...(entry.websocket ? [wsPlugin(entry.websocket)] : [])],
   gracefulShutdown: false,
 });
 
