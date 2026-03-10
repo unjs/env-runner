@@ -1,7 +1,7 @@
 import type { WorkerHooks } from "../../types.ts";
 
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
-import { join, dirname, relative } from "node:path";
+import { readFileSync } from "node:fs";
+import { dirname, resolve, posix } from "node:path";
 import { BaseEnvRunner } from "../../common/base-runner.ts";
 import type { EnvRunnerData } from "../../common/base-runner.ts";
 
@@ -20,7 +20,7 @@ const IPC_HEADER = "x-env-runner-ipc";
 export class MiniflareEnvRunner extends BaseEnvRunner {
   #miniflare?: InstanceType<any>;
   #miniflareOptions: Record<string, unknown>;
-  #tmpDir?: string;
+  #reloadCounter = 0;
 
   constructor(opts: MiniflareEnvRunnerOptions) {
     super({ ...opts, workerEntry: "" });
@@ -55,6 +55,30 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
       .catch(() => {});
   }
 
+  /**
+   * Hot-reload the user entry module without recreating the Miniflare instance.
+   *
+   * Uses `unsafeEvalBinding` to dynamically re-import the entry module with a
+   * cache-busting query string, served via `unsafeModuleFallbackService`.
+   */
+  async reloadModule(): Promise<void> {
+    if (!this.#miniflare) {
+      throw new Error("Miniflare env runner should be initialized before reloading.");
+    }
+    const entryPath = this._data?.entry as string | undefined;
+    if (!entryPath) {
+      return;
+    }
+    this.#reloadCounter++;
+    await this.#miniflare
+      .dispatchFetch("http://localhost/__env_runner_ipc", {
+        method: "POST",
+        headers: { [IPC_HEADER]: "reload" },
+        body: String(this.#reloadCounter),
+      })
+      .catch(() => {});
+  }
+
   // #region Protected methods
 
   protected _hasRuntime() {
@@ -78,10 +102,6 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
       .catch(() => {});
     await this.#miniflare.dispose();
     this.#miniflare = undefined;
-    if (this.#tmpDir) {
-      rmSync(this.#tmpDir, { recursive: true, force: true });
-      this.#tmpDir = undefined;
-    }
   }
 
   // #endregion
@@ -119,15 +139,43 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
       },
     };
 
-    // Generate wrapper module with IPC support
+    // Generate in-memory wrapper module with IPC support
     if (entryPath && !options.script && !options.scriptPath) {
-      // Create temp dir next to entry so workerd can resolve the import
-      // (workerd forbids ".." traversal outside the script root)
-      this.#tmpDir = mkdtempSync(join(dirname(entryPath), ".env-runner-mf-"));
-      const wrapperPath = join(this.#tmpDir, "worker.mjs");
-      const relativeEntry = "./" + relative(this.#tmpDir, entryPath);
-      writeFileSync(wrapperPath, generateWrapper(relativeEntry));
-      options.scriptPath = wrapperPath;
+      const resolvedEntry = resolve(entryPath);
+      const entryDir = dirname(resolvedEntry);
+
+      options.script = generateWrapper(resolvedEntry);
+      // Set scriptPath to entry's directory so workerd resolves imports correctly
+      options.scriptPath = entryDir + "/__env_runner_wrapper.mjs";
+
+      // Enable unsafeEval for hot-reload support (re-import entry without restart)
+      options.unsafeEvalBinding = "__ENV_RUNNER_UNSAFE_EVAL__";
+
+      // Module fallback: resolve imports that workerd can't find on its own
+      // (e.g. imports from node_modules, parent dirs, cache-busted reload imports)
+      if (!options.unsafeModuleFallbackService) {
+        options.unsafeUseModuleFallbackService = true;
+        options.unsafeModuleFallbackService = (request: Request) => {
+          const url = new URL(request.url);
+          const specifier = url.searchParams.get("specifier");
+          if (!specifier) {
+            return new Response(null, { status: 404 });
+          }
+          // Strip cache-busting query string (?t=...)
+          const cleanSpecifier = specifier.split("?")[0] || specifier;
+          // Resolve relative to the entry directory
+          const resolvedPath = cleanSpecifier.startsWith("/")
+            ? cleanSpecifier
+            : resolve(entryDir, cleanSpecifier);
+          try {
+            const contents = readFileSync(resolvedPath, "utf8");
+            const name = posix.relative("/", specifier);
+            return Response.json({ name, esModule: contents });
+          } catch {
+            return new Response(null, { status: 404 });
+          }
+        };
+      }
     }
 
     this.#miniflare = new Miniflare(options);
@@ -157,14 +205,26 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
  * The user module is expected to export `fetch` and optionally `ipc`.
  * The wrapper intercepts IPC requests and bridges `ipc` hooks
  * via `env.__ENV_RUNNER_IPC` service binding.
+ *
+ * Supports hot-reload via `unsafeEvalBinding`: the "reload" IPC message
+ * uses dynamic `import()` with a cache-busting query string to re-import
+ * the entry module (served fresh by `unsafeModuleFallbackService`).
+ *
+ * Passed as an in-memory `script` to Miniflare (no temp files needed).
  */
 function generateWrapper(entryPath: string): string {
-  return `export * from ${JSON.stringify(entryPath)};
-import * as __userModule from ${JSON.stringify(entryPath)};
+  // Use ./ relative path since scriptPath is set to entry's directory
+  const importPath = "./" + entryPath.split("/").pop();
+  return `import * as __userModule from ${JSON.stringify(importPath)};
 
-const __userEntry = __userModule.default || __userModule;
+let __userEntry = __userModule.default || __userModule;
 const __IPC_HEADER = "${IPC_HEADER}";
+const __entryPath = ${JSON.stringify(entryPath)};
 let __ipcInitialized = false;
+let __sendMessage;
+
+// Re-export user module's named exports
+export * from ${JSON.stringify(importPath)};
 
 export default {
   async fetch(request, env, ctx) {
@@ -173,14 +233,14 @@ export default {
       if (ipcType === "init") {
         if (!__ipcInitialized && __userEntry.ipc && env.__ENV_RUNNER_IPC) {
           __ipcInitialized = true;
-          const sendMessage = (message) => {
+          __sendMessage = (message) => {
             env.__ENV_RUNNER_IPC.fetch("http://ipc/", {
               method: "POST",
               body: JSON.stringify(message),
             });
           };
           if (__userEntry.ipc.onOpen) {
-            await __userEntry.ipc.onOpen({ sendMessage });
+            await __userEntry.ipc.onOpen({ sendMessage: __sendMessage });
           }
         }
         return new Response(null, { status: 204 });
@@ -195,6 +255,31 @@ export default {
       if (ipcType === "shutdown") {
         if (__userEntry.ipc?.onClose) {
           await __userEntry.ipc.onClose();
+        }
+        return new Response(null, { status: 204 });
+      }
+      if (ipcType === "reload" && env.__ENV_RUNNER_UNSAFE_EVAL__) {
+        const version = await request.text();
+        try {
+          // Re-import with cache-busting query to get fresh module from fallback service
+          const importFn = env.__ENV_RUNNER_UNSAFE_EVAL__.newAsyncFunction(
+            "return await import(path)",
+            "reload",
+            "path"
+          );
+          const freshModule = await importFn(__entryPath + "?t=" + version);
+          const newEntry = freshModule.default || freshModule;
+          // Notify old entry of close
+          if (__userEntry.ipc?.onClose) {
+            await __userEntry.ipc.onClose();
+          }
+          __userEntry = newEntry;
+          // Re-init IPC on the new entry
+          if (__userEntry.ipc?.onOpen && __sendMessage) {
+            await __userEntry.ipc.onOpen({ sendMessage: __sendMessage });
+          }
+        } catch (e) {
+          return new Response(String(e), { status: 500 });
         }
         return new Response(null, { status: 204 });
       }

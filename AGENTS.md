@@ -50,7 +50,7 @@ src/
 - **`src/runners/deno-process/runner.ts`** — `DenoProcessEnvRunner` extends `BaseEnvRunner`: spawns a `deno run --allow-all` child process with IPC via Node.js `spawn()`. Data passed via `ENV_RUNNER_DATA` env var (JSON). Supports custom `execArgv`
 - **`src/runners/deno-process/worker.ts`** — Built-in srvx worker: same as node-process worker (works on Deno via Node.js compat)
 - **`src/runners/self/runner.ts`** — `SelfEnvRunner` extends `BaseEnvRunner`: runs entry code in the same process using an in-memory channel registry on `process.__envRunners`
-- **`src/runners/miniflare/runner.ts`** — `MiniflareEnvRunner` extends `BaseEnvRunner`: runs entry in Cloudflare Workers runtime via miniflare. Overrides `fetch()` to use `mf.dispatchFetch()`. Requires `miniflare` peer dependency
+- **`src/runners/miniflare/runner.ts`** — `MiniflareEnvRunner` extends `BaseEnvRunner`: runs entry in Cloudflare Workers runtime via miniflare. Overrides `fetch()` to use `mf.dispatchFetch()`. Uses in-memory `script` (no temp files), `unsafeModuleFallbackService` for module resolution, and `unsafeEvalBinding` for hot-reload via `reloadModule()`. Requires `miniflare` peer dependency
 - **`src/loader.ts`** — `loadRunner(name, opts)`: dynamic loader that imports a runner by name (`node-worker` | `node-process` | `bun-process` | `deno-process` | `self` | `miniflare`) and returns an `EnvRunner` instance
 - **`src/manager.ts`** — `RunnerManager`: proxy manager for hot-reload, message queueing, and listener forwarding across runner swaps
 - **`src/server.ts`** — `EnvServer` extends `RunnerManager`: high-level API combining runner loading, watch mode (`fs.watch` with 100ms debounce), and auto-reload on file changes. Supports `watch` and `watchPaths` options
@@ -92,7 +92,15 @@ Runs entry code in the same process (no IPC, no forking). Uses an in-memory chan
 
 ### MiniflareEnvRunner
 
-Runs entry in the Cloudflare Workers runtime via [miniflare](https://github.com/cloudflare/workers-sdk/tree/main/packages/miniflare). No worker file or HTTP proxy needed — overrides `fetch()` to call `mf.dispatchFetch()` directly. Accepts `miniflareOptions` for full Miniflare configuration (bindings, KV, D1, Durable Objects, etc.). Entry script path passed via `data.entry` — the runner reads the file, wraps it with IPC glue code, and passes the generated script to Miniflare. Requires `miniflare` as a peer dependency. Supports full IPC (`ipc.onOpen`, `ipc.onMessage`, `ipc.onClose`) via a `serviceBindings`-based bridge: outbound messages use `env.__ENV_RUNNER_IPC` service binding, inbound messages use `dispatchFetch` with `x-env-runner-ipc` header.
+Runs entry in the Cloudflare Workers runtime via [miniflare](https://github.com/cloudflare/workers-sdk/tree/main/packages/miniflare). No worker file or HTTP proxy needed — overrides `fetch()` to call `mf.dispatchFetch()` directly. Accepts `miniflareOptions` for full Miniflare configuration (bindings, KV, D1, Durable Objects, etc.). Requires `miniflare` as a peer dependency.
+
+**Entry loading:** Entry script path passed via `data.entry`. The runner generates an in-memory wrapper module (passed as `script` to Miniflare, no temp files) that imports the user entry and adds IPC glue. `scriptPath` is set to the entry's directory so workerd resolves relative imports correctly.
+
+**Module resolution:** Uses `unsafeModuleFallbackService` + `unsafeUseModuleFallbackService` to resolve imports that workerd can't find on its own (e.g. imports from `node_modules`, parent directories, or cache-busted reload imports). The fallback reads files from disk relative to the entry directory. Supports cache-busting query strings (`?t=<version>`) for hot-reload.
+
+**IPC:** Full bidirectional IPC (`ipc.onOpen`, `ipc.onMessage`, `ipc.onClose`) via a `serviceBindings`-based bridge: outbound messages (worker → runner) use `env.__ENV_RUNNER_IPC` service binding, inbound messages (runner → worker) use `dispatchFetch` with `x-env-runner-ipc` header.
+
+**Hot-reload:** `reloadModule()` re-imports the user entry without recreating the Miniflare instance. Uses `unsafeEvalBinding` (`__ENV_RUNNER_UNSAFE_EVAL__`) to create a dynamic `import()` with a cache-busting query string. The module fallback service serves the fresh file from disk. Old entry's `ipc.onClose()` is called before swapping, new entry's `ipc.onOpen()` is called after.
 
 ### RunnerManager
 
@@ -181,7 +189,7 @@ const runner2 = new NodeProcessEnvRunner({
 | `env-runner/runners/bun-process/worker` (default)  | `BunProcessEnvRunner`  |
 | `env-runner/runners/deno-process/worker` (default) | `DenoProcessEnvRunner` |
 | _(no worker)_                                      | `SelfEnvRunner`        |
-| _(generated wrapper script)_                       | `MiniflareEnvRunner`   |
+| _(in-memory wrapper module)_                       | `MiniflareEnvRunner`   |
 
 ## Exports
 
@@ -202,8 +210,10 @@ const runner2 = new NodeProcessEnvRunner({
 - Tests use vitest: `pnpm vitest run`
 - **`test/runners.test.ts`** — Parameterized test suite for all IPC-based runner implementations (NodeWorker, NodeProcess, BunProcess, DenoProcess). Runners requiring specific runtimes (bun, deno) are auto-skipped when the runtime is not available
 - **`test/manager.test.ts`** — Tests for `RunnerManager` lifecycle, hot-reload, message queueing, hook forwarding
-- Test app fixture in `test/fixtures/app.ts` — Minimal `export default { fetch }` entry for worker tests
-- Tests cover: lifecycle, fetch (GET/POST), messaging, hooks, graceful close, inspect output, manager hot-reload, message queueing
+- **`test/miniflare.test.ts`** — Tests for `MiniflareEnvRunner`: Durable Object exports, IPC alongside custom exports, hot-reload via `reloadModule()`, IPC re-initialization after reload
+- Test app fixture in `test/fixtures/app.mjs` — Minimal `export default { fetch }` entry for worker tests
+- Test fixture in `test/fixtures/worker-do.mjs` — Worker with Durable Object export + IPC for miniflare tests
+- Tests cover: lifecycle, fetch (GET/POST), messaging, hooks, graceful close, inspect output, manager hot-reload, message queueing, miniflare hot-reload
 
 ## Scripts
 
@@ -222,12 +232,15 @@ const runner2 = new NodeProcessEnvRunner({
 - `std-env` — Environment detection (isCI, isTest)
 - `miniflare` — Cloudflare Workers simulator (optional peer dependency, required for `MiniflareEnvRunner`)
 
+> **See also:** [`.agents/MINIFLARE.md`](.agents/MINIFLARE.md) — Miniflare internals, `unsafeEvalBinding`, `unsafeModuleFallbackService`, service bindings patterns
+> **See also:** [`.agents/PLAN.vite-compat.md`](.agents/PLAN.vite-compat.md) — Planned improvements for Vite Environment API compatibility (`waitForReady`, RPC, transport helpers)
+
 ## Key patterns
 
 - **Co-located runner + worker** — Each runner directory contains both `runner.ts` and `worker.ts` (except `self/` which has no worker). Runners default to their co-located worker via `import.meta.resolve("env-runner/runners/<name>/worker")` when `entry` is omitted
 - **Message-driven readiness** — Workers/processes post `{ address }` to signal ready state
 - **Graceful shutdown protocol** — Runner sends `{ event: "shutdown" }`, entry must close server and respond with `{ event: "exit" }`
-- **Data passing:** Worker threads use `workerData`, processes use `ENV_RUNNER_DATA` env var (JSON), self runner uses in-memory channel, miniflare runner uses `scriptPath`/`script` options
+- **Data passing:** Worker threads use `workerData`, processes use `ENV_RUNNER_DATA` env var (JSON), self runner uses in-memory channel, miniflare runner uses in-memory `script` with `unsafeModuleFallbackService` for module resolution
 - **Socket cleanup** — `_closeSocket()` avoids deleting Windows named pipes and abstract sockets
 - **Custom inspect** — `[Symbol.for('nodejs.util.inspect.custom')]()` shows pending/ready/closed status
 - **Adding a new runner** — Create `src/runners/<name>/runner.ts` extending `BaseEnvRunner`, optionally add `worker.ts`, add export path in `package.json`, add to `loaders` map in `src/loader.ts`, re-export from `src/index.ts`
