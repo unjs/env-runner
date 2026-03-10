@@ -1,0 +1,55 @@
+{
+  "name": "env-runner",
+  "version": "0.1.0",
+  "description": "",
+  "license": "MIT",
+  "repository": "unjs/env-runner",
+  "bin": {
+    "env-runner": "./dist/cli.mjs"
+  },
+  "files": [
+    "dist"
+  ],
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": "./dist/index.mjs",
+    "./runners/node-worker": "./dist/runners/node-worker/runner.mjs",
+    "./runners/node-worker/worker": "./dist/runners/node-worker/worker.mjs",
+    "./runners/node-process": "./dist/runners/node-process/runner.mjs",
+    "./runners/node-process/worker": "./dist/runners/node-process/worker.mjs",
+    "./runners/bun-process": "./dist/runners/bun-process/runner.mjs",
+    "./runners/bun-process/worker": "./dist/runners/bun-process/worker.mjs",
+    "./runners/self": "./dist/runners/self/runner.mjs"
+  },
+  "scripts": {
+    "build": "obuild",
+    "dev": "vitest dev",
+    "fmt": "automd && oxlint . --fix && oxfmt .",
+    "lint": "oxlint . && oxfmt --check .",
+    "prepack": "pnpm build",
+    "env-runner": "node ./src/cli.ts",
+    "release": "pnpm test && pnpm build && changelogen --release && npm publish && git push --follow-tags",
+    "test": "pnpm lint && pnpm typecheck && vitest run --coverage",
+    "typecheck": "tsgo --noEmit --skipLibCheck"
+  },
+  "dependencies": {
+    "httpxy": "^0.3.1",
+    "srvx": "^0.11.9"
+  },
+  "devDependencies": {
+    "@types/node": "latest",
+    "@typescript/native-preview": "latest",
+    "@vitest/coverage-v8": "latest",
+    "automd": "latest",
+    "changelogen": "latest",
+    "env-runner-fixture": "link:.",
+    "obuild": "latest",
+    "oxfmt": "latest",
+    "oxlint": "latest",
+    "std-env": "4.0.0-rc.1",
+    "typescript": "latest",
+    "vitest": "latest"
+  },
+  "packageManager": "pnpm@10.29.3"
+}
