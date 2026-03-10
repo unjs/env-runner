@@ -29,9 +29,7 @@ const _isBun = typeof Bun !== "undefined";
 function resolveBunPath(): string {
   if (_bunPath) return _bunPath;
   // Check common locations
-  const candidates = [
-    join(homedir(), ".bun", "bin", "bun"),
-  ];
+  const candidates = [join(homedir(), ".bun", "bin", "bun")];
   for (const p of candidates) {
     if (existsSync(p)) {
       return (_bunPath = p);
@@ -85,7 +83,9 @@ export class BunProcessEnvRunner extends BaseEnvRunner {
     if (this.#process._exitCode == null) {
       await this._requestGracefulShutdown(
         () => {
-          try { this.#process!.send({ event: "shutdown" }); } catch {}
+          try {
+            this.#process!.send({ event: "shutdown" });
+          } catch {}
         },
         (resolve) => {
           this.#process?.exited.then(() => resolve());
@@ -94,7 +94,9 @@ export class BunProcessEnvRunner extends BaseEnvRunner {
       );
     }
     this.#process.removeAllListeners?.();
-    try { this.#process.kill(); } catch {}
+    try {
+      this.#process.kill();
+    } catch {}
     this.#process = undefined;
   }
 

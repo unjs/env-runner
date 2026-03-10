@@ -154,8 +154,7 @@ function wrapScript(userCode: string): string {
     .replace(/export\s+default\s+/, "const __userEntry = ")
     .replace(
       /export\s*\{([^}]*?\b(\w+)\b\s+as\s+default\b[^}]*)\}/,
-      (_match, _inner, identifier) =>
-        `const __userEntry = ${identifier};`,
+      (_match, _inner, identifier) => `const __userEntry = ${identifier};`,
     );
 
   return `${transformed}

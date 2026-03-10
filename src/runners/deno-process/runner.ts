@@ -59,7 +59,9 @@ export class DenoProcessEnvRunner extends BaseEnvRunner {
     if (this.#process._exitCode == null) {
       await this._requestGracefulShutdown(
         () => {
-          try { this.#process!.send({ event: "shutdown" }); } catch {}
+          try {
+            this.#process!.send({ event: "shutdown" });
+          } catch {}
         },
         (resolve) => {
           this.#process?.exited.then(() => resolve());
@@ -68,7 +70,9 @@ export class DenoProcessEnvRunner extends BaseEnvRunner {
       );
     }
     this.#process.removeAllListeners?.();
-    try { this.#process.kill(); } catch {}
+    try {
+      this.#process.kill();
+    } catch {}
     this.#process = undefined;
   }
 
