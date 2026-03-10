@@ -337,7 +337,9 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
                 resolvedPath = contextRequire.resolve(cleanRaw);
               } catch {
                 // Return an empty stub for unresolvable bare specifiers (e.g. optional native addons like bufferutil)
-                const name = cleanSpecifier.startsWith("/") ? cleanSpecifier.slice(1) : cleanSpecifier;
+                const name = cleanSpecifier.startsWith("/")
+                  ? cleanSpecifier.slice(1)
+                  : cleanSpecifier;
                 return Response.json({ name, esModule: "export default undefined;" });
               }
             }

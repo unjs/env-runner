@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 const GUID = "258EAFA5-E914-47DA-95CA-5AB5DC11E5B4";
 
 export default {
-  fetch(request) {
+  fetch(_req) {
     return new Response("ok");
   },
   upgrade(context) {
