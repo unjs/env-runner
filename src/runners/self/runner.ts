@@ -7,9 +7,19 @@ import { resolveEntry, reloadEntryModule } from "../../common/worker-utils.ts";
 
 export type { EnvRunnerData as SelfEnvRunnerData } from "../../common/base-runner.ts";
 
+interface NodeWSAdapter {
+  handleUpgrade: (
+    req: import("node:http").IncomingMessage,
+    socket: import("node:net").Socket,
+    head: any,
+  ) => Promise<void>;
+  closeAll: (code?: number, data?: string, force?: boolean) => void;
+}
+
 export class SelfEnvRunner extends BaseEnvRunner {
   #active = false;
   #entry?: AppEntry;
+  #wsAdapter?: NodeWSAdapter;
 
   constructor(opts: { name: string; hooks?: WorkerHooks; data?: EnvRunnerData }) {
     super({ ...opts, workerEntry: "" });
@@ -31,10 +41,15 @@ export class SelfEnvRunner extends BaseEnvRunner {
       head: any;
     };
   }) {
-    if (!this.#entry?.upgrade || this.closed) {
+    if (!this.#entry || this.closed) {
       return;
     }
-    this.#entry.upgrade(context);
+    if (this.#entry.websocket) {
+      const adapter = await this.#resolveWSAdapter();
+      await adapter.handleUpgrade(context.node.req, context.node.socket, context.node.head);
+      return;
+    }
+    this.#entry.upgrade?.(context);
   }
 
   sendMessage(message: unknown) {
@@ -57,6 +72,8 @@ export class SelfEnvRunner extends BaseEnvRunner {
     const sendFn = (message: unknown) => {
       queueMicrotask(() => this._handleMessage(message));
     };
+    this.#wsAdapter?.closeAll(1001, undefined, true);
+    this.#wsAdapter = undefined;
     this.#entry = await reloadEntryModule(entryPath, this.#entry, sendFn);
   }
 
@@ -75,6 +92,8 @@ export class SelfEnvRunner extends BaseEnvRunner {
       return;
     }
     this.#active = false;
+    this.#wsAdapter?.closeAll(1001, undefined, true);
+    this.#wsAdapter = undefined;
     await this.#entry?.ipc?.onClose?.();
     this.#entry = undefined;
   }
@@ -82,6 +101,14 @@ export class SelfEnvRunner extends BaseEnvRunner {
   // #endregion
 
   // #region Private methods
+
+  async #resolveWSAdapter(): Promise<NodeWSAdapter> {
+    if (!this.#wsAdapter) {
+      const { default: nodeAdapter } = await import("crossws/adapters/node");
+      this.#wsAdapter = nodeAdapter({ hooks: this.#entry!.websocket! });
+    }
+    return this.#wsAdapter;
+  }
 
   #init() {
     const entryPath = this._data?.entry as string | undefined;
