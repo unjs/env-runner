@@ -7,7 +7,7 @@ import { NodeWorkerEnvRunner } from "../src/runners/node-worker/runner.ts";
 
 const _dir = dirname(fileURLToPath(import.meta.url));
 const workerEntry = resolve(_dir, "../src/runners/node-worker/worker.ts");
-const appEntry = resolve(_dir, "./fixtures/app.ts");
+const appEntry = resolve(_dir, "./fixtures/app.mjs");
 
 function createRunner(name: string) {
   return new NodeWorkerEnvRunner({ name, workerEntry, data: { entry: appEntry } });

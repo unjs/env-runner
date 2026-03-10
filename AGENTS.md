@@ -23,8 +23,10 @@ src/
 │   ├── bun-process/
 │   │   ├── runner.ts        # BunProcessEnvRunner
 │   │   └── worker.ts        # Built-in srvx worker (Bun/Node.js)
-│   └── self/
-│       └── runner.ts        # SelfEnvRunner (in-process, no worker)
+│   ├── self/
+│   │   └── runner.ts        # SelfEnvRunner (in-process, no worker)
+│   └── miniflare/
+│       └── runner.ts        # MiniflareEnvRunner (Cloudflare Workers via miniflare)
 ├── types.ts                 # Core interfaces
 ├── index.ts                 # Public API exports
 ├── loader.ts                # Dynamic runner loader
@@ -43,7 +45,8 @@ src/
 - **`src/runners/bun-process/runner.ts`** — `BunProcessEnvRunner` extends `BaseEnvRunner`: uses `Bun.spawn()` with IPC when under Bun, falls back to Node.js `fork()` otherwise
 - **`src/runners/bun-process/worker.ts`** — Built-in srvx worker: same as node-process worker (works on both Bun and Node.js)
 - **`src/runners/self/runner.ts`** — `SelfEnvRunner` extends `BaseEnvRunner`: runs entry code in the same process using an in-memory channel registry on `process.__envRunners`
-- **`src/loader.ts`** — `loadRunner(name, opts)`: dynamic loader that imports a runner by name (`node-worker` | `node-process` | `bun-process` | `self`) and returns an `EnvRunner` instance
+- **`src/runners/miniflare/runner.ts`** — `MiniflareEnvRunner` extends `BaseEnvRunner`: runs entry in Cloudflare Workers runtime via miniflare. Overrides `fetch()` to use `mf.dispatchFetch()`. Requires `miniflare` peer dependency
+- **`src/loader.ts`** — `loadRunner(name, opts)`: dynamic loader that imports a runner by name (`node-worker` | `node-process` | `bun-process` | `self` | `miniflare`) and returns an `EnvRunner` instance
 - **`src/manager.ts`** — `RunnerManager`: proxy manager for hot-reload, message queueing, and listener forwarding across runner swaps
 - **`src/server.ts`** — `EnvServer` extends `RunnerManager`: high-level API combining runner loading, watch mode (`fs.watch` with 100ms debounce), and auto-reload on file changes. Supports `watch` and `watchPaths` options
 - **`src/cli.ts`** — CLI entry point: `env-runner <entry> [--runner] [--port] [--host] [-w/--watch]`
@@ -77,6 +80,10 @@ Dual-runtime: uses `Bun.spawn()` with IPC callback when running under Bun, falls
 ### SelfEnvRunner
 
 Runs entry code in the same process (no IPC, no forking). Uses an in-memory channel registry stored on `process.__envRunners` (Map). Entry modules retrieve their channel via query string: `import(entry + '?__envRunnerId=<id>')`. Communication uses `queueMicrotask()` to avoid synchronous re-entrancy. Exposes `SelfRunnerChannel` interface with `data`, `send()`, and `onMessage()`.
+
+### MiniflareEnvRunner
+
+Runs entry in the Cloudflare Workers runtime via [miniflare](https://github.com/cloudflare/workers-sdk/tree/main/packages/miniflare). No worker file or HTTP proxy needed — overrides `fetch()` to call `mf.dispatchFetch()` directly. Accepts `miniflareOptions` for full Miniflare configuration (bindings, KV, D1, Durable Objects, etc.). Entry script path passed via `data.entry` — the runner reads the file, wraps it with IPC glue code, and passes the generated script to Miniflare. Requires `miniflare` as a peer dependency. Supports full IPC (`ipc.onOpen`, `ipc.onMessage`, `ipc.onClose`) via a `serviceBindings`-based bridge: outbound messages use `env.__ENV_RUNNER_IPC` service binding, inbound messages use `dispatchFetch` with `x-env-runner-ipc` header.
 
 ### RunnerManager
 
@@ -164,6 +171,7 @@ const runner2 = new NodeProcessEnvRunner({
 | `env-runner/runners/node-process/worker` (default) | `NodeProcessEnvRunner` |
 | `env-runner/runners/bun-process/worker` (default)  | `BunProcessEnvRunner`  |
 | _(no worker)_                                      | `SelfEnvRunner`        |
+| _(generated wrapper script)_                       | `MiniflareEnvRunner`   |
 
 ## Exports
 
@@ -175,6 +183,7 @@ const runner2 = new NodeProcessEnvRunner({
 - `env-runner/runners/bun-process` (`./runners/bun-process`) — Direct import of `BunProcessEnvRunner`
 - `env-runner/runners/bun-process/worker` (`./runners/bun-process/worker`) — Built-in srvx worker for Bun/Node.js process
 - `env-runner/runners/self` (`./runners/self`) — Direct import of `SelfEnvRunner`
+- `env-runner/runners/miniflare` (`./runners/miniflare`) — Direct import of `MiniflareEnvRunner`
 
 ## Testing
 
@@ -199,13 +208,14 @@ const runner2 = new NodeProcessEnvRunner({
 - `httpxy` — HTTP/WebSocket proxy
 - `srvx` — Universal server framework (used by built-in workers)
 - `std-env` — Environment detection (isCI, isTest)
+- `miniflare` — Cloudflare Workers simulator (optional peer dependency, required for `MiniflareEnvRunner`)
 
 ## Key patterns
 
 - **Co-located runner + worker** — Each runner directory contains both `runner.ts` and `worker.ts` (except `self/` which has no worker). Runners default to their co-located worker via `import.meta.resolve("env-runner/runners/<name>/worker")` when `entry` is omitted
 - **Message-driven readiness** — Workers/processes post `{ address }` to signal ready state
 - **Graceful shutdown protocol** — Runner sends `{ event: "shutdown" }`, entry must close server and respond with `{ event: "exit" }`
-- **Data passing:** Worker threads use `workerData`, processes use `ENV_RUNNER_DATA` env var (JSON), self runner uses in-memory channel
+- **Data passing:** Worker threads use `workerData`, processes use `ENV_RUNNER_DATA` env var (JSON), self runner uses in-memory channel, miniflare runner uses `scriptPath`/`script` options
 - **Socket cleanup** — `_closeSocket()` avoids deleting Windows named pipes and abstract sockets
 - **Custom inspect** — `[Symbol.for('nodejs.util.inspect.custom')]()` shows pending/ready/closed status
 - **Adding a new runner** — Create `src/runners/<name>/runner.ts` extending `BaseEnvRunner`, optionally add `worker.ts`, add export path in `package.json`, add to `loaders` map in `src/loader.ts`, re-export from `src/index.ts`

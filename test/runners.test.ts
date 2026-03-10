@@ -8,9 +8,10 @@ import { NodeWorkerEnvRunner } from "../src/runners/node-worker/runner.ts";
 import { NodeProcessEnvRunner } from "../src/runners/node-process/runner.ts";
 import { BunProcessEnvRunner } from "../src/runners/bun-process/runner.ts";
 import { SelfEnvRunner } from "../src/runners/self/runner.ts";
+import { MiniflareEnvRunner } from "../src/runners/miniflare/runner.ts";
 
 const _dir = dirname(fileURLToPath(import.meta.url));
-const appEntry = resolve(_dir, "./fixtures/app.ts");
+const appEntry = resolve(_dir, "./fixtures/app.mjs");
 
 const runners = [
   {
@@ -29,15 +30,28 @@ const runners = [
     name: "SelfEnvRunner",
     create: (opts: any) => new SelfEnvRunner(opts),
   },
+  {
+    name: "MiniflareEnvRunner",
+    create: (opts: any) => new MiniflareEnvRunner(opts),
+    skipWorkerEntry: true,
+    extraOpts: { miniflareOptions: { compatibilityDate: "2024-01-01" } },
+  },
 ];
 
-for (const { name, create } of runners) {
+for (const runnerDef of runners) {
+  const { name, create, entry, skipWorkerEntry, extraOpts } = {
+    entry: appEntry,
+    skipWorkerEntry: false,
+    extraOpts: {} as Record<string, unknown>,
+    ...runnerDef,
+  };
   describe(name, () => {
     let runner: EnvRunner | undefined;
 
     const opts = (testName: string, extra?: Record<string, unknown>) => ({
       name: testName,
-      data: { entry: appEntry },
+      data: { entry },
+      ...extraOpts,
       ...extra,
     });
 
@@ -152,7 +166,7 @@ for (const { name, create } of runners) {
       expect(runner!.ready).toBe(true);
     });
 
-    it("returns 503 when unavailable", async () => {
+    it.skipIf(skipWorkerEntry)("returns 503 when unavailable", async () => {
       runner = create({
         name: "test-unavailable",
         workerEntry: "/non/existent/path.js",

@@ -34,12 +34,12 @@ npx env-runner app.ts
 
 **Flags:**
 
-| Flag              | Description                                                          | Default        |
-| ----------------- | -------------------------------------------------------------------- | -------------- |
-| `--runner <name>` | Runner to use (`node-worker`, `node-process`, `bun-process`, `self`) | `node-process` |
-| `--port <port>`   | Port to listen on                                                    | `3000`         |
-| `--host <host>`   | Host to bind to                                                      | `localhost`    |
-| `-w, --watch`     | Watch entry file for changes and auto-reload                         |                |
+| Flag              | Description                                                                       | Default        |
+| ----------------- | --------------------------------------------------------------------------------- | -------------- |
+| `--runner <name>` | Runner to use (`node-worker`, `node-process`, `bun-process`, `self`, `miniflare`) | `node-process` |
+| `--port <port>`   | Port to listen on                                                                 | `3000`         |
+| `--host <host>`   | Host to bind to                                                                   | `localhost`    |
+| `-w, --watch`     | Watch entry file for changes and auto-reload                                      |                |
 
 ### Server (`EnvServer`)
 
@@ -118,6 +118,7 @@ import { NodeWorkerEnvRunner } from "env-runner/runners/node-worker";
 import { NodeProcessEnvRunner } from "env-runner/runners/node-process";
 import { BunProcessEnvRunner } from "env-runner/runners/bun-process";
 import { SelfEnvRunner } from "env-runner/runners/self";
+import { MiniflareEnvRunner } from "env-runner/runners/miniflare";
 ```
 
 All runners implement the [`EnvRunner`](./src/types.ts) interface:
@@ -149,12 +150,39 @@ await runner.close();
 
 **Available runners:**
 
-| Runner                 | Isolation              | IPC mechanism                      |
-| ---------------------- | ---------------------- | ---------------------------------- |
-| `NodeWorkerEnvRunner`  | Worker thread          | `workerData` / `parentPort`        |
-| `NodeProcessEnvRunner` | Child process (`fork`) | `ENV_RUNNER_DATA` / `process.send` |
-| `BunProcessEnvRunner`  | Bun or Node.js process | `Bun.spawn` IPC or `fork()`        |
-| `SelfEnvRunner`        | In-process             | In-memory channel                  |
+| Runner                 | Isolation                      | IPC mechanism                      |
+| ---------------------- | ------------------------------ | ---------------------------------- |
+| `NodeWorkerEnvRunner`  | Worker thread                  | `workerData` / `parentPort`        |
+| `NodeProcessEnvRunner` | Child process (`fork`)         | `ENV_RUNNER_DATA` / `process.send` |
+| `BunProcessEnvRunner`  | Bun or Node.js process         | `Bun.spawn` IPC or `fork()`        |
+| `SelfEnvRunner`        | In-process                     | In-memory channel                  |
+| `MiniflareEnvRunner`   | Cloudflare Workers (miniflare) | `serviceBindings` + `dispatchFetch` |
+
+#### Miniflare Runner
+
+Run your app in the Cloudflare Workers runtime using [miniflare](https://github.com/cloudflare/workers-sdk/tree/main/packages/miniflare):
+
+```bash
+npm install miniflare
+```
+
+```ts
+import { MiniflareEnvRunner } from "env-runner/runners/miniflare";
+
+const runner = new MiniflareEnvRunner({
+  name: "my-worker",
+  data: { entry: "./worker.ts" },
+  miniflareOptions: {
+    compatibilityDate: "2024-01-01",
+    kvNamespaces: ["MY_KV"],
+  },
+});
+
+const response = await runner.fetch("http://localhost/api");
+await runner.close();
+```
+
+The `miniflareOptions` object is passed directly to the [Miniflare constructor](https://developers.cloudflare.com/workers/testing/miniflare/) — you can configure bindings, KV, D1, Durable Objects, and any other Miniflare option.
 
 You can also use `loadRunner()` to dynamically load a runner by name:
 

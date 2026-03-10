@@ -19,7 +19,7 @@ const usage = `
 \x1B[1mUsage:\x1B[0m env-runner \x1B[36m<entry>\x1B[0m [options]
 
 \x1B[1mOptions:\x1B[0m
-  \x1B[33m--runner\x1B[0m <name>  Runner to use (node-worker, node-process, bun-process, self) \x1B[2m(default: node-process)\x1B[0m
+  \x1B[33m--runner\x1B[0m <name>  Runner to use (node-worker, node-process, bun-process, self, miniflare) \x1B[2m(default: node-process)\x1B[0m
   \x1B[33m--port\x1B[0m <port>    Port to listen on \x1B[2m(default: 3000)\x1B[0m
   \x1B[33m--host\x1B[0m <host>    Host to bind to \x1B[2m(default: localhost)\x1B[0m
   \x1B[33m-w, --watch\x1B[0m      Watch entry file for changes and auto-reload

@@ -20,7 +20,8 @@
     "./runners/node-process/worker": "./dist/runners/node-process/worker.mjs",
     "./runners/bun-process": "./dist/runners/bun-process/runner.mjs",
     "./runners/bun-process/worker": "./dist/runners/bun-process/worker.mjs",
-    "./runners/self": "./dist/runners/self/runner.mjs"
+    "./runners/self": "./dist/runners/self/runner.mjs",
+    "./runners/miniflare": "./dist/runners/miniflare/runner.mjs"
   },
   "scripts": {
     "build": "obuild",
@@ -44,12 +45,21 @@
     "automd": "latest",
     "changelogen": "latest",
     "env-runner-fixture": "link:.",
+    "miniflare": "^4.20260301.1",
     "obuild": "latest",
     "oxfmt": "latest",
     "oxlint": "latest",
     "std-env": "4.0.0-rc.1",
     "typescript": "latest",
     "vitest": "latest"
+  },
+  "peerDependencies": {
+    "miniflare": "^4.0.0"
+  },
+  "peerDependenciesMeta": {
+    "miniflare": {
+      "optional": true
+    }
   },
   "packageManager": "pnpm@10.29.3"
 }
