@@ -1,6 +1,6 @@
 {
   "name": "env-runner",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Generic environment runner for JavaScript runtimes.",
   "license": "MIT",
   "repository": "unjs/env-runner",

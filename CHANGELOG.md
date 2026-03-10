@@ -1,6 +1,29 @@
 # Changelog
 
 
+## v0.1.3
+
+[compare changes](https://github.com/unjs/env-runner/compare/v0.1.2...v0.1.3)
+
+### 🚀 Enhancements
+
+- Worker upgrade support ([ddbd543](https://github.com/unjs/env-runner/commit/ddbd543))
+- Crossws support ([d8252c3](https://github.com/unjs/env-runner/commit/d8252c3))
+- Support crossws for miniflare ([851bb31](https://github.com/unjs/env-runner/commit/851bb31))
+
+### 🩹 Fixes
+
+- **cf:** Use service binding ipc ([5f71e71](https://github.com/unjs/env-runner/commit/5f71e71))
+
+### 🏡 Chore
+
+- **release:** V0.1.2 ([666978e](https://github.com/unjs/env-runner/commit/666978e))
+- Apply automated updates ([7a0a675](https://github.com/unjs/env-runner/commit/7a0a675))
+
+### ❤️ Contributors
+
+- Pooya Parsa <pooya@pi0.io>
+
 ## v0.1.2
 
 [compare changes](https://github.com/unjs/env-runner/compare/v0.1.1...v0.1.2)
