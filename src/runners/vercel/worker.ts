@@ -3,6 +3,9 @@ import { serve } from "srvx";
 import { plugin as wsPlugin } from "crossws/server/node";
 import { resolveEntry, reloadEntryModule, parseServerAddress } from "../../common/worker-utils.ts";
 
+const SYMBOL_FOR_REQ_CONTEXT = Symbol.for("@vercel/request-context");
+(globalThis as any)[SYMBOL_FOR_REQ_CONTEXT] = { get: () => ({}) };
+
 const data = workerData || {};
 let entry = await resolveEntry(data.entry);
 const sendMessage = (message: unknown) => parentPort?.postMessage(message);
