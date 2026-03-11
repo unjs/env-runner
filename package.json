@@ -24,6 +24,8 @@
     "./runners/deno-process/worker": "./dist/runners/deno-process/worker.mjs",
     "./runners/self": "./dist/runners/self/runner.mjs",
     "./runners/miniflare": "./dist/runners/miniflare/runner.mjs",
+    "./runners/vercel": "./dist/runners/vercel/runner.mjs",
+    "./runners/vercel/worker": "./dist/runners/vercel/worker.mjs",
     "./vite": "./dist/vite.mjs"
   },
   "scripts": {
@@ -58,9 +60,13 @@
     "vitest": "latest"
   },
   "peerDependencies": {
+    "@vercel/functions": "^3.0.0",
     "miniflare": "^4.0.0"
   },
   "peerDependenciesMeta": {
+    "@vercel/functions": {
+      "optional": true
+    },
     "miniflare": {
       "optional": true
     }
