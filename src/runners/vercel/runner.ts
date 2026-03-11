@@ -64,7 +64,7 @@ export class VercelEnvRunner extends BaseEnvRunner {
     }
 
     if (input instanceof Request) {
-      return super.fetch(new Request(input, { headers }));
+      return super.fetch(new Request(input, { ...init, headers }));
     }
     return super.fetch(input, { ...init, headers });
   }
