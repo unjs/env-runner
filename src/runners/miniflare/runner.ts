@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { basename, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { resolveModulePath } from "exsolve";
 import { init as initCjsLexer, parse as parseCjs } from "cjs-module-lexer";
 import { proxyUpgrade } from "httpxy";
 import { BaseEnvRunner } from "../../common/base-runner.ts";
@@ -58,6 +59,14 @@ export interface MiniflareEnvRunnerOptions {
   persistent?: boolean;
   /** Wrap the user's `fetch` in a try/catch that returns structured JSON error responses. Default: `true`. */
   captureErrors?: boolean;
+  /**
+   * Export conditions for bare-specifier module resolution in the module
+   * fallback service. Use this to ensure packages with conditional exports
+   * (e.g. `"workerd"`, `"worker"`) resolve to the correct entry.
+   *
+   * Defaults to `["workerd", "worker", "import", "default"]`.
+   */
+  exportConditions?: string[];
 }
 
 const IPC_PATH = "/__env_runner_ipc";
@@ -75,6 +84,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
   #cacheKey?: string;
   #exports: Record<string, MiniflareExportInfo> | boolean;
   #captureErrors: boolean;
+  #exportConditions: string[];
 
   constructor(opts: MiniflareEnvRunnerOptions) {
     super({ ...opts, workerEntry: "" });
@@ -83,6 +93,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
     this.#persistent = opts.persistent ?? false;
     this.#exports = opts.exports ?? {};
     this.#captureErrors = opts.captureErrors ?? true;
+    this.#exportConditions = opts.exportConditions ?? ["workerd", "worker", "import", "default"];
     this.#init();
   }
 
@@ -336,6 +347,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
       if (!options.unsafeModuleFallbackService) {
         const _require = createRequire(resolvedEntry);
         const _transformRequest = this.#transformRequest;
+        const _exportConditions = this.#exportConditions;
         options.unsafeUseModuleFallbackService = true;
         // Map workerd module names to real filesystem paths for correct
         // relative import resolution from bare-specifier modules.
@@ -379,7 +391,14 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
               }
             } else {
               try {
-                resolvedPath = contextRequire.resolve(cleanRaw);
+                // Use exsolve with export conditions so packages with conditional
+                // exports (e.g. srvx with "workerd" condition) resolve correctly.
+                const resolved = resolveModulePath(cleanRaw, {
+                  from: referrerReal || resolvedEntry,
+                  conditions: _exportConditions,
+                  try: true,
+                });
+                resolvedPath = resolved || contextRequire.resolve(cleanRaw);
               } catch {
                 // Return an empty stub for unresolvable bare specifiers (e.g. optional native addons like bufferutil)
                 const name = cleanSpecifier.startsWith("/")
