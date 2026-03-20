@@ -50,7 +50,7 @@
     "changelogen": "latest",
     "cjs-module-lexer": "^2.2.0",
     "env-runner-fixture": "link:.",
-    "miniflare": "^4.20260312.1",
+    "miniflare": "^4.20260317.1",
     "obuild": "latest",
     "oxfmt": "latest",
     "oxlint": "latest",
@@ -58,7 +58,7 @@
     "vitest": "latest"
   },
   "peerDependencies": {
-    "miniflare": "^4.20260312.1"
+    "miniflare": "^4.20260317.1"
   },
   "peerDependenciesMeta": {
     "miniflare": {
