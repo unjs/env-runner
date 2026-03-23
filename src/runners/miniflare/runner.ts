@@ -485,7 +485,10 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
 
     // Persistent Miniflare: reuse cached instance if available
     if (this.#persistent && entryPath) {
-      this.#cacheKey = computeCacheKey(entryPath, this.#miniflareOptions);
+      this.#cacheKey = computeCacheKey(entryPath, {
+        ...this.#miniflareOptions,
+        _exportConditions: this.#exportConditions,
+      });
       const cached = _miniflareCache.get(this.#cacheKey);
       if (cached) {
         this.#miniflare = cached.mf;
