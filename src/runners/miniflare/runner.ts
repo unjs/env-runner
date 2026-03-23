@@ -61,10 +61,10 @@ export interface MiniflareEnvRunnerOptions {
   captureErrors?: boolean;
   /**
    * Export conditions for bare-specifier module resolution in the module
-   * fallback service. Use this to ensure packages with conditional exports
-   * (e.g. `"workerd"`, `"worker"`) resolve to the correct entry.
+   * fallback service. Ensures packages with conditional exports (e.g.
+   * `"workerd"`) resolve to the correct entry instead of the Node.js one.
    *
-   * Defaults to `["workerd", "worker", "import", "default"]`.
+   * Defaults to `["workerd"]`.
    */
   exportConditions?: string[];
 }
@@ -93,7 +93,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
     this.#persistent = opts.persistent ?? false;
     this.#exports = opts.exports ?? {};
     this.#captureErrors = opts.captureErrors ?? true;
-    this.#exportConditions = opts.exportConditions ?? ["workerd", "worker", "import", "default"];
+    this.#exportConditions = opts.exportConditions ?? ["workerd"];
     this.#init();
   }
 
