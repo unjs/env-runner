@@ -443,6 +443,79 @@ for (const { name, create, selfRunner } of upgradeRunners) {
   });
 }
 
+// --- RPC tests ---
+
+const appRpcEntry = resolve(_dir, "./fixtures/app-rpc.mjs");
+
+const rpcRunners = [
+  { name: "NodeWorkerEnvRunner", create: (opts: any) => new NodeWorkerEnvRunner(opts) },
+  { name: "NodeProcessEnvRunner", create: (opts: any) => new NodeProcessEnvRunner(opts) },
+  {
+    name: "BunProcessEnvRunner",
+    create: (opts: any) => new BunProcessEnvRunner(opts),
+    skip: !hasBun,
+  },
+  {
+    name: "DenoProcessEnvRunner",
+    create: (opts: any) => new DenoProcessEnvRunner(opts),
+    skip: !hasDeno,
+  },
+  {
+    name: "SelfEnvRunner",
+    create: (opts: any) => new SelfEnvRunner(opts),
+  },
+  {
+    name: "MiniflareEnvRunner",
+    create: (opts: any) => new MiniflareEnvRunner(opts),
+  },
+];
+
+for (const { name, create, skip } of rpcRunners) {
+  describe.skipIf(skip ?? false)(`${name} rpc`, () => {
+    let runner: EnvRunner | undefined;
+
+    afterEach(async () => {
+      await runner?.close();
+      runner = undefined;
+    });
+
+    it("resolves with response data", async () => {
+      runner = create({ name: "test-rpc", data: { entry: appRpcEntry } });
+      await runner.waitForReady();
+
+      const result = await runner.rpc<string>("greet", "world");
+      expect(result).toBe("hello world");
+    });
+
+    it("rejects when worker returns an error", async () => {
+      runner = create({ name: "test-rpc-error", data: { entry: appRpcEntry } });
+      await runner.waitForReady();
+
+      await expect(runner.rpc("fail")).rejects.toThrow("something went wrong");
+    });
+
+    it("rejects on timeout", async () => {
+      runner = create({ name: "test-rpc-timeout", data: { entry: appRpcEntry } });
+      await runner.waitForReady();
+
+      // "slow" handler responds after 2s, so a 100ms timeout should fire first
+      await expect(runner.rpc("slow", undefined, { timeout: 100 })).rejects.toThrow("timed out");
+    });
+
+    it("handles concurrent rpc calls", async () => {
+      runner = create({ name: "test-rpc-concurrent", data: { entry: appRpcEntry } });
+      await runner.waitForReady();
+
+      const results = await Promise.all([
+        runner.rpc<string>("greet", "a"),
+        runner.rpc<string>("greet", "b"),
+        runner.rpc<string>("greet", "c"),
+      ]);
+      expect(results).toEqual(["hello a", "hello b", "hello c"]);
+    });
+  });
+}
+
 // --- Helpers ---
 
 function waitForReady(runner: EnvRunner, timeout = 5000): Promise<void> {

@@ -381,6 +381,10 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
             const referrerKey = referrer.startsWith("/") ? referrer.slice(1) : referrer;
             const referrerReal = modulePathMap.get(referrerKey);
             const contextRequire = referrerReal ? createRequire(referrerReal) : _require;
+            // cloudflare:* modules are workerd built-ins
+            if (cleanRaw.startsWith("cloudflare:")) {
+              return new Response(null, { status: 404 });
+            }
             // For node:* builtins not natively supported by workerd, use unenv polyfill
             if (cleanRaw.startsWith("node:")) {
               const nodeName = cleanRaw.slice(5);
