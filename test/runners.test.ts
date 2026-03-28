@@ -27,6 +27,7 @@ import { DenoProcessEnvRunner } from "../src/runners/deno-process/runner.ts";
 import { SelfEnvRunner } from "../src/runners/self/runner.ts";
 import { MiniflareEnvRunner } from "../src/runners/miniflare/runner.ts";
 import { VercelEnvRunner } from "../src/runners/vercel/runner.ts";
+import { NetlifyEnvRunner } from "../src/runners/netlify/runner.ts";
 
 const _dir = dirname(fileURLToPath(import.meta.url));
 const appEntry = resolve(_dir, "./fixtures/app.mjs");
@@ -63,6 +64,10 @@ const runners = [
   {
     name: "VercelEnvRunner",
     create: (opts: any) => new VercelEnvRunner(opts),
+  },
+  {
+    name: "NetlifyEnvRunner",
+    create: (opts: any) => new NetlifyEnvRunner(opts),
   },
 ];
 

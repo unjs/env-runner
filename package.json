@@ -26,6 +26,8 @@
     "./runners/miniflare": "./dist/runners/miniflare/runner.mjs",
     "./runners/vercel": "./dist/runners/vercel/runner.mjs",
     "./runners/vercel/worker": "./dist/runners/vercel/worker.mjs",
+    "./runners/netlify": "./dist/runners/netlify/runner.mjs",
+    "./runners/netlify/worker": "./dist/runners/netlify/worker.mjs",
     "./vite": "./dist/vite.mjs"
   },
   "scripts": {
@@ -46,6 +48,7 @@
     "srvx": "^0.11.13"
   },
   "devDependencies": {
+    "@netlify/runtime": "^4.1.20",
     "@types/node": "^25.5.0",
     "@typescript/native-preview": "^7.0.0-dev.20260327.2",
     "@vitest/coverage-v8": "^4.1.2",
@@ -61,10 +64,14 @@
     "vitest": "^4.1.2"
   },
   "peerDependencies": {
+    "@netlify/runtime": "^4",
     "miniflare": "^4.20260317.3"
   },
   "peerDependenciesMeta": {
     "miniflare": {
+      "optional": true
+    },
+    "@netlify/runtime": {
       "optional": true
     }
   },

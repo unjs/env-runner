@@ -7,7 +7,7 @@
 
 <!-- /automd -->
 
-Generic environment runner for JavaScript runtimes. Run your server apps across Node.js worker threads, child processes, Bun, Deno, Cloudflare Workers (via miniflare), or in-process — with hot-reload, WebSocket proxying, and bidirectional messaging.
+Generic environment runner for JavaScript runtimes. Run your server apps across Node.js worker threads, child processes, Bun, Deno, Cloudflare Workers (via miniflare), Vercel, Netlify, or in-process — with hot-reload, WebSocket proxying, and bidirectional messaging.
 
 ## Usage
 
@@ -120,6 +120,8 @@ import { BunProcessEnvRunner } from "env-runner/runners/bun-process";
 import { DenoProcessEnvRunner } from "env-runner/runners/deno-process";
 import { SelfEnvRunner } from "env-runner/runners/self";
 import { MiniflareEnvRunner } from "env-runner/runners/miniflare";
+import { VercelEnvRunner } from "env-runner/runners/vercel";
+import { NetlifyEnvRunner } from "env-runner/runners/netlify";
 ```
 
 All runners implement the [`EnvRunner`](./src/types.ts) interface:
@@ -160,14 +162,16 @@ await runner.close();
 
 **Available runners:**
 
-| Runner                 | Isolation                      | IPC mechanism                      |
-| ---------------------- | ------------------------------ | ---------------------------------- |
-| `NodeWorkerEnvRunner`  | Worker thread                  | `workerData` / `parentPort`        |
-| `NodeProcessEnvRunner` | Child process (`fork`)         | `ENV_RUNNER_DATA` / `process.send` |
-| `BunProcessEnvRunner`  | Bun or Node.js process         | `Bun.spawn` IPC or `fork()`        |
-| `DenoProcessEnvRunner` | Deno process                   | `deno run` with IPC channel        |
-| `SelfEnvRunner`        | In-process                     | In-memory channel                  |
-| `MiniflareEnvRunner`   | Cloudflare Workers (miniflare) | WebSocket pair via `dispatchFetch` |
+| Runner                 | Isolation                       | IPC mechanism                      |
+| ---------------------- | ------------------------------- | ---------------------------------- |
+| `NodeWorkerEnvRunner`  | Worker thread                   | `workerData` / `parentPort`        |
+| `NodeProcessEnvRunner` | Child process (`fork`)          | `ENV_RUNNER_DATA` / `process.send` |
+| `BunProcessEnvRunner`  | Bun or Node.js process          | `Bun.spawn` IPC or `fork()`        |
+| `DenoProcessEnvRunner` | Deno process                    | `deno run` with IPC channel        |
+| `SelfEnvRunner`        | In-process                      | In-memory channel                  |
+| `MiniflareEnvRunner`   | Cloudflare Workers (miniflare)  | WebSocket pair via `dispatchFetch` |
+| `VercelEnvRunner`      | Worker thread (Vercel context)  | `workerData` / `parentPort`        |
+| `NetlifyEnvRunner`     | Worker thread (Netlify context) | `workerData` / `parentPort`        |
 
 #### Miniflare Runner
 
@@ -287,6 +291,32 @@ const runner2 = new MiniflareEnvRunner({
 });
 
 // Fully destroy: runner.dispose() or MiniflareEnvRunner.disposeAll()
+```
+
+#### Vercel Runner
+
+Simulates a Vercel deployment environment with automatic header injection (`x-vercel-deployment-url`, `x-vercel-forwarded-for`, forwarding headers) and global context.
+
+```ts
+import { VercelEnvRunner } from "env-runner/runners/vercel";
+
+const runner = new VercelEnvRunner({
+  name: "my-app",
+  data: { entry: "./app.ts" },
+});
+```
+
+#### Netlify Runner
+
+Simulates a Netlify deployment environment with automatic header injection (`x-nf-client-connection-ip`, `x-nf-account-id`, `x-nf-site-id`, `x-nf-deploy-id`, `x-nf-deploy-context`, `x-nf-geo`, `x-nf-request-id`, forwarding headers) and `globalThis.Netlify` setup:
+
+```ts
+import { NetlifyEnvRunner } from "env-runner/runners/netlify";
+
+const runner = new NetlifyEnvRunner({
+  name: "my-app",
+  data: { entry: "./app.ts" },
+});
 ```
 
 ### Vite Environment API

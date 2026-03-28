@@ -8,7 +8,8 @@ export type RunnerName =
   | "deno-process"
   | "self"
   | "miniflare"
-  | "vercel";
+  | "vercel"
+  | "netlify";
 
 export interface LoadRunnerOptions {
   name: string;
@@ -32,6 +33,7 @@ const loaders: Record<RunnerName, () => Promise<RunnerConstructor>> = {
   self: () => import("env-runner/runners/self").then((m) => m.SelfEnvRunner),
   miniflare: () => import("env-runner/runners/miniflare").then((m) => m.MiniflareEnvRunner),
   vercel: () => import("env-runner/runners/vercel").then((m) => m.VercelEnvRunner),
+  netlify: () => import("env-runner/runners/netlify").then((m) => m.NetlifyEnvRunner),
 };
 
 export async function loadRunner(runner: RunnerName, opts: LoadRunnerOptions): Promise<EnvRunner> {

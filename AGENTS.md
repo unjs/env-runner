@@ -30,9 +30,12 @@ src/
 │   │   └── runner.ts        # SelfEnvRunner (in-process, no worker)
 │   ├── miniflare/
 │   │   └── runner.ts        # MiniflareEnvRunner (Cloudflare Workers via miniflare)
-│   └── vercel/
-│       ├── runner.ts        # VercelEnvRunner (extends NodeWorkerEnvRunner)
-│       └── worker.ts        # Sets Vercel request context symbol, delegates to node-worker
+│   ├── vercel/
+│   │   ├── runner.ts        # VercelEnvRunner (extends NodeWorkerEnvRunner)
+│   │   └── worker.ts        # Sets Vercel request context symbol, delegates to node-worker
+│   └── netlify/
+│       ├── runner.ts        # NetlifyEnvRunner (extends NodeWorkerEnvRunner)
+│       └── worker.ts        # Sets global Netlify context, delegates to node-worker
 ├── types.ts                 # Core interfaces
 ├── index.ts                 # Public API exports
 ├── loader.ts                # Dynamic runner loader
@@ -57,7 +60,9 @@ src/
 - **`src/runners/miniflare/runner.ts`** — `MiniflareEnvRunner` extends `BaseEnvRunner`: runs entry in Cloudflare Workers runtime via miniflare. Overrides `fetch()` to use `mf.dispatchFetch()`. Uses in-memory `script` (no temp files), `unsafeModuleFallbackService` for module resolution, and `unsafeEvalBinding` for hot-reload via `reloadModule()`. Requires `miniflare` peer dependency
 - **`src/runners/vercel/runner.ts`** — `VercelEnvRunner` extends `NodeWorkerEnvRunner`: simulates Vercel deployment environment with header injection
 - **`src/runners/vercel/worker.ts`** — Sets `Symbol.for("@vercel/request-context")` on globalThis, delegates to node-worker worker
-- **`src/loader.ts`** — `loadRunner(name, opts)`: dynamic loader that imports a runner by name (`node-worker` | `node-process` | `bun-process` | `deno-process` | `self` | `miniflare` | `vercel`) and returns an `EnvRunner` instance
+- **`src/runners/netlify/runner.ts`** — `NetlifyEnvRunner` extends `NodeWorkerEnvRunner`: simulates Netlify deployment environment with header injection (`x-nf-client-connection-ip`, `x-nf-account-id`, `x-nf-site-id`, `x-nf-deploy-id`, `x-nf-deploy-context`, `x-nf-geo`, `x-nf-request-id`)
+- **`src/runners/netlify/worker.ts`** — Uses `@netlify/runtime` `startRuntime()` when available (sets up `globalThis.Netlify` with env/context and `globalThis.caches`), falls back to lightweight shim. Delegates to node-worker worker
+- **`src/loader.ts`** — `loadRunner(name, opts)`: dynamic loader that imports a runner by name (`node-worker` | `node-process` | `bun-process` | `deno-process` | `self` | `miniflare` | `vercel` | `netlify`) and returns an `EnvRunner` instance
 - **`src/manager.ts`** — `RunnerManager`: proxy manager for hot-reload, message queueing, and listener forwarding across runner swaps
 - **`src/server.ts`** — `EnvServer` extends `RunnerManager`: high-level API combining runner loading, watch mode (`fs.watch` with 100ms debounce), and auto-reload on file changes. Supports `watch` and `watchPaths` options
 - **`src/cli.ts`** — CLI entry point: `env-runner <entry> [--runner] [--port] [--host] [-w/--watch]`
@@ -121,6 +126,25 @@ Extends `NodeWorkerEnvRunner` to simulate a Vercel deployment environment. The w
 
 - `x-vercel-deployment-url` — constructed from the worker's address (`http://<host>:<port>`)
 - `x-vercel-forwarded-for` — derived from `x-forwarded-for` (first IP) or `x-real-ip`, defaults to `127.0.0.1`
+- `x-forwarded-for`, `x-real-ip` — set to client IP if not already present
+- `x-forwarded-proto` — protocol from request URL
+- `x-forwarded-host` — from `host` header or request URL
+
+All headers are only injected when not already present in the request.
+
+### NetlifyEnvRunner
+
+Extends `NodeWorkerEnvRunner` to simulate a Netlify deployment environment. The worker sets `globalThis.Netlify` with `context` (null) and `env` (backed by `process.env`) for Netlify Functions API compatibility, then delegates to the node-worker worker.
+
+**Header injection:** Overrides `fetch()` to inject Netlify-specific headers before delegating to the parent:
+
+- `x-nf-client-connection-ip` — derived from `x-forwarded-for` (first IP) or `x-real-ip`, defaults to `127.0.0.1`
+- `x-nf-account-id` — defaults to `"0"`
+- `x-nf-site-id` — defaults to `"0"`
+- `x-nf-deploy-id` — defaults to `"0"`
+- `x-nf-deploy-context` — defaults to `"dev"`
+- `x-nf-geo` — base64-encoded JSON geolocation object, defaults to `{ city: "localhost", country: { code: "dev" } }`
+- `x-nf-request-id` — unique UUID per request via `crypto.randomUUID()`
 - `x-forwarded-for`, `x-real-ip` — set to client IP if not already present
 - `x-forwarded-proto` — protocol from request URL
 - `x-forwarded-host` — from `host` header or request URL
@@ -223,6 +247,7 @@ const runner2 = new NodeProcessEnvRunner({
 | _(no worker)_                                      | `SelfEnvRunner`        |
 | _(in-memory wrapper module)_                       | `MiniflareEnvRunner`   |
 | `env-runner/runners/vercel/worker` (default)       | `VercelEnvRunner`      |
+| `env-runner/runners/netlify/worker` (default)      | `NetlifyEnvRunner`     |
 
 ## Exports
 
@@ -239,12 +264,14 @@ const runner2 = new NodeProcessEnvRunner({
 - `env-runner/runners/miniflare` (`./runners/miniflare`) — Direct import of `MiniflareEnvRunner`
 - `env-runner/runners/vercel` (`./runners/vercel`) — Direct import of `VercelEnvRunner`
 - `env-runner/runners/vercel/worker` (`./runners/vercel/worker`) — Vercel worker (sets request context, delegates to node-worker)
+- `env-runner/runners/netlify` (`./runners/netlify`) — Direct import of `NetlifyEnvRunner`
+- `env-runner/runners/netlify/worker` (`./runners/netlify/worker`) — Netlify worker (sets global Netlify context, delegates to node-worker)
 - `env-runner/vite` (`./vite`) — Vite Environment API helpers (`createViteHotChannel`, `createViteTransport`)
 
 ## Testing
 
 - Tests use vitest: `pnpm vitest run`
-- **`test/runners.test.ts`** — Parameterized test suite for all IPC-based runner implementations (NodeWorker, NodeProcess, BunProcess, DenoProcess, Vercel). Runners requiring specific runtimes (bun, deno) are auto-skipped when the runtime is not available
+- **`test/runners.test.ts`** — Parameterized test suite for all IPC-based runner implementations (NodeWorker, NodeProcess, BunProcess, DenoProcess, Vercel, Netlify). Runners requiring specific runtimes (bun, deno) are auto-skipped when the runtime is not available
 - **`test/manager.test.ts`** — Tests for `RunnerManager` lifecycle, hot-reload, message queueing, hook forwarding
 - **`test/miniflare.test.ts`** — Tests for `MiniflareEnvRunner`: Durable Object exports, IPC alongside custom exports, hot-reload via `reloadModule()`, IPC re-initialization after reload
 - **`test/vite.test.ts`** — Tests for Vite helpers: `createViteHotChannel` message namespacing/filtering/on/off, `createViteTransport` connect/send filtering
@@ -255,7 +282,8 @@ const runner2 = new NodeProcessEnvRunner({
 - Test fixture in `test/fixtures/app-websocket.mjs` — Entry with crossws WebSocket hooks for websocket tests
 - Test fixture in `test/fixtures/app-headers.mjs` — Entry that echoes all request headers as JSON for vercel header injection tests
 - **`test/vercel.test.ts`** — Tests for `VercelEnvRunner`: header injection (`x-vercel-deployment-url`, `x-vercel-forwarded-for`, `x-forwarded-for`, `x-real-ip`, `x-forwarded-proto`, `x-forwarded-host`), header preservation, pre-existing header respect
-- Tests cover: lifecycle, fetch (GET/POST), WebSocket upgrade, crossws websocket, messaging, hooks, graceful close, inspect output, manager hot-reload, message queueing, miniflare hot-reload, vercel header injection, waitForReady, vite helpers
+- **`test/netlify.test.ts`** — Tests for `NetlifyEnvRunner`: header injection (`x-nf-client-connection-ip`, `x-nf-account-id`, `x-nf-site-id`, `x-nf-deploy-id`, `x-nf-deploy-context`, `x-nf-geo`, `x-nf-request-id`), IP derivation, header preservation
+- Tests cover: lifecycle, fetch (GET/POST), WebSocket upgrade, crossws websocket, messaging, hooks, graceful close, inspect output, manager hot-reload, message queueing, miniflare hot-reload, vercel header injection, netlify header injection, waitForReady, vite helpers
 
 ## Scripts
 
@@ -273,6 +301,7 @@ const runner2 = new NodeProcessEnvRunner({
 - `httpxy` — HTTP/WebSocket proxy
 - `srvx` — Universal server framework (used by built-in workers)
 - `miniflare` — Cloudflare Workers simulator (optional peer dependency, required for `MiniflareEnvRunner`)
+- `@netlify/runtime` — Netlify compute runtime (optional peer dependency, used by `NetlifyEnvRunner` worker for full `globalThis.Netlify` + `globalThis.caches` setup)
 
 > **See also:** [`.agents/MINIFLARE.md`](.agents/MINIFLARE.md) — Miniflare internals, `unsafeEvalBinding`, `unsafeModuleFallbackService`, service bindings patterns
 > **See also:** [`.agents/PLAN.vite-compat.md`](.agents/PLAN.vite-compat.md) — Planned improvements for Vite Environment API compatibility (`waitForReady`, RPC, transport helpers)
