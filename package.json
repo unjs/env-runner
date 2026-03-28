@@ -60,13 +60,9 @@
     "vitest": "latest"
   },
   "peerDependencies": {
-    "@vercel/functions": "^3.0.0",
     "miniflare": "^4.20260312.1"
   },
   "peerDependenciesMeta": {
-    "@vercel/functions": {
-      "optional": true
-    },
     "miniflare": {
       "optional": true
     }
