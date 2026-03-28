@@ -64,7 +64,7 @@ export interface MiniflareEnvRunnerOptions {
    * fallback service. Ensures packages with conditional exports (e.g.
    * `"workerd"`) resolve to the correct entry instead of the Node.js one.
    *
-   * Defaults to `["workerd"]`.
+   * Defaults to `["workerd", "worker"]`.
    */
   exportConditions?: string[];
 }
