@@ -81,10 +81,10 @@ export class DenoProcessEnvRunner extends BaseEnvRunner {
 
     const child = spawn(
       "deno",
-      ["run", "--allow-all", "--node-modules-dir=auto", ...(execArgv || []), this._workerEntry],
+      ["run", "-A", "--node-modules-dir=auto", "--no-lock", ...(execArgv || []), this._workerEntry],
       {
         env,
-        stdio: ["pipe", "pipe", "pipe", "ipc"],
+        stdio: ["pipe", "pipe", "pipe"],
       },
     );
 
@@ -95,7 +95,9 @@ export class DenoProcessEnvRunner extends BaseEnvRunner {
     const handle: ProcessHandle = {
       pid: child.pid!,
       kill: () => child.kill(),
-      send: (message: unknown) => child.send(message as any),
+      send: (message: unknown) => {
+        child.stdin!.write(JSON.stringify(message) + "\n");
+      },
       exited,
       _exitCode: undefined,
       removeAllListeners: () => child.removeAllListeners(),
@@ -113,8 +115,22 @@ export class DenoProcessEnvRunner extends BaseEnvRunner {
       }
     });
 
-    child.on("message", (message: any) => {
-      this._handleMessage(message);
+    // Parse newline-delimited JSON from stdout for IPC
+    let buffer = "";
+    child.stdout!.on("data", (chunk: Buffer) => {
+      buffer += chunk.toString();
+      let newlineIdx;
+      while ((newlineIdx = buffer.indexOf("\n")) !== -1) {
+        const line = buffer.slice(0, newlineIdx);
+        buffer = buffer.slice(newlineIdx + 1);
+        if (line.startsWith("{")) {
+          try {
+            this._handleMessage(JSON.parse(line));
+          } catch {
+            // Not JSON, ignore
+          }
+        }
+      }
     });
 
     this.#process = handle;
