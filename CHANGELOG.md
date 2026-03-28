@@ -1,6 +1,41 @@
 # Changelog
 
 
+## v0.1.7
+
+[compare changes](https://github.com/unjs/env-runner/compare/v0.1.6...v0.1.7)
+
+### 🚀 Enhancements
+
+- Support custom export conditions ([#5](https://github.com/unjs/env-runner/pull/5))
+- **vercel:** Add vercel runner ([#3](https://github.com/unjs/env-runner/pull/3))
+- Netlify runner ([7e47106](https://github.com/unjs/env-runner/commit/7e47106))
+- **vercel:** Shim full `@vercel/request-context` for `@vercel/functions` compat ([cb9a358](https://github.com/unjs/env-runner/commit/cb9a358))
+
+### 🩹 Fixes
+
+- **miniflare:** Pass through cloudflare:* imports to workerd ([#6](https://github.com/unjs/env-runner/pull/6))
+- **deno:** Use stdin/stdout IPC and prevent `deno.lock` creation ([1df4340](https://github.com/unjs/env-runner/commit/1df4340))
+
+### 📖 Documentation
+
+- Add vercel runner to AGENTS.md ([586bf30](https://github.com/unjs/env-runner/commit/586bf30))
+
+### 🏡 Chore
+
+- Update deps ([6583926](https://github.com/unjs/env-runner/commit/6583926))
+- Apply automated updates ([ee3dd7c](https://github.com/unjs/env-runner/commit/ee3dd7c))
+
+### ✅ Tests
+
+- Add rpc() method coverage across all runners ([#4](https://github.com/unjs/env-runner/pull/4))
+
+### ❤️ Contributors
+
+- Pooya Parsa ([@pi0](https://github.com/pi0))
+- Rihan Arfan ([@RihanArfan](https://github.com/RihanArfan))
+- Ori ([@oritwoen](https://github.com/oritwoen))
+
 ## v0.1.6
 
 [compare changes](https://github.com/unjs/env-runner/compare/v0.1.5...v0.1.6)
