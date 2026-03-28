@@ -26,6 +26,7 @@ import { BunProcessEnvRunner } from "../src/runners/bun-process/runner.ts";
 import { DenoProcessEnvRunner } from "../src/runners/deno-process/runner.ts";
 import { SelfEnvRunner } from "../src/runners/self/runner.ts";
 import { MiniflareEnvRunner } from "../src/runners/miniflare/runner.ts";
+import { VercelEnvRunner } from "../src/runners/vercel/runner.ts";
 
 const _dir = dirname(fileURLToPath(import.meta.url));
 const appEntry = resolve(_dir, "./fixtures/app.mjs");
@@ -58,6 +59,10 @@ const runners = [
     create: (opts: any) => new MiniflareEnvRunner(opts),
     skipWorkerEntry: true,
     extraOpts: {},
+  },
+  {
+    name: "VercelEnvRunner",
+    create: (opts: any) => new VercelEnvRunner(opts),
   },
 ];
 

@@ -27,7 +27,7 @@ export class NodeWorkerEnvRunner extends BaseEnvRunner {
 
   sendMessage(message: unknown) {
     if (!this.#worker) {
-      throw new Error("Node env worker should be initialized before sending messages.");
+      throw new Error("Worker thread should be initialized before sending messages.");
     }
     this.#worker.postMessage(message);
   }
