@@ -28,8 +28,11 @@ src/
 │   │   └── worker.ts        # Built-in srvx worker (Deno)
 │   ├── self/
 │   │   └── runner.ts        # SelfEnvRunner (in-process, no worker)
-│   └── miniflare/
-│       └── runner.ts        # MiniflareEnvRunner (Cloudflare Workers via miniflare)
+│   ├── miniflare/
+│   │   └── runner.ts        # MiniflareEnvRunner (Cloudflare Workers via miniflare)
+│   └── vercel/
+│       ├── runner.ts        # VercelEnvRunner (extends NodeWorkerEnvRunner)
+│       └── worker.ts        # Sets Vercel request context symbol, delegates to node-worker
 ├── types.ts                 # Core interfaces
 ├── index.ts                 # Public API exports
 ├── loader.ts                # Dynamic runner loader
@@ -52,7 +55,9 @@ src/
 - **`src/runners/deno-process/worker.ts`** — Built-in srvx worker: same as node-process worker (works on Deno via Node.js compat)
 - **`src/runners/self/runner.ts`** — `SelfEnvRunner` extends `BaseEnvRunner`: runs entry code in the same process using an in-memory channel registry on `process.__envRunners`
 - **`src/runners/miniflare/runner.ts`** — `MiniflareEnvRunner` extends `BaseEnvRunner`: runs entry in Cloudflare Workers runtime via miniflare. Overrides `fetch()` to use `mf.dispatchFetch()`. Uses in-memory `script` (no temp files), `unsafeModuleFallbackService` for module resolution, and `unsafeEvalBinding` for hot-reload via `reloadModule()`. Requires `miniflare` peer dependency
-- **`src/loader.ts`** — `loadRunner(name, opts)`: dynamic loader that imports a runner by name (`node-worker` | `node-process` | `bun-process` | `deno-process` | `self` | `miniflare`) and returns an `EnvRunner` instance
+- **`src/runners/vercel/runner.ts`** — `VercelEnvRunner` extends `NodeWorkerEnvRunner`: simulates Vercel deployment environment with header injection
+- **`src/runners/vercel/worker.ts`** — Sets `Symbol.for("@vercel/request-context")` on globalThis, delegates to node-worker worker
+- **`src/loader.ts`** — `loadRunner(name, opts)`: dynamic loader that imports a runner by name (`node-worker` | `node-process` | `bun-process` | `deno-process` | `self` | `miniflare` | `vercel`) and returns an `EnvRunner` instance
 - **`src/manager.ts`** — `RunnerManager`: proxy manager for hot-reload, message queueing, and listener forwarding across runner swaps
 - **`src/server.ts`** — `EnvServer` extends `RunnerManager`: high-level API combining runner loading, watch mode (`fs.watch` with 100ms debounce), and auto-reload on file changes. Supports `watch` and `watchPaths` options
 - **`src/cli.ts`** — CLI entry point: `env-runner <entry> [--runner] [--port] [--host] [-w/--watch]`
@@ -107,6 +112,19 @@ Runs entry in the Cloudflare Workers runtime via [miniflare](https://github.com/
 **IPC:** Full bidirectional IPC (`ipc.onOpen`, `ipc.onMessage`, `ipc.onClose`) via a persistent WebSocket pair. During init, `dispatchFetch` with `upgrade: "websocket"` establishes a `WebSocketPair` — the runner keeps the client end, the worker wrapper keeps the server end. All messaging (user messages, reload commands, shutdown) flows over this single persistent connection as JSON. No per-message `dispatchFetch` overhead.
 
 **Hot-reload:** `reloadModule()` sends `{ type: "reload", version }` over the WebSocket. The worker wrapper uses `unsafeEvalBinding` (`__ENV_RUNNER_UNSAFE_EVAL__`) to create a dynamic `import()` with a cache-busting query string. The module fallback service serves the fresh file from disk. Old entry's `ipc.onClose()` is called before swapping, new entry's `ipc.onOpen()` is called after. Worker sends `{ event: "module-reloaded" }` back over the WebSocket when done.
+
+### VercelEnvRunner
+
+Extends `NodeWorkerEnvRunner` to simulate a Vercel deployment environment. The worker sets `Symbol.for("@vercel/request-context")` on `globalThis` for Vercel API compatibility, then delegates to the node-worker worker.
+
+**Header injection:** Overrides `fetch()` to inject Vercel-specific headers before delegating to the parent:
+- `x-vercel-deployment-url` — constructed from the worker's address (`http://<host>:<port>`)
+- `x-vercel-forwarded-for` — derived from `x-forwarded-for` (first IP) or `x-real-ip`, defaults to `127.0.0.1`
+- `x-forwarded-for`, `x-real-ip` — set to client IP if not already present
+- `x-forwarded-proto` — protocol from request URL
+- `x-forwarded-host` — from `host` header or request URL
+
+All headers are only injected when not already present in the request.
 
 ### RunnerManager
 
@@ -203,6 +221,7 @@ const runner2 = new NodeProcessEnvRunner({
 | `env-runner/runners/deno-process/worker` (default) | `DenoProcessEnvRunner` |
 | _(no worker)_                                      | `SelfEnvRunner`        |
 | _(in-memory wrapper module)_                       | `MiniflareEnvRunner`   |
+| `env-runner/runners/vercel/worker` (default)       | `VercelEnvRunner`      |
 
 ## Exports
 
@@ -217,12 +236,14 @@ const runner2 = new NodeProcessEnvRunner({
 - `env-runner/runners/deno-process/worker` (`./runners/deno-process/worker`) — Built-in srvx worker for Deno process
 - `env-runner/runners/self` (`./runners/self`) — Direct import of `SelfEnvRunner`
 - `env-runner/runners/miniflare` (`./runners/miniflare`) — Direct import of `MiniflareEnvRunner`
+- `env-runner/runners/vercel` (`./runners/vercel`) — Direct import of `VercelEnvRunner`
+- `env-runner/runners/vercel/worker` (`./runners/vercel/worker`) — Vercel worker (sets request context, delegates to node-worker)
 - `env-runner/vite` (`./vite`) — Vite Environment API helpers (`createViteHotChannel`, `createViteTransport`)
 
 ## Testing
 
 - Tests use vitest: `pnpm vitest run`
-- **`test/runners.test.ts`** — Parameterized test suite for all IPC-based runner implementations (NodeWorker, NodeProcess, BunProcess, DenoProcess). Runners requiring specific runtimes (bun, deno) are auto-skipped when the runtime is not available
+- **`test/runners.test.ts`** — Parameterized test suite for all IPC-based runner implementations (NodeWorker, NodeProcess, BunProcess, DenoProcess, Vercel). Runners requiring specific runtimes (bun, deno) are auto-skipped when the runtime is not available
 - **`test/manager.test.ts`** — Tests for `RunnerManager` lifecycle, hot-reload, message queueing, hook forwarding
 - **`test/miniflare.test.ts`** — Tests for `MiniflareEnvRunner`: Durable Object exports, IPC alongside custom exports, hot-reload via `reloadModule()`, IPC re-initialization after reload
 - **`test/vite.test.ts`** — Tests for Vite helpers: `createViteHotChannel` message namespacing/filtering/on/off, `createViteTransport` connect/send filtering
@@ -231,7 +252,9 @@ const runner2 = new NodeProcessEnvRunner({
 - Test fixture in `test/fixtures/worker-do.mjs` — Worker with Durable Object export + IPC for miniflare tests
 - Test fixture in `test/fixtures/app-upgrade.mjs` — Entry with WebSocket upgrade handler for upgrade tests
 - Test fixture in `test/fixtures/app-websocket.mjs` — Entry with crossws WebSocket hooks for websocket tests
-- Tests cover: lifecycle, fetch (GET/POST), WebSocket upgrade, crossws websocket, messaging, hooks, graceful close, inspect output, manager hot-reload, message queueing, miniflare hot-reload, waitForReady, vite helpers
+- Test fixture in `test/fixtures/app-headers.mjs` — Entry that echoes all request headers as JSON for vercel header injection tests
+- **`test/vercel.test.ts`** — Tests for `VercelEnvRunner`: header injection (`x-vercel-deployment-url`, `x-vercel-forwarded-for`, `x-forwarded-for`, `x-real-ip`, `x-forwarded-proto`, `x-forwarded-host`), header preservation, pre-existing header respect
+- Tests cover: lifecycle, fetch (GET/POST), WebSocket upgrade, crossws websocket, messaging, hooks, graceful close, inspect output, manager hot-reload, message queueing, miniflare hot-reload, vercel header injection, waitForReady, vite helpers
 
 ## Scripts
 
