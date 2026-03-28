@@ -5,6 +5,7 @@ import { VercelEnvRunner } from "../src/runners/vercel/runner.ts";
 
 const _dir = dirname(fileURLToPath(import.meta.url));
 const headersEntry = resolve(_dir, "./fixtures/app-headers.mjs");
+const envEntry = resolve(_dir, "./fixtures/app-env.mjs");
 const appEntry = resolve(_dir, "./fixtures/app.mjs");
 
 describe("VercelEnvRunner", () => {
@@ -118,5 +119,33 @@ describe("VercelEnvRunner", () => {
     const headers = await res.json();
     expect(headers["x-vercel-deployment-url"]).toBe("https://my-app.vercel.app");
     expect(headers["x-vercel-forwarded-for"]).toBe("10.0.0.1");
+  });
+
+  it("injects x-vercel-id request header", async () => {
+    runner = new VercelEnvRunner({ name: "test-vid", data: { entry: headersEntry } });
+    await runner.waitForReady();
+    const res = await runner.fetch("http://localhost/");
+    const headers = await res.json();
+    expect(headers["x-vercel-id"]).toMatch(/^dev1::\w+-\w+-[\da-f]{12}$/);
+  });
+
+  it("sets vercel response headers", async () => {
+    runner = new VercelEnvRunner({ name: "test-res-headers", data: { entry: appEntry } });
+    await runner.waitForReady();
+    const res = await runner.fetch("http://localhost/");
+    expect(res.headers.get("server")).toBe("Vercel");
+    expect(res.headers.get("x-vercel-id")).toMatch(/^dev1::/);
+    expect(res.headers.get("x-vercel-cache")).toBe("MISS");
+  });
+
+  it("sets vercel environment variables in worker", async () => {
+    runner = new VercelEnvRunner({ name: "test-env", data: { entry: envEntry } });
+    await runner.waitForReady();
+    const res = await runner.fetch("http://localhost/");
+    const { env } = await res.json();
+    expect(env.VERCEL).toBe("1");
+    expect(env.VERCEL_ENV).toBe("development");
+    expect(env.VERCEL_REGION).toBe("dev1");
+    expect(env.NOW_REGION).toBe("dev1");
   });
 });

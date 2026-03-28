@@ -120,17 +120,31 @@ Runs entry in the Cloudflare Workers runtime via [miniflare](https://github.com/
 
 ### VercelEnvRunner
 
-Extends `NodeWorkerEnvRunner` to simulate a Vercel deployment environment. The worker sets `Symbol.for("@vercel/request-context")` on `globalThis` for Vercel API compatibility, then delegates to the node-worker worker.
+Extends `NodeWorkerEnvRunner` to simulate a Vercel deployment environment. The worker sets `Symbol.for("@vercel/request-context")` on `globalThis` (with `waitUntil`, `cache`, `purge`, `addCacheTag`) for `@vercel/functions` compatibility, sets Vercel environment variables, then delegates to the node-worker worker.
 
-**Header injection:** Overrides `fetch()` to inject Vercel-specific headers before delegating to the parent:
+**Environment variables** (set in worker thread, won't override if already set):
+
+- `VERCEL` — `"1"`
+- `VERCEL_ENV` — `"development"`
+- `VERCEL_REGION` — `"dev1"`
+- `NOW_REGION` — `"dev1"` (legacy alias)
+
+**Request header injection:** Overrides `fetch()` to inject Vercel-specific headers before delegating to the parent:
 
 - `x-vercel-deployment-url` — constructed from the worker's address (`http://<host>:<port>`)
+- `x-vercel-id` — unique request ID in format `dev1::<podId>-<timestamp>-<hex>` (stable podId per process, matches vercel dev behavior)
 - `x-vercel-forwarded-for` — derived from `x-forwarded-for` (first IP) or `x-real-ip`, defaults to `127.0.0.1`
 - `x-forwarded-for`, `x-real-ip` — set to client IP if not already present
 - `x-forwarded-proto` — protocol from request URL
 - `x-forwarded-host` — from `host` header or request URL
 
-All headers are only injected when not already present in the request.
+**Response header injection:** After proxying, injects response headers:
+
+- `server` — `"Vercel"`
+- `x-vercel-id` — same request ID as the request header
+- `x-vercel-cache` — `"MISS"`
+
+All headers are only injected when not already present in the request/response.
 
 ### NetlifyEnvRunner
 
@@ -281,9 +295,10 @@ const runner2 = new NodeProcessEnvRunner({
 - Test fixture in `test/fixtures/app-upgrade.mjs` — Entry with WebSocket upgrade handler for upgrade tests
 - Test fixture in `test/fixtures/app-websocket.mjs` — Entry with crossws WebSocket hooks for websocket tests
 - Test fixture in `test/fixtures/app-headers.mjs` — Entry that echoes all request headers as JSON for vercel header injection tests
-- **`test/vercel.test.ts`** — Tests for `VercelEnvRunner`: header injection (`x-vercel-deployment-url`, `x-vercel-forwarded-for`, `x-forwarded-for`, `x-real-ip`, `x-forwarded-proto`, `x-forwarded-host`), header preservation, pre-existing header respect
+- Test fixture in `test/fixtures/app-env.mjs` — Entry that echoes request headers and selected environment variables as JSON
+- **`test/vercel.test.ts`** — Tests for `VercelEnvRunner`: request header injection (`x-vercel-deployment-url`, `x-vercel-id`, `x-vercel-forwarded-for`, `x-forwarded-for`, `x-real-ip`, `x-forwarded-proto`, `x-forwarded-host`), response header injection (`server`, `x-vercel-id`, `x-vercel-cache`), environment variables (`VERCEL`, `VERCEL_ENV`, `VERCEL_REGION`, `NOW_REGION`), header preservation, pre-existing header respect
 - **`test/netlify.test.ts`** — Tests for `NetlifyEnvRunner`: header injection (`x-nf-client-connection-ip`, `x-nf-account-id`, `x-nf-site-id`, `x-nf-deploy-id`, `x-nf-deploy-context`, `x-nf-geo`, `x-nf-request-id`), IP derivation, header preservation
-- Tests cover: lifecycle, fetch (GET/POST), WebSocket upgrade, crossws websocket, messaging, hooks, graceful close, inspect output, manager hot-reload, message queueing, miniflare hot-reload, vercel header injection, netlify header injection, waitForReady, vite helpers
+- Tests cover: lifecycle, fetch (GET/POST), WebSocket upgrade, crossws websocket, messaging, hooks, graceful close, inspect output, manager hot-reload, message queueing, miniflare hot-reload, vercel header/env/response injection, netlify header injection, waitForReady, vite helpers
 
 ## Scripts
 
