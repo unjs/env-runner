@@ -118,6 +118,7 @@ Runs entry in the Cloudflare Workers runtime via [miniflare](https://github.com/
 Extends `NodeWorkerEnvRunner` to simulate a Vercel deployment environment. The worker sets `Symbol.for("@vercel/request-context")` on `globalThis` for Vercel API compatibility, then delegates to the node-worker worker.
 
 **Header injection:** Overrides `fetch()` to inject Vercel-specific headers before delegating to the parent:
+
 - `x-vercel-deployment-url` — constructed from the worker's address (`http://<host>:<port>`)
 - `x-vercel-forwarded-for` — derived from `x-forwarded-for` (first IP) or `x-real-ip`, defaults to `127.0.0.1`
 - `x-forwarded-for`, `x-real-ip` — set to client IP if not already present
