@@ -93,7 +93,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
     this.#persistent = opts.persistent ?? false;
     this.#exports = opts.exports ?? {};
     this.#captureErrors = opts.captureErrors ?? true;
-    this.#exportConditions = opts.exportConditions ?? ["workerd"];
+    this.#exportConditions = opts.exportConditions ?? ["workerd", "worker"];
     this.#init();
   }
 
