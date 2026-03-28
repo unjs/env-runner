@@ -39,6 +39,7 @@
   },
   "dependencies": {
     "crossws": "^0.4.4",
+    "exsolve": "^1.0.8",
     "httpxy": "^0.5.0",
     "srvx": "^0.11.13"
   },
