@@ -16,6 +16,8 @@ export interface LoadRunnerOptions {
   hooks?: WorkerHooks;
   data?: EnvRunnerData;
   execArgv?: string[];
+  /** Additional runner-specific options (passed through to the runner constructor). */
+  [key: string]: unknown;
 }
 
 type RunnerConstructor = new (opts: LoadRunnerOptions) => EnvRunner;
