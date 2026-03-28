@@ -39,8 +39,8 @@
   },
   "dependencies": {
     "crossws": "^0.4.4",
-    "httpxy": "^0.3.1",
-    "srvx": "^0.11.12"
+    "httpxy": "^0.5.0",
+    "srvx": "^0.11.13"
   },
   "devDependencies": {
     "@types/node": "latest",
@@ -50,7 +50,7 @@
     "changelogen": "latest",
     "cjs-module-lexer": "^2.2.0",
     "env-runner-fixture": "link:.",
-    "miniflare": "^4.20260312.1",
+    "miniflare": "^4.20260317.3",
     "obuild": "latest",
     "oxfmt": "latest",
     "oxlint": "latest",
@@ -58,12 +58,12 @@
     "vitest": "latest"
   },
   "peerDependencies": {
-    "miniflare": "^4.20260312.1"
+    "miniflare": "^4.20260317.3"
   },
   "peerDependenciesMeta": {
     "miniflare": {
       "optional": true
     }
   },
-  "packageManager": "pnpm@10.32.1"
+  "packageManager": "pnpm@10.33.0"
 }
