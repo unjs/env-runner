@@ -49,7 +49,7 @@ export function createLazyEnvProxy(
       if (typeof prop !== "string") {
         return false;
       }
-      overrides[prop] = value as string | undefined;
+      overrides[prop] = value === undefined ? undefined : String(value);
       return true;
     },
     deleteProperty(_target, prop) {
