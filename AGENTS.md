@@ -12,6 +12,7 @@ Generic environment runner for Node.js. Ported from the nitro env runner concept
 src/
 ├── common/
 │   ├── base-runner.ts       # BaseEnvRunner abstract class
+│   ├── lazy-env.ts          # Lazy process.env proxy helpers for runtime env overlays
 │   └── worker-utils.ts      # AppEntry interface, resolveEntry(), parseServerAddress()
 ├── runners/
 │   ├── node-worker/
@@ -47,6 +48,7 @@ src/
 - **`src/vite.ts`** — Vite Environment API helpers: `createViteHotChannel()` (host-side HotChannel from runner RPC hooks) and `createViteTransport()` (worker-side ModuleRunner transport)
 - **`src/types.ts`** — Core interfaces: `EnvRunner`, `WorkerAddress`, `WorkerHooks`, `RunnerRPCHooks`, `RPCOptions`
 - **`src/common/base-runner.ts`** — `BaseEnvRunner` abstract class + `EnvRunnerData`: shared logic for all runners (fetch proxy with exponential backoff, upgrade, message dispatch, socket cleanup)
+- **`src/common/lazy-env.ts`** — `createLazyEnvProxy(overrides?)`: lazy `process.env` proxy with overlay precedence, used by process runners to avoid eager env cloning/merging during initialization
 - **`src/common/worker-utils.ts`** — Shared utilities for built-in workers: `AppEntry` interface (with optional `websocket`, `upgrade`, and `ipc` hooks), `AppEntryIPC`/`AppEntryIPCContext` types, `resolveEntry()` to dynamically import user entry, `parseServerAddress()` to extract host/port from srvx server, `reloadEntryModule()` for cache-busted re-import with IPC teardown/re-init
 - **`src/runners/node-worker/runner.ts`** — `NodeWorkerEnvRunner` extends `BaseEnvRunner`: spawns Node.js Worker threads, data via `workerData`
 - **`src/runners/node-worker/worker.ts`** — Built-in srvx worker: reads `data.entry` from `workerData`, starts srvx server, reports address via `parentPort`
@@ -286,6 +288,7 @@ const runner2 = new NodeProcessEnvRunner({
 
 - Tests use vitest: `pnpm vitest run`
 - **`test/runners.test.ts`** — Parameterized test suite for all IPC-based runner implementations (NodeWorker, NodeProcess, BunProcess, DenoProcess, Vercel, Netlify). Runners requiring specific runtimes (bun, deno) are auto-skipped when the runtime is not available
+- **`test/lazy-env.test.ts`** — Unit tests for lazy env proxy semantics: dynamic `process.env` reads and explicit override precedence
 - **`test/manager.test.ts`** — Tests for `RunnerManager` lifecycle, hot-reload, message queueing, hook forwarding
 - **`test/miniflare.test.ts`** — Tests for `MiniflareEnvRunner`: Durable Object exports, IPC alongside custom exports, hot-reload via `reloadModule()`, IPC re-initialization after reload
 - **`test/vite.test.ts`** — Tests for Vite helpers: `createViteHotChannel` message namespacing/filtering/on/off, `createViteTransport` connect/send filtering

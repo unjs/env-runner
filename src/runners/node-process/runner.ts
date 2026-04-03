@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { fork } from "node:child_process";
 
 import { BaseEnvRunner } from "../../common/base-runner.ts";
+import { createLazyEnvProxy } from "../../common/lazy-env.ts";
 import type { EnvRunnerData } from "../../common/base-runner.ts";
 
 export type { EnvRunnerData as ProcessEnvRunnerData } from "../../common/base-runner.ts";
@@ -22,14 +23,18 @@ export class NodeProcessEnvRunner extends BaseEnvRunner {
     data?: EnvRunnerData;
     execArgv?: string[];
   }) {
-    _defaultEntry ||= fileURLToPath(import.meta.resolve("env-runner/runners/node-process/worker"));
+    _defaultEntry ||= fileURLToPath(
+      import.meta.resolve("env-runner/runners/node-process/worker"),
+    );
     super({ ...opts, workerEntry: opts.workerEntry || _defaultEntry });
     this.#initProcess(opts.execArgv);
   }
 
   sendMessage(message: unknown) {
     if (!this.#process) {
-      throw new Error("Node env process should be initialized before sending messages.");
+      throw new Error(
+        "Node env process should be initialized before sending messages.",
+      );
     }
     this.#process.send(message as any);
   }
@@ -64,11 +69,10 @@ export class NodeProcessEnvRunner extends BaseEnvRunner {
     }
 
     const child = fork(this._workerEntry, [], {
-      env: {
-        ...process.env,
+      env: createLazyEnvProxy({
         ENV_RUNNER_NAME: this._name,
         ENV_RUNNER_DATA: JSON.stringify(this._data || {}),
-      },
+      }),
       stdio: ["pipe", "pipe", "pipe", "ipc"],
       execArgv: execArgv || [],
     }) as ChildProcess & { _exitCode?: number | null };

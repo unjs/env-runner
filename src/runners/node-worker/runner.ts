@@ -20,14 +20,18 @@ export class NodeWorkerEnvRunner extends BaseEnvRunner {
     hooks?: WorkerHooks;
     data?: EnvRunnerData;
   }) {
-    _defaultEntry ||= fileURLToPath(import.meta.resolve("env-runner/runners/node-worker/worker"));
+    _defaultEntry ||= fileURLToPath(
+      import.meta.resolve("env-runner/runners/node-worker/worker"),
+    );
     super({ ...opts, workerEntry: opts.workerEntry || _defaultEntry });
     this.#initWorker();
   }
 
   sendMessage(message: unknown) {
     if (!this.#worker) {
-      throw new Error("Worker thread should be initialized before sending messages.");
+      throw new Error(
+        "Worker thread should be initialized before sending messages.",
+      );
     }
     this.#worker.postMessage(message);
   }
@@ -64,9 +68,7 @@ export class NodeWorkerEnvRunner extends BaseEnvRunner {
     }
 
     const worker = new Worker(this._workerEntry, {
-      env: {
-        ...process.env,
-      },
+      env: process.env,
       workerData: {
         name: this._name,
         ...this._data,

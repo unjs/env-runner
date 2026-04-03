@@ -7,6 +7,7 @@ import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 
 import { BaseEnvRunner } from "../../common/base-runner.ts";
+import { createLazyEnvProxy } from "../../common/lazy-env.ts";
 import type { EnvRunnerData } from "../../common/base-runner.ts";
 
 export type { EnvRunnerData as BunProcessEnvRunnerData } from "../../common/base-runner.ts";
@@ -54,14 +55,18 @@ export class BunProcessEnvRunner extends BaseEnvRunner {
     data?: EnvRunnerData;
     execArgv?: string[];
   }) {
-    _defaultEntry ||= fileURLToPath(import.meta.resolve("env-runner/runners/bun-process/worker"));
+    _defaultEntry ||= fileURLToPath(
+      import.meta.resolve("env-runner/runners/bun-process/worker"),
+    );
     super({ ...opts, workerEntry: opts.workerEntry || _defaultEntry });
     this.#initProcess(opts.execArgv);
   }
 
   sendMessage(message: unknown) {
     if (!this.#process) {
-      throw new Error("Bun env process should be initialized before sending messages.");
+      throw new Error(
+        "Bun env process should be initialized before sending messages.",
+      );
     }
     this.#process.send(message);
   }
@@ -97,11 +102,10 @@ export class BunProcessEnvRunner extends BaseEnvRunner {
       return;
     }
 
-    const env = {
-      ...process.env,
+    const env = createLazyEnvProxy({
       ENV_RUNNER_NAME: this._name,
       ENV_RUNNER_DATA: JSON.stringify(this._data || {}),
-    };
+    });
 
     if (_isBun) {
       this.#initBunProcess(execArgv, env);
@@ -110,7 +114,7 @@ export class BunProcessEnvRunner extends BaseEnvRunner {
     }
   }
 
-  #initBunProcess(execArgv: string[] | undefined, env: Record<string, string | undefined>) {
+  #initBunProcess(execArgv: string[] | undefined, env: NodeJS.ProcessEnv) {
     // @ts-expect-error Bun global
     const proc = Bun.spawn({
       cmd: [resolveBunPath(), ...(execArgv || []), this._workerEntry],
@@ -137,12 +141,16 @@ export class BunProcessEnvRunner extends BaseEnvRunner {
     this.#process = child;
   }
 
-  #initNodeProcess(execArgv: string[] | undefined, env: Record<string, string | undefined>) {
+  #initNodeProcess(execArgv: string[] | undefined, env: NodeJS.ProcessEnv) {
     // Spawn a Bun child process even when the host is Node.js
-    const child = spawn(resolveBunPath(), [...(execArgv || []), this._workerEntry], {
-      env,
-      stdio: ["pipe", "pipe", "pipe", "ipc"],
-    });
+    const child = spawn(
+      resolveBunPath(),
+      [...(execArgv || []), this._workerEntry],
+      {
+        env,
+        stdio: ["pipe", "pipe", "pipe", "ipc"],
+      },
+    );
 
     const exited = new Promise<number>((resolve) => {
       child.once("exit", (code) => resolve(code ?? 1));

@@ -275,8 +275,14 @@ for (const runnerDef of runners) {
 // --- reloadModule tests ---
 
 const reloadRunners = [
-  { name: "NodeWorkerEnvRunner", create: (opts: any) => new NodeWorkerEnvRunner(opts) },
-  { name: "NodeProcessEnvRunner", create: (opts: any) => new NodeProcessEnvRunner(opts) },
+  {
+    name: "NodeWorkerEnvRunner",
+    create: (opts: any) => new NodeWorkerEnvRunner(opts),
+  },
+  {
+    name: "NodeProcessEnvRunner",
+    create: (opts: any) => new NodeProcessEnvRunner(opts),
+  },
   {
     name: "BunProcessEnvRunner",
     create: (opts: any) => new BunProcessEnvRunner(opts),
@@ -303,7 +309,10 @@ for (const { name, create, skip } of reloadRunners) {
       tmpDir = mkdtempSync(join(_dir, ".tmp-reload-"));
       const entryPath = join(tmpDir, "app.mjs");
 
-      writeFileSync(entryPath, `export default { fetch() { return new Response("v1"); } };`);
+      writeFileSync(
+        entryPath,
+        `export default { fetch() { return new Response("v1"); } };`,
+      );
 
       runner = create({ name: "test-reload", data: { entry: entryPath } });
       await runner.waitForReady();
@@ -311,7 +320,10 @@ for (const { name, create, skip } of reloadRunners) {
       const res1 = await runner.fetch("http://localhost/");
       expect(await res1.text()).toBe("v1");
 
-      writeFileSync(entryPath, `export default { fetch() { return new Response("v2"); } };`);
+      writeFileSync(
+        entryPath,
+        `export default { fetch() { return new Response("v2"); } };`,
+      );
       await runner.reloadModule!();
 
       const res2 = await runner.fetch("http://localhost/");
@@ -370,8 +382,14 @@ export default {
 const appUpgradeEntry = resolve(_dir, "./fixtures/app-upgrade.mjs");
 
 const upgradeRunners = [
-  { name: "NodeWorkerEnvRunner", create: (opts: any) => new NodeWorkerEnvRunner(opts) },
-  { name: "NodeProcessEnvRunner", create: (opts: any) => new NodeProcessEnvRunner(opts) },
+  {
+    name: "NodeWorkerEnvRunner",
+    create: (opts: any) => new NodeWorkerEnvRunner(opts),
+  },
+  {
+    name: "NodeProcessEnvRunner",
+    create: (opts: any) => new NodeProcessEnvRunner(opts),
+  },
   {
     name: "SelfEnvRunner",
     create: (opts: any) => new SelfEnvRunner(opts),
@@ -390,7 +408,10 @@ for (const { name, create, selfRunner } of upgradeRunners) {
 
     if (selfRunner) {
       it("calls entry.upgrade directly", async () => {
-        runner = create({ name: "test-upgrade", data: { entry: appUpgradeEntry } });
+        runner = create({
+          name: "test-upgrade",
+          data: { entry: appUpgradeEntry },
+        });
         await runner.waitForReady();
 
         // For SelfEnvRunner, verify upgrade is callable with mock objects
@@ -404,7 +425,11 @@ for (const { name, create, selfRunner } of upgradeRunners) {
         };
 
         runner.upgrade!({
-          node: { req: mockReq as any, socket: socket as any, head: Buffer.alloc(0) },
+          node: {
+            req: mockReq as any,
+            socket: socket as any,
+            head: Buffer.alloc(0),
+          },
         });
 
         await new Promise((r) => setTimeout(r, 50));
@@ -428,23 +453,25 @@ for (const { name, create, selfRunner } of upgradeRunners) {
 
         // Send an HTTP upgrade request to the worker's server directly
         const host = address.host || "127.0.0.1";
-        const res = await new Promise<import("node:http").IncomingMessage>((resolve, reject) => {
-          const req = httpRequest({
-            hostname: host,
-            port: address.port,
-            path: "/",
-            headers: {
-              "Sec-WebSocket-Version": "13",
-              "Sec-WebSocket-Key": randomBytes(16).toString("base64"),
-              Connection: "Upgrade",
-              Upgrade: "websocket",
-            },
-          });
-          req.on("upgrade", (res) => resolve(res));
-          req.on("error", reject);
-          req.end();
-          setTimeout(() => reject(new Error("Upgrade timeout")), 3000);
-        });
+        const res = await new Promise<import("node:http").IncomingMessage>(
+          (resolve, reject) => {
+            const req = httpRequest({
+              hostname: host,
+              port: address.port,
+              path: "/",
+              headers: {
+                "Sec-WebSocket-Version": "13",
+                "Sec-WebSocket-Key": randomBytes(16).toString("base64"),
+                Connection: "Upgrade",
+                Upgrade: "websocket",
+              },
+            });
+            req.on("upgrade", (res) => resolve(res));
+            req.on("error", reject);
+            req.end();
+            setTimeout(() => reject(new Error("Upgrade timeout")), 3000);
+          },
+        );
 
         expect(res.headers["x-upgraded"]).toBe("true");
         res.socket?.destroy();
@@ -458,8 +485,14 @@ for (const { name, create, selfRunner } of upgradeRunners) {
 const appRpcEntry = resolve(_dir, "./fixtures/app-rpc.mjs");
 
 const rpcRunners = [
-  { name: "NodeWorkerEnvRunner", create: (opts: any) => new NodeWorkerEnvRunner(opts) },
-  { name: "NodeProcessEnvRunner", create: (opts: any) => new NodeProcessEnvRunner(opts) },
+  {
+    name: "NodeWorkerEnvRunner",
+    create: (opts: any) => new NodeWorkerEnvRunner(opts),
+  },
+  {
+    name: "NodeProcessEnvRunner",
+    create: (opts: any) => new NodeProcessEnvRunner(opts),
+  },
   {
     name: "BunProcessEnvRunner",
     create: (opts: any) => new BunProcessEnvRunner(opts),
@@ -505,15 +538,23 @@ for (const { name, create, skip } of rpcRunners) {
     });
 
     it("rejects on timeout", async () => {
-      runner = create({ name: "test-rpc-timeout", data: { entry: appRpcEntry } });
+      runner = create({
+        name: "test-rpc-timeout",
+        data: { entry: appRpcEntry },
+      });
       await runner.waitForReady();
 
       // "slow" handler responds after 2s, so a 100ms timeout should fire first
-      await expect(runner.rpc("slow", undefined, { timeout: 100 })).rejects.toThrow("timed out");
+      await expect(
+        runner.rpc("slow", undefined, { timeout: 100 }),
+      ).rejects.toThrow("timed out");
     });
 
     it("handles concurrent rpc calls", async () => {
-      runner = create({ name: "test-rpc-concurrent", data: { entry: appRpcEntry } });
+      runner = create({
+        name: "test-rpc-concurrent",
+        data: { entry: appRpcEntry },
+      });
       await runner.waitForReady();
 
       const results = await Promise.all([
@@ -529,17 +570,5 @@ for (const { name, create, skip } of rpcRunners) {
 // --- Helpers ---
 
 function waitForReady(runner: EnvRunner, timeout = 5000): Promise<void> {
-  return new Promise((resolve, reject) => {
-    if (runner.ready) {
-      resolve();
-      return;
-    }
-    const timer = setTimeout(() => reject(new Error("Runner did not become ready")), timeout);
-    runner.onMessage(() => {
-      if (runner.ready) {
-        clearTimeout(timer);
-        resolve();
-      }
-    });
-  });
+  return runner.waitForReady(timeout);
 }

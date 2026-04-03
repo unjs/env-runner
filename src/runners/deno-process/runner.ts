@@ -5,6 +5,7 @@ import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import { BaseEnvRunner } from "../../common/base-runner.ts";
+import { createLazyEnvProxy } from "../../common/lazy-env.ts";
 import type { EnvRunnerData } from "../../common/base-runner.ts";
 
 export type { EnvRunnerData as DenoProcessEnvRunnerData } from "../../common/base-runner.ts";
@@ -30,14 +31,18 @@ export class DenoProcessEnvRunner extends BaseEnvRunner {
     data?: EnvRunnerData;
     execArgv?: string[];
   }) {
-    _defaultEntry ||= fileURLToPath(import.meta.resolve("env-runner/runners/deno-process/worker"));
+    _defaultEntry ||= fileURLToPath(
+      import.meta.resolve("env-runner/runners/deno-process/worker"),
+    );
     super({ ...opts, workerEntry: opts.workerEntry || _defaultEntry });
     this.#initProcess(opts.execArgv);
   }
 
   sendMessage(message: unknown) {
     if (!this.#process) {
-      throw new Error("Deno env process should be initialized before sending messages.");
+      throw new Error(
+        "Deno env process should be initialized before sending messages.",
+      );
     }
     this.#process.send(message);
   }
@@ -73,15 +78,21 @@ export class DenoProcessEnvRunner extends BaseEnvRunner {
       return;
     }
 
-    const env = {
-      ...process.env,
+    const env = createLazyEnvProxy({
       ENV_RUNNER_NAME: this._name,
       ENV_RUNNER_DATA: JSON.stringify(this._data || {}),
-    };
+    });
 
     const child = spawn(
       "deno",
-      ["run", "-A", "--node-modules-dir=auto", "--no-lock", ...(execArgv || []), this._workerEntry],
+      [
+        "run",
+        "-A",
+        "--node-modules-dir=auto",
+        "--no-lock",
+        ...(execArgv || []),
+        this._workerEntry,
+      ],
       {
         env,
         stdio: ["pipe", "pipe", "pipe"],
