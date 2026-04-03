@@ -1,0 +1,11 @@
+node_modules
+coverage
+dist
+.vscode
+.DS_Store
+.eslintcache
+tsconfig.tsbuildinfo
+*.log*
+*.env*
+deno.lock
+**/.tmp-*

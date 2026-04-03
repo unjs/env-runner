@@ -1,0 +1,79 @@
+{
+  "name": "env-runner",
+  "version": "0.1.7",
+  "description": "Generic environment runner for JavaScript runtimes.",
+  "license": "MIT",
+  "repository": "unjs/env-runner",
+  "bin": {
+    "env-runner": "./dist/cli.mjs"
+  },
+  "files": [
+    "dist"
+  ],
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": "./dist/index.mjs",
+    "./runners/node-worker": "./dist/runners/node-worker/runner.mjs",
+    "./runners/node-worker/worker": "./dist/runners/node-worker/worker.mjs",
+    "./runners/node-process": "./dist/runners/node-process/runner.mjs",
+    "./runners/node-process/worker": "./dist/runners/node-process/worker.mjs",
+    "./runners/bun-process": "./dist/runners/bun-process/runner.mjs",
+    "./runners/bun-process/worker": "./dist/runners/bun-process/worker.mjs",
+    "./runners/deno-process": "./dist/runners/deno-process/runner.mjs",
+    "./runners/deno-process/worker": "./dist/runners/deno-process/worker.mjs",
+    "./runners/self": "./dist/runners/self/runner.mjs",
+    "./runners/miniflare": "./dist/runners/miniflare/runner.mjs",
+    "./runners/vercel": "./dist/runners/vercel/runner.mjs",
+    "./runners/vercel/worker": "./dist/runners/vercel/worker.mjs",
+    "./runners/netlify": "./dist/runners/netlify/runner.mjs",
+    "./runners/netlify/worker": "./dist/runners/netlify/worker.mjs",
+    "./vite": "./dist/vite.mjs"
+  },
+  "scripts": {
+    "build": "obuild",
+    "dev": "vitest dev",
+    "fmt": "automd && oxlint . --fix && oxfmt .",
+    "lint": "oxlint . && oxfmt --check .",
+    "prepack": "pnpm build",
+    "env-runner": "node ./src/cli.ts",
+    "release": "pnpm test && pnpm build && changelogen --release && npm publish && git push --follow-tags",
+    "test": "pnpm lint && pnpm typecheck && vitest run --coverage",
+    "typecheck": "tsgo --noEmit --skipLibCheck"
+  },
+  "dependencies": {
+    "crossws": "^0.4.4",
+    "exsolve": "^1.0.8",
+    "httpxy": "^0.5.0",
+    "srvx": "^0.11.13"
+  },
+  "devDependencies": {
+    "@netlify/runtime": "^4.1.20",
+    "@types/node": "^25.5.0",
+    "@typescript/native-preview": "^7.0.0-dev.20260327.2",
+    "@vitest/coverage-v8": "^4.1.2",
+    "automd": "^0.4.3",
+    "changelogen": "^0.6.2",
+    "cjs-module-lexer": "^2.2.0",
+    "env-runner-fixture": "link:",
+    "miniflare": "^4.20260317.3",
+    "obuild": "^0.4.32",
+    "oxfmt": "^0.42.0",
+    "oxlint": "^1.57.0",
+    "typescript": "^6.0.2",
+    "vitest": "^4.1.2"
+  },
+  "peerDependencies": {
+    "@netlify/runtime": "^4",
+    "miniflare": "^4.20260317.3"
+  },
+  "peerDependenciesMeta": {
+    "miniflare": {
+      "optional": true
+    },
+    "@netlify/runtime": {
+      "optional": true
+    }
+  },
+  "packageManager": "pnpm@10.33.0"
+}
