@@ -1,5 +1,9 @@
 type EnvRecord = Record<string, string | undefined>;
 
+/**
+ * Creates a lazy env object that resolves keys from `process.env` on demand,
+ * while allowing explicit override values to take precedence.
+ */
 export function createLazyEnvProxy(
   overrides: EnvRecord = {},
 ): NodeJS.ProcessEnv {

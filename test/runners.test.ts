@@ -569,6 +569,7 @@ for (const { name, create, skip } of rpcRunners) {
 
 // --- Helpers ---
 
+/** Waits for a runner to report ready, with a timeout safeguard. */
 function waitForReady(runner: EnvRunner, timeout = 5000): Promise<void> {
   return runner.waitForReady(timeout);
 }
