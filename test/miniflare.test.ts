@@ -448,18 +448,7 @@ describe("MiniflareEnvRunner (persistent)", () => {
 
 // --- Helpers ---
 
+/** Waits for the runner ready signal with a timeout safeguard. */
 function waitForReady(runner: EnvRunner, timeout = 5000): Promise<void> {
-  return new Promise((resolve, reject) => {
-    if (runner.ready) {
-      resolve();
-      return;
-    }
-    const timer = setTimeout(() => reject(new Error("Runner did not become ready")), timeout);
-    runner.onMessage(() => {
-      if (runner.ready) {
-        clearTimeout(timer);
-        resolve();
-      }
-    });
-  });
+  return runner.waitForReady(timeout);
 }

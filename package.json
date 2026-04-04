@@ -39,6 +39,7 @@
     "env-runner": "node ./src/cli.ts",
     "release": "pnpm test && pnpm build && changelogen --release && npm publish && git push --follow-tags",
     "test": "pnpm lint && pnpm typecheck && vitest run --coverage",
+    "test:coverage:lazy-env": "vitest run test/common-utils.test.ts -t createLazyEnvProxy --coverage --coverage.include=src/common/lazy-env.ts --coverage.thresholds.lines=80 --coverage.thresholds.functions=80 --coverage.thresholds.branches=80 --coverage.thresholds.statements=80",
     "typecheck": "tsgo --noEmit --skipLibCheck"
   },
   "dependencies": {
