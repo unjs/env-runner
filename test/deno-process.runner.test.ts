@@ -9,7 +9,10 @@ const { spawnMock } = vi.hoisted(() => ({
 }));
 
 vi.mock("node:child_process", async () => {
-  const actual = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+  const actual =
+    await vi.importActual<typeof import("node:child_process")>(
+      "node:child_process",
+    );
   return {
     ...actual,
     spawn: spawnMock,
@@ -49,6 +52,33 @@ describe("DenoProcessEnvRunner", () => {
       data: { entry: appEntry },
     });
 
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+    const [, , spawnOptions] = spawnMock.mock.calls[0] as [
+      string,
+      string[],
+      { env: NodeJS.ProcessEnv },
+    ];
+    expect(spawnOptions.env).not.toBe(process.env);
+    expect(spawnOptions.env.ENV_RUNNER_NAME).toBe("deno-mock");
+    expect(JSON.parse(spawnOptions.env.ENV_RUNNER_DATA ?? "{}")).toEqual({
+      entry: appEntry,
+    });
+
+    const probeKey = "ENV_RUNNER_LAZY_ENV_PROBE";
+    const originalProbe = process.env[probeKey];
+    try {
+      process.env[probeKey] = "before";
+      expect(spawnOptions.env[probeKey]).toBe("before");
+      process.env[probeKey] = "after";
+      expect(spawnOptions.env[probeKey]).toBe("after");
+    } finally {
+      if (originalProbe === undefined) {
+        delete process.env[probeKey];
+      } else {
+        process.env[probeKey] = originalProbe;
+      }
+    }
+
     child.stdout.write("not-json\n");
     child.stdout.write('{"address":{"host":"127.0.0.1","port":32123}}\n');
     await runner.waitForReady(2000);
@@ -71,5 +101,6 @@ describe("DenoProcessEnvRunner", () => {
     });
 
     expect(runner.closed).toBe(true);
+    expect(spawnMock).not.toHaveBeenCalled();
   });
 });

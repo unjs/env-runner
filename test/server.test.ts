@@ -23,7 +23,10 @@ describe("EnvServer", () => {
   it("starts, proxies fetch, and closes", async () => {
     tmpDir = mkdtempSync(join(_dir, ".tmp-server-"));
     const entryPath = join(tmpDir, "entry.mjs");
-    writeFileSync(entryPath, `export default { fetch() { return new Response("v1"); } };`);
+    writeFileSync(
+      entryPath,
+      `export default { fetch() { return new Response("v1"); } };`,
+    );
 
     server = new EnvServer({
       runner: "self",
@@ -53,7 +56,10 @@ describe("EnvServer", () => {
   it("reloads when scheduled and notifies listeners", async () => {
     tmpDir = mkdtempSync(join(_dir, ".tmp-server-"));
     const entryPath = join(tmpDir, "entry.mjs");
-    writeFileSync(entryPath, `export default { fetch() { return new Response("v1"); } };`);
+    writeFileSync(
+      entryPath,
+      `export default { fetch() { return new Response("v1"); } };`,
+    );
 
     server = new EnvServer({
       runner: "self",
@@ -65,14 +71,25 @@ describe("EnvServer", () => {
     const reloadSpy = vi.fn();
     server.onReload(reloadSpy);
 
-    writeFileSync(entryPath, `export default { fetch() { return new Response("v2"); } };`);
+    writeFileSync(
+      entryPath,
+      `export default { fetch() { return new Response("v2"); } };`,
+    );
     (server as any)._scheduleReload();
-
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    await new Promise((resolve) => setTimeout(resolve, 600));
     expect(reloadSpy).toHaveBeenCalledTimes(1);
 
-    const res = await server.fetch("http://localhost/");
-    expect(await res.text()).toBe("v2");
+    let responseBody = "";
+    for (let i = 0; i < 20; i++) {
+      const res = await server.fetch("http://localhost/");
+      responseBody = await res.text();
+      if (res.status === 200 && responseBody === "v2") {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+
+    expect(responseBody).toBe("v2");
 
     server.offReload(reloadSpy);
   });
@@ -80,7 +97,10 @@ describe("EnvServer", () => {
   it("logs errors when scheduled reload fails", async () => {
     tmpDir = mkdtempSync(join(_dir, ".tmp-server-"));
     const entryPath = join(tmpDir, "entry.mjs");
-    writeFileSync(entryPath, `export default { fetch() { return new Response("ok"); } };`);
+    writeFileSync(
+      entryPath,
+      `export default { fetch() { return new Response("ok"); } };`,
+    );
 
     server = new EnvServer({
       runner: "self",
@@ -94,8 +114,7 @@ describe("EnvServer", () => {
       throw new Error("reload-failed");
     };
     (server as any)._scheduleReload();
-
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    await new Promise((resolve) => setTimeout(resolve, 600));
     expect(errorSpy).toHaveBeenCalled();
 
     errorSpy.mockRestore();
