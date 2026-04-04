@@ -27,6 +27,7 @@ interface ProcessHandle {
 // @ts-expect-error Bun global
 const _isBun = typeof Bun !== "undefined";
 
+/** Resolve the Bun executable path from common install locations or PATH. */
 function resolveBunPath(): string {
   if (_bunPath) return _bunPath;
   // Check common locations
@@ -55,32 +56,32 @@ export class BunProcessEnvRunner extends BaseEnvRunner {
     data?: EnvRunnerData;
     execArgv?: string[];
   }) {
-    _defaultEntry ||= fileURLToPath(
-      import.meta.resolve("env-runner/runners/bun-process/worker"),
-    );
+    _defaultEntry ||= fileURLToPath(import.meta.resolve("env-runner/runners/bun-process/worker"));
     super({ ...opts, workerEntry: opts.workerEntry || _defaultEntry });
     this.#initProcess(opts.execArgv);
   }
 
+  /** Send a user message to the active process runtime. */
   sendMessage(message: unknown) {
     if (!this.#process) {
-      throw new Error(
-        "Bun env process should be initialized before sending messages.",
-      );
+      throw new Error("Bun env process should be initialized before sending messages.");
     }
     this.#process.send(message);
   }
 
   // #region Protected methods
 
+  /** Whether an underlying runtime process handle is currently active. */
   protected _hasRuntime() {
     return Boolean(this.#process);
   }
 
+  /** Runtime kind used for diagnostics and inspect output. */
   protected _runtimeType() {
     return "process";
   }
 
+  /** Terminate and detach the active process handle. */
   protected async _closeRuntime() {
     if (!this.#process) {
       return;
@@ -96,6 +97,7 @@ export class BunProcessEnvRunner extends BaseEnvRunner {
 
   // #region Private methods
 
+  /** Initialize either Bun-native IPC spawn or Node child-process fallback. */
   #initProcess(execArgv?: string[]) {
     if (!existsSync(this._workerEntry)) {
       this.close(`process entry not found in "${this._workerEntry}".`);
@@ -114,6 +116,7 @@ export class BunProcessEnvRunner extends BaseEnvRunner {
     }
   }
 
+  /** Start a Bun process with Bun IPC callback wiring. */
   #initBunProcess(execArgv: string[] | undefined, env: NodeJS.ProcessEnv) {
     // @ts-expect-error Bun global
     const proc = Bun.spawn({
@@ -141,16 +144,13 @@ export class BunProcessEnvRunner extends BaseEnvRunner {
     this.#process = child;
   }
 
+  /** Start a Bun child process via Node spawn and stdio IPC channel. */
   #initNodeProcess(execArgv: string[] | undefined, env: NodeJS.ProcessEnv) {
     // Spawn a Bun child process even when the host is Node.js
-    const child = spawn(
-      resolveBunPath(),
-      [...(execArgv || []), this._workerEntry],
-      {
-        env,
-        stdio: ["pipe", "pipe", "pipe", "ipc"],
-      },
-    );
+    const child = spawn(resolveBunPath(), [...(execArgv || []), this._workerEntry], {
+      env,
+      stdio: ["pipe", "pipe", "pipe", "ipc"],
+    });
 
     const exited = new Promise<number>((resolve) => {
       child.once("exit", (code) => resolve(code ?? 1));
