@@ -1,9 +1,9 @@
-import { execFileSync } from "node:child_process";
 import { createServer } from "node:http";
 import { fileURLToPath } from "node:url";
 import { resolve, dirname } from "node:path";
 import { describe, expect, it, afterEach } from "vitest";
 import type { EnvRunner } from "../src/index.ts";
+import { hasBun, hasDeno } from "./utils.ts";
 
 import { NodeWorkerEnvRunner } from "../src/runners/node-worker/runner.ts";
 import { NodeProcessEnvRunner } from "../src/runners/node-process/runner.ts";
@@ -11,24 +11,18 @@ import { BunProcessEnvRunner } from "../src/runners/bun-process/runner.ts";
 import { DenoProcessEnvRunner } from "../src/runners/deno-process/runner.ts";
 import { SelfEnvRunner } from "../src/runners/self/runner.ts";
 
-function hasRuntime(cmd: string): boolean {
-  try {
-    execFileSync(cmd, ["--version"], { stdio: "ignore" });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-const hasBun = hasRuntime("bun");
-const hasDeno = hasRuntime("deno");
-
 const _dir = dirname(fileURLToPath(import.meta.url));
 const appWebsocketEntry = resolve(_dir, "./fixtures/app-websocket.mjs");
 
 const websocketRunners = [
-  { name: "NodeWorkerEnvRunner", create: (opts: any) => new NodeWorkerEnvRunner(opts) },
-  { name: "NodeProcessEnvRunner", create: (opts: any) => new NodeProcessEnvRunner(opts) },
+  {
+    name: "NodeWorkerEnvRunner",
+    create: (opts: any) => new NodeWorkerEnvRunner(opts),
+  },
+  {
+    name: "NodeProcessEnvRunner",
+    create: (opts: any) => new NodeProcessEnvRunner(opts),
+  },
   {
     name: "BunProcessEnvRunner",
     create: (opts: any) => new BunProcessEnvRunner(opts),

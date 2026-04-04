@@ -1,4 +1,3 @@
-import { execFileSync } from "node:child_process";
 import { writeFileSync, mkdtempSync, rmSync } from "node:fs";
 import { request as httpRequest } from "node:http";
 import { randomBytes } from "node:crypto";
@@ -7,19 +6,7 @@ import { fileURLToPath } from "node:url";
 import { resolve, dirname, join } from "node:path";
 import { describe, expect, it, afterEach } from "vitest";
 import type { EnvRunner } from "../src/index.ts";
-
-/** Returns true when the given runtime binary is available on PATH. */
-function hasRuntime(cmd: string): boolean {
-  try {
-    execFileSync(cmd, ["--version"], { stdio: "ignore" });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-const hasBun = hasRuntime("bun");
-const hasDeno = hasRuntime("deno");
+import { hasBun, hasDeno } from "./utils.ts";
 
 import { NodeWorkerEnvRunner } from "../src/runners/node-worker/runner.ts";
 import { NodeProcessEnvRunner } from "../src/runners/node-process/runner.ts";
@@ -312,7 +299,10 @@ for (const { name, create, skip } of reloadRunners) {
       tmpDir = mkdtempSync(join(_dir, ".tmp-reload-"));
       const entryPath = join(tmpDir, "app.mjs");
 
-      writeFileSync(entryPath, `export default { fetch() { return new Response("v1"); } };`);
+      writeFileSync(
+        entryPath,
+        `export default { fetch() { return new Response("v1"); } };`,
+      );
 
       runner = create({ name: "test-reload", data: { entry: entryPath } });
       await runner.waitForReady();
@@ -320,7 +310,10 @@ for (const { name, create, skip } of reloadRunners) {
       const res1 = await runner.fetch("http://localhost/");
       expect(await res1.text()).toBe("v1");
 
-      writeFileSync(entryPath, `export default { fetch() { return new Response("v2"); } };`);
+      writeFileSync(
+        entryPath,
+        `export default { fetch() { return new Response("v2"); } };`,
+      );
       await runner.reloadModule!();
 
       const res2 = await runner.fetch("http://localhost/");
@@ -451,23 +444,25 @@ for (const { name, create, selfRunner } of upgradeRunners) {
 
         // Send an HTTP upgrade request to the worker's server directly
         const host = address.host || "127.0.0.1";
-        const res = await new Promise<import("node:http").IncomingMessage>((resolve, reject) => {
-          const req = httpRequest({
-            hostname: host,
-            port: address.port,
-            path: "/",
-            headers: {
-              "Sec-WebSocket-Version": "13",
-              "Sec-WebSocket-Key": randomBytes(16).toString("base64"),
-              Connection: "Upgrade",
-              Upgrade: "websocket",
-            },
-          });
-          req.on("upgrade", (res) => resolve(res));
-          req.on("error", reject);
-          req.end();
-          setTimeout(() => reject(new Error("Upgrade timeout")), 3000);
-        });
+        const res = await new Promise<import("node:http").IncomingMessage>(
+          (resolve, reject) => {
+            const req = httpRequest({
+              hostname: host,
+              port: address.port,
+              path: "/",
+              headers: {
+                "Sec-WebSocket-Version": "13",
+                "Sec-WebSocket-Key": randomBytes(16).toString("base64"),
+                Connection: "Upgrade",
+                Upgrade: "websocket",
+              },
+            });
+            req.on("upgrade", (res) => resolve(res));
+            req.on("error", reject);
+            req.end();
+            setTimeout(() => reject(new Error("Upgrade timeout")), 3000);
+          },
+        );
 
         expect(res.headers["x-upgraded"]).toBe("true");
         res.socket?.destroy();
@@ -541,7 +536,9 @@ for (const { name, create, skip } of rpcRunners) {
       await runner.waitForReady();
 
       // "slow" handler responds after 2s, so a 100ms timeout should fire first
-      await expect(runner.rpc("slow", undefined, { timeout: 100 })).rejects.toThrow("timed out");
+      await expect(
+        runner.rpc("slow", undefined, { timeout: 100 }),
+      ).rejects.toThrow("timed out");
     });
 
     it("handles concurrent rpc calls", async () => {
