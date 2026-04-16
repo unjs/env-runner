@@ -5,7 +5,11 @@ import { fileURLToPath } from "node:url";
 
 import type { EnvRunnerData } from "../../common/base-runner.ts";
 import { NodeWorkerEnvRunner } from "../node-worker/runner.ts";
-import { type VercelImageConfig, createVercelImageHandler } from "./image.ts";
+import {
+  type VercelImageConfig,
+  type VercelImageHandler,
+  createVercelImageHandler,
+} from "./image.ts";
 
 export type { EnvRunnerData, VercelImageConfig };
 
@@ -21,7 +25,7 @@ function generateVercelId(): string {
 }
 
 export class VercelEnvRunner extends NodeWorkerEnvRunner {
-  private _imageHandler?: (request: Request) => Promise<Response>;
+  private _imageHandler?: VercelImageHandler;
   private _imageConfig?: VercelImageConfig;
 
   constructor(opts: {
@@ -90,7 +94,7 @@ export class VercelEnvRunner extends NodeWorkerEnvRunner {
         getAddress: () => this._address,
         config: this._imageConfig,
       });
-      res = await this._imageHandler(new Request(requestUrl, { headers }));
+      res = await this._imageHandler.handle(new Request(requestUrl, { headers }));
     } else if (input instanceof Request) {
       res = await super.fetch(new Request(input, { ...init, headers }));
     } else {
@@ -114,6 +118,12 @@ export class VercelEnvRunner extends NodeWorkerEnvRunner {
       statusText: res.statusText,
       headers: resHeaders,
     });
+  }
+
+  override async close(cause?: unknown) {
+    this._imageHandler?.close();
+    this._imageHandler = undefined;
+    await super.close(cause);
   }
 
   protected override _runtimeType() {
