@@ -32,7 +32,8 @@ src/
 │   │   └── runner.ts        # MiniflareEnvRunner (Cloudflare Workers via miniflare)
 │   ├── vercel/
 │   │   ├── runner.ts        # VercelEnvRunner (extends NodeWorkerEnvRunner)
-│   │   └── worker.ts        # Sets Vercel request context symbol, delegates to node-worker
+│   │   ├── worker.ts        # Sets Vercel request context symbol, delegates to node-worker
+│   │   └── image.ts         # /_vercel/image optimization handler (IPX-based)
 │   └── netlify/
 │       ├── runner.ts        # NetlifyEnvRunner (extends NodeWorkerEnvRunner)
 │       └── worker.ts        # Sets global Netlify context, delegates to node-worker
@@ -58,8 +59,9 @@ src/
 - **`src/runners/deno-process/worker.ts`** — Built-in srvx worker: same as node-process worker (works on Deno via Node.js compat)
 - **`src/runners/self/runner.ts`** — `SelfEnvRunner` extends `BaseEnvRunner`: runs entry code in the same process using an in-memory channel registry on `process.__envRunners`
 - **`src/runners/miniflare/runner.ts`** — `MiniflareEnvRunner` extends `BaseEnvRunner`: runs entry in Cloudflare Workers runtime via miniflare. Overrides `fetch()` to use `mf.dispatchFetch()`. Uses in-memory `script` (no temp files), `unsafeModuleFallbackService` for module resolution, and `unsafeEvalBinding` for hot-reload via `reloadModule()`. Requires `miniflare` peer dependency
-- **`src/runners/vercel/runner.ts`** — `VercelEnvRunner` extends `NodeWorkerEnvRunner`: simulates Vercel deployment environment with header injection
+- **`src/runners/vercel/runner.ts`** — `VercelEnvRunner` extends `NodeWorkerEnvRunner`: simulates Vercel deployment environment with header injection and `/_vercel/image` optimization
 - **`src/runners/vercel/worker.ts`** — Sets `Symbol.for("@vercel/request-context")` on globalThis, delegates to node-worker worker
+- **`src/runners/vercel/image.ts`** — `createVercelImageHandler()`: handles `/_vercel/image` requests using IPX for image optimization. Supports `url`, `w`, `h`, `q`, `f`, `fit`, `blur`, `cache` query params. Validates remote URLs against `domains`/`remotePatterns`, local URLs against `localPatterns`, blocks SVG by default. Falls back to unoptimized proxy when `ipx` is not installed
 - **`src/runners/netlify/runner.ts`** — `NetlifyEnvRunner` extends `NodeWorkerEnvRunner`: simulates Netlify deployment environment with header injection (`x-nf-client-connection-ip`, `x-nf-account-id`, `x-nf-site-id`, `x-nf-deploy-id`, `x-nf-deploy-context`, `x-nf-geo`, `x-nf-request-id`)
 - **`src/runners/netlify/worker.ts`** — Uses `@netlify/runtime` `startRuntime()` when available (sets up `globalThis.Netlify` with env/context and `globalThis.caches`), falls back to lightweight shim. Delegates to node-worker worker
 - **`src/loader.ts`** — `loadRunner(name, opts)`: dynamic loader that imports a runner by name (`node-worker` | `node-process` | `bun-process` | `deno-process` | `self` | `miniflare` | `vercel` | `netlify`) and returns an `EnvRunner` instance
@@ -145,6 +147,23 @@ Extends `NodeWorkerEnvRunner` to simulate a Vercel deployment environment. The w
 - `x-vercel-cache` — `"MISS"`
 
 All headers are only injected when not already present in the request/response.
+
+**Image optimization (`/_vercel/image`):** Intercepts requests to `/_vercel/image` and processes images using IPX (optional `ipx` peer dependency). Supports Vercel's image optimization query parameters:
+
+- `url` (required) — source image URL (local path or absolute URL)
+- `w` (required) — output width in pixels
+- `q` (optional, default 75) — quality 1–100
+- `f` (optional) — output format as MIME type (`image/webp`, `image/avif`, etc.)
+- `h` (optional) — output height in pixels
+- `fit` (optional) — resize mode (`cover`, `contain`, `fill`, `inside`, `outside`)
+- `blur` (optional) — blur amount
+- `cache` (optional) — cache TTL override in seconds
+
+Format auto-detection from `Accept` header when `f` is not provided (prefers avif > webp). Response includes `Vary: Accept` for proper cache keying. Local images are fetched from the worker; remote images are fetched directly. When `ipx` is not installed, warns once and falls back to proxying the unoptimized source image.
+
+**URL validation:** Remote URLs are validated against `domains` (exact hostname match) and `remotePatterns` (protocol, hostname glob, port, pathname glob). Returns 400 when a remote URL doesn't match. Local URLs can be restricted via `localPatterns`. SVG sources are blocked by default (400) unless `dangerouslyAllowSVG` is true.
+
+Constructor accepts optional `images` config (`VercelImageConfig`) matching the Vercel Build Output API `images` property: `sizes`, `domains`, `remotePatterns`, `localPatterns`, `qualities`, `formats`, `minimumCacheTTL`, `dangerouslyAllowSVG`, `contentSecurityPolicy`, `contentDispositionType`.
 
 ### NetlifyEnvRunner
 
@@ -296,9 +315,10 @@ const runner2 = new NodeProcessEnvRunner({
 - Test fixture in `test/fixtures/app-websocket.mjs` — Entry with crossws WebSocket hooks for websocket tests
 - Test fixture in `test/fixtures/app-headers.mjs` — Entry that echoes all request headers as JSON for vercel header injection tests
 - Test fixture in `test/fixtures/app-env.mjs` — Entry that echoes request headers and selected environment variables as JSON
-- **`test/vercel.test.ts`** — Tests for `VercelEnvRunner`: request header injection (`x-vercel-deployment-url`, `x-vercel-id`, `x-vercel-forwarded-for`, `x-forwarded-for`, `x-real-ip`, `x-forwarded-proto`, `x-forwarded-host`), response header injection (`server`, `x-vercel-id`, `x-vercel-cache`), environment variables (`VERCEL`, `VERCEL_ENV`, `VERCEL_REGION`, `NOW_REGION`), header preservation, pre-existing header respect
+- Test fixture in `test/fixtures/app-image.mjs` — Entry that serves a 1x1 PNG at `/test.png` for vercel image optimization tests
+- **`test/vercel.test.ts`** — Tests for `VercelEnvRunner`: request header injection (`x-vercel-deployment-url`, `x-vercel-id`, `x-vercel-forwarded-for`, `x-forwarded-for`, `x-real-ip`, `x-forwarded-proto`, `x-forwarded-host`), response header injection (`server`, `x-vercel-id`, `x-vercel-cache`), environment variables (`VERCEL`, `VERCEL_ENV`, `VERCEL_REGION`, `NOW_REGION`), header preservation, pre-existing header respect, image optimization (`/_vercel/image` with format detection, Accept header negotiation, parameter validation, cache-control/Vary/Content-Length headers, SVG blocking, remote URL domain/pattern validation, sizes/qualities config enforcement)
 - **`test/netlify.test.ts`** — Tests for `NetlifyEnvRunner`: header injection (`x-nf-client-connection-ip`, `x-nf-account-id`, `x-nf-site-id`, `x-nf-deploy-id`, `x-nf-deploy-context`, `x-nf-geo`, `x-nf-request-id`), IP derivation, header preservation
-- Tests cover: lifecycle, fetch (GET/POST), WebSocket upgrade, crossws websocket, messaging, hooks, graceful close, inspect output, manager hot-reload, message queueing, miniflare hot-reload, vercel header/env/response injection, netlify header injection, waitForReady, vite helpers
+- Tests cover: lifecycle, fetch (GET/POST), WebSocket upgrade, crossws websocket, messaging, hooks, graceful close, inspect output, manager hot-reload, message queueing, miniflare hot-reload, vercel header/env/response injection, vercel image optimization (format negotiation, SVG protection, URL validation, config enforcement), netlify header injection, waitForReady, vite helpers
 
 ## Scripts
 
@@ -317,6 +337,7 @@ const runner2 = new NodeProcessEnvRunner({
 - `srvx` — Universal server framework (used by built-in workers)
 - `miniflare` — Cloudflare Workers simulator (optional peer dependency, required for `MiniflareEnvRunner`)
 - `@netlify/runtime` — Netlify compute runtime (optional peer dependency, used by `NetlifyEnvRunner` worker for full `globalThis.Netlify` + `globalThis.caches` setup)
+- `ipx` — Image optimization (optional peer dependency, used by `VercelEnvRunner` for `/_vercel/image` endpoint)
 
 > **See also:** [`.agents/MINIFLARE.md`](.agents/MINIFLARE.md) — Miniflare internals, `unsafeEvalBinding`, `unsafeModuleFallbackService`, service bindings patterns
 > **See also:** [`.agents/PLAN.vite-compat.md`](.agents/PLAN.vite-compat.md) — Planned improvements for Vite Environment API compatibility (`waitForReady`, RPC, transport helpers)

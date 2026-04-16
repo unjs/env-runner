@@ -45,6 +45,9 @@ importers:
       env-runner-fixture:
         specifier: 'link:'
         version: 'link:'
+      ipx:
+        specifier: ^4.0.0-alpha.1
+        version: 4.0.0-alpha.1
       miniflare:
         specifier: ^4.20260410.0
         version: 4.20260410.0
@@ -1561,6 +1564,15 @@ packages:
     resolution: {integrity: sha512-JmXMZ6wuvDmLiHEml9ykzqO6lwFbof0GG4IkcGaENdCRDDmMVnny7s5HsIgHCbaq0w2MyPhDqkhTUgS2LU2PHA==}
     engines: {node: '>=0.8.19'}
 
+  ipx@4.0.0-alpha.1:
+    resolution: {integrity: sha512-naIX/3xFfAOy5Wz2Z/UoQnpMVWGT0eblLSkHj3plcJsEuW040oiX/HqFwK1YygWUoROqSgFZkB6wTLra+GpwCQ==}
+    hasBin: true
+    peerDependencies:
+      unstorage: '*'
+    peerDependenciesMeta:
+      unstorage:
+        optional: true
+
   is-core-module@2.16.1:
     resolution: {integrity: sha512-UfoeMA6fIJ8wTYFEUjelnaGI67v6+N7qXJEvQuIGa99l4xsCruSYOVSQ0uPANn4dAzm8lkYPaKLrrijLq7x23w==}
     engines: {node: '>= 0.4'}
@@ -1856,6 +1868,11 @@ packages:
 
   srvx@0.11.15:
     resolution: {integrity: sha512-iXsux0UcOjdvs0LCMa2Ws3WwcDUozA3JN3BquNXkaFPP7TpRqgunKdEgoZ/uwb1J6xaYHfxtz9Twlh6yzwM6Tg==}
+    engines: {node: '>=20.16.0'}
+    hasBin: true
+
+  srvx@0.9.8:
+    resolution: {integrity: sha512-RZaxTKJEE/14HYn8COLuUOJAt0U55N9l1Xf6jj+T0GoA01EUH1Xz5JtSUOI+EHn+AEgPCVn7gk6jHJffrr06fQ==}
     engines: {node: '>=20.16.0'}
     hasBin: true
 
@@ -3172,6 +3189,12 @@ snapshots:
 
   imurmurhash@0.1.4: {}
 
+  ipx@4.0.0-alpha.1:
+    dependencies:
+      pathe: 2.0.3
+      sharp: 0.34.5
+      srvx: 0.9.8
+
   is-core-module@2.16.1:
     dependencies:
       hasown: 2.0.2
@@ -3584,6 +3607,8 @@ snapshots:
       spdx-ranges: 2.1.1
 
   srvx@0.11.15: {}
+
+  srvx@0.9.8: {}
 
   stackback@0.0.2: {}
 
