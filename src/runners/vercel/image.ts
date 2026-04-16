@@ -100,7 +100,15 @@ function validateLocalUrl(sourceUrl: string, config?: VercelImageConfig): boolea
 }
 
 function isSvgSource(url: string): boolean {
-  const path = url.startsWith("/") ? url : (() => { try { return new URL(url).pathname; } catch { return url; } })();
+  const path = url.startsWith("/")
+    ? url
+    : (() => {
+        try {
+          return new URL(url).pathname;
+        } catch {
+          return url;
+        }
+      })();
   return /\.svgz?(\?|$)/i.test(path);
 }
 
@@ -206,24 +214,15 @@ export function createVercelImageHandler(opts: {
     }
 
     if (config?.sizes?.length && !config.sizes.includes(width)) {
-      return new Response(
-        `"w" must be one of: ${config.sizes.join(", ")}`,
-        { status: 400 },
-      );
+      return new Response(`"w" must be one of: ${config.sizes.join(", ")}`, { status: 400 });
     }
 
     if (config?.qualities?.length && !config.qualities.includes(quality)) {
-      return new Response(
-        `"q" must be one of: ${config.qualities.join(", ")}`,
-        { status: 400 },
-      );
+      return new Response(`"q" must be one of: ${config.qualities.join(", ")}`, { status: 400 });
     }
 
     if (f && config?.formats?.length && !config.formats.includes(f)) {
-      return new Response(
-        `"f" must be one of: ${config.formats.join(", ")}`,
-        { status: 400 },
-      );
+      return new Response(`"f" must be one of: ${config.formats.join(", ")}`, { status: 400 });
     }
 
     // Validate source URL against allowlists
@@ -239,10 +238,9 @@ export function createVercelImageHandler(opts: {
 
     // Block SVG unless explicitly allowed
     if (!config?.dangerouslyAllowSVG && isSvgSource(sourceUrl)) {
-      return new Response(
-        '"url" parameter is valid but image type is not allowed',
-        { status: 400 },
-      );
+      return new Response('"url" parameter is valid but image type is not allowed', {
+        status: 400,
+      });
     }
 
     const ipx = await getIPX();
@@ -286,10 +284,9 @@ export function createVercelImageHandler(opts: {
 
       // Defense in depth: block SVG output even if the URL check was bypassed
       if (!config?.dangerouslyAllowSVG && format === "svg+xml") {
-        return new Response(
-          '"url" parameter is valid but image type is not allowed',
-          { status: 400 },
-        );
+        return new Response('"url" parameter is valid but image type is not allowed', {
+          status: 400,
+        });
       }
 
       const cacheOverride = Number.parseInt(url.searchParams.get("cache") || "");
@@ -305,7 +302,7 @@ export function createVercelImageHandler(opts: {
         "content-type": contentType,
         "content-length": String(body.byteLength),
         "cache-control": `public, max-age=${cacheTTL}, s-maxage=${cacheTTL}`,
-        "vary": "Accept",
+        vary: "Accept",
       };
 
       if (config?.contentSecurityPolicy) {

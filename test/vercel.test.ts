@@ -231,9 +231,7 @@ describe("VercelEnvRunner", () => {
     it("blocks SVG sources by default", async () => {
       runner = new VercelEnvRunner({ name: "test-img-svg", data: { entry: imageEntry } });
       await runner.waitForReady();
-      const res = await runner.fetch(
-        "http://localhost/_vercel/image?url=/icon.svg&w=100&q=75",
-      );
+      const res = await runner.fetch("http://localhost/_vercel/image?url=/icon.svg&w=100&q=75");
       expect(res.status).toBe(400);
       expect(await res.text()).toContain("image type is not allowed");
     });
@@ -247,9 +245,7 @@ describe("VercelEnvRunner", () => {
       await runner.waitForReady();
       // The fixture doesn't actually serve SVG, but validation should pass
       // (will fail at IPX level, not at our validation)
-      const res = await runner.fetch(
-        "http://localhost/_vercel/image?url=/icon.svg&w=100&q=75",
-      );
+      const res = await runner.fetch("http://localhost/_vercel/image?url=/icon.svg&w=100&q=75");
       // Should not be 400 "image type is not allowed"
       expect(await res.text()).not.toContain("image type is not allowed");
     });
@@ -313,9 +309,7 @@ describe("VercelEnvRunner", () => {
         images: { sizes: [64, 128, 256] },
       });
       await runner.waitForReady();
-      const res = await runner.fetch(
-        "http://localhost/_vercel/image?url=/test.png&w=100&q=75",
-      );
+      const res = await runner.fetch("http://localhost/_vercel/image?url=/test.png&w=100&q=75");
       expect(res.status).toBe(400);
       expect(await res.text()).toContain('"w" must be one of');
     });
@@ -327,9 +321,7 @@ describe("VercelEnvRunner", () => {
         images: { qualities: [50, 75, 100] },
       });
       await runner.waitForReady();
-      const res = await runner.fetch(
-        "http://localhost/_vercel/image?url=/test.png&w=1&q=60",
-      );
+      const res = await runner.fetch("http://localhost/_vercel/image?url=/test.png&w=1&q=60");
       expect(res.status).toBe(400);
       expect(await res.text()).toContain('"q" must be one of');
     });
