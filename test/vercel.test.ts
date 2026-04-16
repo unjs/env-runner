@@ -307,11 +307,13 @@ describe("VercelEnvRunner", () => {
         name: "test-img-remote-regex",
         data: { entry: imageEntry },
         images: {
-          remotePatterns: [{
-            protocol: "https",
-            hostname: "^cdn\\.example\\.com$",
-            pathname: "^/assets/.*$",
-          }],
+          remotePatterns: [
+            {
+              protocol: "https",
+              hostname: "^cdn\\.example\\.com$",
+              pathname: "^/assets/.*$",
+            },
+          ],
         },
       });
       await runner.waitForReady();
