@@ -279,7 +279,7 @@ describe("VercelEnvRunner", () => {
       expect(await res.text()).not.toContain('"url" parameter is not allowed');
     });
 
-    it("validates against remotePatterns", async () => {
+    it("validates against remotePatterns (glob format)", async () => {
       runner = new VercelEnvRunner({
         name: "test-img-remote-pattern",
         data: { entry: imageEntry },
@@ -298,6 +298,40 @@ describe("VercelEnvRunner", () => {
       // Allowed: matching pattern (will fail to fetch but passes validation)
       const allowed = await runner.fetch(
         "http://localhost/_vercel/image?url=https://cdn.example.com/img.png&w=100&q=75",
+      );
+      expect(await allowed.text()).not.toContain('"url" parameter is not allowed');
+    });
+
+    it("validates against remotePatterns (Build Output API regex format)", async () => {
+      runner = new VercelEnvRunner({
+        name: "test-img-remote-regex",
+        data: { entry: imageEntry },
+        images: {
+          remotePatterns: [{
+            protocol: "https",
+            hostname: "^cdn\\.example\\.com$",
+            pathname: "^/assets/.*$",
+          }],
+        },
+      });
+      await runner.waitForReady();
+
+      // Blocked: wrong hostname
+      const blocked1 = await runner.fetch(
+        "http://localhost/_vercel/image?url=https://other.com/assets/img.png&w=100&q=75",
+      );
+      expect(blocked1.status).toBe(400);
+      expect(await blocked1.text()).toContain('"url" parameter is not allowed');
+
+      // Blocked: wrong pathname
+      const blocked2 = await runner.fetch(
+        "http://localhost/_vercel/image?url=https://cdn.example.com/other/img.png&w=100&q=75",
+      );
+      expect(blocked2.status).toBe(400);
+
+      // Allowed: matches regex pattern (will fail to fetch but passes validation)
+      const allowed = await runner.fetch(
+        "http://localhost/_vercel/image?url=https://cdn.example.com/assets/img.png&w=100&q=75",
       );
       expect(await allowed.text()).not.toContain('"url" parameter is not allowed');
     });

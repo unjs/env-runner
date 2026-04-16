@@ -1,23 +1,29 @@
 import type { WorkerAddress } from "../../types.ts";
 
+export interface VercelRemotePattern {
+  protocol?: string;
+  hostname: string;
+  port?: string;
+  pathname?: string;
+  search?: string;
+}
+
+export interface VercelLocalPattern {
+  pathname?: string;
+  search?: string;
+}
+
 export interface VercelImageConfig {
   sizes?: number[];
   domains?: string[];
-  remotePatterns?: {
-    protocol?: string;
-    hostname: string;
-    port?: string;
-    pathname?: string;
-  }[];
-  localPatterns?: {
-    pathname?: string;
-  }[];
+  remotePatterns?: VercelRemotePattern[];
+  localPatterns?: VercelLocalPattern[];
   qualities?: number[];
   formats?: string[];
   minimumCacheTTL?: number;
   dangerouslyAllowSVG?: boolean;
   contentSecurityPolicy?: string;
-  contentDispositionType?: "inline" | "attachment";
+  contentDispositionType?: string;
 }
 
 type IPXModule = typeof import("ipx");
@@ -53,7 +59,11 @@ function isRemoteUrl(url: string): boolean {
   return /^https?:\/\//.test(url) || url.startsWith("//");
 }
 
-function matchGlob(pattern: string, value: string): boolean {
+// Build Output API uses PCRE regex (^...$), Next.js config uses globs (**, *)
+function matchPattern(pattern: string, value: string): boolean {
+  if (pattern.startsWith("^") || pattern.endsWith("$")) {
+    return new RegExp(pattern).test(value);
+  }
   let re = "^";
   for (let i = 0; i < pattern.length; i++) {
     const ch = pattern.charAt(i);
@@ -71,14 +81,12 @@ function matchGlob(pattern: string, value: string): boolean {
   return new RegExp(re + "$").test(value);
 }
 
-function matchRemotePattern(
-  pattern: { protocol?: string; hostname: string; port?: string; pathname?: string },
-  url: URL,
-): boolean {
+function matchRemotePattern(pattern: VercelRemotePattern, url: URL): boolean {
   if (pattern.protocol && url.protocol !== pattern.protocol + ":") return false;
-  if (!matchGlob(pattern.hostname, url.hostname)) return false;
+  if (!matchPattern(pattern.hostname, url.hostname)) return false;
   if (pattern.port !== undefined && url.port !== pattern.port) return false;
-  if (pattern.pathname && !matchGlob(pattern.pathname, url.pathname)) return false;
+  if (pattern.pathname && !matchPattern(pattern.pathname, url.pathname)) return false;
+  if (pattern.search !== undefined && url.search !== pattern.search) return false;
   return true;
 }
 
@@ -96,7 +104,12 @@ function validateRemoteUrl(sourceUrl: string, config?: VercelImageConfig): boole
 
 function validateLocalUrl(sourceUrl: string, config?: VercelImageConfig): boolean {
   if (!config?.localPatterns?.length) return true;
-  return config.localPatterns.some((p) => !p.pathname || matchGlob(p.pathname, sourceUrl));
+  const [pathname, search] = sourceUrl.split("?");
+  return config.localPatterns.some((p) => {
+    if (p.pathname && !matchPattern(p.pathname, pathname)) return false;
+    if (p.search !== undefined && (search || "") !== p.search.replace(/^\?/, "")) return false;
+    return true;
+  });
 }
 
 function isSvgSource(url: string): boolean {
