@@ -126,6 +126,7 @@ Extends `NodeWorkerEnvRunner` to simulate a Vercel deployment environment. The w
 
 - `VERCEL` — `"1"`
 - `VERCEL_ENV` — `"development"`
+- `VERCEL_DEPLOYMENT_ID` — `"null"`
 - `VERCEL_REGION` — `"dev1"`
 - `NOW_REGION` — `"dev1"` (legacy alias)
 
@@ -296,7 +297,7 @@ const runner2 = new NodeProcessEnvRunner({
 - Test fixture in `test/fixtures/app-websocket.mjs` — Entry with crossws WebSocket hooks for websocket tests
 - Test fixture in `test/fixtures/app-headers.mjs` — Entry that echoes all request headers as JSON for vercel header injection tests
 - Test fixture in `test/fixtures/app-env.mjs` — Entry that echoes request headers and selected environment variables as JSON
-- **`test/vercel.test.ts`** — Tests for `VercelEnvRunner`: request header injection (`x-vercel-deployment-url`, `x-vercel-id`, `x-vercel-forwarded-for`, `x-forwarded-for`, `x-real-ip`, `x-forwarded-proto`, `x-forwarded-host`), response header injection (`server`, `x-vercel-id`, `x-vercel-cache`), environment variables (`VERCEL`, `VERCEL_ENV`, `VERCEL_REGION`, `NOW_REGION`), header preservation, pre-existing header respect
+- **`test/vercel.test.ts`** — Tests for `VercelEnvRunner`: request header injection (`x-vercel-deployment-url`, `x-vercel-id`, `x-vercel-forwarded-for`, `x-forwarded-for`, `x-real-ip`, `x-forwarded-proto`, `x-forwarded-host`), response header injection (`server`, `x-vercel-id`, `x-vercel-cache`), environment variables (`VERCEL`, `VERCEL_ENV`, `VERCEL_DEPLOYMENT_ID`, `VERCEL_REGION`, `NOW_REGION`), header preservation, pre-existing header respect
 - **`test/netlify.test.ts`** — Tests for `NetlifyEnvRunner`: header injection (`x-nf-client-connection-ip`, `x-nf-account-id`, `x-nf-site-id`, `x-nf-deploy-id`, `x-nf-deploy-context`, `x-nf-geo`, `x-nf-request-id`), IP derivation, header preservation
 - Tests cover: lifecycle, fetch (GET/POST), WebSocket upgrade, crossws websocket, messaging, hooks, graceful close, inspect output, manager hot-reload, message queueing, miniflare hot-reload, vercel header/env/response injection, netlify header injection, waitForReady, vite helpers
 

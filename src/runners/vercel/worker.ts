@@ -2,6 +2,7 @@
 // https://vercel.com/docs/projects/environment-variables/system-environment-variables
 process.env.VERCEL = process.env.VERCEL || "1";
 process.env.VERCEL_ENV = process.env.VERCEL_ENV || "development";
+process.env.VERCEL_DEPLOYMENT_ID = process.env.VERCEL_DEPLOYMENT_ID ?? "null";
 process.env.VERCEL_REGION = process.env.VERCEL_REGION || "dev1";
 process.env.NOW_REGION = process.env.NOW_REGION || "dev1";
 

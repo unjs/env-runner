@@ -145,6 +145,7 @@ describe("VercelEnvRunner", () => {
     const { env } = await res.json();
     expect(env.VERCEL).toBe("1");
     expect(env.VERCEL_ENV).toBe("development");
+    expect(env.VERCEL_DEPLOYMENT_ID).toBe("null");
     expect(env.VERCEL_REGION).toBe("dev1");
     expect(env.NOW_REGION).toBe("dev1");
   });

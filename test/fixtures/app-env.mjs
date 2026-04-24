@@ -9,6 +9,7 @@ export default {
       env: {
         VERCEL: process.env.VERCEL,
         VERCEL_ENV: process.env.VERCEL_ENV,
+        VERCEL_DEPLOYMENT_ID: process.env.VERCEL_DEPLOYMENT_ID,
         VERCEL_REGION: process.env.VERCEL_REGION,
         NOW_REGION: process.env.NOW_REGION,
       },
