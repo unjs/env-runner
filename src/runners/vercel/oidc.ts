@@ -49,9 +49,7 @@ export function warnIfVercelOidcTokenInvalid(token?: string | undefined): Vercel
 
   if (result.status === "missing") {
     _warned = true;
-    console.warn(
-      "[env-runner:vercel] Run `vercel env pull` to set `VERCEL_OIDC_TOKEN`.",
-    );
+    console.warn("[env-runner:vercel] Run `vercel env pull` to set `VERCEL_OIDC_TOKEN`.");
   } else if (result.status === "expired") {
     _warned = true;
     console.warn(
