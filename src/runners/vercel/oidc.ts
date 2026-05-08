@@ -1,5 +1,5 @@
 /**
- * Vercel OIDC token utilities. `VERCEL_OIDC_TOKEN` is a short-lived JWT (~12h locally) written to `.env.local` by `vercel env pull` or to `.vercel/.env.development.local` by `vercel pull`. Surface expiry at dev startup so OIDC-federated SDKs (`@vercel/queue`, AWS, GCP, Azure) don't fail with opaque 401s mid-request.
+ * Vercel OIDC token utilities. `VERCEL_OIDC_TOKEN` is a short-lived JWT (~12h locally) written to `.env.local` by `vercel env pull` or to `.vercel/.env.development.local` by `vercel pull`.
  */
 
 export type VercelOidcStatus = "missing" | "valid" | "expired" | "invalid";
@@ -11,7 +11,7 @@ export interface VercelOidcCheckResult {
 }
 
 /**
- * Inspect a Vercel OIDC token (defaults to `process.env.VERCEL_OIDC_TOKEN`). Decodes the JWT `exp` claim
+ * Inspect a Vercel OIDC token (defaults to `process.env.VERCEL_OIDC_TOKEN`). Decodes the JWT `exp` claim.
  */
 export function checkVercelOidcToken(
   token: string | undefined = process.env.VERCEL_OIDC_TOKEN,
@@ -21,7 +21,7 @@ export function checkVercelOidcToken(
   const parts = token.split(".");
   if (parts.length !== 3) return { status: "invalid" };
 
-  let payload: { exp?: number };
+  let payload: unknown;
   try {
     const json = Buffer.from(parts[1]!, "base64url").toString("utf8");
     payload = JSON.parse(json);
@@ -29,9 +29,16 @@ export function checkVercelOidcToken(
     return { status: "invalid" };
   }
 
-  if (typeof payload.exp !== "number") return { status: "invalid" };
+  if (
+    !payload ||
+    typeof payload !== "object" ||
+    typeof (payload as { exp?: unknown }).exp !== "number"
+  ) {
+    return { status: "invalid" };
+  }
+  const exp = (payload as { exp: number }).exp;
 
-  const expiresAt = new Date(payload.exp * 1000);
+  const expiresAt = new Date(exp * 1000);
   if (expiresAt.getTime() <= Date.now()) {
     return { status: "expired", expiresAt };
   }
