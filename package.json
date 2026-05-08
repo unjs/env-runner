@@ -26,6 +26,7 @@
     "./runners/miniflare": "./dist/runners/miniflare/runner.mjs",
     "./runners/vercel": "./dist/runners/vercel/runner.mjs",
     "./runners/vercel/worker": "./dist/runners/vercel/worker.mjs",
+    "./runners/vercel/oidc": "./dist/runners/vercel/oidc.mjs",
     "./runners/netlify": "./dist/runners/netlify/runner.mjs",
     "./runners/netlify/worker": "./dist/runners/netlify/worker.mjs",
     "./vite": "./dist/vite.mjs"
