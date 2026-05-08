@@ -32,7 +32,8 @@ src/
 │   │   └── runner.ts        # MiniflareEnvRunner (Cloudflare Workers via miniflare)
 │   ├── vercel/
 │   │   ├── runner.ts        # VercelEnvRunner (extends NodeWorkerEnvRunner)
-│   │   └── worker.ts        # Sets Vercel request context symbol, delegates to node-worker
+│   │   ├── worker.ts        # Sets Vercel request context symbol, delegates to node-worker
+│   │   └── oidc.ts          # VERCEL_OIDC_TOKEN check + dev-time warning
 │   └── netlify/
 │       ├── runner.ts        # NetlifyEnvRunner (extends NodeWorkerEnvRunner)
 │       └── worker.ts        # Sets global Netlify context, delegates to node-worker
@@ -59,7 +60,8 @@ src/
 - **`src/runners/self/runner.ts`** — `SelfEnvRunner` extends `BaseEnvRunner`: runs entry code in the same process using an in-memory channel registry on `process.__envRunners`
 - **`src/runners/miniflare/runner.ts`** — `MiniflareEnvRunner` extends `BaseEnvRunner`: runs entry in Cloudflare Workers runtime via miniflare. Overrides `fetch()` to use `mf.dispatchFetch()`. Uses in-memory `script` (no temp files), `unsafeModuleFallbackService` for module resolution, and `unsafeEvalBinding` for hot-reload via `reloadModule()`. Requires `miniflare` peer dependency
 - **`src/runners/vercel/runner.ts`** — `VercelEnvRunner` extends `NodeWorkerEnvRunner`: simulates Vercel deployment environment with header injection
-- **`src/runners/vercel/worker.ts`** — Sets `Symbol.for("@vercel/request-context")` on globalThis, delegates to node-worker worker
+- **`src/runners/vercel/worker.ts`** — Sets Vercel env vars and `Symbol.for("@vercel/request-context")` on globalThis, delegates to node-worker worker
+- **`src/runners/vercel/oidc.ts`** — `checkVercelOidcToken()` decodes `VERCEL_OIDC_TOKEN` (JWT `exp` claim, no signature check) and returns `{ status: "missing" | "valid" | "expired" | "invalid", expiresAt? }`. `warnIfVercelOidcTokenInvalid()` logs a one-time dev warning prompting the user to run `vercel env pull`. Called from the `VercelEnvRunner` constructor
 - **`src/runners/netlify/runner.ts`** — `NetlifyEnvRunner` extends `NodeWorkerEnvRunner`: simulates Netlify deployment environment with header injection (`x-nf-client-connection-ip`, `x-nf-account-id`, `x-nf-site-id`, `x-nf-deploy-id`, `x-nf-deploy-context`, `x-nf-geo`, `x-nf-request-id`)
 - **`src/runners/netlify/worker.ts`** — Uses `@netlify/runtime` `startRuntime()` when available (sets up `globalThis.Netlify` with env/context and `globalThis.caches`), falls back to lightweight shim. Delegates to node-worker worker
 - **`src/loader.ts`** — `loadRunner(name, opts)`: dynamic loader that imports a runner by name (`node-worker` | `node-process` | `bun-process` | `deno-process` | `self` | `miniflare` | `vercel` | `netlify`) and returns an `EnvRunner` instance
@@ -278,6 +280,7 @@ const runner2 = new NodeProcessEnvRunner({
 - `env-runner/runners/miniflare` (`./runners/miniflare`) — Direct import of `MiniflareEnvRunner`
 - `env-runner/runners/vercel` (`./runners/vercel`) — Direct import of `VercelEnvRunner`
 - `env-runner/runners/vercel/worker` (`./runners/vercel/worker`) — Vercel worker (sets request context, delegates to node-worker)
+- `env-runner/runners/vercel/oidc` (`./runners/vercel/oidc`) — `checkVercelOidcToken()` / `warnIfVercelOidcTokenInvalid()` helpers
 - `env-runner/runners/netlify` (`./runners/netlify`) — Direct import of `NetlifyEnvRunner`
 - `env-runner/runners/netlify/worker` (`./runners/netlify/worker`) — Netlify worker (sets global Netlify context, delegates to node-worker)
 - `env-runner/vite` (`./vite`) — Vite Environment API helpers (`createViteHotChannel`, `createViteTransport`)
