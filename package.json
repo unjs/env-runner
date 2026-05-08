@@ -26,6 +26,7 @@
     "./runners/miniflare": "./dist/runners/miniflare/runner.mjs",
     "./runners/vercel": "./dist/runners/vercel/runner.mjs",
     "./runners/vercel/worker": "./dist/runners/vercel/worker.mjs",
+    "./runners/vercel/queue-dev": "./dist/runners/vercel/queue-dev.mjs",
     "./runners/netlify": "./dist/runners/netlify/runner.mjs",
     "./runners/netlify/worker": "./dist/runners/netlify/worker.mjs",
     "./vite": "./dist/vite.mjs"
@@ -65,6 +66,7 @@
   },
   "peerDependencies": {
     "@netlify/runtime": "^4.1.20",
+    "@vercel/queue": "^0.1.6",
     "miniflare": "^4.20260409.0"
   },
   "peerDependenciesMeta": {
@@ -72,6 +74,9 @@
       "optional": true
     },
     "@netlify/runtime": {
+      "optional": true
+    },
+    "@vercel/queue": {
       "optional": true
     }
   },

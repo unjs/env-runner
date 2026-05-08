@@ -32,7 +32,8 @@ src/
 │   │   └── runner.ts        # MiniflareEnvRunner (Cloudflare Workers via miniflare)
 │   ├── vercel/
 │   │   ├── runner.ts        # VercelEnvRunner (extends NodeWorkerEnvRunner)
-│   │   └── worker.ts        # Sets Vercel request context symbol, delegates to node-worker
+│   │   ├── worker.ts        # Sets Vercel request context symbol, delegates to node-worker
+│   │   └── queue-dev.ts     # Local Vercel Queues delivery bridge (registerDevConsumer)
 │   └── netlify/
 │       ├── runner.ts        # NetlifyEnvRunner (extends NodeWorkerEnvRunner)
 │       └── worker.ts        # Sets global Netlify context, delegates to node-worker
@@ -59,7 +60,8 @@ src/
 - **`src/runners/self/runner.ts`** — `SelfEnvRunner` extends `BaseEnvRunner`: runs entry code in the same process using an in-memory channel registry on `process.__envRunners`
 - **`src/runners/miniflare/runner.ts`** — `MiniflareEnvRunner` extends `BaseEnvRunner`: runs entry in Cloudflare Workers runtime via miniflare. Overrides `fetch()` to use `mf.dispatchFetch()`. Uses in-memory `script` (no temp files), `unsafeModuleFallbackService` for module resolution, and `unsafeEvalBinding` for hot-reload via `reloadModule()`. Requires `miniflare` peer dependency
 - **`src/runners/vercel/runner.ts`** — `VercelEnvRunner` extends `NodeWorkerEnvRunner`: simulates Vercel deployment environment with header injection
-- **`src/runners/vercel/worker.ts`** — Sets `Symbol.for("@vercel/request-context")` on globalThis, delegates to node-worker worker
+- **`src/runners/vercel/worker.ts`** — Sets Vercel env vars and `Symbol.for("@vercel/request-context")` on globalThis, delegates to node-worker worker
+- **`src/runners/vercel/queue-dev.ts`** — Bridge for local Vercel Queues delivery. `registerVercelQueueConsumer({ topic, handler, retryAfterSeconds })` lets framework plugins bind a topic to a dispatcher; the first call lazy-loads `@vercel/queue` and constructs a shared `QueueClient`. Re-registering the same topic replaces the handler (HMR-safe), and the returned unregister function is a no-op once the slot has been replaced
 - **`src/runners/netlify/runner.ts`** — `NetlifyEnvRunner` extends `NodeWorkerEnvRunner`: simulates Netlify deployment environment with header injection (`x-nf-client-connection-ip`, `x-nf-account-id`, `x-nf-site-id`, `x-nf-deploy-id`, `x-nf-deploy-context`, `x-nf-geo`, `x-nf-request-id`)
 - **`src/runners/netlify/worker.ts`** — Uses `@netlify/runtime` `startRuntime()` when available (sets up `globalThis.Netlify` with env/context and `globalThis.caches`), falls back to lightweight shim. Delegates to node-worker worker
 - **`src/loader.ts`** — `loadRunner(name, opts)`: dynamic loader that imports a runner by name (`node-worker` | `node-process` | `bun-process` | `deno-process` | `self` | `miniflare` | `vercel` | `netlify`) and returns an `EnvRunner` instance
@@ -128,6 +130,7 @@ Extends `NodeWorkerEnvRunner` to simulate a Vercel deployment environment. The w
 - `VERCEL_ENV` — `"development"`
 - `VERCEL_REGION` — `"dev1"`
 - `NOW_REGION` — `"dev1"` (legacy alias)
+- `NODE_ENV` — `"development"` (gates `@vercel/queue`'s dev mode and other framework dev paths)
 
 **Request header injection:** Overrides `fetch()` to inject Vercel-specific headers before delegating to the parent:
 
@@ -145,6 +148,8 @@ Extends `NodeWorkerEnvRunner` to simulate a Vercel deployment environment. The w
 - `x-vercel-cache` — `"MISS"`
 
 All headers are only injected when not already present in the request/response.
+
+**Local Vercel Queues delivery:** Frameworks running inside the worker call `registerVercelQueueConsumer({ topic, handler, retryAfterSeconds })` from `env-runner/runners/vercel/queue-dev` (e.g. Nitro forwards delivered messages to its `vercel:queue` runtime hook). The first call lazy-imports `@vercel/queue`, constructs a shared `QueueClient`, and registers a dev consumer via `registerDevConsumer`. Subsequent calls reuse the client; re-registering the same topic replaces the handler in place (HMR-safe). If `@vercel/queue` is not installed or is too old to expose `registerDevConsumer`, a one-time warning is logged and registrations become no-ops — dev startup is never blocked.
 
 ### NetlifyEnvRunner
 
