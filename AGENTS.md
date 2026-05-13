@@ -128,9 +128,9 @@ Extends `NodeWorkerEnvRunner` to simulate a Vercel deployment environment. The w
 
 - `VERCEL` — `"1"`
 - `VERCEL_ENV` — `"development"`
-- `VERCEL_REGION` — `"dev1"`
-- `NOW_REGION` — `"dev1"` (legacy alias)
 - `NODE_ENV` — `"development"` (gates `@vercel/queue`'s dev mode and other framework dev paths)
+
+`VERCEL_REGION` and `NOW_REGION` are intentionally not defaulted — Vercel SDKs rely on them being valid region identifiers when set, so they must be explicitly provided if required.
 
 **Request header injection:** Overrides `fetch()` to inject Vercel-specific headers before delegating to the parent:
 
