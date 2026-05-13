@@ -26,10 +26,7 @@ export interface VercelQueueDevConsumer {
   handler: VercelQueueDevHandler;
 }
 
-export type VercelQueueDevHandler = (
-  message: unknown,
-  metadata: unknown,
-) => void | Promise<void>;
+export type VercelQueueDevHandler = (message: unknown, metadata: unknown) => void | Promise<void>;
 
 interface RegisteredSlot {
   handler: VercelQueueDevHandler;
@@ -47,9 +44,7 @@ let client: unknown;
  * and constructs a shared `QueueClient`. Re-registering with the same topic
  * replaces the handler (HMR-safe).
  */
-export function registerVercelQueueConsumer(
-  consumer: VercelQueueDevConsumer,
-): () => void {
+export function registerVercelQueueConsumer(consumer: VercelQueueDevConsumer): () => void {
   const { topic, retryAfterSeconds, handler } = consumer;
 
   // Replace path: a slot for this topic already exists; just swap the handler
@@ -81,9 +76,7 @@ export function registerVercelQueueConsumer(
         topic,
         client,
         consumerGroup: "env-runner-vercel-dev",
-        retry: retryAfterSeconds
-          ? () => ({ afterSeconds: retryAfterSeconds })
-          : undefined,
+        retry: retryAfterSeconds ? () => ({ afterSeconds: retryAfterSeconds }) : undefined,
         handler: (message, metadata) => slot.handler(message, metadata),
       });
     })
@@ -115,11 +108,15 @@ function ensureSdk(): Promise<VercelQueueSdk | null> {
     try {
       mod = (await import("@vercel/queue")) as unknown as VercelQueueSdk;
     } catch {
-      console.warn("[env-runner:vercel-queue] `@vercel/queue` is not installed. Local queue delivery is disabled.");
+      console.warn(
+        "[env-runner:vercel-queue] `@vercel/queue` is not installed. Local queue delivery is disabled.",
+      );
       return null;
     }
     if (typeof mod.registerDevConsumer !== "function") {
-      console.warn("[env-runner:vercel-queue] Installed `@vercel/queue` does not export `registerDevConsumer`. Upgrade to enable local queue delivery.");
+      console.warn(
+        "[env-runner:vercel-queue] Installed `@vercel/queue` does not export `registerDevConsumer`. Upgrade to enable local queue delivery.",
+      );
       return null;
     }
     client = new mod.QueueClient();
@@ -139,9 +136,6 @@ interface VercelQueueSdk {
       error: unknown,
       metadata: unknown,
     ) => { afterSeconds: number } | { acknowledge: true } | void;
-    handler: (
-      message: unknown,
-      metadata: unknown,
-    ) => void | Promise<void>;
+    handler: (message: unknown, metadata: unknown) => void | Promise<void>;
   }) => () => void;
 }
