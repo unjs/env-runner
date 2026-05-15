@@ -10,10 +10,37 @@ export interface VercelOidcCheckResult {
   expiresAt?: Date;
 }
 
+let _warned = false;
+
+/**
+ * Log a one-time warning if the OIDC token is missing, expired, or malformed.
+ */
+export function warnIfVercelOidcTokenInvalid(token?: string | undefined): VercelOidcCheckResult {
+  const result = _checkVercelOidcToken(token);
+  if (_warned) return result;
+
+  if (result.status === "missing") {
+    _warned = true;
+    console.warn("[env-runner:vercel] Run `vercel env pull` to set `VERCEL_OIDC_TOKEN`.");
+  } else if (result.status === "expired") {
+    _warned = true;
+    console.warn(
+      `[env-runner:vercel] \`VERCEL_OIDC_TOKEN\` expired at ${result.expiresAt!.toISOString()}. Run \`vercel env pull\` to refresh it.`,
+    );
+  } else if (result.status === "invalid") {
+    _warned = true;
+    console.warn(
+      "[env-runner:vercel] `VERCEL_OIDC_TOKEN` is invalid. Run `vercel env pull` to refresh it.",
+    );
+  }
+
+  return result;
+}
+
 /**
  * Inspect a Vercel OIDC token (defaults to `process.env.VERCEL_OIDC_TOKEN`). Decodes the JWT `exp` claim.
  */
-export function checkVercelOidcToken(
+function _checkVercelOidcToken(
   token: string | undefined = process.env.VERCEL_OIDC_TOKEN,
 ): VercelOidcCheckResult {
   if (!token) return { status: "missing" };
@@ -43,31 +70,4 @@ export function checkVercelOidcToken(
     return { status: "expired", expiresAt };
   }
   return { status: "valid", expiresAt };
-}
-
-let _warned = false;
-
-/**
- * Log a one-time warning if the OIDC token is missing, expired, or malformed.
- */
-export function warnIfVercelOidcTokenInvalid(token?: string | undefined): VercelOidcCheckResult {
-  const result = checkVercelOidcToken(token);
-  if (_warned) return result;
-
-  if (result.status === "missing") {
-    _warned = true;
-    console.warn("[env-runner:vercel] Run `vercel env pull` to set `VERCEL_OIDC_TOKEN`.");
-  } else if (result.status === "expired") {
-    _warned = true;
-    console.warn(
-      `[env-runner:vercel] \`VERCEL_OIDC_TOKEN\` expired at ${result.expiresAt!.toISOString()}. Run \`vercel env pull\` to refresh it.`,
-    );
-  } else if (result.status === "invalid") {
-    _warned = true;
-    console.warn(
-      "[env-runner:vercel] `VERCEL_OIDC_TOKEN` is invalid. Run `vercel env pull` to refresh it.",
-    );
-  }
-
-  return result;
 }
