@@ -66,7 +66,7 @@
   },
   "peerDependencies": {
     "@netlify/runtime": "^4.1.20",
-    "@vercel/queue": "^0.1.6",
+    "@vercel/queue": "^0.2.0",
     "miniflare": "^4.20260409.0"
   },
   "peerDependenciesMeta": {
