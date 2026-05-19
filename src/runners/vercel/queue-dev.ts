@@ -115,7 +115,7 @@ function ensureSdk(): Promise<VercelQueueSdk | null> {
     }
     if (typeof mod.registerDevConsumer !== "function") {
       console.warn(
-        "[env-runner:vercel-queue] Installed `@vercel/queue` does not export `registerDevConsumer`. Upgrade to enable local queue delivery.",
+        "[env-runner:vercel-queue] Installed `@vercel/queue` does not export `registerDevConsumer`. Upgrade @vercel/queue@^0.2.0 to enable local queue delivery.",
       );
       return null;
     }
