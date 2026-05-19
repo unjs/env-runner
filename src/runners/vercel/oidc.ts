@@ -56,14 +56,13 @@ function _checkVercelOidcToken(
     return { status: "invalid" };
   }
 
-  if (
-    !payload ||
-    typeof payload !== "object" ||
-    typeof (payload as { exp?: unknown }).exp !== "number"
-  ) {
+  if (!payload || typeof payload !== "object") {
     return { status: "invalid" };
   }
-  const exp = (payload as { exp: number }).exp;
+  const exp = (payload as { exp?: unknown }).exp;
+  if (typeof exp !== "number" || !Number.isFinite(exp)) {
+    return { status: "invalid" };
+  }
 
   const expiresAt = new Date(exp * 1000);
   if (expiresAt.getTime() <= Date.now()) {
