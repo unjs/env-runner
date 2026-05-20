@@ -13,6 +13,7 @@
  * Re-registering with the same topic replaces the previous handler (HMR-safe
  * via `@vercel/queue`'s own `consumerGroup` semantics).
  */
+import type { MessageHandler, QueueClient } from "@vercel/queue";
 
 const CONSUMER_GROUP = "env-runner-vercel-dev";
 
@@ -25,13 +26,13 @@ export interface VercelQueueDevConsumer {
    */
   retryAfterSeconds?: number;
   /** Function invoked with each delivered message. */
-  handler: VercelQueueDevHandler;
+  handler: MessageHandler;
 }
 
-export type VercelQueueDevHandler = (message: unknown, metadata: unknown) => void | Promise<void>;
+type VercelQueueSdk = typeof import("@vercel/queue");
 
 let sdkPromise: Promise<VercelQueueSdk | null> | undefined;
-let client: unknown;
+let client: QueueClient | undefined;
 
 const noop = () => {};
 
@@ -50,14 +51,15 @@ export async function registerVercelQueueConsumer(
   consumer: VercelQueueDevConsumer,
 ): Promise<() => void> {
   const sdk = await ensureSdk();
-  if (!sdk) return noop;
+  if (!sdk || !client) return noop;
 
   const { topic, retryAfterSeconds, handler } = consumer;
-  return sdk.registerDevConsumer!({
+  return sdk.registerDevConsumer({
     topic,
     client,
     consumerGroup: CONSUMER_GROUP,
-    retry: retryAfterSeconds ? () => ({ afterSeconds: retryAfterSeconds }) : undefined,
+    retry:
+      retryAfterSeconds === undefined ? undefined : () => ({ afterSeconds: retryAfterSeconds }),
     handler,
   });
 }
@@ -67,7 +69,7 @@ function ensureSdk(): Promise<VercelQueueSdk | null> {
   sdkPromise = (async () => {
     let mod: VercelQueueSdk;
     try {
-      mod = (await import("@vercel/queue")) as unknown as VercelQueueSdk;
+      mod = await import("@vercel/queue");
     } catch {
       console.warn(
         "[env-runner:vercel-queue] `@vercel/queue` is not installed. Local queue delivery is disabled.",
@@ -84,19 +86,4 @@ function ensureSdk(): Promise<VercelQueueSdk | null> {
     return mod;
   })();
   return sdkPromise;
-}
-
-interface VercelQueueSdk {
-  QueueClient: new () => unknown;
-  registerDevConsumer?: (options: {
-    topic: string;
-    client: unknown;
-    consumerGroup?: string;
-    visibilityTimeoutSeconds?: number;
-    retry?: (
-      error: unknown,
-      metadata: unknown,
-    ) => { afterSeconds: number } | { acknowledge: true } | void;
-    handler: (message: unknown, metadata: unknown) => void | Promise<void>;
-  }) => () => void;
 }
