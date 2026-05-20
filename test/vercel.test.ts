@@ -145,7 +145,10 @@ describe("VercelEnvRunner", () => {
     const { env } = await res.json();
     expect(env.VERCEL).toBe("1");
     expect(env.VERCEL_ENV).toBe("development");
-    expect(env.VERCEL_REGION).toBe("dev1");
-    expect(env.NOW_REGION).toBe("dev1");
+    // NODE_ENV is inherited from parent (vitest sets it to "test"); the worker only defaults it when unset.
+    expect(env.NODE_ENV).toBe(process.env.NODE_ENV);
+    // VERCEL_REGION / NOW_REGION are intentionally not defaulted; Vercel SDKs expect valid region identifiers when set.
+    expect(env.VERCEL_REGION).toBeUndefined();
+    expect(env.NOW_REGION).toBeUndefined();
   });
 });
