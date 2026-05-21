@@ -1,9 +1,12 @@
 // Vercel environment variables
 // https://vercel.com/docs/projects/environment-variables/system-environment-variables
 process.env.VERCEL = process.env.VERCEL || "1";
+
+// VERCEL_REGION / NOW_REGION are intentionally not defaulted since Vercel SDKs rely on them being valid when set.
 process.env.VERCEL_ENV = process.env.VERCEL_ENV || "development";
-process.env.VERCEL_REGION = process.env.VERCEL_REGION || "dev1";
-process.env.NOW_REGION = process.env.NOW_REGION || "dev1";
+
+// TODO: Support `new QueueClient({ devMode: true })` upstream so we can scope dev mode to the SDK rather than flipping NODE_ENV process-wide.
+process.env.NODE_ENV = process.env.NODE_ENV || "development";
 
 // Provides the request context that @vercel/functions reads from
 // https://github.com/vercel/vercel/blob/main/packages/functions/src/get-context.ts

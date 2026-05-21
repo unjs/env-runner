@@ -11,6 +11,7 @@ export default {
         VERCEL_ENV: process.env.VERCEL_ENV,
         VERCEL_REGION: process.env.VERCEL_REGION,
         NOW_REGION: process.env.NOW_REGION,
+        NODE_ENV: process.env.NODE_ENV,
       },
     });
   },

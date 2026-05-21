@@ -71,12 +71,7 @@ export class VercelEnvRunner extends NodeWorkerEnvRunner {
       // URL parsing failed, skip proto/host headers
     }
 
-    let res: Response;
-    if (input instanceof Request) {
-      res = await super.fetch(new Request(input, { ...init, headers }));
-    } else {
-      res = await super.fetch(input, { ...init, headers });
-    }
+    const res = await super.fetch(input, { ...init, headers });
 
     // Inject Vercel response headers
     const resHeaders = new Headers(res.headers);

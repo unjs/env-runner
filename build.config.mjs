@@ -6,11 +6,11 @@ const input = Object.entries(pkg.exports).map(([exportPath]) => {
     return "src/index.ts";
   }
   if (exportPath.startsWith("./runners/")) {
-    // ./runners/<name> => src/runners/<name>/runner.ts
-    // ./runners/<name>/worker => src/runners/<name>/worker.ts
+    // ./runners/<name>          => src/runners/<name>/runner.ts
+    // ./runners/<name>/<sub>    => src/runners/<name>/<sub>.ts
     const parts = exportPath.slice(2).split("/");
     const name = parts[1];
-    const file = parts[2] === "worker" ? "worker" : "runner";
+    const file = parts[2] || "runner";
     return `src/runners/${name}/${file}.ts`;
   }
   // ./<path> => src/<path>.ts
