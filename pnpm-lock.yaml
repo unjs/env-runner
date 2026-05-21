@@ -8,9 +8,6 @@ importers:
 
   .:
     dependencies:
-      '@vercel/queue':
-        specifier: ^0.2.0
-        version: 0.2.0
       crossws:
         specifier: ^0.4.5
         version: 0.4.5(srvx@0.11.15)
@@ -33,6 +30,9 @@ importers:
       '@typescript/native-preview':
         specifier: 7.0.0-dev.20260521.1
         version: 7.0.0-dev.20260521.1
+      '@vercel/queue':
+        specifier: ^0.2.0
+        version: 0.2.0
       '@vitest/coverage-v8':
         specifier: ^4.1.7
         version: 4.1.7(vitest@4.1.7)

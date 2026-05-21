@@ -13,20 +13,39 @@
  * Re-registering with the same topic replaces the previous handler (HMR-safe
  * via `@vercel/queue`'s own `consumerGroup` semantics).
  */
-import type { MessageHandler, QueueClient } from "@vercel/queue";
+import type { MessageHandler, QueueClient, RetryHandler } from "@vercel/queue";
 
-const CONSUMER_GROUP = "env-runner-vercel-dev";
+const DEFAULT_CONSUMER_GROUP = "env-runner-vercel-dev";
 
 export interface VercelQueueDevConsumer {
   /** Topic name. Wildcard patterns (e.g. `"user-*"`) are supported. */
   topic: string;
-  /**
-   * Default delay used for local re-delivery when the handler throws and does
-   * not return its own retry directive. Mirrors production semantics.
-   */
-  retryAfterSeconds?: number;
   /** Function invoked with each delivered message. */
   handler: MessageHandler;
+  /**
+   * Logical consumer identifier. Re-registering with the same group on the same
+   * topic replaces the previous handler (HMR-safe). Use distinct groups to fan
+   * a topic out to multiple coexisting handlers.
+   *
+   * @default "env-runner-vercel-dev"
+   */
+  consumerGroup?: string;
+  /**
+   * Lock duration for in-flight messages. Forwarded to the SDK's
+   * `coreHandleCallback`.
+   */
+  visibilityTimeoutSeconds?: number;
+  /**
+   * Convenience: rescheduled re-delivery delay applied when the handler throws.
+   * Equivalent to `retry: () => ({ afterSeconds })`. Ignored if `retry` is set.
+   */
+  retryAfterSeconds?: number;
+  /**
+   * Full retry handler. Receives the thrown error and message metadata; return
+   * `{ afterSeconds }` to reschedule, `{ acknowledge: true }` to drop, or
+   * `undefined` to let the error propagate.
+   */
+  retry?: RetryHandler;
 }
 
 type VercelQueueSdk = typeof import("@vercel/queue");
@@ -53,14 +72,17 @@ export async function registerVercelQueueConsumer(
   const sdk = await ensureSdk();
   if (!sdk || !client) return noop;
 
-  const { topic, retryAfterSeconds, handler } = consumer;
+  const { topic, handler, consumerGroup, visibilityTimeoutSeconds, retry, retryAfterSeconds } =
+    consumer;
   return sdk.registerDevConsumer({
     topic,
     client,
-    consumerGroup: CONSUMER_GROUP,
-    retry:
-      retryAfterSeconds === undefined ? undefined : () => ({ afterSeconds: retryAfterSeconds }),
     handler,
+    consumerGroup: consumerGroup ?? DEFAULT_CONSUMER_GROUP,
+    visibilityTimeoutSeconds,
+    retry:
+      retry ??
+      (retryAfterSeconds === undefined ? undefined : () => ({ afterSeconds: retryAfterSeconds })),
   });
 }
 
