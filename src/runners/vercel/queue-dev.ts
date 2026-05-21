@@ -72,17 +72,17 @@ export async function registerVercelQueueConsumer(
   const sdk = await ensureSdk();
   if (!sdk || !client) return noop;
 
-  const { topic, handler, consumerGroup, visibilityTimeoutSeconds, retry, retryAfterSeconds } =
-    consumer;
   return sdk.registerDevConsumer({
-    topic,
+    topic: consumer.topic,
     client,
-    handler,
-    consumerGroup: consumerGroup ?? DEFAULT_CONSUMER_GROUP,
-    visibilityTimeoutSeconds,
+    handler: consumer.handler,
+    consumerGroup: consumer.consumerGroup ?? DEFAULT_CONSUMER_GROUP,
+    visibilityTimeoutSeconds: consumer.visibilityTimeoutSeconds,
     retry:
-      retry ??
-      (retryAfterSeconds === undefined ? undefined : () => ({ afterSeconds: retryAfterSeconds })),
+      consumer.retry ??
+      (consumer.retryAfterSeconds === undefined
+        ? undefined
+        : () => ({ afterSeconds: consumer.retryAfterSeconds! })),
   });
 }
 
