@@ -1036,7 +1036,6 @@ packages:
     engines: {node: '>=16.20.0'}
     hasBin: true
 
-<<<<<<< HEAD
   '@vercel/oidc@3.4.1':
     resolution: {integrity: sha512-H6B+/ig/GoahccL3WZjiHayHw1H5KhvTJNceqYulwfK9kkz5iul2hTmYzcJ7tTCQzyd0dutuL9xYFZCyLUqsog==}
     engines: {node: '>= 20'}
@@ -1045,12 +1044,8 @@ packages:
     resolution: {integrity: sha512-+iOwbz9wHWwcr8kLyB6m6seE/Kw2mn0Mxatj+6ko6HwBaCZGSYRNgII7JwrKMPSaxaqE1iZ3BZRbhLwYQATaew==}
     engines: {node: '>=20.0.0'}
 
-  '@vitest/coverage-v8@4.1.6':
-    resolution: {integrity: sha512-36l628fQ/9a/8ihy97eOtEnvWQEdqULQOJtcaxtoNq0G1w3Mxd4szSahOaMM9/NGyZ+hyKcMtIW/WIxq0XQViQ==}
-=======
   '@vitest/coverage-v8@4.1.7':
     resolution: {integrity: sha512-qsYPeXc5Q9dFLd1i8Ap+Bx8sQgcp+rFVQo4R0dDsWNBzl26ldVF1qOO+RL24K7FDrR6pA+50XedRLSoSG24bVQ==}
->>>>>>> main
     peerDependencies:
       '@vitest/browser': 4.1.7
       vitest: 4.1.7
@@ -2544,7 +2539,6 @@ snapshots:
       '@typescript/native-preview-win32-arm64': 7.0.0-dev.20260521.1
       '@typescript/native-preview-win32-x64': 7.0.0-dev.20260521.1
 
-<<<<<<< HEAD
   '@vercel/oidc@3.4.1': {}
 
   '@vercel/queue@0.2.0':
@@ -2554,10 +2548,7 @@ snapshots:
       mixpart: 0.0.6
       picocolors: 1.1.1
 
-  '@vitest/coverage-v8@4.1.6(vitest@4.1.6)':
-=======
   '@vitest/coverage-v8@4.1.7(vitest@4.1.7)':
->>>>>>> main
     dependencies:
       '@bcoe/v8-coverage': 1.0.2
       '@vitest/utils': 4.1.7
