@@ -64,8 +64,8 @@
     "vitest": "^4.1.7"
   },
   "peerDependencies": {
-    "@netlify/runtime": "^4.1.23",
-    "miniflare": "^4.20260515.0"
+    "@netlify/runtime": "^4.1.24",
+    "miniflare": "^4.20260520.0"
   },
   "peerDependenciesMeta": {
     "miniflare": {
