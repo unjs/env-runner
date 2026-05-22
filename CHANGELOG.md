@@ -1,6 +1,18 @@
 # Changelog
 
 
+## v0.1.9
+
+[compare changes](https://github.com/unjs/env-runner/compare/v0.1.8...v0.1.9)
+
+### 💅 Refactors
+
+- Simplify vercel oidc token warns ([02a87a5](https://github.com/unjs/env-runner/commit/02a87a5))
+
+### ❤️ Contributors
+
+- Pooya Parsa <x@pi0.io>
+
 ## v0.1.8
 
 [compare changes](https://github.com/unjs/env-runner/compare/v0.1.7...v0.1.8)
