@@ -33,6 +33,7 @@ src/
 │   ├── vercel/
 │   │   ├── runner.ts        # VercelEnvRunner (extends NodeWorkerEnvRunner)
 │   │   ├── worker.ts        # Sets Vercel request context symbol, delegates to node-worker
+│   │   ├── oidc.ts          # VERCEL_OIDC_TOKEN check + dev-time warning
 │   │   └── queue-dev.ts     # Local Vercel Queues delivery bridge (registerDevConsumer)
 │   └── netlify/
 │       ├── runner.ts        # NetlifyEnvRunner (extends NodeWorkerEnvRunner)
@@ -61,6 +62,7 @@ src/
 - **`src/runners/miniflare/runner.ts`** — `MiniflareEnvRunner` extends `BaseEnvRunner`: runs entry in Cloudflare Workers runtime via miniflare. Overrides `fetch()` to use `mf.dispatchFetch()`. Uses in-memory `script` (no temp files), `unsafeModuleFallbackService` for module resolution, and `unsafeEvalBinding` for hot-reload via `reloadModule()`. Requires `miniflare` peer dependency
 - **`src/runners/vercel/runner.ts`** — `VercelEnvRunner` extends `NodeWorkerEnvRunner`: simulates Vercel deployment environment with header injection
 - **`src/runners/vercel/worker.ts`** — Sets Vercel env vars and `Symbol.for("@vercel/request-context")` on globalThis, delegates to node-worker worker
+- **`src/runners/vercel/oidc.ts`** — `_checkVercelOidcToken()` decodes `VERCEL_OIDC_TOKEN` (JWT `exp` claim, no signature check) and returns `{ status: "missing" | "valid" | "expired" | "invalid", expiresAt? }`. `warnIfVercelOidcTokenInvalid()` logs a one-time dev warning hinting the user to run `vercel env pull`. Called from the `VercelEnvRunner` constructor
 - **`src/runners/vercel/queue-dev.ts`** — Bridge for local Vercel Queues delivery. `await registerVercelQueueConsumer({ topic, handler, consumerGroup?, visibilityTimeoutSeconds?, retry?, retryAfterSeconds? })` lets framework plugins bind a topic to a dispatcher; the first call lazy-loads `@vercel/queue` and constructs a shared `QueueClient`. Resolves to an unregister function. Re-registering the same `consumerGroup` on a topic replaces the handler via the SDK's own `consumerGroup` keying (HMR-safe; the unregister for a replaced registration becomes a no-op). `retryAfterSeconds` is a shorthand for `retry: () => ({ afterSeconds })`; pass `retry` for richer directives like `{ acknowledge: true }`
 - **`src/runners/netlify/runner.ts`** — `NetlifyEnvRunner` extends `NodeWorkerEnvRunner`: simulates Netlify deployment environment with header injection (`x-nf-client-connection-ip`, `x-nf-account-id`, `x-nf-site-id`, `x-nf-deploy-id`, `x-nf-deploy-context`, `x-nf-geo`, `x-nf-request-id`)
 - **`src/runners/netlify/worker.ts`** — Uses `@netlify/runtime` `startRuntime()` when available (sets up `globalThis.Netlify` with env/context and `globalThis.caches`), falls back to lightweight shim. Delegates to node-worker worker

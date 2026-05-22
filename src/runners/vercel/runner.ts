@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 
 import type { EnvRunnerData } from "../../common/base-runner.ts";
 import { NodeWorkerEnvRunner } from "../node-worker/runner.ts";
+import { warnIfVercelOidcTokenInvalid } from "./oidc.ts";
 
 export type { EnvRunnerData };
 
@@ -28,6 +29,7 @@ export class VercelEnvRunner extends NodeWorkerEnvRunner {
   }) {
     _defaultEntry ||= fileURLToPath(import.meta.resolve("env-runner/runners/vercel/worker"));
     super({ ...opts, workerEntry: opts.workerEntry || _defaultEntry });
+    warnIfVercelOidcTokenInvalid();
   }
 
   override async fetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
