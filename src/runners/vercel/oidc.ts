@@ -22,17 +22,17 @@ export function warnIfVercelOidcTokenInvalid(token?: string | undefined): Vercel
   if (result.status === "missing") {
     _warned = true;
     console.warn(
-      "[env-runner:vercel] Run `vercel env pull` to set `VERCEL_OIDC_TOKEN` to allow Vercel SDKs to authenticate.",
+      "[env-runner:vercel] VERCEL_OIDC_TOKEN is not set. Vercel SDK features (e.g. @vercel/functions waitUntil, cache) may not work. Run `vercel env pull` to set it.",
     );
   } else if (result.status === "expired") {
     _warned = true;
     console.warn(
-      `[env-runner:vercel] \`VERCEL_OIDC_TOKEN\` expired at ${result.expiresAt!.toISOString()}. Run \`vercel env pull\` to refresh it.`,
+      `[env-runner:vercel] VERCEL_OIDC_TOKEN expired at ${result.expiresAt!.toISOString()}. Vercel SDK authentication will fail. Run \`vercel env pull\` to refresh it.`,
     );
   } else if (result.status === "invalid") {
     _warned = true;
     console.warn(
-      "[env-runner:vercel] `VERCEL_OIDC_TOKEN` is invalid. Run `vercel env pull` to refresh it.",
+      "[env-runner:vercel] VERCEL_OIDC_TOKEN is malformed (not a valid JWT). Vercel SDK authentication will fail. Run `vercel env pull` to get a fresh token.",
     );
   }
 
