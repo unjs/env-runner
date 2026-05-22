@@ -1,6 +1,26 @@
 # Changelog
 
 
+## v0.1.8
+
+[compare changes](https://github.com/unjs/env-runner/compare/v0.1.7...v0.1.8)
+
+### 🚀 Enhancements
+
+- **vercel:** Add env vars, `x-vercel-id` header, and response headers ([caa3625](https://github.com/unjs/env-runner/commit/caa3625))
+- **vercel:** Vercel queues ([#16](https://github.com/unjs/env-runner/pull/16))
+- **vercel:** Prompt to update oidc token if unset/expired ([#15](https://github.com/unjs/env-runner/pull/15))
+
+### 🏡 Chore
+
+- Update deps ([4b5d42f](https://github.com/unjs/env-runner/commit/4b5d42f))
+- Update deps ([faf2f21](https://github.com/unjs/env-runner/commit/faf2f21))
+
+### ❤️ Contributors
+
+- Rihan Arfan ([@RihanArfan](https://github.com/RihanArfan))
+- Pooya Parsa ([@pi0](https://github.com/pi0))
+
 ## v0.1.7
 
 [compare changes](https://github.com/unjs/env-runner/compare/v0.1.6...v0.1.7)
