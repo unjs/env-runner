@@ -33,7 +33,8 @@ src/
 │   ├── vercel/
 │   │   ├── runner.ts        # VercelEnvRunner (extends NodeWorkerEnvRunner)
 │   │   ├── worker.ts        # Sets Vercel request context symbol, delegates to node-worker
-│   │   └── oidc.ts          # VERCEL_OIDC_TOKEN check + dev-time warning
+│   │   ├── oidc.ts          # VERCEL_OIDC_TOKEN check + dev-time warning
+│   │   └── queue-dev.ts     # Local Vercel Queues delivery bridge (registerDevConsumer)
 │   └── netlify/
 │       ├── runner.ts        # NetlifyEnvRunner (extends NodeWorkerEnvRunner)
 │       └── worker.ts        # Sets global Netlify context, delegates to node-worker
@@ -62,6 +63,7 @@ src/
 - **`src/runners/vercel/runner.ts`** — `VercelEnvRunner` extends `NodeWorkerEnvRunner`: simulates Vercel deployment environment with header injection
 - **`src/runners/vercel/worker.ts`** — Sets Vercel env vars and `Symbol.for("@vercel/request-context")` on globalThis, delegates to node-worker worker
 - **`src/runners/vercel/oidc.ts`** — `_checkVercelOidcToken()` decodes `VERCEL_OIDC_TOKEN` (JWT `exp` claim, no signature check) and returns `{ status: "missing" | "valid" | "expired" | "invalid", expiresAt? }`. `warnIfVercelOidcTokenInvalid()` logs a one-time dev warning hinting the user to run `vercel env pull`. Called from the `VercelEnvRunner` constructor
+- **`src/runners/vercel/queue-dev.ts`** — Bridge for local Vercel Queues delivery. `await registerVercelQueueConsumer({ topic, handler, consumerGroup?, visibilityTimeoutSeconds?, retry?, retryAfterSeconds? })` lets framework plugins bind a topic to a dispatcher; the first call lazy-loads `@vercel/queue` and constructs a shared `QueueClient`. Resolves to an unregister function. Re-registering the same `consumerGroup` on a topic replaces the handler via the SDK's own `consumerGroup` keying (HMR-safe; the unregister for a replaced registration becomes a no-op). `retryAfterSeconds` is a shorthand for `retry: () => ({ afterSeconds })`; pass `retry` for richer directives like `{ acknowledge: true }`
 - **`src/runners/netlify/runner.ts`** — `NetlifyEnvRunner` extends `NodeWorkerEnvRunner`: simulates Netlify deployment environment with header injection (`x-nf-client-connection-ip`, `x-nf-account-id`, `x-nf-site-id`, `x-nf-deploy-id`, `x-nf-deploy-context`, `x-nf-geo`, `x-nf-request-id`)
 - **`src/runners/netlify/worker.ts`** — Uses `@netlify/runtime` `startRuntime()` when available (sets up `globalThis.Netlify` with env/context and `globalThis.caches`), falls back to lightweight shim. Delegates to node-worker worker
 - **`src/loader.ts`** — `loadRunner(name, opts)`: dynamic loader that imports a runner by name (`node-worker` | `node-process` | `bun-process` | `deno-process` | `self` | `miniflare` | `vercel` | `netlify`) and returns an `EnvRunner` instance
@@ -128,8 +130,9 @@ Extends `NodeWorkerEnvRunner` to simulate a Vercel deployment environment. The w
 
 - `VERCEL` — `"1"`
 - `VERCEL_ENV` — `"development"`
-- `VERCEL_REGION` — `"dev1"`
-- `NOW_REGION` — `"dev1"` (legacy alias)
+- `NODE_ENV` — `"development"` (gates `@vercel/queue`'s dev mode and other framework dev paths)
+
+`VERCEL_REGION` and `NOW_REGION` are intentionally not defaulted — Vercel SDKs rely on them being valid region identifiers when set, so they must be explicitly provided if required.
 
 **Request header injection:** Overrides `fetch()` to inject Vercel-specific headers before delegating to the parent:
 
@@ -147,6 +150,8 @@ Extends `NodeWorkerEnvRunner` to simulate a Vercel deployment environment. The w
 - `x-vercel-cache` — `"MISS"`
 
 All headers are only injected when not already present in the request/response.
+
+**Local Vercel Queues delivery:** Frameworks running inside the worker `await registerVercelQueueConsumer({ topic, handler, consumerGroup?, visibilityTimeoutSeconds?, retry?, retryAfterSeconds? })` from `env-runner/runners/vercel/queue-dev` (e.g. Nitro forwards delivered messages to its `vercel:queue` runtime hook). The first call lazy-imports `@vercel/queue`, constructs a shared `QueueClient`, and registers a dev consumer via `registerDevConsumer`. Subsequent calls reuse the client; re-registering the same `consumerGroup` on a topic replaces the handler in place (HMR-safe). `retryAfterSeconds` is shorthand for a constant-delay retry; pass `retry: (error, metadata) => RetryDirective` for richer directives (`{ afterSeconds }`, `{ acknowledge: true }`, or `undefined` to propagate). If `@vercel/queue` is not installed or is too old to expose `registerDevConsumer`, a one-time warning is logged and registrations resolve to a no-op unregister — dev startup is never blocked.
 
 ### NetlifyEnvRunner
 
