@@ -32,6 +32,9 @@ process.send!({
   address: parseServerAddress(server),
 });
 
+// Exit when the supervisor disappears (graceful or crash) to avoid orphan workers.
+process.on("disconnect", () => process.exit(0));
+
 process.on("message", async (message: any) => {
   if (message?.event === "shutdown") {
     Promise.resolve(entry.ipc?.onClose?.())

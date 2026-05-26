@@ -32,6 +32,10 @@ process.send!({
   address: parseServerAddress(server),
 });
 
+// Exit when the supervisor disappears (graceful or crash) to avoid orphan workers.
+// Relies on Bun's Node-compat layer when the host is Bun; verified empirically.
+process.on("disconnect", () => process.exit(0));
+
 process.on("message", async (message: any) => {
   if (message?.event === "shutdown") {
     Promise.resolve(entry.ipc?.onClose?.())
