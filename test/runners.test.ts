@@ -5,7 +5,7 @@ import { randomBytes } from "node:crypto";
 import { inspect } from "node:util";
 import { fileURLToPath } from "node:url";
 import { resolve, dirname, join } from "node:path";
-import { describe, expect, it, afterEach } from "vitest";
+import { describe, expect, it, afterEach, vi } from "vitest";
 import type { EnvRunner } from "../src/index.ts";
 
 function hasRuntime(cmd: string): boolean {
@@ -271,6 +271,67 @@ for (const runnerDef of runners) {
     });
   });
 }
+
+describe.skipIf(!hasBun)("BunProcessEnvRunner stdio", () => {
+  let runner: EnvRunner | undefined;
+  let tmpDir: string | undefined;
+
+  afterEach(async () => {
+    await runner?.close();
+    runner = undefined;
+    if (tmpDir) {
+      rmSync(tmpDir, { recursive: true, force: true });
+      tmpDir = undefined;
+    }
+    vi.restoreAllMocks();
+  });
+
+  it("forwards child stdout and stderr to the host process", async () => {
+    tmpDir = mkdtempSync(join(_dir, ".tmp-stdio-"));
+    const entryPath = join(tmpDir, "app.mjs");
+
+    writeFileSync(
+      entryPath,
+      `
+export default {
+  fetch() {
+    console.log("stdout from bun process runner");
+    console.error("stderr from bun process runner");
+    return new Response("ok");
+  },
+};
+`,
+    );
+
+    const stdoutChunks: string[] = [];
+    const stderrChunks: string[] = [];
+    const stdoutWrite = vi
+      .spyOn(process.stdout, "write")
+      .mockImplementation((chunk: string | Uint8Array) => {
+        stdoutChunks.push(chunk.toString());
+        return true;
+      });
+    const stderrWrite = vi
+      .spyOn(process.stderr, "write")
+      .mockImplementation((chunk: string | Uint8Array) => {
+        stderrChunks.push(chunk.toString());
+        return true;
+      });
+
+    runner = new BunProcessEnvRunner({ name: "test-stdio", data: { entry: entryPath } });
+    await waitForReady(runner);
+
+    const res = await runner.fetch("http://localhost/");
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("ok");
+
+    await waitFor(() => stdoutChunks.join("").includes("stdout from bun process runner"));
+    await waitFor(() => stderrChunks.join("").includes("stderr from bun process runner"));
+
+    stdoutWrite.mockRestore();
+    stderrWrite.mockRestore();
+  });
+});
 
 // --- reloadModule tests ---
 
@@ -542,4 +603,15 @@ function waitForReady(runner: EnvRunner, timeout = 5000): Promise<void> {
       }
     });
   });
+}
+
+async function waitFor(predicate: () => boolean, timeout = 1000): Promise<void> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeout) {
+    if (predicate()) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error("Timed out waiting for condition");
 }
