@@ -5,7 +5,7 @@ import { randomBytes } from "node:crypto";
 import { inspect } from "node:util";
 import { fileURLToPath } from "node:url";
 import { resolve, dirname, join } from "node:path";
-import { describe, expect, it, afterEach } from "vitest";
+import { describe, expect, it, afterEach, beforeAll, afterAll, vi } from "vitest";
 import type { EnvRunner } from "../src/index.ts";
 
 function hasRuntime(cmd: string): boolean {
@@ -64,6 +64,12 @@ const runners = [
   {
     name: "VercelEnvRunner",
     create: (opts: any) => new VercelEnvRunner(opts),
+    // Fake unsigned JWT with a far-future `exp` to silence the Vercel OIDC token warning
+    stubEnv: {
+      VERCEL_OIDC_TOKEN:
+        process.env.VERCEL_OIDC_TOKEN ||
+        `e30.${Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 3600 })).toString("base64url")}.x`,
+    },
   },
   {
     name: "NetlifyEnvRunner",
@@ -72,15 +78,25 @@ const runners = [
 ];
 
 for (const runnerDef of runners) {
-  const { name, create, entry, skip, skipWorkerEntry, extraOpts } = {
+  const { name, create, entry, skip, skipWorkerEntry, extraOpts, stubEnv } = {
     entry: appEntry,
     skip: false,
     skipWorkerEntry: false,
     extraOpts: {} as Record<string, unknown>,
+    stubEnv: undefined as Record<string, string> | undefined,
     ...runnerDef,
   };
   describe.skipIf(skip)(name, () => {
     let runner: EnvRunner | undefined;
+
+    if (stubEnv) {
+      beforeAll(() => {
+        for (const [key, value] of Object.entries(stubEnv)) vi.stubEnv(key, value);
+      });
+      afterAll(() => {
+        vi.unstubAllEnvs();
+      });
+    }
 
     const opts = (testName: string, extra?: Record<string, unknown>) => ({
       name: testName,

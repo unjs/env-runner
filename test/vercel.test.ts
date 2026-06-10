@@ -1,7 +1,10 @@
 import { fileURLToPath } from "node:url";
 import { resolve, dirname } from "node:path";
-import { describe, expect, it, afterEach } from "vitest";
+import { describe, expect, it, afterEach, beforeAll, afterAll, vi } from "vitest";
 import { VercelEnvRunner } from "../src/runners/vercel/runner.ts";
+
+// Fake unsigned JWT with a far-future `exp` to silence the Vercel OIDC token warning
+const fakeVercelOidcToken = `e30.${Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 3600 })).toString("base64url")}.x`;
 
 const _dir = dirname(fileURLToPath(import.meta.url));
 const headersEntry = resolve(_dir, "./fixtures/app-headers.mjs");
@@ -10,6 +13,14 @@ const appEntry = resolve(_dir, "./fixtures/app.mjs");
 
 describe("VercelEnvRunner", () => {
   let runner: VercelEnvRunner | undefined;
+
+  beforeAll(() => {
+    vi.stubEnv("VERCEL_OIDC_TOKEN", process.env.VERCEL_OIDC_TOKEN || fakeVercelOidcToken);
+  });
+
+  afterAll(() => {
+    vi.unstubAllEnvs();
+  });
 
   afterEach(async () => {
     await runner?.close();

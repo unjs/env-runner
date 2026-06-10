@@ -292,6 +292,7 @@ const runner2 = new NodeProcessEnvRunner({
 ## Testing
 
 - Tests use vitest: `pnpm vitest run`
+- Vercel suites (`test/vercel.test.ts` and the Vercel entry in `test/runners.test.ts`) stub a fake far-future `VERCEL_OIDC_TOKEN` via `vi.stubEnv` so the OIDC check doesn't log warnings (real env token takes precedence)
 - **`test/runners.test.ts`** — Parameterized test suite for all IPC-based runner implementations (NodeWorker, NodeProcess, BunProcess, DenoProcess, Vercel, Netlify). Runners requiring specific runtimes (bun, deno) are auto-skipped when the runtime is not available
 - **`test/manager.test.ts`** — Tests for `RunnerManager` lifecycle, hot-reload, message queueing, hook forwarding
 - **`test/miniflare.test.ts`** — Tests for `MiniflareEnvRunner`: Durable Object exports, IPC alongside custom exports, hot-reload via `reloadModule()`, IPC re-initialization after reload
