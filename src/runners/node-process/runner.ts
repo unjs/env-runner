@@ -89,6 +89,9 @@ export class NodeProcessEnvRunner extends BaseEnvRunner {
       this._handleMessage(message);
     });
 
+    child.stdout?.pipe(process.stdout);
+    child.stderr?.pipe(process.stderr);
+
     this.#process = child;
   }
 

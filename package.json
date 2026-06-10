@@ -46,24 +46,24 @@
     "crossws": "^0.4.5",
     "exsolve": "^1.0.8",
     "httpxy": "^0.5.3",
-    "srvx": "^0.11.15"
+    "srvx": "^0.11.16"
   },
   "devDependencies": {
-    "@netlify/runtime": "^4.1.24",
-    "@types/node": "^25.9.1",
+    "@netlify/runtime": "^4.1.25",
+    "@types/node": "^25.9.2",
     "@typescript/native-preview": "7.0.0-dev.20260521.1",
-    "@vercel/queue": "^0.2.0",
-    "@vitest/coverage-v8": "^4.1.7",
+    "@vercel/queue": "^0.2.1",
+    "@vitest/coverage-v8": "^4.1.8",
     "automd": "^0.4.3",
     "changelogen": "^0.6.2",
     "cjs-module-lexer": "^2.2.0",
     "env-runner-fixture": "link:",
-    "miniflare": "^4.20260520.0",
-    "obuild": "^0.4.35",
+    "miniflare": "^4.20260603.0",
+    "obuild": "^0.4.36",
     "oxfmt": "^0.51.0",
-    "oxlint": "^1.66.0",
+    "oxlint": "^1.69.0",
     "typescript": "^6.0.3",
-    "vitest": "^4.1.7"
+    "vitest": "^4.1.8"
   },
   "peerDependencies": {
     "@netlify/runtime": "^4.1.23",
@@ -81,5 +81,5 @@
       "optional": true
     }
   },
-  "packageManager": "pnpm@11.2.2"
+  "packageManager": "pnpm@11.5.2"
 }

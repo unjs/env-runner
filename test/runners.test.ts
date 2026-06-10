@@ -5,7 +5,7 @@ import { randomBytes } from "node:crypto";
 import { inspect } from "node:util";
 import { fileURLToPath } from "node:url";
 import { resolve, dirname, join } from "node:path";
-import { describe, expect, it, afterEach } from "vitest";
+import { describe, expect, it, afterEach, beforeAll, afterAll, vi } from "vitest";
 import type { EnvRunner } from "../src/index.ts";
 
 function hasRuntime(cmd: string): boolean {
@@ -64,6 +64,12 @@ const runners = [
   {
     name: "VercelEnvRunner",
     create: (opts: any) => new VercelEnvRunner(opts),
+    // Fake unsigned JWT with a far-future `exp` to silence the Vercel OIDC token warning
+    stubEnv: {
+      VERCEL_OIDC_TOKEN:
+        process.env.VERCEL_OIDC_TOKEN ||
+        `e30.${Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 3600 })).toString("base64url")}.x`,
+    },
   },
   {
     name: "NetlifyEnvRunner",
@@ -72,15 +78,25 @@ const runners = [
 ];
 
 for (const runnerDef of runners) {
-  const { name, create, entry, skip, skipWorkerEntry, extraOpts } = {
+  const { name, create, entry, skip, skipWorkerEntry, extraOpts, stubEnv } = {
     entry: appEntry,
     skip: false,
     skipWorkerEntry: false,
     extraOpts: {} as Record<string, unknown>,
+    stubEnv: undefined as Record<string, string> | undefined,
     ...runnerDef,
   };
   describe.skipIf(skip)(name, () => {
     let runner: EnvRunner | undefined;
+
+    if (stubEnv) {
+      beforeAll(() => {
+        for (const [key, value] of Object.entries(stubEnv)) vi.stubEnv(key, value);
+      });
+      afterAll(() => {
+        vi.unstubAllEnvs();
+      });
+    }
 
     const opts = (testName: string, extra?: Record<string, unknown>) => ({
       name: testName,
@@ -122,6 +138,49 @@ for (const runnerDef of runners) {
       const data = await res.json();
       expect(data.method).toBe("POST");
       expect(data.body).toBe("hello");
+    });
+
+    it("forwards entry stdout and stderr to the host process", async () => {
+      const marker = `${name}-${randomBytes(4).toString("hex")}`;
+      const stdoutChunks: string[] = [];
+      const stderrChunks: string[] = [];
+      const stdoutWrite = vi
+        .spyOn(process.stdout, "write")
+        .mockImplementation((chunk: string | Uint8Array) => {
+          stdoutChunks.push(chunk.toString());
+          return true;
+        });
+      const stderrWrite = vi
+        .spyOn(process.stderr, "write")
+        .mockImplementation((chunk: string | Uint8Array) => {
+          stderrChunks.push(chunk.toString());
+          return true;
+        });
+      // In-process runners (self, miniflare) log through the host console,
+      // which vitest patches — capture that channel too
+      const consoleLog = vi.spyOn(console, "log").mockImplementation((...args) => {
+        stdoutChunks.push(args.join(" "));
+      });
+      const consoleError = vi.spyOn(console, "error").mockImplementation((...args) => {
+        stderrChunks.push(args.join(" "));
+      });
+
+      try {
+        runner = create(opts("test-stdio"));
+        await waitForReady(runner);
+
+        const res = await runner.fetch(`http://localhost/log?marker=${marker}`);
+        expect(res.status).toBe(200);
+        expect(await res.text()).toBe("logged");
+
+        await waitFor(() => stdoutChunks.join("").includes(`stdout:${marker}`), 5000);
+        await waitFor(() => stderrChunks.join("").includes(`stderr:${marker}`), 5000);
+      } finally {
+        stdoutWrite.mockRestore();
+        stderrWrite.mockRestore();
+        consoleLog.mockRestore();
+        consoleError.mockRestore();
+      }
     });
 
     it("sends and receives messages", async () => {
@@ -542,4 +601,15 @@ function waitForReady(runner: EnvRunner, timeout = 5000): Promise<void> {
       }
     });
   });
+}
+
+async function waitFor(predicate: () => boolean, timeout = 1000): Promise<void> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeout) {
+    if (predicate()) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error("Timed out waiting for condition");
 }

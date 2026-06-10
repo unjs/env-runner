@@ -117,7 +117,7 @@ export class DenoProcessEnvRunner extends BaseEnvRunner {
       }
     });
 
-    // Parse newline-delimited JSON from stdout for IPC
+    // Parse newline-delimited JSON from stdout for IPC, forward other output
     let buffer = "";
     child.stdout!.on("data", (chunk: Buffer) => {
       buffer += chunk.toString();
@@ -128,12 +128,16 @@ export class DenoProcessEnvRunner extends BaseEnvRunner {
         if (line.startsWith("{")) {
           try {
             this._handleMessage(JSON.parse(line));
+            continue;
           } catch {
-            // Not JSON, ignore
+            // Not JSON, forward as regular output
           }
         }
+        process.stdout.write(line + "\n");
       }
     });
+
+    child.stderr?.pipe(process.stderr);
 
     this.#process = handle;
   }

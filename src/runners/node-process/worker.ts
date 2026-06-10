@@ -8,6 +8,11 @@ import {
 } from "../../common/worker-utils.ts";
 import { registerVirtualModules } from "../../common/virtual-modules.ts";
 
+// Exit when the supervisor disappears (graceful or crash) to avoid orphan workers.
+// Registered before resolving the entry so a supervisor death during a slow
+// entry import (e.g. opening DB pools) cannot leave an orphan behind.
+process.on("disconnect", () => process.exit(0));
+
 const data = JSON.parse(process.env.ENV_RUNNER_DATA || "{}");
 const unregisterVirtualModules = await registerVirtualModules(data.virtual);
 const virtualEntry = isVirtualSpecifier(data.entry, data.virtual);
