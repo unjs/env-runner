@@ -1,6 +1,22 @@
 # Changelog
 
 
+## v0.1.12
+
+[compare changes](https://github.com/unjs/env-runner/compare/v0.1.11...v0.1.12)
+
+### 🩹 Fixes
+
+- **virtual:** Resolve bare/relative imports from virtual modules against cwd ([4f28877](https://github.com/unjs/env-runner/commit/4f28877))
+
+### 📦 Build
+
+- Better chunk names ([bab0d09](https://github.com/unjs/env-runner/commit/bab0d09))
+
+### ❤️ Contributors
+
+- Pooya Parsa ([@pi0](https://github.com/pi0))
+
 ## v0.1.11
 
 [compare changes](https://github.com/unjs/env-runner/compare/v0.1.10...v0.1.11)
