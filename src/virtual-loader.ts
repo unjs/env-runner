@@ -36,9 +36,16 @@ export async function resolveVirtualModules(
  *
  * Any import whose specifier matches a map key (e.g. `#virtual-import`) is
  * resolved to a `virtual:` URL and loaded from the stored source,
- * short-circuiting Node's default resolution. Intended for use with
+ * short-circuiting default resolution. Intended for use with
  * {@link https://nodejs.org/api/module.html#moduleregisterhooksoptions | module.registerHooks()},
  * which runs the hooks synchronously in the current thread.
+ *
+ * The load format is derived from the specifier extension (see
+ * {@link virtualModuleFormat}): `.ts`/`.mts` sources are served as
+ * `module-typescript` (Node's native type stripping) and `.json` as JSON
+ * modules (import them `with { type: "json" }`). Deno ignores the `format`
+ * returned by custom load hooks, so on Deno the map must be pre-transformed to
+ * plain ESM sources first — see `registerVirtualModules()`.
  *
  * Sources must already be resolved to strings (see {@link resolveVirtualModules})
  * because the load hook runs synchronously and cannot await a factory.
@@ -80,8 +87,9 @@ export function createVirtualHooks(virtual: Record<string, string>): {
 
 /**
  * Module format for a virtual specifier, derived from its extension: `.json`
- * loads as a JSON module, `.ts`/`.mts` as type-stripped TypeScript
- * (Node.js >= 22.18 / 23.6, Deno), anything else as a plain ES module.
+ * loads as a JSON module, `.ts`/`.mts` as type-stripped TypeScript (served
+ * natively by Node.js >= 22.18 / 23.6; other backends transform up front),
+ * anything else as a plain ES module.
  */
 export function virtualModuleFormat(specifier: string): "module" | "module-typescript" | "json" {
   if (specifier.endsWith(".json")) {

@@ -38,10 +38,11 @@ const runners = [
     name: "DenoProcessEnvRunner",
     create: (opts: any) => new DenoProcessEnvRunner(opts),
     skip: !hasDeno,
+    deno: true,
   },
 ];
 
-for (const { name, create, skip } of runners) {
+for (const { name, create, skip, deno } of runners) {
   describe.skipIf(skip ?? false)(`${name} virtual modules`, () => {
     let runner: EnvRunner;
 
@@ -94,6 +95,79 @@ for (const { name, create, skip } of runners) {
       await runner.waitForReady();
       const res = await runner.fetch("http://localhost/");
       expect(await res.text()).toBe("composed virtual");
+    });
+
+    // Deno ignores the `format` of custom load hooks, so virtual `.ts` sources
+    // can't reach its type stripping — registration throws a clear error there.
+    it.skipIf(deno)("resolves virtual TypeScript modules (.ts entry and import)", async () => {
+      runner = create({
+        name: "virtual-ts",
+        data: {
+          entry: "#entry.ts",
+          virtual: {
+            "#entry.ts": `import { getMessage } from "#util.ts";
+              const handler: () => Response = () => new Response(getMessage());
+              export default { fetch: handler };`,
+            "#util.ts": `export function getMessage(): string {
+              const value: string = "hello from typescript";
+              return value;
+            }`,
+          },
+        },
+      });
+      await runner.waitForReady();
+      const res = await runner.fetch("http://localhost/");
+      expect(await res.text()).toBe("hello from typescript");
+    });
+
+    it.skipIf(!deno)("fails fast for a virtual TypeScript module on Deno", async () => {
+      runner = create({
+        name: "virtual-ts-deno",
+        data: {
+          entry: "#entry.ts",
+          virtual: {
+            "#entry.ts": `export default { fetch: () => new Response("unreachable") };`,
+          },
+        },
+      });
+      await expect(runner.waitForReady(3000)).rejects.toThrow();
+      expect(runner.closed).toBe(true);
+    });
+
+    it("resolves a virtual JSON module", async () => {
+      runner = create({
+        name: "virtual-json",
+        data: {
+          entry: "#entry",
+          virtual: {
+            "#entry": `import config from "#config.json";
+              export default { fetch: () => new Response(config.nested.message) };`,
+            "#config.json": JSON.stringify({ nested: { message: "hello from json" } }),
+          },
+        },
+      });
+      await runner.waitForReady();
+      const res = await runner.fetch("http://localhost/");
+      expect(await res.text()).toBe("hello from json");
+    });
+
+    // Deno-side limitation: static imports carrying an import attribute bypass
+    // `registerHooks` resolution entirely, so the attribute form is Node/Bun only.
+    it.skipIf(deno)(`resolves a virtual JSON module imported with { type: "json" }`, async () => {
+      runner = create({
+        name: "virtual-json-attr",
+        data: {
+          entry: "#entry",
+          virtual: {
+            "#entry": `import config from "#config.json" with { type: "json" };
+              export default { fetch: () => new Response(config.message) };`,
+            "#config.json": JSON.stringify({ message: "json with attribute" }),
+          },
+        },
+      });
+      await runner.waitForReady();
+      const res = await runner.fetch("http://localhost/");
+      expect(await res.text()).toBe("json with attribute");
     });
 
     it("resolves a factory-valued virtual source (sync and async)", async () => {

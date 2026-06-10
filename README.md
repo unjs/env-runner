@@ -235,6 +235,32 @@ const runner = new NodeWorkerEnvRunner({
 
 Factories are invoked once on the host (before the worker is spawned), so the worker always receives plain strings — functions can't cross the `workerData`/`JSON` boundary, and Node's synchronous load hook can't await. For the same reason, **all** factories are resolved eagerly at startup (in parallel), not lazily on first import — so keep them cheap, or use plain strings for sources that don't need computation. Maps containing only strings skip this step entirely.
 
+The module format is derived from the specifier extension: `.ts`/`.mts` sources are served as **TypeScript** and `.json` sources as **JSON modules**; everything else is plain JavaScript ESM:
+
+```ts
+const runner = new NodeWorkerEnvRunner({
+  name: "my-app",
+  data: {
+    entry: "#entry.ts",
+    virtual: {
+      "#entry.ts": `
+        import { getGreeting } from "#util.ts";
+        import config from "#config.json";
+        const handler: () => Response = () => new Response(getGreeting(config.name));
+        export default { fetch: handler };
+      `,
+      "#util.ts": `export function getGreeting(name: string): string {
+        return \`Hello, \${name}!\`;
+      }`,
+      "#config.json": JSON.stringify({ name: "virtual" }),
+    },
+  },
+});
+```
+
+- **TypeScript** is type-stripped by Node's native [type stripping](https://nodejs.org/api/typescript.html#type-stripping) (Node.js >= 22.18 / 23.6 — erasable syntax only) and by Bun's `ts` loader. On Deno, custom load hooks bypass its type stripping, so virtual `.ts`/`.mts` sources **throw at registration** — pass pre-transpiled JavaScript instead.
+- **JSON** sources expose the parsed value as the default export on all runtimes. The `with { type: "json" }` import attribute is optional on Node.js and Bun; on Deno it must be **omitted** (static imports carrying an import attribute bypass `registerHooks` resolution).
+
 Virtual modules are registered inside the worker, before the entry is imported. On Node.js (>= 22.15 / 23.5) and Deno (>= 2.x) this uses [ESM customization hooks](https://nodejs.org/api/module.html#moduleregisterhooksoptions) (`module.registerHooks`); on Bun (which does not implement `registerHooks`) it uses [`Bun.plugin()`](https://bun.com/docs/runtime/plugins) virtual modules instead. The source string is treated as an ES module, and virtual specifiers (including a virtual entry) resolve across `reloadModule()`. On runtimes supporting neither mechanism, a warning is logged and registration is skipped. When the worker shuts down gracefully the registration is unregistered again (the `registerHooks` registration is deregistered; on Bun, which has no plugin-removal API, the in-memory source map is detached so fresh loads and reloads stop resolving).
 
 #### Miniflare Runner

@@ -7,6 +7,17 @@ import { createVirtualHooks, virtualModuleFormat } from "../virtual-loader.ts";
  * Must be awaited before the user entry is imported so the hooks are active
  * when its (virtual) imports are resolved.
  *
+ * The module format is derived from the specifier extension on every backend
+ * (see {@link virtualModuleFormat}): `.ts`/`.mts` sources are served as
+ * TypeScript and `.json` as JSON modules (import them `with { type: "json" }`);
+ * everything else is plain ESM. Node serves TS through its native type
+ * stripping (`module-typescript` load format) and Bun through its `ts` plugin
+ * loader. Deno ignores the `format` returned by custom load hooks (sources
+ * would be parsed as plain JS), so there the map is transformed up front:
+ * `.json` sources are wrapped into a default-exporting ES module, and
+ * `.ts`/`.mts` sources **throw** (Deno's native type stripping is unreachable
+ * from hooks; pass pre-transpiled JavaScript instead).
+ *
  * Two registration backends, picked by feature detection:
  *
  * - **`module.registerHooks`** (Node.js >= 22.15 / 23.5, Deno >= 2.x) — wired
@@ -40,6 +51,9 @@ export async function registerVirtualModules(
   }
   const { registerHooks } = await import("node:module");
   if (typeof registerHooks === "function") {
+    if ("Deno" in globalThis) {
+      virtual = _transformForDeno(virtual);
+    }
     const hooks = registerHooks(createVirtualHooks(virtual));
     return _once(() => hooks.deregister());
   }
@@ -93,17 +107,41 @@ function _registerBunModules(specifiers: string[]): void {
           if (source === undefined) {
             throw new Error(`Cannot find virtual module "${specifier}" (unregistered)`);
           }
-          return { contents: source, loader: _bunLoader(specifier) };
+          const format = virtualModuleFormat(specifier);
+          if (format === "json") {
+            // Bun's runtime `json` loader doesn't parse contents — serve the
+            // parsed value through the `object` loader instead (default-only
+            // export, matching Node/Deno JSON module semantics).
+            return { exports: { default: JSON.parse(source) }, loader: "object" };
+          }
+          return { contents: source, loader: format === "module-typescript" ? "ts" : "js" };
         });
       }
     },
   });
 }
 
-// Map the shared format detection (extension-based) to Bun plugin loaders.
-function _bunLoader(specifier: string): "js" | "ts" | "json" {
-  const format = virtualModuleFormat(specifier);
-  return format === "module" ? "js" : format === "module-typescript" ? "ts" : "json";
+// Deno ignores the `format` returned by custom load hooks (every source is
+// parsed as plain JS), so non-JS sources are converted to ES modules before
+// registration: `.json` via a default-exporting wrapper (Deno doesn't validate
+// import attributes on hook-loaded modules, so `with { type: "json" }` stays
+// portable). TypeScript sources can't be served — Deno's native type stripping
+// is unreachable from hooks and bundling a stripper is out of scope — so a
+// `.ts`/`.mts` specifier throws instead of failing later with an opaque
+// SyntaxError.
+function _transformForDeno(virtual: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [specifier, source] of Object.entries(virtual)) {
+    const format = virtualModuleFormat(specifier);
+    if (format === "module-typescript") {
+      throw new Error(
+        `[env-runner] virtual TypeScript modules are not supported on Deno (custom load hooks bypass its type stripping): "${specifier}". Provide a pre-transpiled JavaScript source instead.`,
+      );
+    }
+    out[specifier] =
+      format === "json" ? `export default JSON.parse(${JSON.stringify(source)});` : source;
+  }
+  return out;
 }
 
 const _noop = () => {};
