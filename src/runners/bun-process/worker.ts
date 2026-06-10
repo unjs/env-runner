@@ -1,9 +1,17 @@
 import { serve } from "srvx";
 import { plugin as wsPlugin } from "crossws/server";
-import { resolveEntry, reloadEntryModule, parseServerAddress } from "../../common/worker-utils.ts";
+import {
+  resolveEntry,
+  reloadEntryModule,
+  parseServerAddress,
+  isVirtualSpecifier,
+} from "../../common/worker-utils.ts";
+import { registerVirtualModules } from "../../common/virtual-modules.ts";
 
 const data = JSON.parse(process.env.ENV_RUNNER_DATA || "{}");
-let entry = await resolveEntry(data.entry);
+await registerVirtualModules(data.virtual);
+const virtualEntry = isVirtualSpecifier(data.entry, data.virtual);
+let entry = await resolveEntry(data.entry, virtualEntry);
 const sendMessage = (message: unknown) => process.send!(message);
 
 const server = serve({
@@ -44,7 +52,7 @@ process.on("message", async (message: any) => {
 
   if (message?.event === "reload-module") {
     try {
-      entry = await reloadEntryModule(data.entry, entry, sendMessage);
+      entry = await reloadEntryModule(data.entry, entry, sendMessage, virtualEntry);
       process.send!({ event: "module-reloaded" });
     } catch (error: any) {
       process.send!({ event: "module-reloaded", error: error?.message || String(error) });

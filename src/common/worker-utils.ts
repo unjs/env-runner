@@ -4,6 +4,7 @@ import type { UpgradeContext } from "../types.ts";
 import { pathToFileURL } from "node:url";
 import { isAbsolute } from "node:path";
 import { readFileSync, existsSync } from "node:fs";
+import { refreshVirtualModule } from "./virtual-modules.ts";
 
 export interface AppEntryIPCContext {
   sendMessage: (message: unknown) => void;
@@ -99,6 +100,11 @@ async function _importFresh(entryPath: string, virtual?: boolean): Promise<AppEn
     const code = readFileSync(filePath, "utf8");
     const dataUrl = "data:text/javascript;base64," + Buffer.from(code).toString("base64");
     mod = await import(dataUrl);
+  } else if (virtual && refreshVirtualModule(filePath)) {
+    // Bun-registered virtual module: `build.module` matches specifiers verbatim
+    // (a `?query` suffix would not resolve), so the re-registration above busts
+    // the cache and a plain re-import evaluates fresh.
+    mod = await import(filePath);
   } else {
     // Virtual or bare specifier (e.g. served by registered ESM hooks): re-import
     // through the resolver with a cache-busting query for a fresh evaluation.

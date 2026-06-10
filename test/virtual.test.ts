@@ -6,6 +6,7 @@ import { describe, expect, it, afterEach } from "vitest";
 import type { EnvRunner } from "../src/index.ts";
 import { NodeWorkerEnvRunner } from "../src/runners/node-worker/runner.ts";
 import { NodeProcessEnvRunner } from "../src/runners/node-process/runner.ts";
+import { BunProcessEnvRunner } from "../src/runners/bun-process/runner.ts";
 import { DenoProcessEnvRunner } from "../src/runners/deno-process/runner.ts";
 
 function hasRuntime(cmd: string): boolean {
@@ -18,6 +19,7 @@ function hasRuntime(cmd: string): boolean {
 }
 
 const hasDeno = hasRuntime("deno");
+const hasBun = hasRuntime("bun");
 
 const _dir = dirname(fileURLToPath(import.meta.url));
 const virtualAppEntry = resolve(_dir, "./fixtures/app-virtual.mjs");
@@ -25,6 +27,12 @@ const virtualAppEntry = resolve(_dir, "./fixtures/app-virtual.mjs");
 const runners = [
   { name: "NodeWorkerEnvRunner", create: (opts: any) => new NodeWorkerEnvRunner(opts) },
   { name: "NodeProcessEnvRunner", create: (opts: any) => new NodeProcessEnvRunner(opts) },
+  // Bun lacks `module.registerHooks()`; virtual modules use `Bun.plugin()` instead.
+  {
+    name: "BunProcessEnvRunner",
+    create: (opts: any) => new BunProcessEnvRunner(opts),
+    skip: !hasBun,
+  },
   // Deno >= 2.x supports `module.registerHooks()`; skipped when deno is absent.
   {
     name: "DenoProcessEnvRunner",

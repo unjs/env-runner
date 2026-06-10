@@ -175,7 +175,7 @@ await runner.close();
 
 #### Virtual Modules
 
-The Node.js runners (`NodeWorkerEnvRunner`, `NodeProcessEnvRunner`, and the runners built on top of them) and `DenoProcessEnvRunner` (Deno >= 2.x) can serve **virtual modules** from an in-memory `specifier => source` map passed via `data.virtual`. The entry (and its dependencies) can then `import` them as if they were real files:
+The Node.js runners (`NodeWorkerEnvRunner`, `NodeProcessEnvRunner`, and the runners built on top of them), `BunProcessEnvRunner`, and `DenoProcessEnvRunner` (Deno >= 2.x) can serve **virtual modules** from an in-memory `specifier => source` map passed via `data.virtual`. The entry (and its dependencies) can then `import` them as if they were real files:
 
 ```ts
 import { NodeWorkerEnvRunner } from "env-runner/runners/node-worker";
@@ -235,7 +235,7 @@ const runner = new NodeWorkerEnvRunner({
 
 Factories are invoked once on the host (before the worker is spawned), so the worker always receives plain strings — functions can't cross the `workerData`/`JSON` boundary, and Node's synchronous load hook can't await. For the same reason, **all** factories are resolved eagerly at startup (in parallel), not lazily on first import — so keep them cheap, or use plain strings for sources that don't need computation. Maps containing only strings skip this step entirely.
 
-Virtual modules are registered as [Node.js ESM customization hooks](https://nodejs.org/api/module.html#moduleregisterhooksoptions) (`module.registerHooks`) inside the worker, before the entry is imported. The source string is treated as an ES module, and virtual specifiers (including a virtual entry) resolve across `reloadModule()`. Supported on the Node.js runners (Node.js >= 22.15 / 23.5, where `module.registerHooks` is available) and on `DenoProcessEnvRunner` (Deno >= 2.x). On runtimes without `module.registerHooks`, a warning is logged and registration is skipped. **Bun is not supported** — its `node:module` compat layer does not implement `registerHooks`.
+Virtual modules are registered inside the worker, before the entry is imported. On Node.js (>= 22.15 / 23.5) and Deno (>= 2.x) this uses [ESM customization hooks](https://nodejs.org/api/module.html#moduleregisterhooksoptions) (`module.registerHooks`); on Bun (which does not implement `registerHooks`) it uses [`Bun.plugin()`](https://bun.com/docs/runtime/plugins) virtual modules instead. The source string is treated as an ES module, and virtual specifiers (including a virtual entry) resolve across `reloadModule()`. On runtimes supporting neither mechanism, a warning is logged and registration is skipped.
 
 #### Miniflare Runner
 
