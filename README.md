@@ -64,6 +64,7 @@ envServer.onReload(() => {
   console.log("Reloaded!");
 });
 
+// Optional — the server auto-starts on first fetch()
 await envServer.start();
 
 // Use with any HTTP server

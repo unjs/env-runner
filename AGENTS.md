@@ -71,8 +71,8 @@ src/
 - **`src/runners/netlify/runner.ts`** — `NetlifyEnvRunner` extends `NodeWorkerEnvRunner`: simulates Netlify deployment environment with header injection (`x-nf-client-connection-ip`, `x-nf-account-id`, `x-nf-site-id`, `x-nf-deploy-id`, `x-nf-deploy-context`, `x-nf-geo`, `x-nf-request-id`)
 - **`src/runners/netlify/worker.ts`** — Uses `@netlify/runtime` `startRuntime()` when available (sets up `globalThis.Netlify` with env/context and `globalThis.caches`), falls back to lightweight shim. Delegates to node-worker worker
 - **`src/loader.ts`** — `loadRunner(name, opts)`: dynamic loader that imports a runner by name (`node-worker` | `node-process` | `bun-process` | `deno-process` | `self` | `miniflare` | `vercel` | `netlify`) and returns an `EnvRunner` instance
-- **`src/manager.ts`** — `RunnerManager`: proxy manager for hot-reload, message queueing, and listener forwarding across runner swaps
-- **`src/server.ts`** — `EnvServer` extends `RunnerManager`: high-level API combining runner loading, watch mode (`fs.watch` with 100ms debounce), and auto-reload on file changes. Supports `watch` and `watchPaths` options. The `runner` option is optional and defaults to `"node-worker"`
+- **`src/manager.ts`** — `RunnerManager`: proxy manager for hot-reload, message queueing, and listener forwarding across runner swaps. The `fetch` field delegates to a protected `_fetch()` method so subclasses can hook request handling (used by `EnvServer` for auto-start)
+- **`src/server.ts`** — `EnvServer` extends `RunnerManager`: high-level API combining runner loading, watch mode (`fs.watch` with 100ms debounce), and auto-reload on file changes. Supports `watch` and `watchPaths` options. The `runner` option is optional and defaults to `"node-worker"`. `start()` is idempotent (a shared `_startPromise`; a failed start resets it so a later call retries) and optional: the first `fetch()` auto-starts via the `_fetch()` override (skipped once closed — fetch after `close()` stays a 503, never respawns)
 - **`src/cli.ts`** — CLI entry point: `env-runner <entry> [--runner] [--port] [--host] [-w/--watch]`
 - **`src/index.ts`** — Public API: re-exports types, `BaseEnvRunner`, concrete runners, `SelfEnvRunner`, `RunnerManager`, `EnvServer`, and `loadRunner`
 
@@ -202,7 +202,7 @@ Proxy manager wrapping a runner with hot-reload support:
 
 High-level API extending `RunnerManager` with runner loading and file watching:
 
-- `start()` — Loads runner via `loadRunner()` and optionally starts file watchers
+- `start()` — Loads runner via `loadRunner()` and optionally starts file watchers. Idempotent and optional: the first `fetch()` auto-starts the server (no auto-start after `close()`)
 - `close()` — Stops watchers and closes the runner
 - `watch: true` — Watches the entry file using `fs.watch()` with 100ms debounce; on change, creates a new runner and calls `reload()`
 - `watchPaths` — Additional directories/files to watch (supports `recursive: true`)
@@ -309,6 +309,7 @@ const runner2 = new NodeProcessEnvRunner({
 - Vercel suites (`test/vercel.test.ts` and the Vercel entry in `test/runners.test.ts`) stub a fake far-future `VERCEL_OIDC_TOKEN` via `vi.stubEnv` so the OIDC check doesn't log warnings (real env token takes precedence)
 - **`test/runners.test.ts`** — Parameterized test suite for all IPC-based runner implementations (NodeWorker, NodeProcess, BunProcess, DenoProcess, Vercel, Netlify). Runners requiring specific runtimes (bun, deno) are auto-skipped when the runtime is not available
 - **`test/manager.test.ts`** — Tests for `RunnerManager` lifecycle, hot-reload, message queueing, hook forwarding, `await using` disposal
+- **`test/server.test.ts`** — Tests for `EnvServer`: auto-start on first `fetch()`, idempotent/concurrent `start()`, no restart after `close()`, start-error propagation and retry
 - **`test/miniflare.test.ts`** — Tests for `MiniflareEnvRunner`: Durable Object exports, IPC alongside custom exports, hot-reload via `reloadModule()`, IPC re-initialization after reload
 - **`test/vite.test.ts`** — Tests for Vite helpers: `createViteHotChannel` message namespacing/filtering/on/off, `createViteTransport` connect/send filtering
 - Test app fixture in `test/fixtures/app.mjs` — Minimal `export default { fetch }` entry for worker tests

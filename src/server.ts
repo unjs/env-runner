@@ -29,6 +29,7 @@ export class EnvServer extends RunnerManager {
   private _watchers: FSWatcher[] = [];
   private _reloadTimeout: ReturnType<typeof setTimeout> | undefined;
   private _reloadListeners = new Set<() => void>();
+  private _startPromise: Promise<this> | undefined;
 
   runner: Awaited<ReturnType<typeof loadRunner>> | null = null;
 
@@ -47,14 +48,19 @@ export class EnvServer extends RunnerManager {
     this._opts = opts;
   }
 
-  /** Start the server by loading and attaching the runner. */
-  async start() {
-    this.runner = await this._createRunner();
-    await this.reload(this.runner);
-    if (this._opts.watch) {
-      this._startWatching();
-    }
-    return this;
+  /**
+   * Start the server by loading and attaching the runner.
+   *
+   * Idempotent — concurrent and repeated calls share one startup. Calling
+   * `start()` explicitly is optional: the first `fetch()` auto-starts the
+   * server. A failed start resets so a later call can retry.
+   */
+  start(): Promise<this> {
+    this._startPromise ??= this._start().catch((error) => {
+      this._startPromise = undefined;
+      throw error;
+    });
+    return this._startPromise;
   }
 
   override async close() {
@@ -63,6 +69,26 @@ export class EnvServer extends RunnerManager {
   }
 
   // #region Private
+
+  /** Auto-start on first fetch so an explicit `start()` call is optional. */
+  protected override async _fetch(
+    input: string | URL | Request,
+    init?: RequestInit,
+  ): Promise<Response> {
+    if (!this.closed) {
+      await this.start();
+    }
+    return super._fetch(input, init);
+  }
+
+  private async _start() {
+    this.runner = await this._createRunner();
+    await this.reload(this.runner);
+    if (this._opts.watch) {
+      this._startWatching();
+    }
+    return this;
+  }
 
   private async _createRunner() {
     return loadRunner(this._opts.runner || "node-worker", {

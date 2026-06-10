@@ -47,13 +47,15 @@ export class RunnerManager implements EnvRunner, AsyncDisposable {
 
   // #region EnvRunner proxy
 
-  fetch: FetchHandler = async (input, init) => {
+  fetch: FetchHandler = (input, init) => this._fetch(input, init);
+
+  protected async _fetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
     const runner = await this._waitForRunner();
     if (!runner) {
       return new Response("Runner is unavailable", { status: 503 });
     }
     return runner.fetch(input, init);
-  };
+  }
 
   upgrade: UpgradeHandler = (context) => {
     this._runner?.upgrade?.(context);
