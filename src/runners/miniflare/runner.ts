@@ -304,12 +304,20 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
     // Proxy the WebSocket upgrade to Miniflare's internal workerd HTTP server
     const mfUrl = await this.#miniflare.unsafeGetDirectURL();
     const address = new URL(mfUrl);
-    await proxyUpgrade(
-      { host: address.hostname, port: Number(address.port) },
-      context.node.req,
-      context.node.socket,
-      context.node.head,
-    );
+    try {
+      await proxyUpgrade(
+        { host: address.hostname, port: Number(address.port) },
+        context.node.req,
+        context.node.socket,
+        context.node.head,
+      );
+    } catch {
+      // The worker may refuse the upgrade (e.g. the `upgrade` hook returned a
+      // non-101 response to reject the connection). `proxyUpgrade` has already
+      // settled the client socket (forwarding the upstream response or
+      // destroying it), so swallow the rejection to avoid an unhandled promise
+      // rejection in fire-and-forget callers.
+    }
   }
 
   /**

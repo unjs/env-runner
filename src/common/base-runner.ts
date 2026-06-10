@@ -80,7 +80,15 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
     if (!this.ready || !this._address) {
       return;
     }
-    await proxyUpgrade(this._address, context.node.req, context.node.socket, context.node.head);
+    try {
+      await proxyUpgrade(this._address, context.node.req, context.node.socket, context.node.head);
+    } catch {
+      // The worker may refuse the upgrade (e.g. the `upgrade` hook returned a
+      // non-101 response to reject the connection). `proxyUpgrade` has already
+      // settled the client socket (forwarding the upstream response or
+      // destroying it), so swallow the rejection to avoid an unhandled promise
+      // rejection in fire-and-forget callers.
+    }
   }
 
   abstract sendMessage(message: unknown): void;

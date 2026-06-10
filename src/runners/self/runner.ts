@@ -45,12 +45,22 @@ export class SelfEnvRunner extends BaseEnvRunner {
     if (!this.#entry || this.closed) {
       return;
     }
-    if (this.#entry.websocket) {
-      const adapter = await this.#resolveWSAdapter();
-      await adapter.handleUpgrade(context.node.req, context.node.socket, context.node.head);
-      return;
+    try {
+      if (this.#entry.websocket) {
+        const adapter = await this.#resolveWSAdapter();
+        await adapter.handleUpgrade(context.node.req, context.node.socket, context.node.head);
+        return;
+      }
+      this.#entry.upgrade?.(context);
+    } catch {
+      // The entry may refuse the upgrade by throwing. Unlike the proxied
+      // runners there is no upstream to settle the in-process socket, so
+      // destroy it here — and swallow the rejection to avoid an unhandled
+      // promise rejection in fire-and-forget callers.
+      if (!context.node.socket.destroyed) {
+        context.node.socket.destroy();
+      }
     }
-    this.#entry.upgrade?.(context);
   }
 
   sendMessage(message: unknown) {

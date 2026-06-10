@@ -25,6 +25,7 @@ const hasDeno = hasRuntime("deno");
 
 const _dir = dirname(fileURLToPath(import.meta.url));
 const appWebsocketEntry = resolve(_dir, "./fixtures/app-websocket.mjs");
+const appWebsocketRejectEntry = resolve(_dir, "./fixtures/app-websocket-reject.mjs");
 
 const websocketRunners = [
   { name: "NodeWorkerEnvRunner", create: (opts: any) => new NodeWorkerEnvRunner(opts) },
@@ -139,4 +140,72 @@ describe("SelfEnvRunner websocket", () => {
     await closed;
     expect(messages).toEqual(["welcome", "echo:hello"]);
   });
+});
+
+describe("upgrade rejection", () => {
+  let runner: EnvRunner | undefined;
+  let server: import("node:http").Server | undefined;
+
+  afterEach(async () => {
+    await runner?.close();
+    runner = undefined;
+    if (server) {
+      await new Promise<void>((resolve) => server!.close(() => resolve()));
+      server = undefined;
+    }
+  });
+
+  // A runner whose entry refuses the upgrade (the worker forwards a non-101
+  // response, making `proxyUpgrade` reject; the self runner's entry hook throws
+  // directly) must handle the rejection internally — `runner.upgrade()` is
+  // called fire-and-forget, so an unhandled rejection would crash the process.
+  const rejectRunners = [
+    { name: "NodeWorkerEnvRunner", create: (opts: any) => new NodeWorkerEnvRunner(opts) },
+    { name: "SelfEnvRunner", create: (opts: any) => new SelfEnvRunner(opts) },
+  ];
+
+  for (const { name, create } of rejectRunners) {
+    it(`does not crash when the entry refuses the upgrade (${name})`, async () => {
+      runner = create({
+        name: "test-ws-reject",
+        data: { entry: appWebsocketRejectEntry },
+      });
+      await runner.waitForReady();
+
+      // Front HTTP server forwarding upgrade events through the runner (proxy).
+      server = createServer();
+      server.on("upgrade", (req, socket, head) => {
+        runner!.upgrade!({ node: { req, socket: socket as any, head } });
+      });
+      const address = await new Promise<{ port: number }>((resolve) => {
+        server!.listen(0, "127.0.0.1", () => {
+          const addr = server!.address() as import("node:net").AddressInfo;
+          resolve({ port: addr.port });
+        });
+      });
+
+      // The rejected upgrade should close the socket without opening ...
+      const ws = new WebSocket(`ws://127.0.0.1:${address.port}/`);
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("upgrade timed out")), 10_000);
+        ws.addEventListener("open", () => {
+          clearTimeout(timer);
+          ws.close();
+          reject(new Error("upgrade should have been rejected"));
+        });
+        ws.addEventListener("error", () => {
+          clearTimeout(timer);
+          resolve();
+        });
+        ws.addEventListener("close", () => {
+          clearTimeout(timer);
+          resolve();
+        });
+      });
+
+      // ... and the runner must still be alive (no crash from unhandled rejection).
+      const res = await runner.fetch("http://localhost/");
+      expect(await res.text()).toBe("ok");
+    });
+  }
 });
