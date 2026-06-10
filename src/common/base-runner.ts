@@ -73,7 +73,7 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
         status: 503,
       });
     }
-    return proxyFetch(this._address, input, init);
+    return proxyFetch(this._address, this._resolveFetchInput(input), init);
   }
 
   async upgrade(context: { node: { req: IncomingMessage; socket: Socket; head: any } }) {
@@ -187,6 +187,18 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
   // #endregion
 
   // #region Protected methods
+
+  /**
+   * Resolve a relative fetch input (e.g. `"/path"`) against a placeholder
+   * `http://localhost` origin so it parses as a full URL. The origin is a
+   * placeholder — requests are dispatched to the worker address regardless.
+   */
+  protected _resolveFetchInput(input: string | URL | Request): string | URL | Request {
+    if (typeof input === "string" && !URL.canParse(input)) {
+      return new URL(input, "http://localhost");
+    }
+    return input;
+  }
 
   protected _handleMessage(message: any) {
     if (message?.address) {

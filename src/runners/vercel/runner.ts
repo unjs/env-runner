@@ -33,6 +33,7 @@ export class VercelEnvRunner extends NodeWorkerEnvRunner {
   }
 
   override async fetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
+    input = this._resolveFetchInput(input);
     const headers = new Headers(input instanceof Request ? input.headers : init?.headers);
 
     const requestId = generateVercelId();

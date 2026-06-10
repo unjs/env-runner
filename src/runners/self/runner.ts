@@ -30,7 +30,8 @@ export class SelfEnvRunner extends BaseEnvRunner {
     if (!this.#entry || this.closed) {
       return new Response("self env runner is unavailable", { status: 503 });
     }
-    const request = input instanceof Request ? input : new Request(input, init);
+    const request =
+      input instanceof Request ? input : new Request(this._resolveFetchInput(input), init);
     return this.#entry.fetch(request) as Promise<Response>;
   }
 

@@ -1,7 +1,12 @@
 import type { IncomingMessage } from "node:http";
 import type { Socket } from "node:net";
 
-/** Handler for proxying HTTP requests to the worker. */
+/**
+ * Handler for proxying HTTP requests to the worker.
+ *
+ * A relative string input (e.g. `"/path"`) is resolved against a placeholder
+ * `http://localhost` origin before dispatching.
+ */
 export type FetchHandler = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 
 /** Callback for receiving messages from the worker. */

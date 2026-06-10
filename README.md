@@ -144,7 +144,8 @@ await using runner = new NodeProcessEnvRunner({
 });
 
 // Proxy HTTP requests (retries with exponential backoff)
-const response = await runner.fetch("http://localhost/api");
+// Relative URLs are resolved against a placeholder origin
+const response = await runner.fetch("/api");
 
 // Proxy WebSocket upgrades
 runner.upgrade?.({ node: { req, socket, head } });

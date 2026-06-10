@@ -82,7 +82,7 @@ src/
 
 1. Runner takes an optional `entry` script path (defaults to co-located `worker.ts`/`.mjs`) and spawns it (Worker thread, child process, or in-process)
 2. Entry posts `{ address: { host, port } }` or `{ address: { socketPath } }` when ready
-3. `fetch()` proxies HTTP requests to the address via `httpxy` (retries with exponential backoff: 100ms → 1.6s, up to 5 attempts)
+3. `fetch()` proxies HTTP requests to the address via `httpxy` (retries with exponential backoff: 100ms → 1.6s, up to 5 attempts). Relative URL inputs (e.g. `"/path"`) are resolved against a placeholder `http://localhost` origin via the protected `_resolveFetchInput()` helper — also applied by the `self`, `miniflare`, `vercel`, and `netlify` fetch overrides (which otherwise throw or skip URL-derived headers on relative input)
 4. `upgrade()` proxies WebSocket upgrades
 5. `sendMessage()` / `onMessage()` / `offMessage()` for bidirectional messaging
 6. `waitForReady(timeout?)` returns a promise that resolves when the runner becomes ready (address received)
@@ -331,7 +331,7 @@ const runner2 = new NodeProcessEnvRunner({
 - **`test/orphan.test.ts`** — Regression tests for orphaned workers (#23): SIGKILLs the supervisor process and asserts the worker stops serving HTTP, plus mid-import variants asserting the worker exits even when the supervisor dies during a slow entry import (node-process, bun-process under both Node and Bun hosts)
 - **`test/vercel.test.ts`** — Tests for `VercelEnvRunner`: request header injection (`x-vercel-deployment-url`, `x-vercel-id`, `x-vercel-forwarded-for`, `x-forwarded-for`, `x-real-ip`, `x-forwarded-proto`, `x-forwarded-host`), response header injection (`server`, `x-vercel-id`, `x-vercel-cache`), environment variables (`VERCEL`, `VERCEL_ENV`, `VERCEL_REGION`, `NOW_REGION`), header preservation, pre-existing header respect
 - **`test/netlify.test.ts`** — Tests for `NetlifyEnvRunner`: header injection (`x-nf-client-connection-ip`, `x-nf-account-id`, `x-nf-site-id`, `x-nf-deploy-id`, `x-nf-deploy-context`, `x-nf-geo`, `x-nf-request-id`), IP derivation, header preservation
-- Tests cover: lifecycle, fetch (GET/POST), WebSocket upgrade, crossws websocket, messaging, hooks, graceful close, inspect output, stdio forwarding (all runners), manager hot-reload, message queueing, miniflare hot-reload, vercel header/env/response injection, netlify header injection, waitForReady, vite helpers, orphan-worker exit on supervisor death, `await using` disposal (all runners + manager)
+- Tests cover: lifecycle, fetch (GET/POST, relative URLs), WebSocket upgrade, crossws websocket, messaging, hooks, graceful close, inspect output, stdio forwarding (all runners), manager hot-reload, message queueing, miniflare hot-reload, vercel header/env/response injection, netlify header injection, waitForReady, vite helpers, orphan-worker exit on supervisor death, `await using` disposal (all runners + manager)
 
 ## Scripts
 

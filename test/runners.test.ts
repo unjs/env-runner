@@ -126,6 +126,15 @@ for (const runnerDef of runners) {
       expect(await res.text()).toBe("ok");
     });
 
+    it("fetches with a relative url", async () => {
+      runner = create(opts("test-fetch-relative"));
+      await waitForReady(runner);
+
+      const res = await runner.fetch("/");
+      expect(res.status).toBe(200);
+      expect(await res.text()).toBe("ok");
+    });
+
     it("fetches with POST body", async () => {
       runner = create(opts("test-post"));
       await waitForReady(runner);
