@@ -140,6 +140,49 @@ for (const runnerDef of runners) {
       expect(data.body).toBe("hello");
     });
 
+    it("forwards entry stdout and stderr to the host process", async () => {
+      const marker = `${name}-${randomBytes(4).toString("hex")}`;
+      const stdoutChunks: string[] = [];
+      const stderrChunks: string[] = [];
+      const stdoutWrite = vi
+        .spyOn(process.stdout, "write")
+        .mockImplementation((chunk: string | Uint8Array) => {
+          stdoutChunks.push(chunk.toString());
+          return true;
+        });
+      const stderrWrite = vi
+        .spyOn(process.stderr, "write")
+        .mockImplementation((chunk: string | Uint8Array) => {
+          stderrChunks.push(chunk.toString());
+          return true;
+        });
+      // In-process runners (self, miniflare) log through the host console,
+      // which vitest patches — capture that channel too
+      const consoleLog = vi.spyOn(console, "log").mockImplementation((...args) => {
+        stdoutChunks.push(args.join(" "));
+      });
+      const consoleError = vi.spyOn(console, "error").mockImplementation((...args) => {
+        stderrChunks.push(args.join(" "));
+      });
+
+      try {
+        runner = create(opts("test-stdio"));
+        await waitForReady(runner);
+
+        const res = await runner.fetch(`http://localhost/log?marker=${marker}`);
+        expect(res.status).toBe(200);
+        expect(await res.text()).toBe("logged");
+
+        await waitFor(() => stdoutChunks.join("").includes(`stdout:${marker}`), 5000);
+        await waitFor(() => stderrChunks.join("").includes(`stderr:${marker}`), 5000);
+      } finally {
+        stdoutWrite.mockRestore();
+        stderrWrite.mockRestore();
+        consoleLog.mockRestore();
+        consoleError.mockRestore();
+      }
+    });
+
     it("sends and receives messages", async () => {
       runner = create(opts("test-msg"));
       await waitForReady(runner);
@@ -558,4 +601,15 @@ function waitForReady(runner: EnvRunner, timeout = 5000): Promise<void> {
       }
     });
   });
+}
+
+async function waitFor(predicate: () => boolean, timeout = 1000): Promise<void> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeout) {
+    if (predicate()) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error("Timed out waiting for condition");
 }

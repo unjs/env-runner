@@ -9,6 +9,13 @@ export default {
       return Response.json({ body, method: request.method });
     }
 
+    if (url.pathname === "/log") {
+      const marker = url.searchParams.get("marker");
+      console.log(`stdout:${marker}`);
+      console.error(`stderr:${marker}`);
+      return new Response("logged");
+    }
+
     return new Response("ok");
   },
   ipc: {
