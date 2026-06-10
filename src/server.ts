@@ -1,5 +1,5 @@
 import { type FSWatcher, watch as watchFile } from "node:fs";
-import type { WorkerHooks } from "./types.ts";
+import type { EnvRunner, WorkerHooks } from "./types.ts";
 import type { RunnerName } from "./loader.ts";
 
 import { loadRunner } from "./loader.ts";
@@ -63,6 +63,15 @@ export class EnvServer extends RunnerManager {
     return this._startPromise;
   }
 
+  /**
+   * Replace the active runner. When called without an argument, a fresh
+   * runner is created from the server options.
+   */
+  override async reload(runner?: EnvRunner) {
+    this.runner = runner ?? (await this._createRunner());
+    await super.reload(this.runner);
+  }
+
   override async close() {
     this._stopWatching();
     await super.close();
@@ -82,15 +91,14 @@ export class EnvServer extends RunnerManager {
   }
 
   private async _start() {
-    this.runner = await this._createRunner();
-    await this.reload(this.runner);
+    await this.reload();
     if (this._opts.watch) {
       this._startWatching();
     }
     return this;
   }
 
-  private async _createRunner() {
+  protected override async _createRunner() {
     return loadRunner(this._opts.runner || "node-worker", {
       name: this._opts.name || this._opts.entry,
       hooks: this._opts.hooks,
@@ -125,8 +133,7 @@ export class EnvServer extends RunnerManager {
     clearTimeout(this._reloadTimeout);
     this._reloadTimeout = setTimeout(async () => {
       try {
-        this.runner = await this._createRunner();
-        await this.reload(this.runner);
+        await this.reload();
         for (const fn of this._reloadListeners) fn();
       } catch (error) {
         console.error("Failed to reload runner:", error);

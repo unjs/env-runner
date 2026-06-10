@@ -36,6 +36,22 @@ describe("EnvServer", () => {
     expect(server.runner).toBe(runner);
   });
 
+  it("reload() without an argument creates a fresh runner", async () => {
+    server = new EnvServer({ entry: appEntry });
+    await server.start();
+    const runner = server.runner;
+    expect(runner).toBeTruthy();
+
+    await server.reload();
+    expect(server.runner).toBeTruthy();
+    expect(server.runner).not.toBe(runner);
+    expect(runner!.closed).toBe(true);
+
+    const res = await server.fetch("http://localhost/");
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("ok");
+  });
+
   it("does not restart after close", async () => {
     server = new EnvServer({ entry: appEntry });
     await server.start();

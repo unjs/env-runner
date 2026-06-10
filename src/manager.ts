@@ -33,16 +33,30 @@ export class RunnerManager implements EnvRunner, AsyncDisposable {
     return this._closed;
   }
 
-  /** Replace the active runner with a new one. Closes the previous runner. */
-  async reload(runner: EnvRunner) {
+  /**
+   * Replace the active runner with a new one. Closes the previous runner.
+   *
+   * When called without a runner, a fresh one is created via `_createRunner()`
+   * (only available on subclasses with a runner factory, e.g. `EnvServer`).
+   */
+  async reload(runner?: EnvRunner) {
     this._reloading = true;
-    const prev = this._runner;
-    this._detach();
-    this._attach(runner);
-    this._reloading = false;
-    if (prev) {
-      await prev.close();
+    try {
+      runner ??= await this._createRunner();
+      const prev = this._runner;
+      this._detach();
+      this._attach(runner);
+      if (prev) {
+        await prev.close();
+      }
+    } finally {
+      this._reloading = false;
     }
+  }
+
+  /** Create a fresh runner for argument-less `reload()`. Overridden by subclasses with a runner factory. */
+  protected _createRunner(): EnvRunner | Promise<EnvRunner> {
+    throw new Error("reload() requires a runner argument (this manager has no runner factory)");
   }
 
   // #region EnvRunner proxy

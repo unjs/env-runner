@@ -71,7 +71,7 @@ src/
 - **`src/runners/netlify/runner.ts`** — `NetlifyEnvRunner` extends `NodeWorkerEnvRunner`: simulates Netlify deployment environment with header injection (`x-nf-client-connection-ip`, `x-nf-account-id`, `x-nf-site-id`, `x-nf-deploy-id`, `x-nf-deploy-context`, `x-nf-geo`, `x-nf-request-id`)
 - **`src/runners/netlify/worker.ts`** — Uses `@netlify/runtime` `startRuntime()` when available (sets up `globalThis.Netlify` with env/context and `globalThis.caches`), falls back to lightweight shim. Delegates to node-worker worker
 - **`src/loader.ts`** — `loadRunner(name, opts)`: dynamic loader that imports a runner by name (`node-worker` | `node-process` | `bun-process` | `deno-process` | `self` | `miniflare` | `vercel` | `netlify`) and returns an `EnvRunner` instance
-- **`src/manager.ts`** — `RunnerManager`: proxy manager for hot-reload, message queueing, and listener forwarding across runner swaps. The `fetch` field delegates to a protected `_fetch()` method so subclasses can hook request handling (used by `EnvServer` for auto-start)
+- **`src/manager.ts`** — `RunnerManager`: proxy manager for hot-reload, message queueing, and listener forwarding across runner swaps. The `fetch` field delegates to a protected `_fetch()` method so subclasses can hook request handling (used by `EnvServer` for auto-start). `reload(runner?)`'s argument is optional: with no runner it calls the protected `_createRunner()` factory, which throws on the base class and is overridden by `EnvServer`
 - **`src/server.ts`** — `EnvServer` extends `RunnerManager`: high-level API combining runner loading, watch mode (`fs.watch` with 100ms debounce), and auto-reload on file changes. Supports `watch` and `watchPaths` options. The `runner` option is optional and defaults to `"node-worker"`. `start()` is idempotent (a shared `_startPromise`; a failed start resets it so a later call retries) and optional: the first `fetch()` auto-starts via the `_fetch()` override (skipped once closed — fetch after `close()` stays a 503, never respawns)
 - **`src/cli.ts`** — CLI entry point: `env-runner <entry> [--runner] [--port] [--host] [-w/--watch]`
 - **`src/index.ts`** — Public API: re-exports types, `BaseEnvRunner`, concrete runners, `SelfEnvRunner`, `RunnerManager`, `EnvServer`, and `loadRunner`
@@ -190,7 +190,7 @@ All headers are only injected when not already present in the request.
 
 Proxy manager wrapping a runner with hot-reload support:
 
-- `reload(runner)` — Swaps active runner, closes old one, preserves listeners
+- `reload(runner?)` — Swaps active runner, closes old one, preserves listeners. Without an argument it creates a runner via the protected `_createRunner()` factory (base class throws; `EnvServer` overrides it, so `envServer.reload()` restarts with a fresh runner built from the server options). A failed factory leaves the current runner attached
 - Message queueing — `sendMessage()` queues when runner not ready, auto-flushes on ready
 - Listener forwarding — `onMessage()`/`offMessage()` persist across runner swaps
 - Hook wrapping — Detects unexpected runner exits, forwards `onReady()`/`onClose()` multi-listener hooks (Set-based, mirrors `onMessage`/`offMessage` pattern)
@@ -203,6 +203,7 @@ Proxy manager wrapping a runner with hot-reload support:
 High-level API extending `RunnerManager` with runner loading and file watching:
 
 - `start()` — Loads runner via `loadRunner()` and optionally starts file watchers. Idempotent and optional: the first `fetch()` auto-starts the server (no auto-start after `close()`)
+- `reload(runner?)` — With no argument creates a fresh runner from the server options (overrides `_createRunner()`); keeps the public `runner` field in sync. `start()` and the watch path go through it
 - `close()` — Stops watchers and closes the runner
 - `watch: true` — Watches the entry file using `fs.watch()` with 100ms debounce; on change, creates a new runner and calls `reload()`
 - `watchPaths` — Additional directories/files to watch (supports `recursive: true`)

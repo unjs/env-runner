@@ -67,6 +67,9 @@ envServer.onReload(() => {
 // Optional — the server auto-starts on first fetch()
 await envServer.start();
 
+// Restart with a fresh runner created from the server options
+await envServer.reload();
+
 // Use with any HTTP server
 const server = serve({
   fetch: (request) => envServer.fetch(request),

@@ -85,6 +85,20 @@ describe("RunnerManager", () => {
     expect(res.status).toBe(200);
   });
 
+  it("reload without a runner rejects (no runner factory)", async () => {
+    const runner = createRunner("reload-no-arg");
+    runners.push(runner);
+    manager = new RunnerManager(runner);
+    await waitForReady(manager);
+
+    await expect(manager.reload()).rejects.toThrow("reload() requires a runner argument");
+
+    // The active runner stays attached after a failed reload
+    expect(manager.ready).toBe(true);
+    const res = await manager.fetch("http://localhost/");
+    expect(res.status).toBe(200);
+  });
+
   it("fires onClose when runner exits", async () => {
     const runner = createRunner("on-close");
     runners.push(runner);
