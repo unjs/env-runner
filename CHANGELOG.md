@@ -1,6 +1,20 @@
 # Changelog
 
 
+## v0.1.11
+
+[compare changes](https://github.com/unjs/env-runner/compare/v0.1.10...v0.1.11)
+
+### 🚀 Enhancements
+
+- **server:** Support `reload()` without arguments to create a fresh runner ([322e5e4](https://github.com/unjs/env-runner/commit/322e5e4))
+- `invalidateModule` for virtuals ([00d99a6](https://github.com/unjs/env-runner/commit/00d99a6))
+- Support relative fetch ([b69598f](https://github.com/unjs/env-runner/commit/b69598f))
+
+### ❤️ Contributors
+
+- Pooya Parsa ([@pi0](https://github.com/pi0))
+
 ## v0.1.10
 
 [compare changes](https://github.com/unjs/env-runner/compare/v0.1.9...v0.1.10)
