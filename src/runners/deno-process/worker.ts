@@ -9,7 +9,7 @@ import {
 import { registerVirtualModules } from "../../common/virtual-modules.ts";
 
 const data = JSON.parse(process.env.ENV_RUNNER_DATA || "{}");
-await registerVirtualModules(data.virtual);
+const unregisterVirtualModules = await registerVirtualModules(data.virtual);
 const virtualEntry = isVirtualSpecifier(data.entry, data.virtual);
 let entry = await resolveEntry(data.entry, virtualEntry);
 
@@ -74,6 +74,7 @@ async function handleMessage(message: any) {
     Promise.resolve(entry.ipc?.onClose?.())
       .then(() => server.close())
       .then(() => {
+        unregisterVirtualModules();
         sendMessage({ event: "exit" });
       });
     return;

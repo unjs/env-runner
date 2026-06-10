@@ -1,4 +1,4 @@
-import { createVirtualHooks } from "../virtual-loader.ts";
+import { createVirtualHooks, virtualModuleFormat } from "../virtual-loader.ts";
 
 /**
  * Register runtime hooks that serve virtual modules from an in-memory
@@ -24,25 +24,39 @@ import { createVirtualHooks } from "../virtual-loader.ts";
  *
  * When neither backend is available a one-time warning is logged and
  * registration is skipped instead of crashing the worker.
+ *
+ * Resolves to an **unregister function** (idempotent) so the registration can
+ * be released when the runner shuts down. On the `registerHooks` backend it
+ * calls the returned `deregister()`, restoring default resolution for the
+ * specifiers. Bun has no plugin-removal API, so there it detaches the live
+ * source map instead: already-evaluated modules stay cached, but fresh loads
+ * of the specifiers fail and {@link refreshVirtualModule} stops matching.
  */
-export async function registerVirtualModules(virtual?: Record<string, string>): Promise<void> {
+export async function registerVirtualModules(
+  virtual?: Record<string, string>,
+): Promise<() => void> {
   if (!virtual || Object.keys(virtual).length === 0) {
-    return;
+    return _noop;
   }
   const { registerHooks } = await import("node:module");
   if (typeof registerHooks === "function") {
-    registerHooks(createVirtualHooks(virtual));
-    return;
+    const hooks = registerHooks(createVirtualHooks(virtual));
+    return _once(() => hooks.deregister());
   }
   const bunPlugin = (globalThis as any).Bun?.plugin;
   if (typeof bunPlugin === "function") {
     _bunVirtual = virtual;
-    _registerBunModules(virtual);
-    return;
+    _registerBunModules(Object.keys(virtual));
+    return _once(() => {
+      if (_bunVirtual === virtual) {
+        _bunVirtual = undefined;
+      }
+    });
   }
   console.warn(
     "[env-runner] virtual modules require `module.registerHooks` (Node.js >= 22.15 / Deno >= 2.x) or `Bun.plugin`; skipping registration.",
   );
+  return _noop;
 }
 
 /**
@@ -57,23 +71,49 @@ export async function registerVirtualModules(virtual?: Record<string, string>): 
  * `virtual:` URLs).
  */
 export function refreshVirtualModule(specifier: string): boolean {
-  const source = _bunVirtual?.[specifier];
-  if (source === undefined) {
+  if (_bunVirtual?.[specifier] === undefined) {
     return false;
   }
-  _registerBunModules({ [specifier]: source });
+  _registerBunModules([specifier]);
   return true;
 }
 
 let _bunVirtual: Record<string, string> | undefined;
 
-function _registerBunModules(virtual: Record<string, string>): void {
+// Load callbacks read from the live `_bunVirtual` map (not a captured source)
+// so unregistering — detaching the map — disables fresh loads even though
+// Bun's plugin API offers no way to remove a `build.module` registration.
+function _registerBunModules(specifiers: string[]): void {
   (globalThis as any).Bun.plugin({
     name: "env-runner-virtual",
     setup(build: any) {
-      for (const [specifier, source] of Object.entries(virtual)) {
-        build.module(specifier, () => ({ contents: source, loader: "js" }));
+      for (const specifier of specifiers) {
+        build.module(specifier, () => {
+          const source = _bunVirtual?.[specifier];
+          if (source === undefined) {
+            throw new Error(`Cannot find virtual module "${specifier}" (unregistered)`);
+          }
+          return { contents: source, loader: _bunLoader(specifier) };
+        });
       }
     },
   });
+}
+
+// Map the shared format detection (extension-based) to Bun plugin loaders.
+function _bunLoader(specifier: string): "js" | "ts" | "json" {
+  const format = virtualModuleFormat(specifier);
+  return format === "module" ? "js" : format === "module-typescript" ? "ts" : "json";
+}
+
+const _noop = () => {};
+
+function _once(fn: () => void): () => void {
+  let done = false;
+  return () => {
+    if (!done) {
+      done = true;
+      fn();
+    }
+  };
 }

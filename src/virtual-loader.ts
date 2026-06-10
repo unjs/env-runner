@@ -66,7 +66,7 @@ export function createVirtualHooks(virtual: Record<string, string>): {
       const key = _stripQuery(decodeURIComponent(url.slice(VIRTUAL_SCHEME.length)));
       if (Object.hasOwn(virtual, key)) {
         return {
-          format: "module",
+          format: virtualModuleFormat(key),
           source: virtual[key],
           shortCircuit: true,
         };
@@ -76,6 +76,21 @@ export function createVirtualHooks(virtual: Record<string, string>): {
   };
 
   return { resolve, load };
+}
+
+/**
+ * Module format for a virtual specifier, derived from its extension: `.json`
+ * loads as a JSON module, `.ts`/`.mts` as type-stripped TypeScript
+ * (Node.js >= 22.18 / 23.6, Deno), anything else as a plain ES module.
+ */
+export function virtualModuleFormat(specifier: string): "module" | "module-typescript" | "json" {
+  if (specifier.endsWith(".json")) {
+    return "json";
+  }
+  if (specifier.endsWith(".ts") || specifier.endsWith(".mts")) {
+    return "module-typescript";
+  }
+  return "module";
 }
 
 function _stripQuery(specifier: string): string {

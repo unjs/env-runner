@@ -154,6 +154,34 @@ for (const { name, create, skip } of runners) {
       expect((closeCause as Error)?.message).toBe("factory failed");
     });
 
+    it("unregisters virtual modules on shutdown without breaking close", async () => {
+      runner = create({
+        name: "virtual-unregister",
+        data: {
+          entry: "#entry",
+          virtual: {
+            "#entry": `export default { fetch: () => new Response("ok") };`,
+          },
+        },
+      });
+      await runner.waitForReady();
+      // Graceful path: workers call unregisterVirtualModules() in their
+      // shutdown handler and confirm with an exit event.
+      const exited = new Promise((resolve) => {
+        runner.onMessage((message: any) => {
+          if (message?.event === "exit") resolve(message);
+        });
+      });
+      runner.sendMessage({ event: "shutdown" });
+      await expect(
+        Promise.race([
+          exited,
+          new Promise((_, reject) => setTimeout(() => reject(new Error("no exit event")), 5000)),
+        ]),
+      ).resolves.toBeTruthy();
+      await runner.close();
+    });
+
     it("reloads a virtual entry without restarting the worker", async () => {
       runner = create({
         name: "virtual-entry-reload",
@@ -172,3 +200,19 @@ for (const { name, create, skip } of runners) {
     });
   });
 }
+
+// Subprocess-based: the vitest module runner intercepts in-process dynamic
+// imports, so the fixture exercises the real ESM hook chain / Bun plugin.
+describe("registerVirtualModules unregister", () => {
+  const fixture = resolve(_dir, "./fixtures/virtual-unregister.mjs");
+
+  it("deregisters the ESM hooks (registerHooks backend)", () => {
+    const output = execFileSync(process.execPath, [fixture], { encoding: "utf8" });
+    expect(output.trim()).toBe("ok");
+  });
+
+  it.skipIf(!hasBun)("detaches the live source map (Bun.plugin backend)", () => {
+    const output = execFileSync("bun", [fixture], { encoding: "utf8" });
+    expect(output.trim()).toBe("ok");
+  });
+});

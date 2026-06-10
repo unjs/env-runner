@@ -10,7 +10,7 @@ import {
 import { registerVirtualModules } from "../../common/virtual-modules.ts";
 
 const data = workerData || {};
-await registerVirtualModules(data.virtual);
+const unregisterVirtualModules = await registerVirtualModules(data.virtual);
 const virtualEntry = isVirtualSpecifier(data.entry, data.virtual);
 let entry = await resolveEntry(data.entry, virtualEntry);
 const sendMessage = (message: unknown) => parentPort?.postMessage(message);
@@ -46,6 +46,7 @@ parentPort?.on("message", async (message) => {
     Promise.resolve(entry.ipc?.onClose?.())
       .then(() => server.close())
       .then(() => {
+        unregisterVirtualModules();
         parentPort?.postMessage({ event: "exit" });
       });
     return;
