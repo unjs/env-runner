@@ -4,9 +4,30 @@ import type { RunnerMessageListener, EnvRunner, WorkerAddress, WorkerHooks } fro
 
 import { rm } from "node:fs/promises";
 import { proxyFetch, proxyUpgrade } from "httpxy";
+import { resolveVirtualModules } from "../virtual-loader.ts";
+import type { VirtualModules } from "../virtual-loader.ts";
+
+export type { VirtualModules, VirtualModuleSource } from "../virtual-loader.ts";
 
 export interface EnvRunnerData {
   name?: string;
+
+  /**
+   * Virtual modules as a `specifier => source` map.
+   *
+   * Registered as Node.js ESM customization hooks in the worker so the entry
+   * (and its dependencies) can `import` them, e.g.
+   * `{ "#virtual-import": "export const foo = 1" }`.
+   *
+   * Each source may be a string or a factory `() => string | Promise<string>`.
+   * Factories are evaluated once on the host before the worker is spawned (so the
+   * worker always receives plain strings).
+   *
+   * Supported by the `node-worker`, `node-process`, `bun-process`,
+   * `deno-process`, `vercel`, `netlify`, and `miniflare` runners.
+   */
+  virtual?: VirtualModules;
+
   [key: string]: unknown;
 }
 
@@ -70,6 +91,7 @@ export abstract class BaseEnvRunner implements EnvRunner {
 
   waitForReady(timeout = 5000): Promise<void> {
     if (this.ready) return Promise.resolve();
+    if (this.closed) return Promise.reject(new Error("Runner closed before becoming ready"));
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this._messageListeners.delete(listener);
@@ -80,6 +102,10 @@ export abstract class BaseEnvRunner implements EnvRunner {
           clearTimeout(timer);
           this._messageListeners.delete(listener);
           resolve();
+        } else if (this.closed) {
+          clearTimeout(timer);
+          this._messageListeners.delete(listener);
+          reject(new Error("Runner closed before becoming ready"));
         }
       };
       this._messageListeners.add(listener);
@@ -165,8 +191,51 @@ export abstract class BaseEnvRunner implements EnvRunner {
       this._address = message.address;
       this._hooks.onReady?.(this, this._address);
     }
+    // Workers report a failed init (virtual module registration, entry import)
+    // with `init-error` before exiting, so the runner closes with a meaningful
+    // cause instead of a bare "process exited with code 1".
+    if (message?.event === "init-error" && !this.ready && !this.closed) {
+      this.close(new Error(String(message.error || "Worker initialization failed")));
+    }
     for (const listener of this._messageListeners) {
       listener(message);
+    }
+  }
+
+  /**
+   * Resolve any factory-valued `data.virtual` sources to strings before the
+   * worker is spawned. Returns a pending promise only when there is async work
+   * to do (a factory is present); otherwise returns `undefined` so subclasses can
+   * keep their synchronous spawn path. Factories must be resolved here because
+   * functions can't cross the worker boundary and the load hook can't await.
+   */
+  protected _resolveVirtualData(): Promise<void> | undefined {
+    const virtual = this._data?.virtual;
+    if (!virtual || !Object.values(virtual).some((v) => typeof v === "function")) {
+      return undefined;
+    }
+    return resolveVirtualModules(virtual).then((resolved) => {
+      this._data = { ...this._data, virtual: resolved };
+    });
+  }
+
+  /**
+   * Run a subclass spawn callback after `data.virtual` is resolved.
+   * Synchronous when no factory-valued source is present; otherwise defers
+   * `init` until factories resolve. A throwing/rejecting factory closes the
+   * runner with the error as cause instead of leaving an unhandled rejection.
+   */
+  protected _initWithVirtualData(init: () => void): void {
+    const pending = this._resolveVirtualData();
+    if (pending) {
+      pending.then(
+        () => {
+          if (!this.closed) init();
+        },
+        (error) => this.close(error),
+      );
+    } else {
+      init();
     }
   }
 

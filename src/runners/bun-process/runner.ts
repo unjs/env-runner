@@ -70,7 +70,7 @@ export class BunProcessEnvRunner extends BaseEnvRunner {
   }) {
     _defaultEntry ||= fileURLToPath(import.meta.resolve("env-runner/runners/bun-process/worker"));
     super({ ...opts, workerEntry: opts.workerEntry || _defaultEntry });
-    this.#initProcess(opts.execArgv);
+    this._initWithVirtualData(() => this.#initProcess(opts.execArgv));
   }
 
   sendMessage(message: unknown) {

@@ -22,7 +22,9 @@ export class NodeWorkerEnvRunner extends BaseEnvRunner {
   }) {
     _defaultEntry ||= fileURLToPath(import.meta.resolve("env-runner/runners/node-worker/worker"));
     super({ ...opts, workerEntry: opts.workerEntry || _defaultEntry });
-    this.#initWorker();
+    // Resolve factory-valued `data.virtual` sources before spawning, since
+    // functions can't be passed via `workerData`. Stays synchronous otherwise.
+    this._initWithVirtualData(() => this.#initWorker());
   }
 
   sendMessage(message: unknown) {

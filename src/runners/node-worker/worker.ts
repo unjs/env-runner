@@ -1,11 +1,32 @@
 import { parentPort, workerData } from "node:worker_threads";
 import { serve } from "srvx";
 import { plugin as wsPlugin } from "crossws/server/node";
-import { resolveEntry, reloadEntryModule, parseServerAddress } from "../../common/worker-utils.ts";
+import {
+  resolveEntry,
+  reloadEntryModule,
+  parseServerAddress,
+  isVirtualSpecifier,
+  type AppEntry,
+} from "../../common/worker-utils.ts";
+import { registerVirtualModules } from "../../common/virtual-modules.ts";
 
 const data = workerData || {};
-let entry = await resolveEntry(data.entry);
 const sendMessage = (message: unknown) => parentPort?.postMessage(message);
+const virtualEntry = isVirtualSpecifier(data.entry, data.virtual);
+
+let unregisterVirtualModules: () => void;
+let entry: AppEntry;
+try {
+  unregisterVirtualModules = await registerVirtualModules(data.virtual);
+  entry = await resolveEntry(data.entry, virtualEntry);
+} catch (error: any) {
+  // Report a structured error before exiting so the runner closes with a
+  // meaningful cause instead of an uncaught rejection + bare exit code.
+  const message = error?.message || String(error);
+  sendMessage({ event: "init-error", error: message });
+  console.error(`[env-runner] worker init failed: ${message}`);
+  process.exit(1);
+}
 
 const server = serve({
   port: 0,
@@ -38,6 +59,7 @@ parentPort?.on("message", async (message) => {
     Promise.resolve(entry.ipc?.onClose?.())
       .then(() => server.close())
       .then(() => {
+        unregisterVirtualModules();
         parentPort?.postMessage({ event: "exit" });
       });
     return;
@@ -45,7 +67,7 @@ parentPort?.on("message", async (message) => {
 
   if (message?.event === "reload-module") {
     try {
-      entry = await reloadEntryModule(data.entry, entry, sendMessage);
+      entry = await reloadEntryModule(data.entry, entry, sendMessage, virtualEntry);
       parentPort?.postMessage({ event: "module-reloaded" });
     } catch (error: any) {
       parentPort?.postMessage({ event: "module-reloaded", error: error?.message || String(error) });

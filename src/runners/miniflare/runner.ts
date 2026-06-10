@@ -2,13 +2,15 @@ import type { WorkerHooks } from "../../types.ts";
 
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
-import { basename, dirname, resolve } from "node:path";
+import { basename, dirname, isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { resolveModulePath } from "exsolve";
 import { init as initCjsLexer, parse as parseCjs } from "cjs-module-lexer";
 import { proxyUpgrade } from "httpxy";
 import { BaseEnvRunner } from "../../common/base-runner.ts";
 import type { EnvRunnerData } from "../../common/base-runner.ts";
+import { isVirtualSpecifier } from "../../common/worker-utils.ts";
+import { virtualModuleFormat } from "../../virtual-loader.ts";
 import { generateWrapper, IPC_BINDING } from "./wrapper.ts";
 import type { IncomingMessage } from "node:http";
 import type { Socket } from "node:net";
@@ -94,7 +96,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
     this.#exports = opts.exports ?? {};
     this.#captureErrors = opts.captureErrors ?? true;
     this.#exportConditions = opts.exportConditions ?? ["workerd", "worker"];
-    this.#init();
+    this._initWithVirtualData(() => this.#init());
   }
 
   /** Dispose all persistent Miniflare instances from the cache. */
@@ -126,6 +128,11 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
   }
 
   override async fetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
+    // Match BaseEnvRunner.fetch: wait with exponential backoff while init is
+    // still in flight (the address is set at the end of #initAsync).
+    for (let i = 0; i < 5 && !this._address && !this.closed; i++) {
+      await new Promise((r) => setTimeout(r, 100 * Math.pow(2, i)));
+    }
     if (!this.#miniflare || this.closed) {
       return new Response("miniflare env runner is unavailable", { status: 503 });
     }
@@ -259,10 +266,44 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
     );
   }
 
+  /**
+   * Resolved `data.virtual` map, prepared for workerd. Sources arrive as plain
+   * strings (factories are resolved on the host by `_initWithVirtualData()`).
+   * workerd parses every `esModule` as plain JS, so `.ts`/`.mts` sources are
+   * type-stripped here with `module.stripTypeScriptTypes`; `.json` sources stay
+   * raw and are served as native `json` modules by the fallback service.
+   */
+  async #prepareVirtualModules(): Promise<Record<string, string> | undefined> {
+    const virtual = this._data?.virtual as Record<string, string> | undefined;
+    if (!virtual || Object.keys(virtual).length === 0) {
+      return undefined;
+    }
+    const out: Record<string, string> = {};
+    let strip: ((code: string) => string) | undefined;
+    for (const [specifier, source] of Object.entries(virtual)) {
+      if (virtualModuleFormat(specifier) === "module-typescript") {
+        if (!strip) {
+          const { stripTypeScriptTypes } = await import("node:module");
+          if (typeof stripTypeScriptTypes !== "function") {
+            throw new TypeError(
+              `[env-runner] virtual TypeScript module "${specifier}" requires \`module.stripTypeScriptTypes\` on the host (workerd does not parse TypeScript); upgrade Node.js or provide a pre-transpiled JavaScript source instead.`,
+            );
+          }
+          strip = stripTypeScriptTypes;
+        }
+        out[specifier] = strip(source);
+      } else {
+        out[specifier] = source;
+      }
+    }
+    return out;
+  }
+
   async #initAsync() {
     const { Miniflare } = await import("miniflare");
 
     const entryPath = this._data?.entry as string | undefined;
+    const virtual = await this.#prepareVirtualModules();
 
     const userFlags = (this.#miniflareOptions.compatibilityFlags as string[]) || [];
     const userDirectSockets = (this.#miniflareOptions.unsafeDirectSockets as unknown[]) || [];
@@ -277,17 +318,35 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
 
     // Generate in-memory wrapper module with IPC support
     if (entryPath && !options.script && !options.scriptPath) {
-      const resolvedEntry = resolve(entryPath);
-      const entryDir = dirname(resolvedEntry);
+      // A virtual entry is matched verbatim by the module fallback service —
+      // don't resolve non-path specifiers (e.g. "#entry") against cwd.
+      const entryIsVirtual = isVirtualSpecifier(entryPath, virtual);
+      const resolvedEntry = entryIsVirtual ? entryPath : resolve(entryPath);
+      // Anchor for scriptPath and bare-specifier resolution; a non-path
+      // virtual key has no directory, so fall back to cwd.
+      const entryBase = isAbsolute(resolvedEntry)
+        ? resolvedEntry
+        : resolve("__env_runner_virtual_entry__.mjs");
+      const entryDir = dirname(entryBase);
 
-      // Auto-detect exported classes from entry file (opt-in)
+      // Auto-detect exported classes from entry source (opt-in)
+      const entrySource = entryIsVirtual ? virtual![entryPath] : _tryReadFile(resolvedEntry);
       const detectedExports =
         this.#exports === false || this.#exports === undefined
           ? []
           : detectExportedClasses(
-              resolvedEntry,
+              entrySource,
               typeof this.#exports === "object" ? this.#exports : {},
             );
+
+      // The wrapper wires DO/Entrypoint exports as static re-exports from the
+      // entry, which miniflare's ModuleLocator resolves on disk at startup —
+      // impossible for a fallback-served virtual entry.
+      if (entryIsVirtual && detectedExports.length > 0) {
+        throw new Error(
+          `[env-runner] named exports (${detectedExports.join(", ")}) are not supported with a virtual entry on the miniflare runner; pass \`exports: false\` or use a real entry file.`,
+        );
+      }
 
       // Auto-wire durableObjects bindings for detected/declared exports
       if (detectedExports.length > 0 && !options.durableObjects) {
@@ -345,7 +404,8 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
       // Module fallback: resolve imports that workerd can't find on its own
       // (e.g. imports from node_modules, parent dirs, cache-busted reload imports)
       if (!options.unsafeModuleFallbackService) {
-        const _require = createRequire(resolvedEntry);
+        const _require = createRequire(entryBase);
+        const _virtual = virtual;
         const _transformRequest = this.#transformRequest;
         const _exportConditions = this.#exportConditions;
         options.unsafeUseModuleFallbackService = true;
@@ -364,6 +424,31 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
           }
           const cleanSpecifier = specifier.split("?")[0] || specifier;
           const cleanRaw = rawSpecifier?.split("?")[0];
+
+          // Virtual modules (data.virtual) win over any other resolution — a
+          // virtual key overrides a real file with the same path. The query is
+          // kept in the returned name so reload cache-busting (`?t=<n>`) gives
+          // workerd a fresh module identity while matching the same key.
+          if (_virtual) {
+            const bareSpecifier = cleanSpecifier.startsWith("/")
+              ? cleanSpecifier.slice(1)
+              : cleanSpecifier;
+            const virtualKey = [cleanRaw, cleanSpecifier, bareSpecifier].find(
+              (key) => key !== undefined && Object.hasOwn(_virtual, key),
+            );
+            if (virtualKey !== undefined) {
+              const query = specifier.includes("?") ? specifier.slice(specifier.indexOf("?")) : "";
+              const name = bareSpecifier + query;
+              const source = _virtual[virtualKey]!;
+              // workerd parses `json` modules natively (the parsed value is the
+              // default export); `.ts`/`.mts` sources were already type-stripped
+              // on the host (see #prepareVirtualModules).
+              return virtualModuleFormat(virtualKey) === "json"
+                ? Response.json({ name, json: source })
+                : Response.json({ name, esModule: source });
+            }
+          }
+
           let resolvedPath: string;
 
           // file:// URL specifier — convert to filesystem path
@@ -398,7 +483,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
                 // Use exsolve with export conditions so packages with conditional
                 // exports (e.g. srvx with "workerd" condition) resolve correctly.
                 const resolved = resolveModulePath(cleanRaw, {
-                  from: referrerReal || resolvedEntry,
+                  from: referrerReal || entryBase,
                   conditions: _exportConditions,
                   try: true,
                 });
@@ -488,6 +573,9 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
       this.#cacheKey = computeCacheKey(entryPath, {
         ...this.#miniflareOptions,
         _exportConditions: this.#exportConditions,
+        // The fallback service closure captures the virtual map, so instances
+        // are only shareable when the resolved sources are identical.
+        _virtual: virtual,
       });
       const cached = _miniflareCache.get(this.#cacheKey);
       if (cached) {
@@ -536,25 +624,31 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
 // #region Helpers
 
 /**
- * Detect `export class` declarations in the entry file.
+ * Detect `export class` declarations in the entry source.
  * Merges with explicitly declared exports from options.
  */
 function detectExportedClasses(
-  entryPath: string,
+  entrySource: string | undefined,
   explicit: Record<string, MiniflareExportInfo>,
 ): string[] {
   const names = new Set(Object.keys(explicit));
-  try {
-    const source = readFileSync(entryPath, "utf8");
+  if (entrySource) {
     const re = /\bexport\s+class\s+(\w+)/g;
     let match;
-    while ((match = re.exec(source))) {
+    while ((match = re.exec(entrySource))) {
       if (match[1]) names.add(match[1]);
     }
-  } catch {
-    // Entry might not exist yet (e.g. generated at build time)
   }
   return [...names];
+}
+
+/** Entry might not exist yet (e.g. generated at build time). */
+function _tryReadFile(path: string): string | undefined {
+  try {
+    return readFileSync(path, "utf8");
+  } catch {
+    return undefined;
+  }
 }
 
 /** Convert PascalCase/camelCase to SCREAMING_SNAKE_CASE (e.g. `Counter` → `COUNTER`, `MyDurableObject` → `MY_DURABLE_OBJECT`). */

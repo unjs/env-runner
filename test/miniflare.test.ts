@@ -16,6 +16,22 @@ describe("MiniflareEnvRunner (custom exports)", () => {
     runner = undefined;
   });
 
+  it("fetch waits for initialization instead of returning 503", async () => {
+    runner = new MiniflareEnvRunner({
+      name: "test-fetch-before-ready",
+      data: { entry: workerDoEntry },
+      miniflareOptions: {
+        durableObjects: {
+          COUNTER: "Counter",
+        },
+      },
+    });
+    // No waitForReady — fetch must back off while init is in flight
+    const res = await runner.fetch("http://localhost/counter");
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ count: 0 });
+  });
+
   it("supports Durable Object exports", async () => {
     runner = new MiniflareEnvRunner({
       name: "test-do",

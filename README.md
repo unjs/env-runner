@@ -173,6 +173,98 @@ await runner.close();
 | `VercelEnvRunner`      | Worker thread (Vercel context)  | `workerData` / `parentPort`        |
 | `NetlifyEnvRunner`     | Worker thread (Netlify context) | `workerData` / `parentPort`        |
 
+#### Virtual Modules
+
+The Node.js runners (`NodeWorkerEnvRunner`, `NodeProcessEnvRunner`, and the runners built on top of them), `BunProcessEnvRunner`, `DenoProcessEnvRunner` (Deno >= 2.x), and `MiniflareEnvRunner` can serve **virtual modules** from an in-memory `specifier => source` map passed via `data.virtual`. The entry (and its dependencies) can then `import` them as if they were real files:
+
+```ts
+import { NodeWorkerEnvRunner } from "env-runner/runners/node-worker";
+
+const runner = new NodeWorkerEnvRunner({
+  name: "my-app",
+  data: {
+    entry: "./app.ts",
+    virtual: {
+      "#config": `export const apiBase = "https://api.example.com";`,
+      "#banner": `export default "Hello from a virtual module!";`,
+    },
+  },
+});
+```
+
+```ts
+// app.ts
+import banner from "#banner";
+import { apiBase } from "#config";
+
+export default {
+  fetch: () => new Response(`${banner} (${apiBase})`),
+};
+```
+
+The **entry itself can be virtual** — set `data.entry` to one of the `data.virtual` keys to run an entry whose source lives in memory (it may import other virtual modules too):
+
+```ts
+const runner = new NodeWorkerEnvRunner({
+  name: "my-app",
+  data: {
+    entry: "#entry",
+    virtual: {
+      "#entry": `import { body } from "#dep";
+        export default { fetch: () => new Response(body) };`,
+      "#dep": `export const body = "Hello from a virtual entry!";`,
+    },
+  },
+});
+```
+
+Each source may also be a **factory** `() => string | Promise<string>` instead of a literal string — useful for lazily computed or asynchronously loaded sources:
+
+```ts
+const runner = new NodeWorkerEnvRunner({
+  name: "my-app",
+  data: {
+    entry: "./app.ts",
+    virtual: {
+      "#config": () => `export const apiBase = ${JSON.stringify(getApiBase())};`,
+      "#schema": async () => `export default ${await loadSchemaJson()};`,
+    },
+  },
+});
+```
+
+Factories are invoked once on the host (before the worker is spawned), so the worker always receives plain strings — functions can't cross the `workerData`/`JSON` boundary, and Node's synchronous load hook can't await. For the same reason, **all** factories are resolved eagerly at startup (in parallel), not lazily on first import — so keep them cheap, or use plain strings for sources that don't need computation. Maps containing only strings skip this step entirely.
+
+The module format is derived from the specifier extension: `.ts`/`.mts` sources are served as **TypeScript** and `.json` sources as **JSON modules**; everything else is plain JavaScript ESM:
+
+```ts
+const runner = new NodeWorkerEnvRunner({
+  name: "my-app",
+  data: {
+    entry: "#entry.ts",
+    virtual: {
+      "#entry.ts": `
+        import { getGreeting } from "#util.ts";
+        import config from "#config.json";
+        const handler: () => Response = () => new Response(getGreeting(config.name));
+        export default { fetch: handler };
+      `,
+      "#util.ts": `export function getGreeting(name: string): string {
+        return \`Hello, \${name}!\`;
+      }`,
+      "#config.json": JSON.stringify({ name: "virtual" }),
+    },
+  },
+});
+```
+
+- **TypeScript** is type-stripped by Node's native [type stripping](https://nodejs.org/api/typescript.html#type-stripping) (Node.js >= 22.18 / 23.6 — erasable syntax only) and by Bun's `ts` loader. On Deno, custom load hooks bypass its native type stripping, so sources are pre-stripped with [`module.stripTypeScriptTypes`](https://docs.deno.com/api/node/module/~/Module.stripTypeScriptTypes) (Deno >= 2.8.2); on older Deno without it, virtual `.ts`/`.mts` sources **throw at registration** — pass pre-transpiled JavaScript instead. On miniflare, sources are likewise pre-stripped with `module.stripTypeScriptTypes` on the host (workerd does not parse TypeScript).
+- **JSON** sources expose the parsed value as the default export on all runtimes. The `with { type: "json" }` import attribute is optional on Node.js and Bun; on Deno and miniflare it must be **omitted** (static imports carrying an import attribute bypass `registerHooks` resolution on Deno, and workerd rejects import attributes outright).
+
+Virtual modules are registered inside the worker, before the entry is imported. On Node.js (>= 22.15 / 23.5) and Deno (>= 2.x) this uses [ESM customization hooks](https://nodejs.org/api/module.html#moduleregisterhooksoptions) (`module.registerHooks`); on Bun (which does not implement `registerHooks`) it uses [`Bun.plugin()`](https://bun.com/docs/runtime/plugins) virtual modules instead. The source string is treated as an ES module, and virtual specifiers (including a virtual entry) resolve across `reloadModule()`. On runtimes supporting neither mechanism, a warning is logged and registration is skipped. When the worker shuts down gracefully the registration is unregistered again (the `registerHooks` registration is deregistered; on Bun, which has no plugin-removal API, the in-memory source map is detached so fresh loads and reloads stop resolving).
+
+On `MiniflareEnvRunner` there is no in-worker registration: the runner's module fallback service serves virtual specifiers to workerd directly (taking precedence over disk files and the `transformRequest` pipeline, so a virtual key overrides a real file with the same path). One limitation: named `exports` (Durable Objects / WorkerEntrypoints) cannot be combined with a **virtual entry** — the wrapper would need a static re-export that miniflare cannot resolve at startup — and the runner fails fast with a clear error in that case.
+
 #### Miniflare Runner
 
 Run your app in the Cloudflare Workers runtime using [miniflare](https://github.com/cloudflare/workers-sdk/tree/main/packages/miniflare):
@@ -343,7 +435,10 @@ const env = new DevEnvironment("ssr", config, { hot: true, transport });
 import { createViteTransport } from "env-runner/vite";
 
 const transport = createViteTransport(sendMessage, onMessage, "ssr");
-const runner = new ModuleRunner({ transport, sourcemapInterceptor: "prepareStackTrace" });
+const runner = new ModuleRunner({
+  transport,
+  sourcemapInterceptor: "prepareStackTrace",
+});
 ```
 
 Messages are namespaced by environment name, so multiple Vite environments can share a single runner's IPC channel.
