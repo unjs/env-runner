@@ -21,4 +21,23 @@ input.push("src/cli.ts");
 
 export default defineBuildConfig({
   entries: [{ type: "bundle", input }],
+  hooks: {
+    rolldownOutput(cfg) {
+      cfg.chunkFileNames = (chunk) => {
+        // Name shared chunks after their source module path instead of the
+        // basename (multiple `runner.ts` entries otherwise collide into
+        // `runner.mjs`, `runner2.mjs`, ...)
+        const moduleId = chunk.facadeModuleId || chunk.moduleIds.at(-1) || "";
+        const srcPath = moduleId.split(/[/\\]src[/\\]/)[1];
+        if (!srcPath) {
+          return "_chunks/[name].mjs"; // node_modules libs, etc.
+        }
+        const name = srcPath
+          .replace(/(\.d)?\.[mc]?ts$/, "")
+          .replace(/^runners[/\\]/, "")
+          .replace(/[/\\]/g, "-");
+        return `_chunks/${name}.mjs`;
+      };
+    },
+  },
 });
