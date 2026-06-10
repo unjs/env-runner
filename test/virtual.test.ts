@@ -178,6 +178,30 @@ for (const { name, create, skip, deno, miniflare } of runners) {
       },
     );
 
+    // A bare/relative import inside a virtual module arrives with a `virtual:`
+    // parentURL; default resolution must be re-based on a real directory (the
+    // cwd) instead of crashing on the opaque scheme. Node backends only — Bun
+    // (`Bun.plugin`) and miniflare (workerd) don't use these resolve hooks, and
+    // Deno's bare-npm resolution differs.
+    it.skipIf(deno || miniflare || name.startsWith("Bun"))(
+      "resolves a bare dependency imported by a virtual module",
+      async () => {
+        runner = create({
+          name: "virtual-bare-import",
+          data: {
+            entry: "#entry",
+            virtual: {
+              "#entry": `import { resolveModulePath } from "exsolve";
+                export default { fetch: () => new Response(typeof resolveModulePath) };`,
+            },
+          },
+        });
+        await runner.waitForReady();
+        const res = await runner.fetch("http://localhost/");
+        expect(await res.text()).toBe("function");
+      },
+    );
+
     it("resolves a virtual JSON module", async () => {
       runner = create({
         name: "virtual-json",

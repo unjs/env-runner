@@ -1,4 +1,5 @@
 import type { ResolveHookSync, LoadHookSync } from "node:module";
+import { pathToFileURL } from "node:url";
 
 /**
  * Source for a virtual module: either a literal ES module string or a factory
@@ -55,6 +56,10 @@ const VIRTUAL_SCHEME = "virtual:";
 export function createVirtualHooks(
   virtual: Record<string, string>,
   versions?: ReadonlyMap<string, number>,
+  // Real directory URL used as the resolution base for a virtual module's own
+  // (non-virtual) imports — see the re-base in `resolve` below. Defaults to the
+  // working directory so bare/relative specifiers resolve against the project.
+  parentURL: string = _defaultParentURL(),
 ): {
   resolve: ResolveHookSync;
   load: LoadHookSync;
@@ -72,6 +77,14 @@ export function createVirtualHooks(
         url: VIRTUAL_SCHEME + encodeURIComponent(specifier) + (version ? `?v=${version}` : ""),
         shortCircuit: true,
       };
+    }
+    // A bare/relative import inside a virtual module arrives with a `virtual:`
+    // parentURL. That scheme is opaque (non-hierarchical), so default resolution
+    // throws when it builds a base from it (`new URL("./package.json",
+    // "virtual:...")` in `getPackageScopeConfig`). Re-base such imports on a real
+    // directory URL so they resolve against the project instead of crashing.
+    if (context.parentURL?.startsWith(VIRTUAL_SCHEME)) {
+      return nextResolve(specifier, { ...context, parentURL });
     }
     return nextResolve(specifier, context);
   };
@@ -163,4 +176,10 @@ export function expandVirtualInvalidation(
 function _stripQuery(specifier: string): string {
   const qIndex = specifier.indexOf("?");
   return qIndex === -1 ? specifier : specifier.slice(0, qIndex);
+}
+
+// Working directory as a trailing-slash file URL, usable directly as a module
+// resolution base (node_modules walk starts at the directory itself).
+function _defaultParentURL(): string {
+  return pathToFileURL(process.cwd() + "/").href;
 }
