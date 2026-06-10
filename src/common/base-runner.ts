@@ -90,6 +90,7 @@ export abstract class BaseEnvRunner implements EnvRunner {
 
   waitForReady(timeout = 5000): Promise<void> {
     if (this.ready) return Promise.resolve();
+    if (this.closed) return Promise.reject(new Error("Runner closed before becoming ready"));
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this._messageListeners.delete(listener);
@@ -100,6 +101,10 @@ export abstract class BaseEnvRunner implements EnvRunner {
           clearTimeout(timer);
           this._messageListeners.delete(listener);
           resolve();
+        } else if (this.closed) {
+          clearTimeout(timer);
+          this._messageListeners.delete(listener);
+          reject(new Error("Runner closed before becoming ready"));
         }
       };
       this._messageListeners.add(listener);
@@ -184,6 +189,12 @@ export abstract class BaseEnvRunner implements EnvRunner {
     if (message?.address) {
       this._address = message.address;
       this._hooks.onReady?.(this, this._address);
+    }
+    // Workers report a failed init (virtual module registration, entry import)
+    // with `init-error` before exiting, so the runner closes with a meaningful
+    // cause instead of a bare "process exited with code 1".
+    if (message?.event === "init-error" && !this.ready && !this.closed) {
+      this.close(new Error(String(message.error || "Worker initialization failed")));
     }
     for (const listener of this._messageListeners) {
       listener(message);

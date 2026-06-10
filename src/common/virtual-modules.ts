@@ -16,7 +16,7 @@ import { createVirtualHooks, virtualModuleFormat } from "../virtual-loader.ts";
  * would be parsed as plain JS), so there the map is transformed up front:
  * `.json` sources are wrapped into a default-exporting ES module, and
  * `.ts`/`.mts` sources are stripped with `module.stripTypeScriptTypes` when
- * available (Deno > 2.8.0) and **throw** on older Deno (native type stripping
+ * available (Deno >= 2.8.2) and **throw** on older Deno (native type stripping
  * is unreachable from hooks; pass pre-transpiled JavaScript instead).
  *
  * Two registration backends, picked by feature detection:
@@ -126,10 +126,9 @@ function _registerBunModules(specifiers: string[]): void {
 // parsed as plain JS), so non-JS sources are converted to ES modules before
 // registration: `.json` via a default-exporting wrapper (Deno doesn't validate
 // import attributes on hook-loaded modules, so `with { type: "json" }` stays
-// portable), `.ts`/`.mts` via `module.stripTypeScriptTypes` (added to Deno's
-// node:module compat on 2026-05-31, after 2.8.0). On older Deno without it a
-// `.ts`/`.mts` specifier throws instead of failing later with an opaque
-// SyntaxError.
+// portable), `.ts`/`.mts` via `module.stripTypeScriptTypes` (in Deno's
+// node:module compat since 2.8.2). On older Deno without it a `.ts`/`.mts`
+// specifier throws instead of failing later with an opaque SyntaxError.
 function _transformForDeno(
   virtual: Record<string, string>,
   stripTypeScriptTypes?: (code: string) => string,

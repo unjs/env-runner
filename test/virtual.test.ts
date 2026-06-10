@@ -21,8 +21,8 @@ function hasRuntime(cmd: string): boolean {
 const hasDeno = hasRuntime("deno");
 const hasBun = hasRuntime("bun");
 
-// Deno serves virtual .ts modules via `module.stripTypeScriptTypes`, added to
-// its node:module compat after 2.8.0 (older Deno fails fast at registration).
+// Deno serves virtual .ts modules via `module.stripTypeScriptTypes`, in its
+// node:module compat since 2.8.2 (older Deno fails fast at registration).
 function denoSupportsTypeStripping(): boolean {
   if (!hasDeno) return false;
   try {
@@ -118,7 +118,7 @@ for (const { name, create, skip, deno } of runners) {
     });
 
     // Deno ignores the `format` of custom load hooks; virtual `.ts` sources are
-    // pre-stripped with `module.stripTypeScriptTypes` (Deno > 2.8.0) and
+    // pre-stripped with `module.stripTypeScriptTypes` (Deno >= 2.8.2) and
     // registration throws a clear error on older Deno without it.
     it.skipIf(deno && !denoTypeStripping)(
       "resolves virtual TypeScript modules (.ts entry and import)",
@@ -147,8 +147,14 @@ for (const { name, create, skip, deno } of runners) {
     it.skipIf(!deno || denoTypeStripping)(
       "fails fast for a virtual TypeScript module on Deno without stripTypeScriptTypes",
       async () => {
+        let closeCause: unknown;
         runner = create({
           name: "virtual-ts-deno",
+          hooks: {
+            onClose: (_runner: EnvRunner, cause: unknown) => {
+              closeCause = cause;
+            },
+          },
           data: {
             entry: "#entry.ts",
             virtual: {
@@ -158,6 +164,9 @@ for (const { name, create, skip, deno } of runners) {
         });
         await expect(runner.waitForReady(3000)).rejects.toThrow();
         expect(runner.closed).toBe(true);
+        // The worker reports the failure via an `init-error` message, so the
+        // close cause carries the actionable error instead of a bare exit code.
+        expect(String((closeCause as Error)?.message)).toContain("stripTypeScriptTypes");
       },
     );
 

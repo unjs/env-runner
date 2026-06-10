@@ -5,13 +5,11 @@ import {
   reloadEntryModule,
   parseServerAddress,
   isVirtualSpecifier,
+  type AppEntry,
 } from "../../common/worker-utils.ts";
 import { registerVirtualModules } from "../../common/virtual-modules.ts";
 
 const data = JSON.parse(process.env.ENV_RUNNER_DATA || "{}");
-const unregisterVirtualModules = await registerVirtualModules(data.virtual);
-const virtualEntry = isVirtualSpecifier(data.entry, data.virtual);
-let entry = await resolveEntry(data.entry, virtualEntry);
 
 // Deno doesn't support Node.js IPC (process.send), so use stdin/stdout JSON lines
 const _stdout = (globalThis as any).Deno?.stdout
@@ -20,6 +18,22 @@ const _stdout = (globalThis as any).Deno?.stdout
 const sendMessage = (message: unknown) => _stdout.write(JSON.stringify(message) + "\n");
 
 const _stdin = (globalThis as any).Deno?.stdin?.readable || process.stdin;
+
+const virtualEntry = isVirtualSpecifier(data.entry, data.virtual);
+
+let unregisterVirtualModules: () => void;
+let entry: AppEntry;
+try {
+  unregisterVirtualModules = await registerVirtualModules(data.virtual);
+  entry = await resolveEntry(data.entry, virtualEntry);
+} catch (error: any) {
+  // Report a structured error before exiting so the runner closes with a
+  // meaningful cause instead of an uncaught rejection + bare exit code.
+  const message = error?.message || String(error);
+  sendMessage({ event: "init-error", error: message });
+  console.error(`[env-runner] worker init failed: ${message}`);
+  process.exit(1);
+}
 
 const server = serve({
   port: 0,
