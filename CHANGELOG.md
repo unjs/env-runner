@@ -1,6 +1,18 @@
 # Changelog
 
 
+## v0.1.13
+
+[compare changes](https://github.com/unjs/env-runner/compare/v0.1.12...v0.1.13)
+
+### 🩹 Fixes
+
+- **upgrade:** Handle rejected websocket upgrades without crashing ([0558ae0](https://github.com/unjs/env-runner/commit/0558ae0))
+
+### ❤️ Contributors
+
+- Pooya Parsa ([@pi0](https://github.com/pi0))
+
 ## v0.1.12
 
 [compare changes](https://github.com/unjs/env-runner/compare/v0.1.11...v0.1.12)
