@@ -1,6 +1,8 @@
 import { spawn, execFileSync } from "node:child_process";
+import { mkdtempSync, existsSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { resolve, dirname } from "node:path";
+import { resolve, dirname, join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 // Regression tests for https://github.com/unjs/env-runner/issues/23:
@@ -98,6 +100,61 @@ describe("orphan workers on supervisor death", () => {
               process.kill(workerPid, "SIGKILL"); // clean up orphan if the test failed
             } catch {}
           }
+        }
+      },
+    );
+  }
+});
+
+// The disconnect handler must be registered before the entry import, otherwise a
+// supervisor death during a slow import (e.g. opening DB pools) is missed: the
+// `disconnect` event fires with no listener and is never replayed, so the worker
+// keeps running until the import completes — or forever, if it never does.
+describe("orphan workers on supervisor death during entry import", () => {
+  for (const c of cases) {
+    const exec = c.bunHost ? "bun" : process.execPath;
+    it.skipIf(c.skip ?? false)(
+      `${c.name}: worker exits when supervisor is SIGKILLed mid-import`,
+      { timeout: 20_000 },
+      async () => {
+        const markerDir = mkdtempSync(join(tmpdir(), "env-runner-orphan-"));
+        const startedMarker = join(markerDir, "import-started");
+        const finishedMarker = join(markerDir, "import-finished");
+        const supervisor = spawn(exec, [supervisorEntry, c.runner, "app-slow-import.mjs"], {
+          stdio: ["ignore", "ignore", "inherit"],
+          env: { ...process.env, ORPHAN_TEST_MARKER_DIR: markerDir },
+        });
+        try {
+          // Wait for the worker to begin importing the entry
+          const deadline = Date.now() + 10_000;
+          while (!existsSync(startedMarker)) {
+            if (supervisor.exitCode !== null) {
+              throw new Error(`supervisor exited early (code ${supervisor.exitCode})`);
+            }
+            if (Date.now() > deadline) {
+              throw new Error("timeout waiting for the worker to start importing");
+            }
+            await new Promise((r) => setTimeout(r, 50));
+          }
+
+          // Simulate non-graceful supervisor death while the import is in flight
+          supervisor.kill("SIGKILL");
+
+          // The import sleeps 3s; the worker must exit at IPC disconnect instead
+          // of completing it (a hanging import would otherwise orphan forever)
+          await new Promise((r) => setTimeout(r, 4500));
+          expect(
+            existsSync(finishedMarker),
+            "worker survived supervisor death through the entry import",
+          ).toBe(false);
+        } finally {
+          supervisor.kill("SIGKILL");
+          if (existsSync(startedMarker)) {
+            try {
+              process.kill(Number(readFileSync(startedMarker, "utf8")), "SIGKILL");
+            } catch {}
+          }
+          rmSync(markerDir, { recursive: true, force: true });
         }
       },
     );

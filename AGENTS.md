@@ -306,7 +306,8 @@ const runner2 = new NodeProcessEnvRunner({
 - Test fixture in `test/fixtures/app-env.mjs` — Entry that echoes request headers and selected environment variables as JSON
 - Test fixture in `test/fixtures/app-pid.mjs` — Entry that responds with the worker `process.pid` for orphan tests
 - Test fixture in `test/fixtures/orphan-supervisor.mjs` — Standalone supervisor process that spawns a runner, prints worker pid/address, and stays alive until SIGKILLed (for orphan tests)
-- **`test/orphan.test.ts`** — Regression tests for orphaned workers (#23): SIGKILLs the supervisor process and asserts the worker stops serving HTTP (node-process, bun-process under both Node and Bun hosts)
+- Test fixture in `test/fixtures/app-slow-import.mjs` — Entry with a slow (3s) top-level import that writes start/finish marker files, for mid-import orphan tests
+- **`test/orphan.test.ts`** — Regression tests for orphaned workers (#23): SIGKILLs the supervisor process and asserts the worker stops serving HTTP, plus mid-import variants asserting the worker exits even when the supervisor dies during a slow entry import (node-process, bun-process under both Node and Bun hosts)
 - **`test/vercel.test.ts`** — Tests for `VercelEnvRunner`: request header injection (`x-vercel-deployment-url`, `x-vercel-id`, `x-vercel-forwarded-for`, `x-forwarded-for`, `x-real-ip`, `x-forwarded-proto`, `x-forwarded-host`), response header injection (`server`, `x-vercel-id`, `x-vercel-cache`), environment variables (`VERCEL`, `VERCEL_ENV`, `VERCEL_REGION`, `NOW_REGION`), header preservation, pre-existing header respect
 - **`test/netlify.test.ts`** — Tests for `NetlifyEnvRunner`: header injection (`x-nf-client-connection-ip`, `x-nf-account-id`, `x-nf-site-id`, `x-nf-deploy-id`, `x-nf-deploy-context`, `x-nf-geo`, `x-nf-request-id`), IP derivation, header preservation
 - Tests cover: lifecycle, fetch (GET/POST), WebSocket upgrade, crossws websocket, messaging, hooks, graceful close, inspect output, manager hot-reload, message queueing, miniflare hot-reload, vercel header/env/response injection, netlify header injection, waitForReady, vite helpers, orphan-worker exit on supervisor death
@@ -337,6 +338,7 @@ const runner2 = new NodeProcessEnvRunner({
 - **Co-located runner + worker** — Each runner directory contains both `runner.ts` and `worker.ts` (except `self/` which has no worker). Runners default to their co-located worker via `import.meta.resolve("env-runner/runners/<name>/worker")` when `entry` is omitted
 - **Message-driven readiness** — Workers/processes post `{ address }` to signal ready state
 - **Immediate shutdown** — `close()` immediately terminates the worker/process (no graceful shutdown handshake)
+- **Orphan protection** — node-process/bun-process workers register `process.on("disconnect", () => process.exit(0))` at the top of the worker (before the entry import) so a non-graceful supervisor death (SIGKILL, crash) never leaves an orphan, even mid-import (#23)
 - **Data passing:** Worker threads use `workerData`, processes use `ENV_RUNNER_DATA` env var (JSON), self runner uses in-memory channel, miniflare runner uses in-memory `script` with `unsafeModuleFallbackService` for module resolution
 - **Socket cleanup** — `_closeSocket()` avoids deleting Windows named pipes and abstract sockets
 - **Custom inspect** — `[Symbol.for('nodejs.util.inspect.custom')]()` shows pending/ready/closed status
