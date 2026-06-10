@@ -52,16 +52,24 @@ export async function resolveVirtualModules(
  */
 const VIRTUAL_SCHEME = "virtual:";
 
-export function createVirtualHooks(virtual: Record<string, string>): {
+export function createVirtualHooks(
+  virtual: Record<string, string>,
+  versions?: ReadonlyMap<string, number>,
+): {
   resolve: ResolveHookSync;
   load: LoadHookSync;
 } {
   const resolve: ResolveHookSync = (specifier, context, nextResolve) => {
     // Strip a cache-busting `?query` suffix (used by reload) before matching, but
     // keep it in the URL so each reload yields a distinct module identity.
-    if (Object.hasOwn(virtual, _stripQuery(specifier))) {
+    const key = _stripQuery(specifier);
+    if (Object.hasOwn(virtual, key)) {
+      // The invalidation version (see `invalidateVirtualModule()`) is appended
+      // outside the encoded specifier, so the same plain import resolves to a
+      // fresh module identity after each invalidation.
+      const version = versions?.get(key);
       return {
-        url: VIRTUAL_SCHEME + encodeURIComponent(specifier),
+        url: VIRTUAL_SCHEME + encodeURIComponent(specifier) + (version ? `?v=${version}` : ""),
         shortCircuit: true,
       };
     }
@@ -99,6 +107,57 @@ export function virtualModuleFormat(specifier: string): "module" | "module-types
     return "module-typescript";
   }
   return "module";
+}
+
+/**
+ * Strip types from a virtual `.ts`/`.mts` source for a backend that can't
+ * parse TypeScript itself (Deno load hooks, workerd). Throws a clear
+ * `TypeError` when `module.stripTypeScriptTypes` is unavailable, with a
+ * backend-specific `requirement` (why it's needed) and `remedy` (what to
+ * upgrade) woven into the message.
+ */
+export function stripVirtualTypeScript(
+  specifier: string,
+  source: string,
+  stripTypeScriptTypes: ((code: string) => string) | undefined,
+  hints: { requirement: string; remedy: string },
+): string {
+  if (typeof stripTypeScriptTypes !== "function") {
+    throw new TypeError(
+      `[env-runner] virtual TypeScript module "${specifier}" requires \`module.stripTypeScriptTypes\` ${hints.requirement}; ${hints.remedy} or provide a pre-transpiled JavaScript source instead.`,
+    );
+  }
+  return stripTypeScriptTypes(source);
+}
+
+/**
+ * Expand an invalidated specifier to the set of virtual modules that must get
+ * a fresh identity: the specifier itself plus every virtual module that
+ * (transitively) imports it. Without this, a reloaded entry would resolve an
+ * intermediate importer to its cached instance, which still links the old
+ * module.
+ *
+ * Importers are detected with a quoted-occurrence scan of the virtual sources
+ * (the only modules whose identity invalidation can refresh — disk modules
+ * follow the entry-reload semantics). Over-matching is harmless: a bumped
+ * version only forces a re-evaluation of a module we already own the source of.
+ */
+export function expandVirtualInvalidation(
+  virtual: Record<string, string>,
+  specifier: string,
+): string[] {
+  const invalidated = [specifier];
+  const seen = new Set(invalidated);
+  for (const target of invalidated) {
+    const refs = [`"${target}"`, `'${target}'`, "`" + target + "`"];
+    for (const [key, source] of Object.entries(virtual)) {
+      if (!seen.has(key) && refs.some((ref) => source.includes(ref))) {
+        seen.add(key);
+        invalidated.push(key);
+      }
+    }
+  }
+  return invalidated;
 }
 
 function _stripQuery(specifier: string): string {

@@ -268,4 +268,70 @@ describe("RunnerManager", () => {
     expect(manager.closed).toBe(true);
     expect(runner.closed).toBe(true);
   });
+
+  function createVirtualCounterRunner(name: string, next: () => number) {
+    return new NodeWorkerEnvRunner({
+      name,
+      workerEntry,
+      data: {
+        entry: "#entry",
+        virtual: {
+          "#entry": `import config from "#config.json";
+            export default { fetch: () => new Response(String(config.count)) };`,
+          "#config.json": () => JSON.stringify({ count: next() }),
+        },
+      },
+    });
+  }
+
+  it("fetch after invalidateModule reloads the entry automatically", async () => {
+    let counter = 0;
+    const runner = createVirtualCounterRunner("manager-invalidate", () => counter++);
+    runners.push(runner);
+    manager = new RunnerManager(runner);
+    await waitForReady(runner);
+
+    let reloads = 0;
+    manager.onMessage((msg: any) => {
+      if (msg?.event === "module-reloaded") reloads++;
+    });
+
+    expect(await (await manager.fetch("http://localhost/")).text()).toBe("0");
+
+    // No explicit reloadModule(): the pending invalidation flushes on fetch,
+    // and concurrent fetches share a single reload.
+    await manager.invalidateModule("#config.json");
+    const [res1, res2] = await Promise.all([
+      manager.fetch("http://localhost/"),
+      manager.fetch("http://localhost/"),
+    ]);
+    expect(await res1.text()).toBe("1");
+    expect(await res2.text()).toBe("1");
+    expect(reloads).toBe(1);
+
+    // Plain fetches don't reload again
+    expect(await (await manager.fetch("http://localhost/")).text()).toBe("1");
+    expect(reloads).toBe(1);
+  });
+
+  it("explicit reloadModule satisfies a pending invalidation", async () => {
+    let counter = 0;
+    const runner = createVirtualCounterRunner("manager-invalidate-explicit", () => counter++);
+    runners.push(runner);
+    manager = new RunnerManager(runner);
+    await waitForReady(runner);
+
+    let reloads = 0;
+    manager.onMessage((msg: any) => {
+      if (msg?.event === "module-reloaded") reloads++;
+    });
+
+    await manager.invalidateModule("#config.json");
+    await manager.reloadModule();
+    expect(reloads).toBe(1);
+
+    // The explicit reload cleared the flag — fetch must not reload again
+    expect(await (await manager.fetch("http://localhost/")).text()).toBe("1");
+    expect(reloads).toBe(1);
+  });
 });

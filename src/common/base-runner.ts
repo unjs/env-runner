@@ -37,9 +37,12 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
   protected _name: string;
   protected _workerEntry: string;
   protected _data?: EnvRunnerData;
+  protected _virtualSources?: VirtualModules;
   protected _hooks: Partial<WorkerHooks>;
   protected _address?: WorkerAddress;
   protected _messageListeners: Set<(data: unknown) => void>;
+  protected _pendingRequests: Set<(cause?: unknown) => void>;
+  protected _virtualResolved?: Promise<void>;
 
   constructor(opts: {
     name: string;
@@ -52,6 +55,7 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
     this._data = opts.data;
     this._hooks = opts.hooks || {};
     this._messageListeners = new Set();
+    this._pendingRequests = new Set();
   }
 
   get ready() {
@@ -114,54 +118,43 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
 
   rpc<T = unknown>(name: string, data?: unknown, opts?: { timeout?: number }): Promise<T> {
     const id = Math.random().toString(36).slice(2);
-    const timeout = opts?.timeout ?? 3000;
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        cleanup();
-        reject(new Error(`RPC "${name}" timed out`));
-      }, timeout);
-      const listener = (msg: any) => {
-        if (msg?.__rpc_id === id) {
-          cleanup();
-          if (msg.error) {
-            reject(typeof msg.error === "string" ? new Error(msg.error) : msg.error);
-          } else {
-            resolve(msg.data as T);
-          }
-        }
-      };
-      const cleanup = () => {
-        clearTimeout(timer);
-        this.offMessage(listener);
-      };
-      this.onMessage(listener);
-      this.sendMessage({ __rpc: name, __rpc_id: id, data });
-    });
+    return this._request<{ data: T }>(
+      { __rpc: name, __rpc_id: id, data },
+      {
+        match: (msg) => msg?.__rpc_id === id,
+        timeout: opts?.timeout ?? 3000,
+        timeoutError: `RPC "${name}" timed out`,
+      },
+    ).then((msg) => msg.data);
   }
 
   async reloadModule(timeout = 5000): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        cleanup();
-        reject(new Error("Module reload timed out"));
-      }, timeout);
-      const listener = (msg: any) => {
-        if (msg?.event === "module-reloaded") {
-          cleanup();
-          if (msg.error) {
-            reject(typeof msg.error === "string" ? new Error(msg.error) : msg.error);
-          } else {
-            resolve();
-          }
-        }
-      };
-      const cleanup = () => {
-        clearTimeout(timer);
-        this.offMessage(listener);
-      };
-      this.onMessage(listener);
-      this.sendMessage({ event: "reload-module" });
-    });
+    await this._request(
+      { event: "reload-module" },
+      {
+        match: (msg) => msg?.event === "module-reloaded",
+        timeout,
+        timeoutError: "Module reload timed out",
+      },
+    );
+  }
+
+  /**
+   * Invalidate a virtual module so the next `reloadModule()` re-evaluates it.
+   * A factory-valued `data.virtual` source is re-run on the host and the fresh
+   * source is shipped to the worker along with the invalidation. Rejects when
+   * the specifier is not a registered virtual module.
+   */
+  async invalidateModule(specifier: string, timeout = 5000): Promise<void> {
+    const source = await this._refreshVirtualSource(specifier);
+    await this._request(
+      { event: "invalidate-module", specifier, source },
+      {
+        match: (msg) => msg?.event === "module-invalidated" && msg.specifier === specifier,
+        timeout,
+        timeoutError: `Module invalidation timed out for "${specifier}"`,
+      },
+    );
   }
 
   async close(cause?: unknown) {
@@ -169,6 +162,11 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
       return;
     }
     this.closed = true;
+    // Safe to iterate directly: each rejector only deletes itself from the set.
+    for (const rejectPending of this._pendingRequests) {
+      rejectPending(cause);
+    }
+    this._pendingRequests.clear();
     this._hooks.onClose?.(this, cause);
     this._hooks = {};
     const onError = (error: unknown) => console.error(error);
@@ -207,6 +205,59 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
   }
 
   /**
+   * Send a message and await a matching response message. Shared by `rpc()`,
+   * `reloadModule()`, and `invalidateModule()`. Rejects on timeout, on a
+   * response carrying an `error`, and promptly when the runner closes mid-wait
+   * (instead of letting callers wait out the timeout on a dead worker).
+   */
+  protected _request<T = unknown>(
+    message: unknown,
+    opts: {
+      match: (msg: any) => boolean;
+      timeout: number;
+      timeoutError: string;
+      send?: (message: unknown) => void;
+    },
+  ): Promise<T> {
+    if (this.closed) {
+      return Promise.reject(new Error("Runner is closed"));
+    }
+    return new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        cleanup();
+        reject(new Error(opts.timeoutError));
+      }, opts.timeout);
+      const listener = (msg: any) => {
+        if (opts.match(msg)) {
+          cleanup();
+          if (msg.error) {
+            reject(typeof msg.error === "string" ? new Error(msg.error) : msg.error);
+          } else {
+            resolve(msg as T);
+          }
+        }
+      };
+      const onClose = (cause?: unknown) => {
+        cleanup();
+        reject(new Error("Runner closed before responding", cause ? { cause } : undefined));
+      };
+      const cleanup = () => {
+        clearTimeout(timer);
+        this.offMessage(listener);
+        this._pendingRequests.delete(onClose);
+      };
+      this.onMessage(listener);
+      this._pendingRequests.add(onClose);
+      try {
+        (opts.send ?? ((m: unknown) => this.sendMessage(m)))(message);
+      } catch (error) {
+        cleanup();
+        reject(error);
+      }
+    });
+  }
+
+  /**
    * Resolve any factory-valued `data.virtual` sources to strings before the
    * worker is spawned. Returns a pending promise only when there is async work
    * to do (a factory is present); otherwise returns `undefined` so subclasses can
@@ -215,12 +266,39 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
    */
   protected _resolveVirtualData(): Promise<void> | undefined {
     const virtual = this._data?.virtual;
+    // Keep the original sources (including factories) so `invalidateModule()`
+    // can re-run a factory for fresh contents.
+    this._virtualSources = virtual;
     if (!virtual || !Object.values(virtual).some((v) => typeof v === "function")) {
       return undefined;
     }
-    return resolveVirtualModules(virtual).then((resolved) => {
+    this._virtualResolved = resolveVirtualModules(virtual).then((resolved) => {
       this._data = { ...this._data, virtual: resolved };
     });
+    return this._virtualResolved;
+  }
+
+  /**
+   * Re-run a factory-valued virtual source on the host and sync the resolved
+   * `data.virtual` map. Returns the fresh source, or `undefined` when the
+   * source is a plain string or unknown (nothing to re-evaluate).
+   */
+  protected async _refreshVirtualSource(specifier: string): Promise<string | undefined> {
+    // Wait for the initial factory resolution first: until it settles,
+    // `_data.virtual` still aliases the original (factory-valued) map, and
+    // writing a resolved string into it would permanently replace the factory.
+    // (A rejected resolution closes the runner via `_initWithVirtualData`.)
+    await this._virtualResolved?.catch(() => {});
+    const original = this._virtualSources?.[specifier];
+    if (typeof original !== "function") {
+      return undefined;
+    }
+    const source = await original();
+    const resolved = this._data?.virtual as Record<string, string> | undefined;
+    if (resolved) {
+      resolved[specifier] = source;
+    }
+    return source;
   }
 
   /**

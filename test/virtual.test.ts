@@ -309,6 +309,82 @@ for (const { name, create, skip, deno, miniflare } of runners) {
       },
     );
 
+    it("invalidates a virtual module so reload re-runs its factory source", async () => {
+      let counter = 0;
+      runner = create({
+        name: "virtual-invalidate",
+        data: {
+          entry: "#entry",
+          virtual: {
+            "#entry": `import config from "#config.json";
+              export default { fetch: () => new Response(String(config.count)) };`,
+            "#config.json": () => JSON.stringify({ count: counter++ }),
+          },
+        },
+      });
+      await runner.waitForReady();
+      expect(await (await runner.fetch("http://localhost/")).text()).toBe("0");
+
+      // Reload alone keeps the cached dependency (the factory is not re-run)
+      await runner.reloadModule!();
+      expect(await (await runner.fetch("http://localhost/")).text()).toBe("0");
+
+      // Invalidate + reload re-runs the factory and re-imports the graph
+      await runner.invalidateModule!("#config.json");
+      await runner.reloadModule!();
+      expect(await (await runner.fetch("http://localhost/")).text()).toBe("1");
+
+      // Repeated invalidation keeps working
+      await runner.invalidateModule!("#config.json");
+      await runner.reloadModule!();
+      expect(await (await runner.fetch("http://localhost/")).text()).toBe("2");
+    });
+
+    it("invalidation reaches a module imported through an intermediate virtual module", async () => {
+      let counter = 0;
+      runner = create({
+        name: "virtual-invalidate-transitive",
+        data: {
+          entry: "#entry",
+          virtual: {
+            "#entry": `import { count } from "#middle";
+              export default { fetch: () => new Response(String(count)) };`,
+            "#middle": `import config from "#config.json";
+              export const count = config.count;`,
+            "#config.json": () => JSON.stringify({ count: counter++ }),
+          },
+        },
+      });
+      await runner.waitForReady();
+      expect(await (await runner.fetch("http://localhost/")).text()).toBe("0");
+
+      // The intermediate importer (#middle) must also get a fresh identity,
+      // otherwise its cached instance keeps linking the old #config.json.
+      await runner.invalidateModule!("#config.json");
+      await runner.reloadModule!();
+      expect(await (await runner.fetch("http://localhost/")).text()).toBe("1");
+
+      await runner.invalidateModule!("#config.json");
+      await runner.reloadModule!();
+      expect(await (await runner.fetch("http://localhost/")).text()).toBe("2");
+    });
+
+    it("rejects invalidating an unknown virtual specifier", async () => {
+      runner = create({
+        name: "virtual-invalidate-unknown",
+        data: {
+          entry: "#entry",
+          virtual: {
+            "#entry": `export default { fetch: () => new Response("ok") };`,
+          },
+        },
+      });
+      await runner.waitForReady();
+      await expect(runner.invalidateModule!("#unknown")).rejects.toThrow(
+        'Cannot invalidate "#unknown"',
+      );
+    });
+
     it("reloads a virtual entry without restarting the worker", async () => {
       runner = create({
         name: "virtual-entry-reload",
@@ -327,6 +403,70 @@ for (const { name, create, skip, deno, miniflare } of runners) {
     });
   });
 }
+
+describe("MiniflareEnvRunner virtual module invalidation", () => {
+  // Versioning rewrites import specifiers only (es-module-lexer), never
+  // arbitrary string literals — code mentioning the key as plain data must
+  // come through invalidation unchanged.
+  it("does not rewrite string literals that merely mention an invalidated key", async () => {
+    let counter = 0;
+    const runner = new MiniflareEnvRunner({
+      name: "virtual-invalidate-literal",
+      data: {
+        entry: "#entry",
+        virtual: {
+          "#entry": `import config from "#config.json";
+            const KEY = "#config.json";
+            export default { fetch: () => new Response(KEY + ":" + config.count) };`,
+          "#config.json": () => JSON.stringify({ count: counter++ }),
+        },
+      },
+    });
+    try {
+      await runner.waitForReady();
+      expect(await (await runner.fetch("http://localhost/")).text()).toBe("#config.json:0");
+      await runner.invalidateModule("#config.json");
+      await runner.reloadModule();
+      // The import picked up the fresh module; the data string is untouched.
+      expect(await (await runner.fetch("http://localhost/")).text()).toBe("#config.json:1");
+    } finally {
+      await runner.close();
+    }
+  });
+
+  it("invalidation works across runners sharing a persistent instance", async () => {
+    let counter = 0;
+    const data = {
+      entry: "#entry",
+      virtual: {
+        "#entry": `import config from "#config.json";
+          export default { fetch: () => new Response(String(config.count)) };`,
+        // Resolves to the same source for both runners so the cache key matches.
+        "#config.json": () => JSON.stringify({ count: counter }),
+      },
+    };
+    // Mirror a RunnerManager swap: the new runner attaches to the cached
+    // instance first, then the old one closes (refCount stays > 0).
+    const first = new MiniflareEnvRunner({ name: "virtual-persistent", persistent: true, data });
+    await first.waitForReady();
+    const second = new MiniflareEnvRunner({ name: "virtual-persistent", persistent: true, data });
+    try {
+      await second.waitForReady();
+      await first.close();
+      expect(await (await second.fetch("http://localhost/")).text()).toBe("0");
+      // Invalidate through the runner that attached to the cached instance —
+      // the fresh source must reach the maps the live fallback actually serves.
+      counter = 1;
+      await second.invalidateModule("#config.json");
+      await second.reloadModule();
+      expect(await (await second.fetch("http://localhost/")).text()).toBe("1");
+    } finally {
+      await second.close();
+      await first.close();
+      await MiniflareEnvRunner.disposeAll();
+    }
+  });
+});
 
 describe("MiniflareEnvRunner virtual module limitations", () => {
   // The wrapper wires DO/Entrypoint exports as static re-exports, which
@@ -352,6 +492,18 @@ describe("MiniflareEnvRunner virtual module limitations", () => {
     expect(runner.closed).toBe(true);
     expect(String((closeCause as Error)?.message)).toContain("virtual entry");
     await runner.close();
+  });
+});
+
+describe("SelfEnvRunner virtual module limitations", () => {
+  it("rejects invalidateModule instead of leaking the IPC message to the entry", async () => {
+    const { SelfEnvRunner } = await import("../src/runners/self/runner.ts");
+    await using runner = new SelfEnvRunner({
+      name: "self-invalidate",
+      data: { entry: resolve(_dir, "./fixtures/app.mjs") },
+    });
+    await runner.waitForReady();
+    await expect(runner.invalidateModule("#x")).rejects.toThrow("does not support virtual modules");
   });
 });
 

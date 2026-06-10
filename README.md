@@ -162,6 +162,10 @@ const result = await runner.rpc<string>("transformHTML", "<html>...</html>");
 // Hot-reload entry module without restarting the worker
 await runner.reloadModule();
 
+// Invalidate a virtual module (re-runs a factory source), then reload
+await runner.invalidateModule("#config.json");
+await runner.reloadModule();
+
 // Graceful shutdown happens automatically at the end of the scope
 // (`await using`) — or call `await runner.close()` explicitly
 ```
@@ -240,6 +244,15 @@ await using runner = new NodeWorkerEnvRunner({
 ```
 
 Factories are invoked once on the host (before the worker is spawned), so the worker always receives plain strings — functions can't cross the `workerData`/`JSON` boundary, and Node's synchronous load hook can't await. For the same reason, **all** factories are resolved eagerly at startup (in parallel), not lazily on first import — so keep them cheap, or use plain strings for sources that don't need computation. Maps containing only strings skip this step entirely.
+
+To refresh a single virtual module without restarting the worker, call `invalidateModule(specifier)`: a factory-valued source is re-run on the host and the module is invalidated in the worker so its **next import evaluates fresh**. Virtual modules that import the invalidated one (directly or transitively) are invalidated along with it, so the fresh module is picked up even through intermediate virtual importers. Already-imported modules keep their instances, so pair it with `reloadModule()` to re-import the entry graph:
+
+```ts
+await runner.invalidateModule("#config"); // re-runs the factory, busts the module
+await runner.reloadModule(); // re-imports the entry, picking up the fresh module
+```
+
+When fetching through `RunnerManager` or `EnvServer`, the reload is automatic: `invalidateModule()` marks the manager dirty and the next `fetch()` reloads the entry once before serving (concurrent fetches share the reload), so no explicit `reloadModule()` call is needed.
 
 The module format is derived from the specifier extension: `.ts`/`.mts` sources are served as **TypeScript** and `.json` sources as **JSON modules**; everything else is plain JavaScript ESM:
 

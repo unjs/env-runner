@@ -7,7 +7,7 @@ import {
   isVirtualSpecifier,
   type AppEntry,
 } from "../../common/worker-utils.ts";
-import { registerVirtualModules } from "../../common/virtual-modules.ts";
+import { registerVirtualModules, handleInvalidateModule } from "../../common/virtual-modules.ts";
 
 // Exit when the supervisor disappears (graceful or crash) to avoid orphan workers.
 // Registered before resolving the entry so a supervisor death during a slow
@@ -76,6 +76,11 @@ process.on("message", async (message: any) => {
     } catch (error: any) {
       process.send!({ event: "module-reloaded", error: error?.message || String(error) });
     }
+    return;
+  }
+
+  if (message?.event === "invalidate-module") {
+    handleInvalidateModule(message, sendMessage);
     return;
   }
 

@@ -81,6 +81,12 @@ export interface EnvRunner extends RunnerRPCHooks, AsyncDisposable {
   /** Re-import the entry module without restarting the worker/process. */
   reloadModule?(timeout?: number): Promise<void>;
 
+  /**
+   * Invalidate a virtual module so the next `reloadModule()` re-evaluates it.
+   * A factory-valued source is re-run for fresh contents.
+   */
+  invalidateModule?(specifier: string, timeout?: number): Promise<void>;
+
   /** Gracefully shut down the worker. */
   close(): Promise<void>;
 

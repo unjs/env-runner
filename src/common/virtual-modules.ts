@@ -1,4 +1,9 @@
-import { createVirtualHooks, virtualModuleFormat } from "../virtual-loader.ts";
+import {
+  createVirtualHooks,
+  expandVirtualInvalidation,
+  stripVirtualTypeScript,
+  virtualModuleFormat,
+} from "../virtual-loader.ts";
 
 /**
  * Register runtime hooks that serve virtual modules from an in-memory
@@ -52,11 +57,32 @@ export async function registerVirtualModules(
   }
   const { registerHooks, stripTypeScriptTypes } = await import("node:module");
   if (typeof registerHooks === "function") {
+    let transformSource: ((specifier: string, source: string) => string) | undefined;
     if ("Deno" in globalThis) {
-      virtual = _transformForDeno(virtual, stripTypeScriptTypes);
+      transformSource = (specifier, source) =>
+        _transformSourceForDeno(specifier, source, stripTypeScriptTypes);
+      const transformed: Record<string, string> = {};
+      for (const [specifier, source] of Object.entries(virtual)) {
+        transformed[specifier] = transformSource(specifier, source);
+      }
+      virtual = transformed;
     }
-    const hooks = registerHooks(createVirtualHooks(virtual));
-    return _once(() => hooks.deregister());
+    const registration: HooksRegistration = {
+      virtual,
+      versions: new Map(),
+      transformSource,
+    };
+    // Track only after registerHooks succeeds — a throw here must not leave an
+    // orphaned registration (no unregister function is returned to remove it).
+    const hooks = registerHooks(createVirtualHooks(virtual, registration.versions));
+    _hooksRegistrations.unshift(registration);
+    return _once(() => {
+      const index = _hooksRegistrations.indexOf(registration);
+      if (index !== -1) {
+        _hooksRegistrations.splice(index, 1);
+      }
+      hooks.deregister();
+    });
   }
   const bunPlugin = (globalThis as any).Bun?.plugin;
   if (typeof bunPlugin === "function") {
@@ -93,6 +119,83 @@ export function refreshVirtualModule(specifier: string): boolean {
   return true;
 }
 
+/**
+ * Invalidate a registered virtual module so its **next import evaluates
+ * fresh**, optionally replacing the stored source. Already-linked importers
+ * keep their instances — pair with an entry reload (`reloadModule()`) so the
+ * re-imported graph picks up the new module.
+ *
+ * The invalidation is expanded to every virtual module that (transitively)
+ * imports the specifier ({@link expandVirtualInvalidation}), so the fresh
+ * module is picked up even through intermediate virtual importers — not only
+ * when the entry imports it directly.
+ *
+ * - `registerHooks` backend: the per-specifier versions consulted by the
+ *   resolve hook are bumped, so the same plain imports resolve to new
+ *   `virtual:` URLs (fresh module identities). An updated source goes through
+ *   the same Deno transform as registration (JSON wrap / type stripping).
+ * - `Bun.plugin` backend: the live source map is updated and the specifiers
+ *   re-registered (Bun busts its module cache on override).
+ *
+ * Returns `false` when the specifier is not part of an active registration.
+ */
+export function invalidateVirtualModule(specifier: string, source?: string): boolean {
+  for (const registration of _hooksRegistrations) {
+    if (!Object.hasOwn(registration.virtual, specifier)) {
+      continue;
+    }
+    const { virtual, versions, transformSource } = registration;
+    if (source !== undefined) {
+      virtual[specifier] = transformSource ? transformSource(specifier, source) : source;
+    }
+    for (const key of expandVirtualInvalidation(virtual, specifier)) {
+      versions.set(key, (versions.get(key) ?? 0) + 1);
+    }
+    return true;
+  }
+  if (_bunVirtual && Object.hasOwn(_bunVirtual, specifier)) {
+    if (source !== undefined) {
+      _bunVirtual[specifier] = source;
+    }
+    _registerBunModules(expandVirtualInvalidation(_bunVirtual, specifier));
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Handle an `invalidate-module` IPC message in a built-in worker: invalidate
+ * the virtual module (see {@link invalidateVirtualModule}) and ack with a
+ * `module-invalidated` event, carrying an `error` when the specifier is not
+ * part of an active registration.
+ */
+export function handleInvalidateModule(
+  message: { specifier: string; source?: string },
+  sendMessage: (message: unknown) => void,
+): void {
+  const ok = invalidateVirtualModule(message.specifier, message.source);
+  sendMessage({
+    event: "module-invalidated",
+    specifier: message.specifier,
+    error: ok
+      ? undefined
+      : `Cannot invalidate "${message.specifier}" (not a registered virtual module)`,
+  });
+}
+
+interface HooksRegistration {
+  virtual: Record<string, string>;
+  versions: Map<string, number>;
+  transformSource?: (specifier: string, source: string) => string;
+}
+
+// Active registerHooks-backend registrations, latest first. `registerHooks`
+// stacks registrations (all stay active until deregistered), so invalidation
+// searches every live registration instead of only the most recent one. The
+// hooks close over each registration's `virtual` and `versions`, so
+// invalidation mutates them in place.
+const _hooksRegistrations: HooksRegistration[] = [];
+
 let _bunVirtual: Record<string, string> | undefined;
 
 // Load callbacks read from the live `_bunVirtual` map (not a captured source)
@@ -124,32 +227,28 @@ function _registerBunModules(specifiers: string[]): void {
 
 // Deno ignores the `format` returned by custom load hooks (every source is
 // parsed as plain JS), so non-JS sources are converted to ES modules before
-// registration: `.json` via a default-exporting wrapper (Deno doesn't validate
-// import attributes on hook-loaded modules, so `with { type: "json" }` stays
-// portable), `.ts`/`.mts` via `module.stripTypeScriptTypes` (in Deno's
-// node:module compat since 2.8.2). On older Deno without it a `.ts`/`.mts`
-// specifier throws instead of failing later with an opaque SyntaxError.
-function _transformForDeno(
-  virtual: Record<string, string>,
+// registration (and again when invalidation replaces a source): `.json` via a
+// default-exporting wrapper (Deno doesn't validate import attributes on
+// hook-loaded modules, so `with { type: "json" }` stays portable), `.ts`/`.mts`
+// via `module.stripTypeScriptTypes` (in Deno's node:module compat since 2.8.2).
+// On older Deno without it a `.ts`/`.mts` specifier throws instead of failing
+// later with an opaque SyntaxError.
+function _transformSourceForDeno(
+  specifier: string,
+  source: string,
   stripTypeScriptTypes?: (code: string) => string,
-): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const [specifier, source] of Object.entries(virtual)) {
-    const format = virtualModuleFormat(specifier);
-    if (format === "module-typescript") {
-      if (typeof stripTypeScriptTypes !== "function") {
-        throw new TypeError(
-          `[env-runner] virtual TypeScript module "${specifier}" requires \`module.stripTypeScriptTypes\` (custom load hooks bypass Deno's native type stripping); upgrade Deno or provide a pre-transpiled JavaScript source instead.`,
-        );
-      }
-      out[specifier] = stripTypeScriptTypes(source);
-    } else if (format === "json") {
-      out[specifier] = `export default JSON.parse(${JSON.stringify(source)});`;
-    } else {
-      out[specifier] = source;
-    }
+): string {
+  const format = virtualModuleFormat(specifier);
+  if (format === "module-typescript") {
+    return stripVirtualTypeScript(specifier, source, stripTypeScriptTypes, {
+      requirement: "(custom load hooks bypass Deno's native type stripping)",
+      remedy: "upgrade Deno",
+    });
   }
-  return out;
+  if (format === "json") {
+    return `export default JSON.parse(${JSON.stringify(source)});`;
+  }
+  return source;
 }
 
 const _noop = () => {};

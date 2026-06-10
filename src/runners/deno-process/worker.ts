@@ -7,7 +7,7 @@ import {
   isVirtualSpecifier,
   type AppEntry,
 } from "../../common/worker-utils.ts";
-import { registerVirtualModules } from "../../common/virtual-modules.ts";
+import { registerVirtualModules, handleInvalidateModule } from "../../common/virtual-modules.ts";
 
 const data = JSON.parse(process.env.ENV_RUNNER_DATA || "{}");
 
@@ -101,6 +101,11 @@ async function handleMessage(message: any) {
     } catch (error: any) {
       sendMessage({ event: "module-reloaded", error: error?.message || String(error) });
     }
+    return;
+  }
+
+  if (message?.event === "invalidate-module") {
+    handleInvalidateModule(message, sendMessage);
     return;
   }
 

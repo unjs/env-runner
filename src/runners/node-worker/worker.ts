@@ -8,7 +8,7 @@ import {
   isVirtualSpecifier,
   type AppEntry,
 } from "../../common/worker-utils.ts";
-import { registerVirtualModules } from "../../common/virtual-modules.ts";
+import { registerVirtualModules, handleInvalidateModule } from "../../common/virtual-modules.ts";
 
 const data = workerData || {};
 const sendMessage = (message: unknown) => parentPort?.postMessage(message);
@@ -72,6 +72,11 @@ parentPort?.on("message", async (message) => {
     } catch (error: any) {
       parentPort?.postMessage({ event: "module-reloaded", error: error?.message || String(error) });
     }
+    return;
+  }
+
+  if (message?.event === "invalidate-module") {
+    handleInvalidateModule(message, sendMessage);
     return;
   }
 

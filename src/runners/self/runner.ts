@@ -64,6 +64,15 @@ export class SelfEnvRunner extends BaseEnvRunner {
     this.#entry?.ipc?.onMessage?.(message);
   }
 
+  // Without this override the inherited implementation would leak the internal
+  // `invalidate-module` message into the entry's `ipc.onMessage` and hang until
+  // the ack timeout (there is no worker to respond).
+  override async invalidateModule(specifier: string): Promise<void> {
+    throw new Error(
+      `Cannot invalidate "${specifier}": the self runner does not support virtual modules`,
+    );
+  }
+
   override async reloadModule(): Promise<void> {
     const entryPath = this._data?.entry as string | undefined;
     if (!entryPath || !this.#entry) {

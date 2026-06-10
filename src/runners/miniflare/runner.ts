@@ -6,11 +6,16 @@ import { basename, dirname, isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { resolveModulePath } from "exsolve";
 import { init as initCjsLexer, parse as parseCjs } from "cjs-module-lexer";
+import { init as initEsmLexer, parse as parseEsm } from "es-module-lexer";
 import { proxyUpgrade } from "httpxy";
 import { BaseEnvRunner } from "../../common/base-runner.ts";
 import type { EnvRunnerData } from "../../common/base-runner.ts";
 import { isVirtualSpecifier } from "../../common/worker-utils.ts";
-import { virtualModuleFormat } from "../../virtual-loader.ts";
+import {
+  expandVirtualInvalidation,
+  stripVirtualTypeScript,
+  virtualModuleFormat,
+} from "../../virtual-loader.ts";
 import { generateWrapper, IPC_BINDING } from "./wrapper.ts";
 import type { IncomingMessage } from "node:http";
 import type { Socket } from "node:net";
@@ -73,14 +78,27 @@ export interface MiniflareEnvRunnerOptions {
 
 const IPC_PATH = "/__env_runner_ipc";
 
+interface MiniflareCacheEntry {
+  mf: InstanceType<any>;
+  refCount: number;
+  // The instance's fallback-service closure serves these live maps; runners
+  // attaching to the cached instance adopt them so `invalidateModule()`
+  // mutates what the instance actually serves (see #initAsync).
+  virtual?: Record<string, string>;
+  versions: Map<string, number>;
+}
+
 // Module-level cache for persistent Miniflare instances
-const _miniflareCache = new Map<string, { mf: InstanceType<any>; refCount: number }>();
+const _miniflareCache = new Map<string, MiniflareCacheEntry>();
 
 export class MiniflareEnvRunner extends BaseEnvRunner {
   #miniflare?: InstanceType<any>;
   #miniflareOptions: Record<string, unknown>;
   #transformRequest?: (id: string) => Promise<TransformResult | null | undefined>;
   #reloadCounter = 0;
+  #virtual?: Record<string, string>;
+  #virtualVersions = new Map<string, number>();
+  #cacheEntry?: MiniflareCacheEntry;
   #ws?: { send(data: string): void; close(): void };
   #persistent: boolean;
   #cacheKey?: string;
@@ -116,7 +134,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
         this.#ws.close();
         this.#ws = undefined;
       }
-      if (this.#cacheKey) {
+      if (this.#cacheKey && _miniflareCache.get(this.#cacheKey)?.mf === this.#miniflare) {
         _miniflareCache.delete(this.#cacheKey);
       }
       await this.#miniflare.dispose();
@@ -178,29 +196,49 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
       return;
     }
     this.#reloadCounter++;
-    const version = this.#reloadCounter;
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        cleanup();
-        reject(new Error("Module reload timed out"));
-      }, timeout);
-      const listener = (msg: any) => {
-        if (msg?.event === "module-reloaded") {
-          cleanup();
-          if (msg.error) {
-            reject(typeof msg.error === "string" ? new Error(msg.error) : msg.error);
-          } else {
-            resolve();
-          }
-        }
-      };
-      const cleanup = () => {
-        clearTimeout(timer);
-        this.offMessage(listener);
-      };
-      this.onMessage(listener);
-      this.#ws!.send(JSON.stringify({ type: "reload", version }));
-    });
+    await this._request(
+      { type: "reload", version: this.#reloadCounter },
+      {
+        match: (msg) => msg?.event === "module-reloaded",
+        timeout,
+        timeoutError: "Module reload timed out",
+        send: (message) => this.#ws!.send(JSON.stringify(message)),
+      },
+    );
+  }
+
+  /**
+   * Invalidate a virtual module so the next `reloadModule()` re-evaluates it.
+   *
+   * Host-side only (no worker round-trip): the module fallback service serves
+   * virtual sources from a live map, so re-running a factory source and
+   * bumping the per-specifier versions — the module plus its transitive
+   * virtual importers — is enough. Import specifiers in re-served module code
+   * are rewritten to the versioned form, giving workerd fresh module
+   * identities (it caches by name). A `persistent` instance is evicted from
+   * the cache, since its served sources no longer match the cache key.
+   */
+  override async invalidateModule(specifier: string, _timeout?: number): Promise<void> {
+    const virtual = this.#virtual;
+    if (!virtual || !Object.hasOwn(virtual, specifier)) {
+      const hasVirtual = Object.keys((this._data?.virtual as object) ?? {}).length > 0;
+      throw !virtual && hasVirtual && !this.closed
+        ? new Error("Miniflare env runner should be initialized before invalidating modules.")
+        : new Error(`Cannot invalidate "${specifier}" (not a registered virtual module)`);
+    }
+    const source = await this._refreshVirtualSource(specifier);
+    if (source !== undefined) {
+      virtual[specifier] = await this.#prepareVirtualSource(specifier, source);
+    }
+    for (const key of expandVirtualInvalidation(virtual, specifier)) {
+      this.#virtualVersions.set(key, (this.#virtualVersions.get(key) ?? 0) + 1);
+    }
+    // The mutated sources no longer match the cache key — evict so future
+    // runners constructed with the original sources get a fresh instance.
+    // Current handles keep ref-counting through #cacheEntry.
+    if (this.#cacheKey && _miniflareCache.get(this.#cacheKey) === this.#cacheEntry) {
+      _miniflareCache.delete(this.#cacheKey);
+    }
   }
 
   // #region Protected methods
@@ -222,14 +260,16 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
       this.#ws.close();
       this.#ws = undefined;
     }
-    if (this.#persistent && this.#cacheKey) {
-      const cached = _miniflareCache.get(this.#cacheKey);
-      if (cached) {
-        cached.refCount--;
-        if (cached.refCount <= 0) {
+    // Ref-count through the entry object (not a cache lookup): invalidation
+    // evicts the entry from the cache while handles still share the instance.
+    const entry = this.#cacheEntry;
+    if (entry) {
+      entry.refCount--;
+      if (entry.refCount <= 0) {
+        if (this.#cacheKey && _miniflareCache.get(this.#cacheKey) === entry) {
           _miniflareCache.delete(this.#cacheKey);
-          await this.#miniflare.dispose();
         }
+        await this.#miniflare.dispose();
       }
     } else {
       await this.#miniflare.dispose();
@@ -279,24 +319,20 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
       return undefined;
     }
     const out: Record<string, string> = {};
-    let strip: ((code: string) => string) | undefined;
     for (const [specifier, source] of Object.entries(virtual)) {
-      if (virtualModuleFormat(specifier) === "module-typescript") {
-        if (!strip) {
-          const { stripTypeScriptTypes } = await import("node:module");
-          if (typeof stripTypeScriptTypes !== "function") {
-            throw new TypeError(
-              `[env-runner] virtual TypeScript module "${specifier}" requires \`module.stripTypeScriptTypes\` on the host (workerd does not parse TypeScript); upgrade Node.js or provide a pre-transpiled JavaScript source instead.`,
-            );
-          }
-          strip = stripTypeScriptTypes;
-        }
-        out[specifier] = strip(source);
-      } else {
-        out[specifier] = source;
-      }
+      out[specifier] = await this.#prepareVirtualSource(specifier, source);
     }
     return out;
+  }
+
+  async #prepareVirtualSource(specifier: string, source: string): Promise<string> {
+    if (virtualModuleFormat(specifier) !== "module-typescript") {
+      return source;
+    }
+    return stripVirtualTypeScript(specifier, source, await _getStripTypeScriptTypes(), {
+      requirement: "on the host (workerd does not parse TypeScript)",
+      remedy: "upgrade Node.js",
+    });
   }
 
   async #initAsync() {
@@ -304,6 +340,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
 
     const entryPath = this._data?.entry as string | undefined;
     const virtual = await this.#prepareVirtualModules();
+    this.#virtual = virtual;
 
     const userFlags = (this.#miniflareOptions.compatibilityFlags as string[]) || [];
     const userDirectSockets = (this.#miniflareOptions.unsafeDirectSockets as unknown[]) || [];
@@ -406,15 +443,18 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
       if (!options.unsafeModuleFallbackService) {
         const _require = createRequire(entryBase);
         const _virtual = virtual;
+        const _virtualVersions = this.#virtualVersions;
         const _transformRequest = this.#transformRequest;
         const _exportConditions = this.#exportConditions;
+        const _applyVirtualVersions = (code: string) =>
+          applyVirtualVersions(code, _virtualVersions);
         options.unsafeUseModuleFallbackService = true;
         // Map workerd module names to real filesystem paths for correct
         // relative import resolution from bare-specifier modules.
         const modulePathMap = new Map<string, string>();
-        const _cjsLexerReady = ensureCjsLexer();
+        const _lexersReady = Promise.all([ensureCjsLexer(), initEsmLexer]);
         options.unsafeModuleFallbackService = async (request: Request) => {
-          await _cjsLexerReady;
+          await _lexersReady;
           const url = new URL(request.url);
           const specifier = url.searchParams.get("specifier");
           const rawSpecifier = url.searchParams.get("rawSpecifier");
@@ -445,7 +485,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
               // on the host (see #prepareVirtualModules).
               return virtualModuleFormat(virtualKey) === "json"
                 ? Response.json({ name, json: source })
-                : Response.json({ name, esModule: source });
+                : Response.json({ name, esModule: _applyVirtualVersions(source) });
             }
           }
 
@@ -530,7 +570,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
               const result = await _transformRequest(resolvedPath);
               if (result?.code) {
                 modulePathMap.set(name, resolvedPath);
-                return Response.json({ name, esModule: result.code });
+                return Response.json({ name, esModule: _applyVirtualVersions(result.code) });
               }
             } catch {
               // Fall through to raw disk read
@@ -548,7 +588,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
               (!resolvedPath.endsWith(".cjs") &&
                 /\b(import\s|import\(|export\s|export\{|import\.meta\b)/.test(contents));
             if (isESM) {
-              return Response.json({ name, esModule: contents });
+              return Response.json({ name, esModule: _applyVirtualVersions(contents) });
             }
             // Serve CJS modules with an ESM shim wrapper.
             // workerd's `commonJsModule` handles CJS execution (module/exports/require),
@@ -581,6 +621,12 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
       if (cached) {
         this.#miniflare = cached.mf;
         cached.refCount++;
+        this.#cacheEntry = cached;
+        // The live fallback service closes over the creating runner's maps —
+        // adopt them so invalidateModule() mutates what the instance actually
+        // serves (the sources are identical by cache-key construction).
+        this.#virtual = cached.virtual;
+        this.#virtualVersions = cached.versions;
       }
     }
 
@@ -588,7 +634,13 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
       this.#miniflare = new Miniflare(options);
       await this.#miniflare.ready;
       if (this.#persistent && this.#cacheKey) {
-        _miniflareCache.set(this.#cacheKey, { mf: this.#miniflare, refCount: 1 });
+        this.#cacheEntry = {
+          mf: this.#miniflare,
+          refCount: 1,
+          virtual,
+          versions: this.#virtualVersions,
+        };
+        _miniflareCache.set(this.#cacheKey, this.#cacheEntry);
       }
     }
 
@@ -665,6 +717,59 @@ function computeCacheKey(entryPath: string, opts: Record<string, unknown>): stri
     }
   }
   return `${resolve(entryPath)}::${JSON.stringify(serializableOpts)}`;
+}
+
+/**
+ * Rewrite import specifiers of invalidated virtual modules in re-served module
+ * code to their current version (`#config.json` → `#config.json?v=2`). workerd
+ * caches modules by name, so the versioned specifier misses its registry, hits
+ * the fallback again, and the fresh source is served under a new identity.
+ * Only parsed import/re-export specifiers are rewritten (es-module-lexer) —
+ * never arbitrary string literals in the code.
+ */
+function applyVirtualVersions(code: string, versions: ReadonlyMap<string, number>): string {
+  if (versions.size === 0) {
+    return code;
+  }
+  let imports: ReturnType<typeof parseEsm>[0];
+  try {
+    [imports] = parseEsm(code);
+  } catch {
+    // Unparsable code is served untouched — workerd reports its own error.
+    return code;
+  }
+  let out = "";
+  let last = 0;
+  for (const imp of imports) {
+    let specifier: string | undefined = imp.n;
+    // `n` is unset for template-literal dynamic imports; extract a plain
+    // `import(`...`)` literal (no substitutions) manually.
+    if (specifier === undefined && imp.d > -1) {
+      const expr = code.slice(imp.s, imp.e);
+      if (expr.length > 1 && expr[0] === "`" && expr.endsWith("`") && !expr.includes("${")) {
+        specifier = expr.slice(1, -1);
+      }
+    }
+    const version = specifier === undefined ? undefined : versions.get(specifier);
+    if (!version) {
+      continue;
+    }
+    const versioned = `${specifier}?v=${version}`;
+    // Static import/re-export offsets exclude the quotes; dynamic import
+    // offsets span the full specifier expression including them.
+    out += code.slice(last, imp.s) + (imp.d > -1 ? JSON.stringify(versioned) : versioned);
+    last = imp.e;
+  }
+  return out + code.slice(last);
+}
+
+// `node:module` is imported lazily (only when a TS virtual source is present)
+// and the lookup is cached across sources and invalidations.
+let _stripTypesPromise: Promise<((code: string) => string) | undefined> | undefined;
+
+function _getStripTypeScriptTypes() {
+  _stripTypesPromise ??= import("node:module").then((m) => (m as any).stripTypeScriptTypes);
+  return _stripTypesPromise;
 }
 
 let _cjsLexerReady: Promise<void> | undefined;

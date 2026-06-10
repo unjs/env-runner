@@ -16,6 +16,8 @@ export class RunnerManager implements EnvRunner, AsyncDisposable {
   private _messageListeners = new Set<RunnerMessageListener>();
   private _closed = false;
   private _reloading = false;
+  private _moduleInvalidated = false;
+  private _pendingModuleReload: Promise<void> | undefined;
   private _closeListeners = new Set<(runner: EnvRunner, cause?: unknown) => void>();
   private _readyListeners = new Set<(runner: EnvRunner, address?: WorkerAddress) => void>();
 
@@ -46,6 +48,8 @@ export class RunnerManager implements EnvRunner, AsyncDisposable {
       const prev = this._runner;
       this._detach();
       this._attach(runner);
+      // A fresh runner re-resolves its sources, satisfying any pending invalidation.
+      this._moduleInvalidated = false;
       if (prev) {
         await prev.close();
       }
@@ -68,7 +72,26 @@ export class RunnerManager implements EnvRunner, AsyncDisposable {
     if (!runner) {
       return new Response("Runner is unavailable", { status: 503 });
     }
+    if (this._moduleInvalidated) {
+      await this._flushInvalidation(runner);
+    }
     return runner.fetch(input, init);
+  }
+
+  /**
+   * Lazily satisfy a pending `invalidateModule()` with a single entry reload
+   * before serving — concurrent fetches share the same reload. A failed reload
+   * keeps the invalidation pending, so the next fetch retries.
+   */
+  private _flushInvalidation(runner: EnvRunner): Promise<void> {
+    this._pendingModuleReload ??= Promise.resolve(runner.reloadModule?.())
+      .then(() => {
+        this._moduleInvalidated = false;
+      })
+      .finally(() => {
+        this._pendingModuleReload = undefined;
+      });
+    return this._pendingModuleReload;
   }
 
   upgrade: UpgradeHandler = (context) => {
@@ -142,7 +165,22 @@ export class RunnerManager implements EnvRunner, AsyncDisposable {
     if (!this._runner?.reloadModule) {
       throw new Error("Active runner does not support reloadModule()");
     }
-    return this._runner.reloadModule(timeout);
+    await this._runner.reloadModule(timeout);
+    // An explicit reload satisfies any pending invalidation.
+    this._moduleInvalidated = false;
+  }
+
+  /**
+   * Invalidate a virtual module on the active runner and mark the manager
+   * dirty: the next `fetch()` reloads the entry automatically, so callers
+   * don't need to pair the call with an explicit `reloadModule()`.
+   */
+  async invalidateModule(specifier: string, timeout?: number): Promise<void> {
+    if (!this._runner?.invalidateModule) {
+      throw new Error("Active runner does not support invalidateModule()");
+    }
+    await this._runner.invalidateModule(specifier, timeout);
+    this._moduleInvalidated = true;
   }
 
   async close() {
