@@ -305,7 +305,7 @@ const runner2 = new NodeProcessEnvRunner({
 - Test fixture in `test/fixtures/app-env.mjs` — Entry that echoes request headers and selected environment variables as JSON
 - **`test/vercel.test.ts`** — Tests for `VercelEnvRunner`: request header injection (`x-vercel-deployment-url`, `x-vercel-id`, `x-vercel-forwarded-for`, `x-forwarded-for`, `x-real-ip`, `x-forwarded-proto`, `x-forwarded-host`), response header injection (`server`, `x-vercel-id`, `x-vercel-cache`), environment variables (`VERCEL`, `VERCEL_ENV`, `VERCEL_REGION`, `NOW_REGION`), header preservation, pre-existing header respect
 - **`test/netlify.test.ts`** — Tests for `NetlifyEnvRunner`: header injection (`x-nf-client-connection-ip`, `x-nf-account-id`, `x-nf-site-id`, `x-nf-deploy-id`, `x-nf-deploy-context`, `x-nf-geo`, `x-nf-request-id`), IP derivation, header preservation
-- Tests cover: lifecycle, fetch (GET/POST), WebSocket upgrade, crossws websocket, messaging, hooks, graceful close, inspect output, manager hot-reload, message queueing, miniflare hot-reload, vercel header/env/response injection, netlify header injection, waitForReady, vite helpers
+- Tests cover: lifecycle, fetch (GET/POST), WebSocket upgrade, crossws websocket, messaging, hooks, graceful close, inspect output, stdio forwarding (all runners), manager hot-reload, message queueing, miniflare hot-reload, vercel header/env/response injection, netlify header injection, waitForReady, vite helpers
 
 ## Scripts
 
@@ -334,6 +334,7 @@ const runner2 = new NodeProcessEnvRunner({
 - **Message-driven readiness** — Workers/processes post `{ address }` to signal ready state
 - **Immediate shutdown** — `close()` immediately terminates the worker/process (no graceful shutdown handshake)
 - **Data passing:** Worker threads use `workerData`, processes use `ENV_RUNNER_DATA` env var (JSON), self runner uses in-memory channel, miniflare runner uses in-memory `script` with `unsafeModuleFallbackService` for module resolution
+- **Stdio forwarding** — All runners forward entry stdout/stderr to the host process: node-process and bun-process pipe child streams to `process.stdout`/`process.stderr`, deno-process forwards non-IPC stdout lines (stdout doubles as NDJSON IPC) and pipes stderr, worker threads use Node.js's built-in forwarding, miniflare uses its default runtime stdio handler
 - **Socket cleanup** — `_closeSocket()` avoids deleting Windows named pipes and abstract sockets
 - **Custom inspect** — `[Symbol.for('nodejs.util.inspect.custom')]()` shows pending/ready/closed status
 - **Adding a new runner** — Create `src/runners/<name>/runner.ts` extending `BaseEnvRunner`, optionally add `worker.ts`, add export path in `package.json`, add to `loaders` map in `src/loader.ts`, re-export from `src/index.ts`

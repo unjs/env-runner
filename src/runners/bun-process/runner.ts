@@ -26,6 +26,20 @@ interface ProcessHandle {
 // @ts-expect-error Bun global
 const _isBun = typeof Bun !== "undefined";
 
+async function forwardStream(
+  stream: AsyncIterable<Uint8Array> | undefined,
+  dest: NodeJS.WriteStream,
+) {
+  if (!stream) return;
+  try {
+    for await (const chunk of stream) {
+      dest.write(chunk);
+    }
+  } catch {
+    // Stream closed (process exited)
+  }
+}
+
 function resolveBunPath(): string {
   if (_bunPath) return _bunPath;
   // Check common locations
@@ -133,6 +147,9 @@ export class BunProcessEnvRunner extends BaseEnvRunner {
       child._exitCode = code;
       this.close(`process exited with code ${code}`);
     });
+
+    forwardStream(proc.stdout, process.stdout);
+    forwardStream(proc.stderr, process.stderr);
 
     this.#process = child;
   }

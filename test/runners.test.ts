@@ -124,6 +124,49 @@ for (const runnerDef of runners) {
       expect(data.body).toBe("hello");
     });
 
+    it("forwards entry stdout and stderr to the host process", async () => {
+      const marker = `${name}-${randomBytes(4).toString("hex")}`;
+      const stdoutChunks: string[] = [];
+      const stderrChunks: string[] = [];
+      const stdoutWrite = vi
+        .spyOn(process.stdout, "write")
+        .mockImplementation((chunk: string | Uint8Array) => {
+          stdoutChunks.push(chunk.toString());
+          return true;
+        });
+      const stderrWrite = vi
+        .spyOn(process.stderr, "write")
+        .mockImplementation((chunk: string | Uint8Array) => {
+          stderrChunks.push(chunk.toString());
+          return true;
+        });
+      // In-process runners (self, miniflare) log through the host console,
+      // which vitest patches — capture that channel too
+      const consoleLog = vi.spyOn(console, "log").mockImplementation((...args) => {
+        stdoutChunks.push(args.join(" "));
+      });
+      const consoleError = vi.spyOn(console, "error").mockImplementation((...args) => {
+        stderrChunks.push(args.join(" "));
+      });
+
+      try {
+        runner = create(opts("test-stdio"));
+        await waitForReady(runner);
+
+        const res = await runner.fetch(`http://localhost/log?marker=${marker}`);
+        expect(res.status).toBe(200);
+        expect(await res.text()).toBe("logged");
+
+        await waitFor(() => stdoutChunks.join("").includes(`stdout:${marker}`), 5000);
+        await waitFor(() => stderrChunks.join("").includes(`stderr:${marker}`), 5000);
+      } finally {
+        stdoutWrite.mockRestore();
+        stderrWrite.mockRestore();
+        consoleLog.mockRestore();
+        consoleError.mockRestore();
+      }
+    });
+
     it("sends and receives messages", async () => {
       runner = create(opts("test-msg"));
       await waitForReady(runner);
@@ -271,67 +314,6 @@ for (const runnerDef of runners) {
     });
   });
 }
-
-describe.skipIf(!hasBun)("BunProcessEnvRunner stdio", () => {
-  let runner: EnvRunner | undefined;
-  let tmpDir: string | undefined;
-
-  afterEach(async () => {
-    await runner?.close();
-    runner = undefined;
-    if (tmpDir) {
-      rmSync(tmpDir, { recursive: true, force: true });
-      tmpDir = undefined;
-    }
-    vi.restoreAllMocks();
-  });
-
-  it("forwards child stdout and stderr to the host process", async () => {
-    tmpDir = mkdtempSync(join(_dir, ".tmp-stdio-"));
-    const entryPath = join(tmpDir, "app.mjs");
-
-    writeFileSync(
-      entryPath,
-      `
-export default {
-  fetch() {
-    console.log("stdout from bun process runner");
-    console.error("stderr from bun process runner");
-    return new Response("ok");
-  },
-};
-`,
-    );
-
-    const stdoutChunks: string[] = [];
-    const stderrChunks: string[] = [];
-    const stdoutWrite = vi
-      .spyOn(process.stdout, "write")
-      .mockImplementation((chunk: string | Uint8Array) => {
-        stdoutChunks.push(chunk.toString());
-        return true;
-      });
-    const stderrWrite = vi
-      .spyOn(process.stderr, "write")
-      .mockImplementation((chunk: string | Uint8Array) => {
-        stderrChunks.push(chunk.toString());
-        return true;
-      });
-
-    runner = new BunProcessEnvRunner({ name: "test-stdio", data: { entry: entryPath } });
-    await waitForReady(runner);
-
-    const res = await runner.fetch("http://localhost/");
-    expect(res.status).toBe(200);
-    expect(await res.text()).toBe("ok");
-
-    await waitFor(() => stdoutChunks.join("").includes("stdout from bun process runner"));
-    await waitFor(() => stderrChunks.join("").includes("stderr from bun process runner"));
-
-    stdoutWrite.mockRestore();
-    stderrWrite.mockRestore();
-  });
-});
 
 // --- reloadModule tests ---
 
