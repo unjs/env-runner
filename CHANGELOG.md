@@ -1,6 +1,38 @@
 # Changelog
 
 
+## v0.1.10
+
+[compare changes](https://github.com/unjs/env-runner/compare/v0.1.9...v0.1.10)
+
+### 🚀 Enhancements
+
+- Virtual imports ([#26](https://github.com/unjs/env-runner/pull/26))
+- Default env server runner to `node-worker` ([4744002](https://github.com/unjs/env-runner/commit/4744002))
+- Implement async disposable ([1ec6f29](https://github.com/unjs/env-runner/commit/1ec6f29))
+- **server:** Auto start on first fetch ([bf37885](https://github.com/unjs/env-runner/commit/bf37885))
+
+### 🩹 Fixes
+
+- **node-process, bun-process:** Exit worker on IPC disconnect to avoid orphans ([#24](https://github.com/unjs/env-runner/pull/24))
+- **node-process, bun-process:** Register disconnect handler before entry import ([838b252](https://github.com/unjs/env-runner/commit/838b252))
+- Forward child stdio for process runners ([#25](https://github.com/unjs/env-runner/pull/25))
+
+### 🏡 Chore
+
+- Update deps ([af647ed](https://github.com/unjs/env-runner/commit/af647ed))
+
+### ✅ Tests
+
+- Fake oidc token ([3e9fac7](https://github.com/unjs/env-runner/commit/3e9fac7))
+
+### ❤️ Contributors
+
+- Pooya Parsa ([@pi0](https://github.com/pi0))
+- Pi0x <x@pi0.io>
+- Ou ([@ourongxing](https://github.com/ourongxing))
+- Saba Tchikhinashvili ([@saba-ch](https://github.com/saba-ch))
+
 ## v0.1.9
 
 [compare changes](https://github.com/unjs/env-runner/compare/v0.1.8...v0.1.9)
