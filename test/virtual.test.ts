@@ -105,6 +105,24 @@ for (const { name, create, skip } of runners) {
       expect(await res.text()).toBe("from factory");
     });
 
+    it("prefers a virtual override over a real file with the same path", async () => {
+      runner = create({
+        name: "virtual-override",
+        data: {
+          // A real file exists at this path; the virtual source must win,
+          // both on initial import and across reloadModule().
+          entry: virtualAppEntry,
+          virtual: {
+            [virtualAppEntry]: `export default { fetch: () => new Response("virtual override") };`,
+          },
+        },
+      });
+      await runner.waitForReady();
+      expect(await (await runner.fetch("http://localhost/")).text()).toBe("virtual override");
+      await runner.reloadModule?.();
+      expect(await (await runner.fetch("http://localhost/")).text()).toBe("virtual override");
+    });
+
     it("closes the runner with the factory error as cause when a factory throws", async () => {
       let closeCause: unknown;
       runner = create({
