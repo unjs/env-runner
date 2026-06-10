@@ -24,7 +24,9 @@ export class NodeProcessEnvRunner extends BaseEnvRunner {
   }) {
     _defaultEntry ||= fileURLToPath(import.meta.resolve("env-runner/runners/node-process/worker"));
     super({ ...opts, workerEntry: opts.workerEntry || _defaultEntry });
-    this.#initProcess(opts.execArgv);
+    // Resolve factory-valued `data.virtual` sources before spawning, since
+    // functions can't survive `JSON.stringify`. Stays synchronous otherwise.
+    this._initWithVirtualData(() => this.#initProcess(opts.execArgv));
   }
 
   sendMessage(message: unknown) {

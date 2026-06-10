@@ -1,8 +1,10 @@
 import { serve } from "srvx";
 import { plugin as wsPlugin } from "crossws/server/node";
 import { resolveEntry, reloadEntryModule, parseServerAddress } from "../../common/worker-utils.ts";
+import { registerVirtualModules } from "../../common/virtual-modules.ts";
 
 const data = JSON.parse(process.env.ENV_RUNNER_DATA || "{}");
+await registerVirtualModules(data.virtual);
 let entry = await resolveEntry(data.entry);
 const sendMessage = (message: unknown) => process.send!(message);
 

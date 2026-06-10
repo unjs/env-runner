@@ -12,7 +12,8 @@ Generic environment runner for Node.js. Ported from the nitro env runner concept
 src/
 ├── common/
 │   ├── base-runner.ts       # BaseEnvRunner abstract class
-│   └── worker-utils.ts      # AppEntry interface, resolveEntry(), parseServerAddress()
+│   ├── worker-utils.ts      # AppEntry interface, resolveEntry(), parseServerAddress()
+│   └── virtual-modules.ts   # registerVirtualModules() — async registerHooks() wiring shared by node/deno workers
 ├── runners/
 │   ├── node-worker/
 │   │   ├── runner.ts        # NodeWorkerEnvRunner
@@ -39,6 +40,7 @@ src/
 │       ├── runner.ts        # NetlifyEnvRunner (extends NodeWorkerEnvRunner)
 │       └── worker.ts        # Sets global Netlify context, delegates to node-worker
 ├── types.ts                 # Core interfaces
+├── virtual-loader.ts        # createVirtualHooks() — ESM resolve/load hooks for virtual modules
 ├── index.ts                 # Public API exports
 ├── loader.ts                # Dynamic runner loader
 ├── manager.ts               # RunnerManager for hot-reload
@@ -48,16 +50,18 @@ src/
 
 - **`src/vite.ts`** — Vite Environment API helpers: `createViteHotChannel()` (host-side HotChannel from runner RPC hooks) and `createViteTransport()` (worker-side ModuleRunner transport)
 - **`src/types.ts`** — Core interfaces: `EnvRunner`, `WorkerAddress`, `WorkerHooks`, `RunnerRPCHooks`, `RPCOptions`
-- **`src/common/base-runner.ts`** — `BaseEnvRunner` abstract class + `EnvRunnerData`: shared logic for all runners (fetch proxy with exponential backoff, upgrade, message dispatch, socket cleanup)
-- **`src/common/worker-utils.ts`** — Shared utilities for built-in workers: `AppEntry` interface (with optional `websocket`, `upgrade`, and `ipc` hooks), `AppEntryIPC`/`AppEntryIPCContext` types, `resolveEntry()` to dynamically import user entry, `parseServerAddress()` to extract host/port from srvx server, `reloadEntryModule()` for cache-busted re-import with IPC teardown/re-init
+- **`src/common/base-runner.ts`** — `BaseEnvRunner` abstract class + `EnvRunnerData`: shared logic for all runners (fetch proxy with exponential backoff, upgrade, message dispatch, socket cleanup). `_resolveVirtualData()` resolves factory-valued `data.virtual` sources to strings on the host before spawn (returns a promise only when a factory is present, else `undefined` for the synchronous spawn path); `_initWithVirtualData(init)` wraps it for subclass constructors — runs `init` synchronously when no factory is present, defers it otherwise, and routes a throwing/rejecting factory to `close(error)` (no unhandled rejection). Re-exports `VirtualModules`/`VirtualModuleSource`
+- **`src/common/worker-utils.ts`** — Shared utilities for built-in workers: `AppEntry` interface (with optional `websocket`, `upgrade`, and `ipc` hooks), `AppEntryIPC`/`AppEntryIPCContext` types, `resolveEntry()` to dynamically import user entry (a real path **or** a virtual/bare specifier resolved by registered ESM hooks), `parseServerAddress()` to extract host/port from srvx server, `reloadEntryModule()` for cache-busted re-import with IPC teardown/re-init. `_importFresh()` re-reads real files via a `data:` URL, but cache-busts virtual/bare specifiers with a `?__envRunnerReload=<n>` query (detected by `existsSync` on the path part)
+- **`src/common/virtual-modules.ts`** — `async registerVirtualModules(virtual?)`: calls Node's `module.registerHooks()` with `createVirtualHooks()` when a non-empty `data.virtual` map is present. **Feature-detects `registerHooks` via a dynamic `import("node:module")`** (never a static named import, which would throw at link time on runtimes without it — Node < 22.15/23.5, older Deno, Bun): when absent it logs a one-time warning and skips registration. Shared by the node-worker, node-process, and deno-process workers (all `await` it before importing the entry); the dynamic import only runs when a non-empty map is present
+- **`src/virtual-loader.ts`** — `createVirtualHooks(virtual)`: builds synchronous ESM `resolve`/`load` hooks (`ResolveHookSync`/`LoadHookSync`) that serve virtual modules from a resolved `Record<string, string>`. A specifier present in the map (e.g. `#virtual-import`) resolves to a `virtual:<encoded-specifier>` URL and loads the stored source as an ES module, short-circuiting default resolution; everything else falls through to `nextResolve`/`nextLoad`. Map lookups strip a `?query` suffix (so a reload cache-buster like `#entry?__envRunnerReload=1` still matches `#entry`) while keeping the full specifier in the URL for a distinct module identity. Also defines `VirtualModuleSource` (`string | (() => string | Promise<string>)`), `VirtualModules` (`Record<string, VirtualModuleSource>`), and `resolveVirtualModules(virtual)` which invokes/awaits factory sources into a plain `Record<string, string>` (the hooks run synchronously, so factories must be resolved ahead of time)
 - **`src/runners/node-worker/runner.ts`** — `NodeWorkerEnvRunner` extends `BaseEnvRunner`: spawns Node.js Worker threads, data via `workerData`
-- **`src/runners/node-worker/worker.ts`** — Built-in srvx worker: reads `data.entry` from `workerData`, starts srvx server, reports address via `parentPort`
+- **`src/runners/node-worker/worker.ts`** — Built-in srvx worker: reads `data.entry` from `workerData`, registers `data.virtual` modules, starts srvx server, reports address via `parentPort`
 - **`src/runners/node-process/runner.ts`** — `NodeProcessEnvRunner` extends `BaseEnvRunner`: spawns a child process via `fork()`, supports custom `execArgv`
-- **`src/runners/node-process/worker.ts`** — Built-in srvx worker: reads `data.entry` from `ENV_RUNNER_DATA`, starts srvx server, reports address via `process.send()`
+- **`src/runners/node-process/worker.ts`** — Built-in srvx worker: reads `data.entry` from `ENV_RUNNER_DATA`, registers `data.virtual` modules, starts srvx server, reports address via `process.send()`
 - **`src/runners/bun-process/runner.ts`** — `BunProcessEnvRunner` extends `BaseEnvRunner`: uses `Bun.spawn()` with IPC when under Bun, falls back to Node.js `fork()` otherwise
 - **`src/runners/bun-process/worker.ts`** — Built-in srvx worker: same as node-process worker (works on both Bun and Node.js)
 - **`src/runners/deno-process/runner.ts`** — `DenoProcessEnvRunner` extends `BaseEnvRunner`: spawns a `deno run --allow-all` child process with IPC via Node.js `spawn()`. Data passed via `ENV_RUNNER_DATA` env var (JSON). Supports custom `execArgv`
-- **`src/runners/deno-process/worker.ts`** — Built-in srvx worker: same as node-process worker (works on Deno via Node.js compat)
+- **`src/runners/deno-process/worker.ts`** — Built-in srvx worker for Deno: stdin/stdout newline-delimited JSON IPC (Deno lacks Node's `process.send`). Registers `data.virtual` modules via the shared `registerVirtualModules()` (feature-detected; Deno >= 2.x implements `registerHooks`, older Deno warns and skips). Otherwise mirrors the node-process worker
 - **`src/runners/self/runner.ts`** — `SelfEnvRunner` extends `BaseEnvRunner`: runs entry code in the same process using an in-memory channel registry on `process.__envRunners`
 - **`src/runners/miniflare/runner.ts`** — `MiniflareEnvRunner` extends `BaseEnvRunner`: runs entry in Cloudflare Workers runtime via miniflare. Overrides `fetch()` to use `mf.dispatchFetch()`. Uses in-memory `script` (no temp files), `unsafeModuleFallbackService` for module resolution, and `unsafeEvalBinding` for hot-reload via `reloadModule()`. Requires `miniflare` peer dependency
 - **`src/runners/vercel/runner.ts`** — `VercelEnvRunner` extends `NodeWorkerEnvRunner`: simulates Vercel deployment environment with header injection
@@ -95,6 +99,10 @@ Uses `worker_threads.Worker`. Entry communicates via `parentPort.postMessage()` 
 ### NodeProcessEnvRunner
 
 Uses `child_process.fork()`. Entry communicates via `process.send()` / `process.on('message')`. Data passed via `ENV_RUNNER_DATA` env var (JSON). Supports custom `execArgv` (e.g. `--inspect`).
+
+### Virtual modules (Node + Deno runners)
+
+Pass a `data.virtual` map (`specifier => source`) to the `node-worker`, `node-process`, and `deno-process` runners (plus the `vercel`/`netlify` runners built on the node-worker worker) to serve in-memory ES modules. Each source is either a string or a factory `() => string | Promise<string>` (`VirtualModuleSource`); the map type is `VirtualModules`. **Factories are resolved on the host, before the worker spawns** — the node-worker/node-process/deno-process runner constructors call `BaseEnvRunner._initWithVirtualData(init)`, which detects function values via `_resolveVirtualData()`, awaits `resolveVirtualModules()`, replaces `data.virtual` with a plain `Record<string, string>`, then runs `init`; a throwing/rejecting factory closes the runner with the error as cause. This is required because functions can't cross the `workerData`/`JSON` boundary and Node's synchronous load hook can't await; the spawn stays synchronous when all sources are already strings. Each worker then `await`s `registerVirtualModules(data.virtual)` **before** importing the entry, which wires Node's `module.registerHooks()` (in-thread, synchronous — the non-deprecated successor to `module.register()`) with hooks from `createVirtualHooks()`. The entry and its dependencies can then `import` any map key (e.g. `import { x } from "#virtual-import"`). **The entry itself may be virtual**: set `data.entry` to one of the `data.virtual` keys (e.g. `"#entry"`) and its source is served from the map — including when it imports other virtual modules. Since hooks stay registered for the thread's lifetime, virtual specifiers (including a virtual entry) also resolve across `reloadModule()`. First-step scope: each source resolves to a self-contained ES module string (no transform pipeline, no per-reload mutation of the map; a factory is invoked once on the host, not re-evaluated on reload). `data.virtual` is typed on `EnvRunnerData`. `registerVirtualModules()` feature-detects `module.registerHooks` via a dynamic import and warns-and-skips when it's missing, so runtimes without it (Node < 22.15/23.5, Deno < 2.x) degrade gracefully instead of crashing the worker. **Bun is not supported** — its `node:module` compat lacks `registerHooks`, so the bun-process worker omits virtual registration entirely.
 
 ### BunProcessEnvRunner
 
@@ -303,6 +311,8 @@ const runner2 = new NodeProcessEnvRunner({
 - Test fixture in `test/fixtures/app-websocket.mjs` — Entry with crossws WebSocket hooks for websocket tests
 - Test fixture in `test/fixtures/app-headers.mjs` — Entry that echoes all request headers as JSON for vercel header injection tests
 - Test fixture in `test/fixtures/app-env.mjs` — Entry that echoes request headers and selected environment variables as JSON
+- Test fixture in `test/fixtures/app-virtual.mjs` — Entry that imports `#virtual-message` and returns its `message` export as the response body
+- **`test/virtual.test.ts`** — Tests virtual modules for `NodeWorkerEnvRunner`, `NodeProcessEnvRunner`, and `DenoProcessEnvRunner` (auto-skipped when `deno` is not installed) via the `data.virtual` map: a virtual import, a virtual entry (`data.entry` = a virtual key), a virtual entry composing another virtual module, factory-valued sources (sync and async), and reload of a virtual entry
 - **`test/vercel.test.ts`** — Tests for `VercelEnvRunner`: request header injection (`x-vercel-deployment-url`, `x-vercel-id`, `x-vercel-forwarded-for`, `x-forwarded-for`, `x-real-ip`, `x-forwarded-proto`, `x-forwarded-host`), response header injection (`server`, `x-vercel-id`, `x-vercel-cache`), environment variables (`VERCEL`, `VERCEL_ENV`, `VERCEL_REGION`, `NOW_REGION`), header preservation, pre-existing header respect
 - **`test/netlify.test.ts`** — Tests for `NetlifyEnvRunner`: header injection (`x-nf-client-connection-ip`, `x-nf-account-id`, `x-nf-site-id`, `x-nf-deploy-id`, `x-nf-deploy-context`, `x-nf-geo`, `x-nf-request-id`), IP derivation, header preservation
 - Tests cover: lifecycle, fetch (GET/POST), WebSocket upgrade, crossws websocket, messaging, hooks, graceful close, inspect output, manager hot-reload, message queueing, miniflare hot-reload, vercel header/env/response injection, netlify header injection, waitForReady, vite helpers

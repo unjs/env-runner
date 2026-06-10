@@ -4,9 +4,29 @@ import type { RunnerMessageListener, EnvRunner, WorkerAddress, WorkerHooks } fro
 
 import { rm } from "node:fs/promises";
 import { proxyFetch, proxyUpgrade } from "httpxy";
+import { resolveVirtualModules } from "../virtual-loader.ts";
+import type { VirtualModules } from "../virtual-loader.ts";
+
+export type { VirtualModules, VirtualModuleSource } from "../virtual-loader.ts";
 
 export interface EnvRunnerData {
   name?: string;
+
+  /**
+   * Virtual modules as a `specifier => source` map.
+   *
+   * Registered as Node.js ESM customization hooks in the worker so the entry
+   * (and its dependencies) can `import` them, e.g.
+   * `{ "#virtual-import": "export const foo = 1" }`.
+   *
+   * Each source may be a string or a factory `() => string | Promise<string>`.
+   * Factories are evaluated once on the host before the worker is spawned (so the
+   * worker always receives plain strings).
+   *
+   * Supported by the Node.js runners (`node-worker`, `node-process`).
+   */
+  virtual?: VirtualModules;
+
   [key: string]: unknown;
 }
 
@@ -167,6 +187,43 @@ export abstract class BaseEnvRunner implements EnvRunner {
     }
     for (const listener of this._messageListeners) {
       listener(message);
+    }
+  }
+
+  /**
+   * Resolve any factory-valued `data.virtual` sources to strings before the
+   * worker is spawned. Returns a pending promise only when there is async work
+   * to do (a factory is present); otherwise returns `undefined` so subclasses can
+   * keep their synchronous spawn path. Factories must be resolved here because
+   * functions can't cross the worker boundary and the load hook can't await.
+   */
+  protected _resolveVirtualData(): Promise<void> | undefined {
+    const virtual = this._data?.virtual;
+    if (!virtual || !Object.values(virtual).some((v) => typeof v === "function")) {
+      return undefined;
+    }
+    return resolveVirtualModules(virtual).then((resolved) => {
+      this._data = { ...this._data, virtual: resolved };
+    });
+  }
+
+  /**
+   * Run a subclass spawn callback after `data.virtual` is resolved.
+   * Synchronous when no factory-valued source is present; otherwise defers
+   * `init` until factories resolve. A throwing/rejecting factory closes the
+   * runner with the error as cause instead of leaving an unhandled rejection.
+   */
+  protected _initWithVirtualData(init: () => void): void {
+    const pending = this._resolveVirtualData();
+    if (pending) {
+      pending.then(
+        () => {
+          if (!this.closed) init();
+        },
+        (error) => this.close(error),
+      );
+    } else {
+      init();
     }
   }
 

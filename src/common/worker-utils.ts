@@ -3,7 +3,7 @@ import type { Hooks } from "crossws";
 import type { UpgradeContext } from "../types.ts";
 import { pathToFileURL } from "node:url";
 import { isAbsolute } from "node:path";
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 
 export interface AppEntryIPCContext {
   sendMessage: (message: unknown) => void;
@@ -72,10 +72,25 @@ function _toImportPath(entryPath: string): string {
   return entryPath;
 }
 
+let _reloadCounter = 0;
+
 async function _importFresh(entryPath: string): Promise<AppEntry> {
-  const code = readFileSync(entryPath, "utf8");
-  const dataUrl = "data:text/javascript;base64," + Buffer.from(code).toString("base64");
-  const mod = await import(dataUrl);
+  const qIndex = entryPath.indexOf("?");
+  const filePath = qIndex === -1 ? entryPath : entryPath.slice(0, qIndex);
+
+  let mod: any;
+  if (existsSync(filePath)) {
+    // Real file: re-read latest content via data: URL to bypass the module cache.
+    const code = readFileSync(filePath, "utf8");
+    const dataUrl = "data:text/javascript;base64," + Buffer.from(code).toString("base64");
+    mod = await import(dataUrl);
+  } else {
+    // Virtual or bare specifier (e.g. served by registered ESM hooks): re-import
+    // through the resolver with a cache-busting query for a fresh evaluation.
+    const sep = entryPath.includes("?") ? "&" : "?";
+    mod = await import(entryPath + sep + "__envRunnerReload=" + _reloadCounter++);
+  }
+
   const entry = mod.default || mod;
   if (typeof entry.fetch !== "function") {
     throw new Error(

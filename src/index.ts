@@ -11,7 +11,12 @@ export type {
   EnvRunner,
 } from "./types.ts";
 
-export { type EnvRunnerData, BaseEnvRunner } from "./common/base-runner.ts";
+export {
+  type EnvRunnerData,
+  type VirtualModules,
+  type VirtualModuleSource,
+  BaseEnvRunner,
+} from "./common/base-runner.ts";
 export { RunnerManager } from "./manager.ts";
 export { type EnvServerOptions, EnvServer } from "./server.ts";
 export { type RunnerName, type LoadRunnerOptions, loadRunner } from "./loader.ts";

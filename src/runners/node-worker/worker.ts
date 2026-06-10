@@ -2,8 +2,10 @@ import { parentPort, workerData } from "node:worker_threads";
 import { serve } from "srvx";
 import { plugin as wsPlugin } from "crossws/server/node";
 import { resolveEntry, reloadEntryModule, parseServerAddress } from "../../common/worker-utils.ts";
+import { registerVirtualModules } from "../../common/virtual-modules.ts";
 
 const data = workerData || {};
+await registerVirtualModules(data.virtual);
 let entry = await resolveEntry(data.entry);
 const sendMessage = (message: unknown) => parentPort?.postMessage(message);
 
