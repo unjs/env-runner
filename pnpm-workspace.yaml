@@ -1,15 +1,4 @@
 allowBuilds:
   "@parcel/watcher": false
   sharp: false
-  workerd: false
-
-minimumReleaseAgeExclude:
-  - "@typescript/native-preview-darwin-arm64@7.0.0-dev.20260521.1"
-  - "@typescript/native-preview-darwin-x64@7.0.0-dev.20260521.1"
-  - "@typescript/native-preview-linux-arm64@7.0.0-dev.20260521.1"
-  - "@typescript/native-preview-linux-arm@7.0.0-dev.20260521.1"
-  - "@typescript/native-preview-linux-x64@7.0.0-dev.20260521.1"
-  - "@typescript/native-preview-win32-arm64@7.0.0-dev.20260521.1"
-  - "@typescript/native-preview-win32-x64@7.0.0-dev.20260521.1"
-  - "@typescript/native-preview@7.0.0-dev.20260521.1"
-  - miniflare@4.20260520.0
+  workerd: true
