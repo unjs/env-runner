@@ -59,7 +59,7 @@ export interface RPCOptions {
 }
 
 /** Core runner interface combining lifecycle hooks, RPC, and request proxying. */
-export interface EnvRunner extends RunnerRPCHooks {
+export interface EnvRunner extends RunnerRPCHooks, AsyncDisposable {
   /** Whether the worker is ready to accept requests. */
   readonly ready: boolean;
 
@@ -83,4 +83,7 @@ export interface EnvRunner extends RunnerRPCHooks {
 
   /** Gracefully shut down the worker. */
   close(): Promise<void>;
+
+  /** Alias for `close()`, enabling `await using` (explicit resource management). */
+  [Symbol.asyncDispose](): Promise<void>;
 }

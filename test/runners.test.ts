@@ -227,6 +227,17 @@ for (const runnerDef of runners) {
       runner = undefined;
     });
 
+    it("closes via `await using` disposal", async () => {
+      {
+        await using r = create(opts("test-dispose"));
+        runner = r;
+        await waitForReady(r);
+        expect(r.closed).toBe(false);
+      }
+      expect(runner.closed).toBe(true);
+      runner = undefined;
+    });
+
     it("calls onClose hook", async () => {
       let closeCalled = false;
       runner = create(

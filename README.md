@@ -79,7 +79,7 @@ Proxy manager for hot-reload with message queueing and listener forwarding:
 ```ts
 import { RunnerManager, NodeProcessEnvRunner } from "env-runner";
 
-const manager = new RunnerManager();
+await using manager = new RunnerManager();
 
 manager.onReady((_runner, address) => {
   console.log("Ready:", address);
@@ -106,8 +106,10 @@ await manager.reload(newRunner); // old runner is closed automatically
 manager.sendMessage({ type: "config", value: 42 });
 manager.onMessage((msg) => console.log("From worker:", msg));
 
-await manager.close();
+// manager.close() is awaited automatically at the end of the scope (`await using`)
 ```
+
+All runners, `RunnerManager`, and `EnvServer` implement `AsyncDisposable`, so they can be auto-closed with [explicit resource management](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Statements/await_using) (`await using`) — or closed manually with `await runner.close()`.
 
 ### Runners
 
@@ -127,7 +129,7 @@ import { NetlifyEnvRunner } from "env-runner/runners/netlify";
 All runners implement the [`EnvRunner`](./src/types.ts) interface:
 
 ```ts
-const runner = new NodeProcessEnvRunner({
+await using runner = new NodeProcessEnvRunner({
   name: "my-app",
   data: { entry: "./app.ts" },
   hooks: {
@@ -156,8 +158,8 @@ const result = await runner.rpc<string>("transformHTML", "<html>...</html>");
 // Hot-reload entry module without restarting the worker
 await runner.reloadModule();
 
-// Graceful shutdown
-await runner.close();
+// Graceful shutdown happens automatically at the end of the scope
+// (`await using`) — or call `await runner.close()` explicitly
 ```
 
 **Available runners:**
@@ -180,7 +182,7 @@ The Node.js runners (`NodeWorkerEnvRunner`, `NodeProcessEnvRunner`, and the runn
 ```ts
 import { NodeWorkerEnvRunner } from "env-runner/runners/node-worker";
 
-const runner = new NodeWorkerEnvRunner({
+await using runner = new NodeWorkerEnvRunner({
   name: "my-app",
   data: {
     entry: "./app.ts",
@@ -205,7 +207,7 @@ export default {
 The **entry itself can be virtual** — set `data.entry` to one of the `data.virtual` keys to run an entry whose source lives in memory (it may import other virtual modules too):
 
 ```ts
-const runner = new NodeWorkerEnvRunner({
+await using runner = new NodeWorkerEnvRunner({
   name: "my-app",
   data: {
     entry: "#entry",
@@ -221,7 +223,7 @@ const runner = new NodeWorkerEnvRunner({
 Each source may also be a **factory** `() => string | Promise<string>` instead of a literal string — useful for lazily computed or asynchronously loaded sources:
 
 ```ts
-const runner = new NodeWorkerEnvRunner({
+await using runner = new NodeWorkerEnvRunner({
   name: "my-app",
   data: {
     entry: "./app.ts",
@@ -238,7 +240,7 @@ Factories are invoked once on the host (before the worker is spawned), so the wo
 The module format is derived from the specifier extension: `.ts`/`.mts` sources are served as **TypeScript** and `.json` sources as **JSON modules**; everything else is plain JavaScript ESM:
 
 ```ts
-const runner = new NodeWorkerEnvRunner({
+await using runner = new NodeWorkerEnvRunner({
   name: "my-app",
   data: {
     entry: "#entry.ts",
@@ -276,7 +278,7 @@ npm install miniflare
 ```ts
 import { MiniflareEnvRunner } from "env-runner/runners/miniflare";
 
-const runner = new MiniflareEnvRunner({
+await using runner = new MiniflareEnvRunner({
   name: "my-worker",
   data: { entry: "./worker.ts" },
   miniflareOptions: {
@@ -286,7 +288,6 @@ const runner = new MiniflareEnvRunner({
 });
 
 const response = await runner.fetch("http://localhost/api");
-await runner.close();
 ```
 
 The `miniflareOptions` object is passed directly to the [Miniflare constructor](https://developers.cloudflare.com/workers/testing/miniflare/) — you can configure bindings, KV, D1, Durable Objects, and any other Miniflare option.
@@ -298,7 +299,7 @@ Pass a `transformRequest` callback to route module resolution through Vite's (or
 ```ts
 import { MiniflareEnvRunner } from "env-runner/runners/miniflare";
 
-const runner = new MiniflareEnvRunner({
+await using runner = new MiniflareEnvRunner({
   name: "my-worker",
   data: { entry: "./worker.ts" },
   // Route module resolution through Vite's transform pipeline
@@ -337,7 +338,7 @@ export default {
 To explicitly declare exports or override auto-detection:
 
 ```ts
-const runner = new MiniflareEnvRunner({
+await using runner = new MiniflareEnvRunner({
   name: "my-worker",
   data: { entry: "./worker.ts" },
   // Explicit exports (merged with auto-detected ones)
@@ -392,7 +393,7 @@ Simulates a Vercel deployment environment with automatic header injection (`x-ve
 ```ts
 import { VercelEnvRunner } from "env-runner/runners/vercel";
 
-const runner = new VercelEnvRunner({
+await using runner = new VercelEnvRunner({
   name: "my-app",
   data: { entry: "./app.ts" },
 });
@@ -405,7 +406,7 @@ Simulates a Netlify deployment environment with automatic header injection (`x-n
 ```ts
 import { NetlifyEnvRunner } from "env-runner/runners/netlify";
 
-const runner = new NetlifyEnvRunner({
+await using runner = new NetlifyEnvRunner({
   name: "my-app",
   data: { entry: "./app.ts" },
 });
@@ -484,7 +485,7 @@ You can also use `loadRunner()` to dynamically load a runner by name:
 ```ts
 import { loadRunner } from "env-runner";
 
-const runner = await loadRunner("node-worker", {
+await using runner = await loadRunner("node-worker", {
   name: "my-app",
   data: { entry: "./app.ts" },
 });
@@ -543,7 +544,7 @@ The built-in worker automatically:
 For advanced use cases, you can provide a custom worker entry:
 
 ```ts
-const runner = new NodeProcessEnvRunner({
+await using runner = new NodeProcessEnvRunner({
   name: "my-app",
   workerEntry: "/path/to/custom-worker.ts",
   data: { entry: "./app.ts" },

@@ -10,7 +10,7 @@ import type {
  * Manages an active `EnvRunner` instance, proxying all calls to it.
  * Supports hot-reload, auto-restart on unexpected exit, and message queueing.
  */
-export class RunnerManager implements EnvRunner {
+export class RunnerManager implements EnvRunner, AsyncDisposable {
   private _runner: EnvRunner | undefined;
   private _messageQueue: unknown[] = [];
   private _messageListeners = new Set<RunnerMessageListener>();
@@ -137,6 +137,10 @@ export class RunnerManager implements EnvRunner {
     if (runner) {
       await runner.close();
     }
+  }
+
+  async [Symbol.asyncDispose]() {
+    await this.close();
   }
 
   // #endregion

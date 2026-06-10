@@ -90,6 +90,8 @@ src/
 8. `reloadModule(timeout?)` re-imports the entry module without restarting the worker/process (cache-busted `import()`, IPC teardown/re-init)
 9. `close()` immediately terminates the worker/process and cleans up sockets
 
+`EnvRunner` extends `AsyncDisposable`: `[Symbol.asyncDispose]()` delegates to `close()` (implemented on both `BaseEnvRunner` and `RunnerManager`, inherited by `EnvServer`), so runners and managers work with `await using`. Note that `await using x = ...` does not await the initializer — async factories like `EnvServer.start()` need an inner `await`.
+
 Subclasses implement abstract methods: `sendMessage()`, `_hasRuntime()`, `_closeRuntime()`, `_runtimeType()`, and runtime init.
 
 ### NodeWorkerEnvRunner
@@ -306,7 +308,7 @@ const runner2 = new NodeProcessEnvRunner({
 - Tests use vitest: `pnpm vitest run`
 - Vercel suites (`test/vercel.test.ts` and the Vercel entry in `test/runners.test.ts`) stub a fake far-future `VERCEL_OIDC_TOKEN` via `vi.stubEnv` so the OIDC check doesn't log warnings (real env token takes precedence)
 - **`test/runners.test.ts`** — Parameterized test suite for all IPC-based runner implementations (NodeWorker, NodeProcess, BunProcess, DenoProcess, Vercel, Netlify). Runners requiring specific runtimes (bun, deno) are auto-skipped when the runtime is not available
-- **`test/manager.test.ts`** — Tests for `RunnerManager` lifecycle, hot-reload, message queueing, hook forwarding
+- **`test/manager.test.ts`** — Tests for `RunnerManager` lifecycle, hot-reload, message queueing, hook forwarding, `await using` disposal
 - **`test/miniflare.test.ts`** — Tests for `MiniflareEnvRunner`: Durable Object exports, IPC alongside custom exports, hot-reload via `reloadModule()`, IPC re-initialization after reload
 - **`test/vite.test.ts`** — Tests for Vite helpers: `createViteHotChannel` message namespacing/filtering/on/off, `createViteTransport` connect/send filtering
 - Test app fixture in `test/fixtures/app.mjs` — Minimal `export default { fetch }` entry for worker tests
@@ -325,7 +327,7 @@ const runner2 = new NodeProcessEnvRunner({
 - **`test/orphan.test.ts`** — Regression tests for orphaned workers (#23): SIGKILLs the supervisor process and asserts the worker stops serving HTTP, plus mid-import variants asserting the worker exits even when the supervisor dies during a slow entry import (node-process, bun-process under both Node and Bun hosts)
 - **`test/vercel.test.ts`** — Tests for `VercelEnvRunner`: request header injection (`x-vercel-deployment-url`, `x-vercel-id`, `x-vercel-forwarded-for`, `x-forwarded-for`, `x-real-ip`, `x-forwarded-proto`, `x-forwarded-host`), response header injection (`server`, `x-vercel-id`, `x-vercel-cache`), environment variables (`VERCEL`, `VERCEL_ENV`, `VERCEL_REGION`, `NOW_REGION`), header preservation, pre-existing header respect
 - **`test/netlify.test.ts`** — Tests for `NetlifyEnvRunner`: header injection (`x-nf-client-connection-ip`, `x-nf-account-id`, `x-nf-site-id`, `x-nf-deploy-id`, `x-nf-deploy-context`, `x-nf-geo`, `x-nf-request-id`), IP derivation, header preservation
-- Tests cover: lifecycle, fetch (GET/POST), WebSocket upgrade, crossws websocket, messaging, hooks, graceful close, inspect output, stdio forwarding (all runners), manager hot-reload, message queueing, miniflare hot-reload, vercel header/env/response injection, netlify header injection, waitForReady, vite helpers, orphan-worker exit on supervisor death
+- Tests cover: lifecycle, fetch (GET/POST), WebSocket upgrade, crossws websocket, messaging, hooks, graceful close, inspect output, stdio forwarding (all runners), manager hot-reload, message queueing, miniflare hot-reload, vercel header/env/response injection, netlify header injection, waitForReady, vite helpers, orphan-worker exit on supervisor death, `await using` disposal (all runners + manager)
 
 ## Scripts
 

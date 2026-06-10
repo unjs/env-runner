@@ -229,6 +229,19 @@ describe("RunnerManager", () => {
     expect(manager.ready).toBe(true);
   });
 
+  it("supports `await using` disposal (Symbol.asyncDispose)", async () => {
+    const runner = createRunner("async-dispose");
+    runners.push(runner);
+    {
+      await using m = new RunnerManager(runner);
+      manager = m;
+      await waitForReady(m);
+      expect(m.ready).toBe(true);
+    }
+    expect(manager.closed).toBe(true);
+    expect(runner.closed).toBe(true);
+  });
+
   it("close clears queue and shuts down runner", async () => {
     const runner = createRunner("close-cleanup");
     runners.push(runner);

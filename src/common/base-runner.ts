@@ -31,7 +31,7 @@ export interface EnvRunnerData {
   [key: string]: unknown;
 }
 
-export abstract class BaseEnvRunner implements EnvRunner {
+export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
   closed: boolean = false;
 
   protected _name: string;
@@ -174,6 +174,10 @@ export abstract class BaseEnvRunner implements EnvRunner {
     const onError = (error: unknown) => console.error(error);
     await this._closeRuntime().catch(onError);
     await this._closeSocket().catch(onError);
+  }
+
+  async [Symbol.asyncDispose]() {
+    await this.close();
   }
 
   [Symbol.for("nodejs.util.inspect.custom")]() {
