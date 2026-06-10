@@ -175,7 +175,7 @@ await runner.close();
 
 #### Virtual Modules
 
-The Node.js runners (`NodeWorkerEnvRunner`, `NodeProcessEnvRunner`, and the runners built on top of them), `BunProcessEnvRunner`, and `DenoProcessEnvRunner` (Deno >= 2.x) can serve **virtual modules** from an in-memory `specifier => source` map passed via `data.virtual`. The entry (and its dependencies) can then `import` them as if they were real files:
+The Node.js runners (`NodeWorkerEnvRunner`, `NodeProcessEnvRunner`, and the runners built on top of them), `BunProcessEnvRunner`, `DenoProcessEnvRunner` (Deno >= 2.x), and `MiniflareEnvRunner` can serve **virtual modules** from an in-memory `specifier => source` map passed via `data.virtual`. The entry (and its dependencies) can then `import` them as if they were real files:
 
 ```ts
 import { NodeWorkerEnvRunner } from "env-runner/runners/node-worker";
@@ -258,10 +258,12 @@ const runner = new NodeWorkerEnvRunner({
 });
 ```
 
-- **TypeScript** is type-stripped by Node's native [type stripping](https://nodejs.org/api/typescript.html#type-stripping) (Node.js >= 22.18 / 23.6 — erasable syntax only) and by Bun's `ts` loader. On Deno, custom load hooks bypass its native type stripping, so sources are pre-stripped with [`module.stripTypeScriptTypes`](https://docs.deno.com/api/node/module/~/Module.stripTypeScriptTypes) (Deno >= 2.8.2); on older Deno without it, virtual `.ts`/`.mts` sources **throw at registration** — pass pre-transpiled JavaScript instead.
-- **JSON** sources expose the parsed value as the default export on all runtimes. The `with { type: "json" }` import attribute is optional on Node.js and Bun; on Deno it must be **omitted** (static imports carrying an import attribute bypass `registerHooks` resolution).
+- **TypeScript** is type-stripped by Node's native [type stripping](https://nodejs.org/api/typescript.html#type-stripping) (Node.js >= 22.18 / 23.6 — erasable syntax only) and by Bun's `ts` loader. On Deno, custom load hooks bypass its native type stripping, so sources are pre-stripped with [`module.stripTypeScriptTypes`](https://docs.deno.com/api/node/module/~/Module.stripTypeScriptTypes) (Deno >= 2.8.2); on older Deno without it, virtual `.ts`/`.mts` sources **throw at registration** — pass pre-transpiled JavaScript instead. On miniflare, sources are likewise pre-stripped with `module.stripTypeScriptTypes` on the host (workerd does not parse TypeScript).
+- **JSON** sources expose the parsed value as the default export on all runtimes. The `with { type: "json" }` import attribute is optional on Node.js and Bun; on Deno and miniflare it must be **omitted** (static imports carrying an import attribute bypass `registerHooks` resolution on Deno, and workerd rejects import attributes outright).
 
 Virtual modules are registered inside the worker, before the entry is imported. On Node.js (>= 22.15 / 23.5) and Deno (>= 2.x) this uses [ESM customization hooks](https://nodejs.org/api/module.html#moduleregisterhooksoptions) (`module.registerHooks`); on Bun (which does not implement `registerHooks`) it uses [`Bun.plugin()`](https://bun.com/docs/runtime/plugins) virtual modules instead. The source string is treated as an ES module, and virtual specifiers (including a virtual entry) resolve across `reloadModule()`. On runtimes supporting neither mechanism, a warning is logged and registration is skipped. When the worker shuts down gracefully the registration is unregistered again (the `registerHooks` registration is deregistered; on Bun, which has no plugin-removal API, the in-memory source map is detached so fresh loads and reloads stop resolving).
+
+On `MiniflareEnvRunner` there is no in-worker registration: the runner's module fallback service serves virtual specifiers to workerd directly (taking precedence over disk files and the `transformRequest` pipeline, so a virtual key overrides a real file with the same path). One limitation: named `exports` (Durable Objects / WorkerEntrypoints) cannot be combined with a **virtual entry** — the wrapper would need a static re-export that miniflare cannot resolve at startup — and the runner fails fast with a clear error in that case.
 
 #### Miniflare Runner
 

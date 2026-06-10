@@ -23,7 +23,8 @@ export interface EnvRunnerData {
    * Factories are evaluated once on the host before the worker is spawned (so the
    * worker always receives plain strings).
    *
-   * Supported by the Node.js runners (`node-worker`, `node-process`).
+   * Supported by the `node-worker`, `node-process`, `bun-process`,
+   * `deno-process`, `vercel`, `netlify`, and `miniflare` runners.
    */
   virtual?: VirtualModules;
 

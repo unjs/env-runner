@@ -8,6 +8,7 @@ import { NodeWorkerEnvRunner } from "../src/runners/node-worker/runner.ts";
 import { NodeProcessEnvRunner } from "../src/runners/node-process/runner.ts";
 import { BunProcessEnvRunner } from "../src/runners/bun-process/runner.ts";
 import { DenoProcessEnvRunner } from "../src/runners/deno-process/runner.ts";
+import { MiniflareEnvRunner } from "../src/runners/miniflare/runner.ts";
 
 function hasRuntime(cmd: string): boolean {
   try {
@@ -60,9 +61,16 @@ const runners = [
     skip: !hasDeno,
     deno: true,
   },
+  // Miniflare serves virtual modules through `unsafeModuleFallbackService`
+  // (workerd), with `.ts`/`.mts` sources type-stripped on the host.
+  {
+    name: "MiniflareEnvRunner",
+    create: (opts: any) => new MiniflareEnvRunner(opts),
+    miniflare: true,
+  },
 ];
 
-for (const { name, create, skip, deno } of runners) {
+for (const { name, create, skip, deno, miniflare } of runners) {
   describe.skipIf(skip ?? false)(`${name} virtual modules`, () => {
     let runner: EnvRunner;
 
@@ -188,23 +196,27 @@ for (const { name, create, skip, deno } of runners) {
     });
 
     // Deno-side limitation: static imports carrying an import attribute bypass
-    // `registerHooks` resolution entirely, so the attribute form is Node/Bun only.
-    it.skipIf(deno)(`resolves a virtual JSON module imported with { type: "json" }`, async () => {
-      runner = create({
-        name: "virtual-json-attr",
-        data: {
-          entry: "#entry",
-          virtual: {
-            "#entry": `import config from "#config.json" with { type: "json" };
+    // `registerHooks` resolution entirely. workerd rejects import attributes
+    // outright ("Unrecognized import attributes specified"). Node/Bun only.
+    it.skipIf(deno || miniflare)(
+      `resolves a virtual JSON module imported with { type: "json" }`,
+      async () => {
+        runner = create({
+          name: "virtual-json-attr",
+          data: {
+            entry: "#entry",
+            virtual: {
+              "#entry": `import config from "#config.json" with { type: "json" };
               export default { fetch: () => new Response(config.message) };`,
-            "#config.json": JSON.stringify({ message: "json with attribute" }),
+              "#config.json": JSON.stringify({ message: "json with attribute" }),
+            },
           },
-        },
-      });
-      await runner.waitForReady();
-      const res = await runner.fetch("http://localhost/");
-      expect(await res.text()).toBe("json with attribute");
-    });
+        });
+        await runner.waitForReady();
+        const res = await runner.fetch("http://localhost/");
+        expect(await res.text()).toBe("json with attribute");
+      },
+    );
 
     it("resolves a factory-valued virtual source (sync and async)", async () => {
       runner = create({
@@ -264,33 +276,38 @@ for (const { name, create, skip, deno } of runners) {
       expect((closeCause as Error)?.message).toBe("factory failed");
     });
 
-    it("unregisters virtual modules on shutdown without breaking close", async () => {
-      runner = create({
-        name: "virtual-unregister",
-        data: {
-          entry: "#entry",
-          virtual: {
-            "#entry": `export default { fetch: () => new Response("ok") };`,
+    // Miniflare has no graceful-shutdown handshake/exit event and nothing to
+    // unregister — the fallback-service closure dies with the instance.
+    it.skipIf(miniflare)(
+      "unregisters virtual modules on shutdown without breaking close",
+      async () => {
+        runner = create({
+          name: "virtual-unregister",
+          data: {
+            entry: "#entry",
+            virtual: {
+              "#entry": `export default { fetch: () => new Response("ok") };`,
+            },
           },
-        },
-      });
-      await runner.waitForReady();
-      // Graceful path: workers call unregisterVirtualModules() in their
-      // shutdown handler and confirm with an exit event.
-      const exited = new Promise((resolve) => {
-        runner.onMessage((message: any) => {
-          if (message?.event === "exit") resolve(message);
         });
-      });
-      runner.sendMessage({ event: "shutdown" });
-      await expect(
-        Promise.race([
-          exited,
-          new Promise((_, reject) => setTimeout(() => reject(new Error("no exit event")), 5000)),
-        ]),
-      ).resolves.toBeTruthy();
-      await runner.close();
-    });
+        await runner.waitForReady();
+        // Graceful path: workers call unregisterVirtualModules() in their
+        // shutdown handler and confirm with an exit event.
+        const exited = new Promise((resolve) => {
+          runner.onMessage((message: any) => {
+            if (message?.event === "exit") resolve(message);
+          });
+        });
+        runner.sendMessage({ event: "shutdown" });
+        await expect(
+          Promise.race([
+            exited,
+            new Promise((_, reject) => setTimeout(() => reject(new Error("no exit event")), 5000)),
+          ]),
+        ).resolves.toBeTruthy();
+        await runner.close();
+      },
+    );
 
     it("reloads a virtual entry without restarting the worker", async () => {
       runner = create({
@@ -310,6 +327,33 @@ for (const { name, create, skip, deno } of runners) {
     });
   });
 }
+
+describe("MiniflareEnvRunner virtual module limitations", () => {
+  // The wrapper wires DO/Entrypoint exports as static re-exports, which
+  // miniflare's ModuleLocator resolves on disk — impossible for a virtual entry.
+  it("fails fast for named exports with a virtual entry", async () => {
+    let closeCause: unknown;
+    const runner = new MiniflareEnvRunner({
+      name: "virtual-do",
+      exports: { Counter: {} },
+      hooks: {
+        onClose: (_runner, cause) => {
+          closeCause = cause;
+        },
+      },
+      data: {
+        entry: "#entry",
+        virtual: {
+          "#entry": `export default { fetch: () => new Response("unreachable") };`,
+        },
+      },
+    });
+    await expect(runner.waitForReady(3000)).rejects.toThrow();
+    expect(runner.closed).toBe(true);
+    expect(String((closeCause as Error)?.message)).toContain("virtual entry");
+    await runner.close();
+  });
+});
 
 // Subprocess-based: the vitest module runner intercepts in-process dynamic
 // imports, so the fixture exercises the real ESM hook chain / Bun plugin.
