@@ -15,8 +15,9 @@ import { createVirtualHooks, virtualModuleFormat } from "../virtual-loader.ts";
  * loader. Deno ignores the `format` returned by custom load hooks (sources
  * would be parsed as plain JS), so there the map is transformed up front:
  * `.json` sources are wrapped into a default-exporting ES module, and
- * `.ts`/`.mts` sources **throw** (Deno's native type stripping is unreachable
- * from hooks; pass pre-transpiled JavaScript instead).
+ * `.ts`/`.mts` sources are stripped with `module.stripTypeScriptTypes` when
+ * available (Deno > 2.8.0) and **throw** on older Deno (native type stripping
+ * is unreachable from hooks; pass pre-transpiled JavaScript instead).
  *
  * Two registration backends, picked by feature detection:
  *
@@ -49,10 +50,10 @@ export async function registerVirtualModules(
   if (!virtual || Object.keys(virtual).length === 0) {
     return _noop;
   }
-  const { registerHooks } = await import("node:module");
+  const { registerHooks, stripTypeScriptTypes } = await import("node:module");
   if (typeof registerHooks === "function") {
     if ("Deno" in globalThis) {
-      virtual = _transformForDeno(virtual);
+      virtual = _transformForDeno(virtual, stripTypeScriptTypes);
     }
     const hooks = registerHooks(createVirtualHooks(virtual));
     return _once(() => hooks.deregister());
@@ -125,21 +126,29 @@ function _registerBunModules(specifiers: string[]): void {
 // parsed as plain JS), so non-JS sources are converted to ES modules before
 // registration: `.json` via a default-exporting wrapper (Deno doesn't validate
 // import attributes on hook-loaded modules, so `with { type: "json" }` stays
-// portable). TypeScript sources can't be served — Deno's native type stripping
-// is unreachable from hooks and bundling a stripper is out of scope — so a
+// portable), `.ts`/`.mts` via `module.stripTypeScriptTypes` (added to Deno's
+// node:module compat on 2026-05-31, after 2.8.0). On older Deno without it a
 // `.ts`/`.mts` specifier throws instead of failing later with an opaque
 // SyntaxError.
-function _transformForDeno(virtual: Record<string, string>): Record<string, string> {
+function _transformForDeno(
+  virtual: Record<string, string>,
+  stripTypeScriptTypes?: (code: string) => string,
+): Record<string, string> {
   const out: Record<string, string> = {};
   for (const [specifier, source] of Object.entries(virtual)) {
     const format = virtualModuleFormat(specifier);
     if (format === "module-typescript") {
-      throw new Error(
-        `[env-runner] virtual TypeScript modules are not supported on Deno (custom load hooks bypass its type stripping): "${specifier}". Provide a pre-transpiled JavaScript source instead.`,
-      );
+      if (typeof stripTypeScriptTypes !== "function") {
+        throw new TypeError(
+          `[env-runner] virtual TypeScript module "${specifier}" requires \`module.stripTypeScriptTypes\` (custom load hooks bypass Deno's native type stripping); upgrade Deno or provide a pre-transpiled JavaScript source instead.`,
+        );
+      }
+      out[specifier] = stripTypeScriptTypes(source);
+    } else if (format === "json") {
+      out[specifier] = `export default JSON.parse(${JSON.stringify(source)});`;
+    } else {
+      out[specifier] = source;
     }
-    out[specifier] =
-      format === "json" ? `export default JSON.parse(${JSON.stringify(source)});` : source;
   }
   return out;
 }

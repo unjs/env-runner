@@ -21,6 +21,26 @@ function hasRuntime(cmd: string): boolean {
 const hasDeno = hasRuntime("deno");
 const hasBun = hasRuntime("bun");
 
+// Deno serves virtual .ts modules via `module.stripTypeScriptTypes`, added to
+// its node:module compat after 2.8.0 (older Deno fails fast at registration).
+function denoSupportsTypeStripping(): boolean {
+  if (!hasDeno) return false;
+  try {
+    execFileSync(
+      "deno",
+      [
+        "eval",
+        `const m = await import("node:module"); if (typeof m.stripTypeScriptTypes !== "function") Deno.exit(1);`,
+      ],
+      { stdio: "ignore" },
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+const denoTypeStripping = denoSupportsTypeStripping();
+
 const _dir = dirname(fileURLToPath(import.meta.url));
 const virtualAppEntry = resolve(_dir, "./fixtures/app-virtual.mjs");
 
@@ -97,42 +117,49 @@ for (const { name, create, skip, deno } of runners) {
       expect(await res.text()).toBe("composed virtual");
     });
 
-    // Deno ignores the `format` of custom load hooks, so virtual `.ts` sources
-    // can't reach its type stripping — registration throws a clear error there.
-    it.skipIf(deno)("resolves virtual TypeScript modules (.ts entry and import)", async () => {
-      runner = create({
-        name: "virtual-ts",
-        data: {
-          entry: "#entry.ts",
-          virtual: {
-            "#entry.ts": `import { getMessage } from "#util.ts";
+    // Deno ignores the `format` of custom load hooks; virtual `.ts` sources are
+    // pre-stripped with `module.stripTypeScriptTypes` (Deno > 2.8.0) and
+    // registration throws a clear error on older Deno without it.
+    it.skipIf(deno && !denoTypeStripping)(
+      "resolves virtual TypeScript modules (.ts entry and import)",
+      async () => {
+        runner = create({
+          name: "virtual-ts",
+          data: {
+            entry: "#entry.ts",
+            virtual: {
+              "#entry.ts": `import { getMessage } from "#util.ts";
               const handler: () => Response = () => new Response(getMessage());
               export default { fetch: handler };`,
-            "#util.ts": `export function getMessage(): string {
+              "#util.ts": `export function getMessage(): string {
               const value: string = "hello from typescript";
               return value;
             }`,
+            },
           },
-        },
-      });
-      await runner.waitForReady();
-      const res = await runner.fetch("http://localhost/");
-      expect(await res.text()).toBe("hello from typescript");
-    });
+        });
+        await runner.waitForReady();
+        const res = await runner.fetch("http://localhost/");
+        expect(await res.text()).toBe("hello from typescript");
+      },
+    );
 
-    it.skipIf(!deno)("fails fast for a virtual TypeScript module on Deno", async () => {
-      runner = create({
-        name: "virtual-ts-deno",
-        data: {
-          entry: "#entry.ts",
-          virtual: {
-            "#entry.ts": `export default { fetch: () => new Response("unreachable") };`,
+    it.skipIf(!deno || denoTypeStripping)(
+      "fails fast for a virtual TypeScript module on Deno without stripTypeScriptTypes",
+      async () => {
+        runner = create({
+          name: "virtual-ts-deno",
+          data: {
+            entry: "#entry.ts",
+            virtual: {
+              "#entry.ts": `export default { fetch: () => new Response("unreachable") };`,
+            },
           },
-        },
-      });
-      await expect(runner.waitForReady(3000)).rejects.toThrow();
-      expect(runner.closed).toBe(true);
-    });
+        });
+        await expect(runner.waitForReady(3000)).rejects.toThrow();
+        expect(runner.closed).toBe(true);
+      },
+    );
 
     it("resolves a virtual JSON module", async () => {
       runner = create({
