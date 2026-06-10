@@ -50,7 +50,7 @@ import { serve } from "srvx";
 import { EnvServer } from "env-runner";
 
 const envServer = new EnvServer({
-  runner: "node-process",
+  runner: "node-process", // optional, defaults to "node-worker"
   entry: "./app.ts",
   watch: true,
   watchPaths: ["./src"],

@@ -6,8 +6,8 @@ import { loadRunner } from "./loader.ts";
 import { RunnerManager } from "./manager.ts";
 
 export interface EnvServerOptions {
-  /** Runner implementation to use. */
-  runner: RunnerName;
+  /** Runner implementation to use (defaults to `"node-worker"`). */
+  runner?: RunnerName;
   /** Path to the user entry module (passed as `data.entry`). */
   entry: string;
   /** Runner instance name. */
@@ -65,7 +65,7 @@ export class EnvServer extends RunnerManager {
   // #region Private
 
   private async _createRunner() {
-    return loadRunner(this._opts.runner, {
+    return loadRunner(this._opts.runner || "node-worker", {
       name: this._opts.name || this._opts.entry,
       hooks: this._opts.hooks,
       data: { ...this._opts.data, entry: this._opts.entry },
