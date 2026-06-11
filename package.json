@@ -51,8 +51,8 @@
   "devDependencies": {
     "@netlify/runtime": "^4.1.25",
     "@types/node": "^25.9.2",
-    "@typescript/native-preview": "7.0.0-dev.20260521.1",
-    "@vercel/queue": "^0.2.1",
+    "@typescript/native-preview": "7.0.0-dev.20260607.1",
+    "@vercel/queue": "^0.3.0",
     "@vitest/coverage-v8": "^4.1.8",
     "automd": "^0.4.3",
     "changelogen": "^0.6.2",
@@ -61,15 +61,15 @@
     "es-module-lexer": "^2.1.0",
     "miniflare": "^4.20260603.0",
     "obuild": "^0.4.36",
-    "oxfmt": "^0.51.0",
+    "oxfmt": "^0.53.0",
     "oxlint": "^1.69.0",
     "typescript": "^6.0.3",
     "vitest": "^4.1.8"
   },
   "peerDependencies": {
-    "@netlify/runtime": "^4.1.23",
-    "@vercel/queue": "^0.2.0",
-    "miniflare": "^4.20260515.0"
+    "@netlify/runtime": "^4.1.25",
+    "@vercel/queue": "^0.3.0",
+    "miniflare": "^4.20260603.0"
   },
   "peerDependenciesMeta": {
     "miniflare": {
