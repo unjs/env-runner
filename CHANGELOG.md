@@ -1,6 +1,18 @@
 # Changelog
 
 
+## v0.1.14
+
+[compare changes](https://github.com/unjs/env-runner/compare/v0.1.13...v0.1.14)
+
+### 🚀 Enhancements
+
+- **miniflare:** Support optionally loading wrangler config ([#28](https://github.com/unjs/env-runner/pull/28))
+
+### ❤️ Contributors
+
+- Pi0x <x@pi0.io>
+
 ## v0.1.13
 
 [compare changes](https://github.com/unjs/env-runner/compare/v0.1.12...v0.1.13)
