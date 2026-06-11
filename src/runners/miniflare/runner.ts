@@ -104,8 +104,7 @@ export interface MiniflareEnvRunnerOptions {
   wrangler?: boolean | string | WranglerInlineConfig;
   /**
    * Wrangler environment (`--env`) to select when loading the config.
-   * Defaults to the `CLOUDFLARE_ENV` environment variable (matching
-   * `@cloudflare/vite-plugin`).
+   * Defaults to the `CLOUDFLARE_ENV` environment variable.
    */
   wranglerEnv?: string;
 }
@@ -151,8 +150,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
     this.#captureErrors = opts.captureErrors ?? true;
     this.#exportConditions = opts.exportConditions ?? ["workerd", "worker"];
     this.#wrangler = opts.wrangler ?? false;
-    // Default the wrangler `--env` to the `CLOUDFLARE_ENV` variable (matches
-    // `@cloudflare/vite-plugin`, which reads the selected env solely from it).
+    // Default the wrangler `--env` to the `CLOUDFLARE_ENV` variable.
     this.#wranglerEnv = opts.wranglerEnv ?? process.env.CLOUDFLARE_ENV;
     this._initWithVirtualData(() => this.#init());
   }

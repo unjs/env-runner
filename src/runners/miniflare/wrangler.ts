@@ -21,8 +21,7 @@ const WRANGLER_OPTION_DENYLIST = new Set([
   // wrangler always returns default module rules (Text/Data/CompiledWasm); the
   // runner owns module loading via the fallback service + dynamicOnly wrapper
   // and injects its own `.ts/.tsx/.jsx/.mts` rules for `transformRequest`.
-  // Adopting wrangler's rules would defeat that injection (mirrors
-  // @cloudflare/vite-plugin, which also strips `modulesRules`).
+  // Adopting wrangler's rules would defeat that injection.
   "modulesRules",
   "unsafeDirectSockets",
   "unsafeEvalBinding",
