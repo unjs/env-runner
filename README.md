@@ -326,7 +326,7 @@ await using runner = new MiniflareEnvRunner({
 });
 ```
 
-You can also pass an **inline** config object (raw `wrangler.json` shape) instead of a file — handy for programmatic setups:
+You can also pass an **inline** config object (raw `wrangler.json` shape) instead of (or in addition to) a file — handy for programmatic setups:
 
 ```ts
 await using runner = new MiniflareEnvRunner({
@@ -341,7 +341,9 @@ await using runner = new MiniflareEnvRunner({
 });
 ```
 
-When the [`wrangler`](https://www.npmjs.com/package/wrangler) package is installed (an optional peer dependency), it is used for full fidelity — TOML, `env` inheritance, `.dev.vars`, and every binding type — via `unstable_readConfig` + `unstable_getMiniflareWorkerOptions` (the same approach as the official `@cloudflare/vite-plugin`, which also runs Miniflare directly and uses `wrangler` only to read config); an inline config is normalized through a short-lived temp file. When `wrangler` is **not** installed, a built-in minimal reader handles plain JSON files and inline objects (common fields only) and logs a one-time warning; JSONC and TOML files are skipped with a warning (they need `wrangler` to parse). Values you pass in `miniflareOptions` always take precedence over config-derived ones (`compatibilityFlags` are merged).
+When an inline config is passed, a `wrangler.{json,jsonc,toml}` file is still auto-discovered (next to the entry, then cwd) and loaded, and the inline config is **merged on top of it** — inline values win per key, binding records (e.g. `vars`) merge, and `compatibilityFlags` are unioned. This lets you keep a committed `wrangler` file and override a few fields programmatically.
+
+When the [`wrangler`](https://www.npmjs.com/package/wrangler) package is installed (an optional peer dependency), it is used for full fidelity — TOML, `env` inheritance, `.dev.vars`, and every binding type — via `unstable_readConfig` + `unstable_getMiniflareWorkerOptions` (the same approach as the official `@cloudflare/vite-plugin`, which also runs Miniflare directly and uses `wrangler` only to read config); an inline config is normalized through a short-lived temp file. When `wrangler` is **not** installed, a built-in minimal reader handles plain JSON files and inline objects (common fields only) and logs a one-time warning; JSONC and TOML files are skipped with a warning (they need `wrangler` to parse). Values you pass in `miniflareOptions` always take precedence over config-derived ones — binding records (e.g. `bindings`) merge per key, and `compatibilityFlags` are merged.
 
 #### Module Transform Pipeline
 

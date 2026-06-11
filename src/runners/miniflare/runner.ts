@@ -84,7 +84,10 @@ export interface MiniflareEnvRunnerOptions {
    *   file, then in the current working directory.
    * - `string` — explicit path to a wrangler config file.
    * - `object` — an inline raw (snake_case) wrangler config, as you would
-   *   write in `wrangler.json` (no file needed).
+   *   write in `wrangler.json` (no file needed). A config file is still
+   *   auto-discovered (next to the entry, then cwd) and the inline config is
+   *   merged on top of it (inline wins per key, binding records merge,
+   *   `compatibilityFlags` are unioned).
    *
    * The installed `wrangler` package is preferred (full fidelity: TOML,
    * `env` inheritance, `.dev.vars`, every binding type; an inline config is
@@ -92,8 +95,8 @@ export interface MiniflareEnvRunnerOptions {
    * installed, a built-in minimal reader handles plain JSON files and inline
    * objects (common fields only) and a one-time warning is logged. JSONC and
    * TOML files without `wrangler` are skipped with a warning. Values from
-   * `miniflareOptions` always win over config-derived ones;
-   * `compatibilityFlags` are merged.
+   * `miniflareOptions` always win over config-derived ones; binding records
+   * (e.g. `bindings`) merge per key and `compatibilityFlags` are unioned.
    */
   wrangler?: boolean | string | WranglerInlineConfig;
   /** Wrangler environment (`--env`) to select when loading the config. */
@@ -383,10 +386,13 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
   /**
    * Resolve the optional wrangler config into a partial Miniflare options
    * object (compat date/flags + bindings). Accepts a file path, auto-discovery
-   * (`true`), or an inline raw config object. Prefers the installed `wrangler`
-   * package; falls back to a built-in minimal JSON/JSONC reader (with a
-   * one-time warning) when it isn't available. Returns `undefined` when
-   * `wrangler` is disabled or no config could be loaded.
+   * (`true`), or an inline raw config object. When an inline config is passed,
+   * a config file is still auto-discovered (next to the entry, then cwd) and
+   * loaded — the inline config is merged on top of it (inline wins per key,
+   * binding records merge, `compatibilityFlags` are unioned). Prefers the
+   * installed `wrangler` package; falls back to a built-in minimal JSON reader
+   * (with a one-time warning) when it isn't available. Returns `undefined`
+   * when `wrangler` is disabled or no config could be loaded.
    */
   async #loadWranglerConfig(entryPath?: string): Promise<Record<string, unknown> | undefined> {
     const opt = this.#wrangler;
@@ -396,17 +402,26 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
     const env = this.#wranglerEnv;
     const inline = isInlineWranglerConfig(opt) ? opt : undefined;
 
+    // Resolve a config file: an explicit string path, or auto-discovery for
+    // both `true` and inline objects (an inline config is merged on top of any
+    // discovered file). A missing explicit/auto-discovered file warns, but a
+    // missing file is fine for an inline config (the inline config is enough).
     let configPath: string | undefined;
-    if (!inline) {
-      configPath = typeof opt === "string" ? resolve(opt) : findWranglerConfig(entryPath);
-      if (!configPath || !existsSync(configPath)) {
-        console.warn(
-          `[env-runner] wrangler config requested but ${
-            configPath ? `not found at "${configPath}"` : "none found near the entry or cwd"
-          }`,
-        );
+    if (typeof opt === "string") {
+      configPath = resolve(opt);
+      if (!existsSync(configPath)) {
+        console.warn(`[env-runner] wrangler config requested but not found at "${configPath}"`);
         return undefined;
       }
+    } else if (opt === true) {
+      configPath = findWranglerConfig(entryPath);
+      if (!configPath) {
+        console.warn("[env-runner] wrangler config requested but none found near the entry or cwd");
+        return undefined;
+      }
+    } else {
+      // Inline object — augment with an auto-discovered file when present.
+      configPath = findWranglerConfig(entryPath);
     }
 
     // Prefer the real `wrangler` package for full fidelity (TOML, env
@@ -420,26 +435,41 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
         _warnedNoWrangler = true;
         console.warn(
           "[env-runner] 'wrangler' is not installed; using the built-in minimal config reader " +
-            "(JSON/JSONC, common fields only). Install 'wrangler' for full fidelity " +
-            "(TOML, env inheritance, all binding types).",
+            "(plain JSON, common fields only). Install 'wrangler' for full fidelity " +
+            "(JSONC, TOML, env inheritance, all binding types).",
         );
       }
-      return inline
+      const fileOptions = configPath ? readWranglerConfigMinimal(configPath, env) : undefined;
+      const inlineOptions = inline
         ? mapWranglerConfigToMiniflare(applyWranglerEnv(inline, env))
-        : readWranglerConfigMinimal(configPath!, env);
+        : undefined;
+      return mergeWranglerMiniflareOptions(fileOptions, inlineOptions);
     }
 
     try {
-      const config = inline
-        ? readInlineWranglerConfig(wrangler, inline, env)
-        : wrangler.unstable_readConfig({ config: configPath!, env }, { hideWarnings: true });
-      const { workerOptions } = wrangler.unstable_getMiniflareWorkerOptions(config, env);
-      return pickWranglerMiniflareOptions(workerOptions);
+      const fileOptions = configPath
+        ? pickWranglerMiniflareOptions(
+            wrangler.unstable_getMiniflareWorkerOptions(
+              wrangler.unstable_readConfig({ config: configPath, env }, { hideWarnings: true }),
+              env,
+            ).workerOptions,
+          )
+        : undefined;
+      const inlineOptions = inline
+        ? pickWranglerMiniflareOptions(
+            wrangler.unstable_getMiniflareWorkerOptions(
+              readInlineWranglerConfig(wrangler, inline, env),
+              env,
+            ).workerOptions,
+          )
+        : undefined;
+      return mergeWranglerMiniflareOptions(fileOptions, inlineOptions);
     } catch (error) {
+      const desc = [configPath && `"${configPath}"`, inline && "(inline)"]
+        .filter(Boolean)
+        .join(" + ");
       console.warn(
-        `[env-runner] failed to load wrangler config ${
-          inline ? "(inline)" : `"${configPath}"`
-        }: ${(error as Error).message}`,
+        `[env-runner] failed to load wrangler config ${desc}: ${(error as Error).message}`,
       );
       return undefined;
     }
@@ -468,6 +498,18 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
       // Expose a direct socket so we can proxy WebSocket upgrades via workerd
       unsafeDirectSockets: [{ host: "127.0.0.1", port: 0 }, ...userDirectSockets],
     };
+
+    // Deep-merge nested record options (e.g. `bindings`) so user-supplied
+    // `miniflareOptions` extend wrangler-derived ones per key instead of
+    // replacing the whole object (user keys still win on conflict).
+    if (wranglerOptions) {
+      for (const [key, wValue] of Object.entries(wranglerOptions)) {
+        const uValue = this.#miniflareOptions[key];
+        if (isPlainObject(wValue) && isPlainObject(uValue)) {
+          options[key] = { ...wValue, ...uValue };
+        }
+      }
+    }
 
     // Generate in-memory wrapper module with IPC support
     if (entryPath && !options.script && !options.scriptPath) {
@@ -810,9 +852,40 @@ const WRANGLER_OPTION_DENYLIST = new Set([
   "unsafeUseModuleFallbackService",
 ]);
 
+/** Whether a value is a plain (non-array, non-null) object. */
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 /** Whether a `wrangler` option value is an inline raw config object. */
 function isInlineWranglerConfig(opt: unknown): opt is WranglerInlineConfig {
-  return typeof opt === "object" && opt !== null && !Array.isArray(opt);
+  return isPlainObject(opt);
+}
+
+/**
+ * Merge two partial Miniflare option objects derived from wrangler configs
+ * (file + inline). `override` wins per key, binding records (`bindings`, KV,
+ * etc.) are shallow-merged, and array options (`compatibilityFlags`) are
+ * unioned. Returns `undefined` when both inputs are empty.
+ */
+function mergeWranglerMiniflareOptions(
+  base: Record<string, unknown> | undefined,
+  override: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+  if (!base) return override;
+  if (!override) return base;
+  const out: Record<string, unknown> = { ...base };
+  for (const [key, value] of Object.entries(override)) {
+    const prev = out[key];
+    if (Array.isArray(value) && Array.isArray(prev)) {
+      out[key] = [...new Set([...prev, ...value])];
+    } else if (isPlainObject(value) && isPlainObject(prev)) {
+      out[key] = { ...prev, ...value };
+    } else {
+      out[key] = value;
+    }
+  }
+  return out;
 }
 
 /**
