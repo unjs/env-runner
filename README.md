@@ -310,6 +310,8 @@ const response = await runner.fetch("http://localhost/api");
 
 The `miniflareOptions` object is passed directly to the [Miniflare constructor](https://developers.cloudflare.com/workers/testing/miniflare/) — you can configure bindings, KV, D1, Durable Objects, and any other Miniflare option.
 
+When you don't set a `compatibilityDate` (via `miniflareOptions` or a wrangler config), it defaults to the date supported by the installed `workerd` binary rather than today's date — the binary always lags the calendar slightly, and pinning a future date makes `workerd` refuse to start.
+
 #### Wrangler Config
 
 Set the `wrangler` option to load a Cloudflare [Wrangler config](https://developers.cloudflare.com/workers/wrangler/configuration/) (`wrangler.json` / `wrangler.jsonc` / `wrangler.toml`) into the Miniflare options — compatibility date/flags and bindings (`vars`, KV, R2, D1, Durable Objects, queues):
@@ -325,6 +327,8 @@ await using runner = new MiniflareEnvRunner({
   // wranglerEnv: "production",          // select a `[env.production]` block
 });
 ```
+
+`wranglerEnv` selects a named Wrangler environment (`--env`). When omitted, it defaults to the `CLOUDFLARE_ENV` environment variable (matching `@cloudflare/vite-plugin`), so `CLOUDFLARE_ENV=production` selects the `production` env without passing the option.
 
 You can also pass an **inline** config object (raw `wrangler.json` shape) instead of (or in addition to) a file — handy for programmatic setups:
 

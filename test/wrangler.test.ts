@@ -162,6 +162,36 @@ const INSTALLED_CASES: WranglerCase[] = [
     assert: (json) => expect(json).toEqual({ greeting: "from-inline", tier: "from-file" }),
   },
   {
+    // `transformRequest` (Vite-style TS compilation) and a `wrangler` config are
+    // the headline combination this feature targets, so verify they coexist: a
+    // TS helper is transformed on the fly while bindings come from wrangler.
+    // (Also guards the denylist: wrangler's `unstable_getMiniflareWorkerOptions`
+    // always returns default `modulesRules`, which the runner must not adopt.)
+    name: "supports transformRequest alongside a wrangler config",
+    files: {
+      "helper.ts": `const msg: string = "transformed"; export default msg;`,
+    },
+    entry: `import msg from "./helper.ts";
+export default {
+  fetch(request, env) {
+    return Response.json({ greeting: env.GREETING ?? null, tier: msg });
+  },
+};`,
+    options: () => ({
+      wrangler: {
+        name: "inline",
+        compatibility_date: "2024-09-01",
+        vars: { GREETING: "from-wrangler" },
+      },
+      transformRequest: async (id: string) => {
+        if (!id.endsWith(".ts")) return null;
+        const { readFileSync } = await import("node:fs");
+        return { code: readFileSync(id, "utf8").replace(/:\s*string/g, "") };
+      },
+    }),
+    assert: (json) => expect(json).toEqual({ greeting: "from-wrangler", tier: "transformed" }),
+  },
+  {
     name: "lets miniflareOptions bindings merge with (and win over) wrangler vars",
     files: {
       "wrangler.json": JSON.stringify({
@@ -187,6 +217,29 @@ describe("MiniflareEnvRunner (wrangler config)", () => {
       c.assert(json);
     });
   }
+
+  it("defaults wranglerEnv to the CLOUDFLARE_ENV variable", async () => {
+    vi.stubEnv("CLOUDFLARE_ENV", "production");
+    try {
+      const json = await runWranglerCase({
+        name: "cloudflare-env",
+        files: {
+          "wrangler.json": JSON.stringify({
+            name: "test",
+            compatibility_date: "2024-09-01",
+            vars: { TIER: "base" },
+            env: { production: { vars: { TIER: "prod" } } },
+          }),
+        },
+        // No `wranglerEnv` — it should fall back to CLOUDFLARE_ENV.
+        options: () => ({ wrangler: true }),
+        assert: (json) => expect(json.tier).toBe("prod"),
+      });
+      expect(json.tier).toBe("prod");
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
 });
 
 // --- Built-in minimal reader (wrangler not installed) ---
