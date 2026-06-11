@@ -1,8 +1,9 @@
 import type { WorkerHooks } from "../../types.ts";
 
-import { readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
-import { basename, dirname, isAbsolute, resolve } from "node:path";
+import { tmpdir } from "node:os";
+import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { resolveModulePath } from "exsolve";
 import { init as initCjsLexer, parse as parseCjs } from "cjs-module-lexer";
@@ -74,7 +75,33 @@ export interface MiniflareEnvRunnerOptions {
    * Defaults to `["workerd", "worker"]`.
    */
   exportConditions?: string[];
+  /**
+   * Load a Cloudflare `wrangler` config to populate Miniflare options
+   * (compatibility date/flags and bindings: `vars`, KV, R2, D1, Durable
+   * Objects, queues).
+   *
+   * - `true` — auto-discover `wrangler.{json,jsonc,toml}` next to the entry
+   *   file, then in the current working directory.
+   * - `string` — explicit path to a wrangler config file.
+   * - `object` — an inline raw (snake_case) wrangler config, as you would
+   *   write in `wrangler.json` (no file needed).
+   *
+   * The installed `wrangler` package is preferred (full fidelity: TOML,
+   * `env` inheritance, `.dev.vars`, every binding type; an inline config is
+   * normalized through a short-lived temp file). When `wrangler` is not
+   * installed, a built-in minimal reader handles plain JSON files and inline
+   * objects (common fields only) and a one-time warning is logged. JSONC and
+   * TOML files without `wrangler` are skipped with a warning. Values from
+   * `miniflareOptions` always win over config-derived ones;
+   * `compatibilityFlags` are merged.
+   */
+  wrangler?: boolean | string | WranglerInlineConfig;
+  /** Wrangler environment (`--env`) to select when loading the config. */
+  wranglerEnv?: string;
 }
+
+/** Raw (snake_case) Wrangler config object, mirroring `wrangler.json` contents. */
+export type WranglerInlineConfig = Record<string, unknown>;
 
 const IPC_PATH = "/__env_runner_ipc";
 
@@ -105,6 +132,8 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
   #exports: Record<string, MiniflareExportInfo> | boolean;
   #captureErrors: boolean;
   #exportConditions: string[];
+  #wrangler: boolean | string | WranglerInlineConfig;
+  #wranglerEnv?: string;
 
   constructor(opts: MiniflareEnvRunnerOptions) {
     super({ ...opts, workerEntry: "" });
@@ -114,6 +143,8 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
     this.#exports = opts.exports ?? {};
     this.#captureErrors = opts.captureErrors ?? true;
     this.#exportConditions = opts.exportConditions ?? ["workerd", "worker"];
+    this.#wrangler = opts.wrangler ?? false;
+    this.#wranglerEnv = opts.wranglerEnv;
     this._initWithVirtualData(() => this.#init());
   }
 
@@ -349,6 +380,71 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
     });
   }
 
+  /**
+   * Resolve the optional wrangler config into a partial Miniflare options
+   * object (compat date/flags + bindings). Accepts a file path, auto-discovery
+   * (`true`), or an inline raw config object. Prefers the installed `wrangler`
+   * package; falls back to a built-in minimal JSON/JSONC reader (with a
+   * one-time warning) when it isn't available. Returns `undefined` when
+   * `wrangler` is disabled or no config could be loaded.
+   */
+  async #loadWranglerConfig(entryPath?: string): Promise<Record<string, unknown> | undefined> {
+    const opt = this.#wrangler;
+    if (!opt) {
+      return undefined;
+    }
+    const env = this.#wranglerEnv;
+    const inline = isInlineWranglerConfig(opt) ? opt : undefined;
+
+    let configPath: string | undefined;
+    if (!inline) {
+      configPath = typeof opt === "string" ? resolve(opt) : findWranglerConfig(entryPath);
+      if (!configPath || !existsSync(configPath)) {
+        console.warn(
+          `[env-runner] wrangler config requested but ${
+            configPath ? `not found at "${configPath}"` : "none found near the entry or cwd"
+          }`,
+        );
+        return undefined;
+      }
+    }
+
+    // Prefer the real `wrangler` package for full fidelity (TOML, env
+    // inheritance, .dev.vars, every binding type). An inline config is
+    // normalized through a short-lived temp file (readConfig is file-based).
+    let wrangler: any;
+    try {
+      wrangler = await import("wrangler");
+    } catch {
+      if (!_warnedNoWrangler) {
+        _warnedNoWrangler = true;
+        console.warn(
+          "[env-runner] 'wrangler' is not installed; using the built-in minimal config reader " +
+            "(JSON/JSONC, common fields only). Install 'wrangler' for full fidelity " +
+            "(TOML, env inheritance, all binding types).",
+        );
+      }
+      return inline
+        ? mapWranglerConfigToMiniflare(applyWranglerEnv(inline, env))
+        : readWranglerConfigMinimal(configPath!, env);
+    }
+
+    try {
+      const config = inline
+        ? readInlineWranglerConfig(wrangler, inline, env)
+        : wrangler.unstable_readConfig({ config: configPath!, env }, { hideWarnings: true });
+      const { workerOptions } = wrangler.unstable_getMiniflareWorkerOptions(config, env);
+      return pickWranglerMiniflareOptions(workerOptions);
+    } catch (error) {
+      console.warn(
+        `[env-runner] failed to load wrangler config ${
+          inline ? "(inline)" : `"${configPath}"`
+        }: ${(error as Error).message}`,
+      );
+      return undefined;
+    }
+  }
+
   async #initAsync() {
     const { Miniflare } = await import("miniflare");
 
@@ -356,13 +452,19 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
     const virtual = await this.#prepareVirtualModules();
     this.#virtual = virtual;
 
+    // Optional wrangler config → Miniflare options (compat date/flags +
+    // bindings). User-provided `miniflareOptions` win; flags are merged.
+    const wranglerOptions = await this.#loadWranglerConfig(entryPath);
+
     const userFlags = (this.#miniflareOptions.compatibilityFlags as string[]) || [];
+    const wranglerFlags = (wranglerOptions?.compatibilityFlags as string[]) || [];
     const userDirectSockets = (this.#miniflareOptions.unsafeDirectSockets as unknown[]) || [];
     const options: Record<string, unknown> = {
       compatibilityDate: new Date().toISOString().split("T")[0],
       modules: true,
+      ...wranglerOptions,
       ...this.#miniflareOptions,
-      compatibilityFlags: [...new Set(["nodejs_compat", ...userFlags])],
+      compatibilityFlags: [...new Set(["nodejs_compat", ...wranglerFlags, ...userFlags])],
       // Expose a direct socket so we can proxy WebSocket upgrades via workerd
       unsafeDirectSockets: [{ host: "127.0.0.1", port: 0 }, ...userDirectSockets],
     };
@@ -688,6 +790,185 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
 }
 
 // #region Helpers
+
+// One-time warning when `wrangler` is requested but not installed.
+let _warnedNoWrangler = false;
+
+const WRANGLER_CONFIG_FILENAMES = ["wrangler.json", "wrangler.jsonc", "wrangler.toml"];
+
+// Miniflare option keys the runner controls itself — never adopt these from a
+// wrangler config (`compatibilityFlags` is merged separately by the caller).
+const WRANGLER_OPTION_DENYLIST = new Set([
+  "name",
+  "script",
+  "scriptPath",
+  "modules",
+  "modulesRoot",
+  "unsafeDirectSockets",
+  "unsafeEvalBinding",
+  "unsafeModuleFallbackService",
+  "unsafeUseModuleFallbackService",
+]);
+
+/** Whether a `wrangler` option value is an inline raw config object. */
+function isInlineWranglerConfig(opt: unknown): opt is WranglerInlineConfig {
+  return typeof opt === "object" && opt !== null && !Array.isArray(opt);
+}
+
+/**
+ * Normalize an inline raw config through the `wrangler` package. `readConfig`
+ * is file-based, so the object is written to a short-lived temp file (env-runner
+ * ignores the config's `main`, so the temp location's relative resolution is
+ * irrelevant for our use). Returns the normalized wrangler `Config`.
+ */
+function readInlineWranglerConfig(wrangler: any, inline: WranglerInlineConfig, env?: string): any {
+  const dir = mkdtempSync(join(tmpdir(), "env-runner-wrangler-"));
+  const file = join(dir, "wrangler.json");
+  try {
+    writeFileSync(file, JSON.stringify(inline));
+    return wrangler.unstable_readConfig({ config: file, env }, { hideWarnings: true });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/** Discover a wrangler config next to the entry file, then in the cwd. */
+function findWranglerConfig(entryPath?: string): string | undefined {
+  const dirs: string[] = [];
+  if (entryPath) {
+    const resolved = isAbsolute(entryPath) ? entryPath : resolve(entryPath);
+    dirs.push(dirname(resolved));
+  }
+  dirs.push(process.cwd());
+  for (const dir of dirs) {
+    for (const name of WRANGLER_CONFIG_FILENAMES) {
+      const candidate = join(dir, name);
+      if (existsSync(candidate)) {
+        return candidate;
+      }
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Keep the binding/compat fields from wrangler's `unstable_getMiniflareWorkerOptions`
+ * output, dropping keys the runner manages (entry script, module fallback,
+ * direct sockets, etc.). The returned object is spread under `miniflareOptions`.
+ */
+function pickWranglerMiniflareOptions(
+  workerOptions: Record<string, unknown>,
+): Record<string, unknown> | undefined {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(workerOptions)) {
+    if (value === undefined || WRANGLER_OPTION_DENYLIST.has(key)) {
+      continue;
+    }
+    out[key] = value;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/**
+ * Minimal wrangler-config reader used when the `wrangler` package is absent.
+ * Parses plain JSON only and maps the common fields to Miniflare options.
+ * JSONC and TOML files need the `wrangler` package and are skipped with a
+ * warning.
+ */
+function readWranglerConfigMinimal(
+  configPath: string,
+  env?: string,
+): Record<string, unknown> | undefined {
+  if (extname(configPath).toLowerCase() !== ".json") {
+    console.warn(
+      `[env-runner] reading "${basename(configPath)}" requires the 'wrangler' package; the built-in reader supports plain JSON only (install 'wrangler' for JSONC/TOML).`,
+    );
+    return undefined;
+  }
+  let raw: string;
+  try {
+    raw = readFileSync(configPath, "utf8");
+  } catch {
+    return undefined;
+  }
+  let config: Record<string, any>;
+  try {
+    config = JSON.parse(raw);
+  } catch (error) {
+    console.warn(
+      `[env-runner] failed to parse wrangler config "${configPath}": ${(error as Error).message}`,
+    );
+    return undefined;
+  }
+  return mapWranglerConfigToMiniflare(applyWranglerEnv(config, env));
+}
+
+/**
+ * Shallow `--env` override of the selected fields. Real wrangler inheritance is
+ * more nuanced (bindings are not inherited into named environments), but this
+ * covers the common case for the minimal fallback path.
+ */
+function applyWranglerEnv(config: Record<string, any>, env?: string): Record<string, any> {
+  return env && config.env?.[env] ? { ...config, ...config.env[env] } : config;
+}
+
+/** Map raw (snake_case) wrangler config fields to Miniflare option shapes. */
+function mapWranglerConfigToMiniflare(
+  config: Record<string, any>,
+): Record<string, unknown> | undefined {
+  const out: Record<string, unknown> = {};
+  if (typeof config.compatibility_date === "string") {
+    out.compatibilityDate = config.compatibility_date;
+  }
+  if (Array.isArray(config.compatibility_flags)) {
+    out.compatibilityFlags = config.compatibility_flags;
+  }
+  if (config.vars && typeof config.vars === "object") {
+    out.bindings = { ...config.vars };
+  }
+  const kv = mapBindingArray(config.kv_namespaces, "binding", (n) => n.id ?? n.binding);
+  if (kv) out.kvNamespaces = kv;
+  const r2 = mapBindingArray(config.r2_buckets, "binding", (n) => n.bucket_name ?? n.binding);
+  if (r2) out.r2Buckets = r2;
+  const d1 = mapBindingArray(
+    config.d1_databases,
+    "binding",
+    (n) => n.database_id ?? n.preview_database_id ?? n.binding,
+  );
+  if (d1) out.d1Databases = d1;
+  const queues = mapBindingArray(config.queues?.producers, "binding", (n) => n.queue);
+  if (queues) out.queueProducers = queues;
+  if (Array.isArray(config.durable_objects?.bindings)) {
+    const dos: Record<string, unknown> = {};
+    for (const b of config.durable_objects.bindings) {
+      if (!b?.name || !b?.class_name) continue;
+      dos[b.name] = b.script_name
+        ? { className: b.class_name, scriptName: b.script_name }
+        : b.class_name;
+    }
+    if (Object.keys(dos).length > 0) out.durableObjects = dos;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/** Turn a wrangler binding array (`[{ binding, ... }]`) into a Miniflare record. */
+function mapBindingArray(
+  arr: unknown,
+  keyField: string,
+  value: (entry: any) => unknown,
+): Record<string, unknown> | undefined {
+  if (!Array.isArray(arr)) {
+    return undefined;
+  }
+  const out: Record<string, unknown> = {};
+  for (const entry of arr) {
+    const key = entry?.[keyField];
+    if (typeof key === "string") {
+      out[key] = value(entry);
+    }
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
 
 /**
  * Detect `export class` declarations in the entry source.

@@ -310,6 +310,39 @@ const response = await runner.fetch("http://localhost/api");
 
 The `miniflareOptions` object is passed directly to the [Miniflare constructor](https://developers.cloudflare.com/workers/testing/miniflare/) — you can configure bindings, KV, D1, Durable Objects, and any other Miniflare option.
 
+#### Wrangler Config
+
+Set the `wrangler` option to load a Cloudflare [Wrangler config](https://developers.cloudflare.com/workers/wrangler/configuration/) (`wrangler.json` / `wrangler.jsonc` / `wrangler.toml`) into the Miniflare options — compatibility date/flags and bindings (`vars`, KV, R2, D1, Durable Objects, queues):
+
+```ts
+import { MiniflareEnvRunner } from "env-runner/runners/miniflare";
+
+await using runner = new MiniflareEnvRunner({
+  name: "my-worker",
+  data: { entry: "./worker.ts" },
+  wrangler: true, // auto-discover wrangler.{json,jsonc,toml} next to the entry, then cwd
+  // wrangler: "./config/wrangler.toml", // or an explicit path
+  // wranglerEnv: "production",          // select a `[env.production]` block
+});
+```
+
+You can also pass an **inline** config object (raw `wrangler.json` shape) instead of a file — handy for programmatic setups:
+
+```ts
+await using runner = new MiniflareEnvRunner({
+  name: "my-worker",
+  data: { entry: "./worker.ts" },
+  wrangler: {
+    compatibility_date: "2024-09-01",
+    compatibility_flags: ["nodejs_compat"],
+    vars: { GREETING: "hello" },
+    kv_namespaces: [{ binding: "MY_KV", id: "..." }],
+  },
+});
+```
+
+When the [`wrangler`](https://www.npmjs.com/package/wrangler) package is installed (an optional peer dependency), it is used for full fidelity — TOML, `env` inheritance, `.dev.vars`, and every binding type — via `unstable_readConfig` + `unstable_getMiniflareWorkerOptions` (the same approach as the official `@cloudflare/vite-plugin`, which also runs Miniflare directly and uses `wrangler` only to read config); an inline config is normalized through a short-lived temp file. When `wrangler` is **not** installed, a built-in minimal reader handles plain JSON files and inline objects (common fields only) and logs a one-time warning; JSONC and TOML files are skipped with a warning (they need `wrangler` to parse). Values you pass in `miniflareOptions` always take precedence over config-derived ones (`compatibilityFlags` are merged).
+
 #### Module Transform Pipeline
 
 Pass a `transformRequest` callback to route module resolution through Vite's (or any) transform pipeline. This enables TS, JSX, and other non-JS formats to be compiled on-the-fly inside the Workers runtime without pre-bundling:
