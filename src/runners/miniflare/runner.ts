@@ -17,6 +17,10 @@ import {
   virtualModuleFormat,
 } from "../../virtual-loader.ts";
 import { generateWrapper, IPC_BINDING } from "./wrapper.ts";
+import { isPlainObject, loadWranglerConfig } from "./wrangler.ts";
+import type { WranglerInlineConfig } from "./wrangler.ts";
+
+export type { WranglerInlineConfig } from "./wrangler.ts";
 import type { IncomingMessage } from "node:http";
 import type { Socket } from "node:net";
 
@@ -74,6 +78,35 @@ export interface MiniflareEnvRunnerOptions {
    * Defaults to `["workerd", "worker"]`.
    */
   exportConditions?: string[];
+  /**
+   * Load a Cloudflare `wrangler` config to populate Miniflare options
+   * (compatibility date/flags and bindings: `vars`, KV, R2, D1, Durable
+   * Objects, queues).
+   *
+   * - `true` — auto-discover `wrangler.{json,jsonc,toml}` next to the entry
+   *   file, then in the current working directory.
+   * - `string` — explicit path to a wrangler config file.
+   * - `object` — an inline raw (snake_case) wrangler config, as you would
+   *   write in `wrangler.json` (no file needed). A config file is still
+   *   auto-discovered (next to the entry, then cwd) and the inline config is
+   *   merged on top of it (inline wins per key, binding records merge,
+   *   `compatibilityFlags` are unioned).
+   *
+   * The installed `wrangler` package is preferred (full fidelity: TOML,
+   * `env` inheritance, `.dev.vars`, every binding type; an inline config is
+   * normalized through a short-lived temp file). When `wrangler` is not
+   * installed, a built-in minimal reader handles plain JSON files and inline
+   * objects (common fields only) and a one-time warning is logged. JSONC and
+   * TOML files without `wrangler` are skipped with a warning. Values from
+   * `miniflareOptions` always win over config-derived ones; binding records
+   * (e.g. `bindings`) merge per key and `compatibilityFlags` are unioned.
+   */
+  wrangler?: boolean | string | WranglerInlineConfig;
+  /**
+   * Wrangler environment (`--env`) to select when loading the config.
+   * Defaults to the `CLOUDFLARE_ENV` environment variable.
+   */
+  wranglerEnv?: string;
 }
 
 const IPC_PATH = "/__env_runner_ipc";
@@ -105,6 +138,8 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
   #exports: Record<string, MiniflareExportInfo> | boolean;
   #captureErrors: boolean;
   #exportConditions: string[];
+  #wrangler: boolean | string | WranglerInlineConfig;
+  #wranglerEnv?: string;
 
   constructor(opts: MiniflareEnvRunnerOptions) {
     super({ ...opts, workerEntry: "" });
@@ -114,6 +149,9 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
     this.#exports = opts.exports ?? {};
     this.#captureErrors = opts.captureErrors ?? true;
     this.#exportConditions = opts.exportConditions ?? ["workerd", "worker"];
+    this.#wrangler = opts.wrangler ?? false;
+    // Default the wrangler `--env` to the `CLOUDFLARE_ENV` variable.
+    this.#wranglerEnv = opts.wranglerEnv ?? process.env.CLOUDFLARE_ENV;
     this._initWithVirtualData(() => this.#init());
   }
 
@@ -350,22 +388,45 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
   }
 
   async #initAsync() {
-    const { Miniflare } = await import("miniflare");
+    const { Miniflare, supportedCompatibilityDate } = await import("miniflare");
 
     const entryPath = this._data?.entry as string | undefined;
     const virtual = await this.#prepareVirtualModules();
     this.#virtual = virtual;
 
+    // Optional wrangler config → Miniflare options (compat date/flags +
+    // bindings). User-provided `miniflareOptions` win; flags are merged.
+    const wranglerOptions = await loadWranglerConfig(this.#wrangler, this.#wranglerEnv, entryPath);
+
     const userFlags = (this.#miniflareOptions.compatibilityFlags as string[]) || [];
+    const wranglerFlags = (wranglerOptions?.compatibilityFlags as string[]) || [];
     const userDirectSockets = (this.#miniflareOptions.unsafeDirectSockets as unknown[]) || [];
     const options: Record<string, unknown> = {
-      compatibilityDate: new Date().toISOString().split("T")[0],
+      // Default to the date supported by the installed workerd binary, not
+      // today: the binary always lags the calendar by a few days, and pinning
+      // a future date makes workerd refuse to start ("requires compatibility
+      // date X, but the newest date supported ... is Y"). `miniflare` exports
+      // this already clamped to `min(today, binary date)`.
+      compatibilityDate: supportedCompatibilityDate,
       modules: true,
+      ...wranglerOptions,
       ...this.#miniflareOptions,
-      compatibilityFlags: [...new Set(["nodejs_compat", ...userFlags])],
+      compatibilityFlags: [...new Set(["nodejs_compat", ...wranglerFlags, ...userFlags])],
       // Expose a direct socket so we can proxy WebSocket upgrades via workerd
       unsafeDirectSockets: [{ host: "127.0.0.1", port: 0 }, ...userDirectSockets],
     };
+
+    // Deep-merge nested record options (e.g. `bindings`) so user-supplied
+    // `miniflareOptions` extend wrangler-derived ones per key instead of
+    // replacing the whole object (user keys still win on conflict).
+    if (wranglerOptions) {
+      for (const [key, wValue] of Object.entries(wranglerOptions)) {
+        const uValue = this.#miniflareOptions[key];
+        if (isPlainObject(wValue) && isPlainObject(uValue)) {
+          options[key] = { ...wValue, ...uValue };
+        }
+      }
+    }
 
     // Generate in-memory wrapper module with IPC support
     if (entryPath && !options.script && !options.scriptPath) {

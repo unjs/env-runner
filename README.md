@@ -310,6 +310,45 @@ const response = await runner.fetch("http://localhost/api");
 
 The `miniflareOptions` object is passed directly to the [Miniflare constructor](https://developers.cloudflare.com/workers/testing/miniflare/) — you can configure bindings, KV, D1, Durable Objects, and any other Miniflare option.
 
+When you don't set a `compatibilityDate` (via `miniflareOptions` or a wrangler config), it defaults to the date supported by the installed `workerd` binary rather than today's date — the binary always lags the calendar slightly, and pinning a future date makes `workerd` refuse to start.
+
+#### Wrangler Config
+
+Set the `wrangler` option to load a Cloudflare [Wrangler config](https://developers.cloudflare.com/workers/wrangler/configuration/) (`wrangler.json` / `wrangler.jsonc` / `wrangler.toml`) into the Miniflare options — compatibility date/flags and bindings (`vars`, KV, R2, D1, Durable Objects, queues):
+
+```ts
+import { MiniflareEnvRunner } from "env-runner/runners/miniflare";
+
+await using runner = new MiniflareEnvRunner({
+  name: "my-worker",
+  data: { entry: "./worker.ts" },
+  wrangler: true, // auto-discover wrangler.{json,jsonc,toml} next to the entry, then cwd
+  // wrangler: "./config/wrangler.toml", // or an explicit path
+  // wranglerEnv: "production",          // select a `[env.production]` block
+});
+```
+
+`wranglerEnv` selects a named Wrangler environment (`--env`). When omitted, it defaults to the `CLOUDFLARE_ENV` environment variable, so `CLOUDFLARE_ENV=production` selects the `production` env without passing the option.
+
+You can also pass an **inline** config object (raw `wrangler.json` shape) instead of (or in addition to) a file — handy for programmatic setups:
+
+```ts
+await using runner = new MiniflareEnvRunner({
+  name: "my-worker",
+  data: { entry: "./worker.ts" },
+  wrangler: {
+    compatibility_date: "2024-09-01",
+    compatibility_flags: ["nodejs_compat"],
+    vars: { GREETING: "hello" },
+    kv_namespaces: [{ binding: "MY_KV", id: "..." }],
+  },
+});
+```
+
+When an inline config is passed, a `wrangler.{json,jsonc,toml}` file is still auto-discovered (next to the entry, then cwd) and loaded, and the inline config is **merged on top of it** — inline values win per key, binding records (e.g. `vars`) merge, and `compatibilityFlags` are unioned. This lets you keep a committed `wrangler` file and override a few fields programmatically.
+
+When the [`wrangler`](https://www.npmjs.com/package/wrangler) package is installed (an optional peer dependency), it is used for full fidelity — TOML, `env` inheritance, `.dev.vars`, and every binding type. When `wrangler` is **not** installed, a built-in minimal reader handles plain JSON files and inline objects (common fields only) and logs a one-time warning; JSONC and TOML files are skipped with a warning (they need `wrangler` to parse). Values you pass in `miniflareOptions` always take precedence over config-derived ones — binding records (e.g. `bindings`) merge per key, and `compatibilityFlags` are merged.
+
 #### Module Transform Pipeline
 
 Pass a `transformRequest` callback to route module resolution through Vite's (or any) transform pipeline. This enables TS, JSX, and other non-JS formats to be compiled on-the-fly inside the Workers runtime without pre-bundling:

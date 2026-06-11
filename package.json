@@ -64,12 +64,14 @@
     "oxfmt": "^0.51.0",
     "oxlint": "^1.69.0",
     "typescript": "^6.0.3",
-    "vitest": "^4.1.8"
+    "vitest": "^4.1.8",
+    "wrangler": "^4.99.0"
   },
   "peerDependencies": {
     "@netlify/runtime": "^4.1.23",
     "@vercel/queue": "^0.2.0",
-    "miniflare": "^4.20260515.0"
+    "miniflare": "^4.20260515.0",
+    "wrangler": "^4.0.0"
   },
   "peerDependenciesMeta": {
     "miniflare": {
@@ -79,6 +81,9 @@
       "optional": true
     },
     "@vercel/queue": {
+      "optional": true
+    },
+    "wrangler": {
       "optional": true
     }
   },
