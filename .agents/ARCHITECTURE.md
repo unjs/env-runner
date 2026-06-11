@@ -1,0 +1,58 @@
+# Architecture — Core Source Files
+
+Detailed per-file notes for the shared/core modules. For the directory map see the tree in [`AGENTS.md`](../AGENTS.md); for per-runner internals see [`NODE-RUNNERS.md`](NODE-RUNNERS.md), [`MINIFLARE.md`](MINIFLARE.md), [`VERCEL.md`](VERCEL.md), [`NETLIFY.md`](NETLIFY.md); for virtual modules see [`VIRTUAL-MODULES.md`](VIRTUAL-MODULES.md).
+
+- **`src/vite.ts`** — Vite Environment API helpers: `createViteHotChannel()` (host-side HotChannel from runner RPC hooks) and `createViteTransport()` (worker-side ModuleRunner transport)
+- **`src/types.ts`** — Core interfaces: `EnvRunner`, `WorkerAddress`, `WorkerHooks`, `RunnerRPCHooks`, `RPCOptions`
+- **`src/common/base-runner.ts`** — `BaseEnvRunner` abstract class + `EnvRunnerData`: shared logic for all runners (fetch proxy with exponential backoff, upgrade, message dispatch, socket cleanup). `_resolveVirtualData()` resolves factory-valued `data.virtual` sources to strings on the host before spawn (returns a promise only when a factory is present, else `undefined` for the synchronous spawn path); `_initWithVirtualData(init)` wraps it for subclass constructors — runs `init` synchronously when no factory is present, defers it otherwise, and routes a throwing/rejecting factory to `close(error)` (no unhandled rejection). `_handleMessage()` treats a worker `{ event: "init-error", error }` message (sent by built-in workers when virtual-module registration or the entry import throws) as fatal before ready: it closes the runner with the error as cause, so callers see the actionable message instead of a bare "process exited with code 1". `waitForReady()` also rejects promptly ("Runner closed before becoming ready") when the runner is/becomes closed before the address arrives. `rpc()`, `reloadModule()`, and `invalidateModule()` all go through the protected `_request(message, { match, timeout, timeoutError, send? })` helper (one send-and-await-ack implementation; `send` overrides the transport, used by the miniflare runner's WebSocket reload): it rejects on timeout, on an `error`-carrying response, and **promptly when the runner closes mid-wait** (pending rejectors in `_pendingRequests`, fired by `close()` with the close cause) instead of letting callers wait out the timeout on a dead worker. `invalidateModule(specifier, timeout?)` re-runs a factory-valued virtual source on the host (`_refreshVirtualSource()`, using the original sources kept in `_virtualSources` by `_resolveVirtualData()`), sends `{ event: "invalidate-module", specifier, source? }` to the worker, and awaits the `{ event: "module-invalidated", specifier, error? }` ack — rejects for non-virtual specifiers. `_refreshVirtualSource()` first awaits `_virtualResolved` (the pending factory resolution): before it settles, `_data.virtual` still aliases the original factory-valued map, and writing a resolved string into it would permanently replace the factory (and mutate the caller's options). Re-exports `VirtualModules`/`VirtualModuleSource`
+- **`src/common/worker-utils.ts`** — Shared utilities for built-in workers: `AppEntry` interface (with optional `websocket`, `upgrade`, and `ipc` hooks), `AppEntryIPC`/`AppEntryIPCContext` types, `resolveEntry()` to dynamically import user entry (a real path **or** a virtual/bare specifier resolved by registered ESM hooks), `isVirtualSpecifier()` to check whether a specifier is a key of the `data.virtual` map, `parseServerAddress()` to extract host/port from srvx server, `reloadEntryModule()` for cache-busted re-import with IPC teardown/re-init. Workers pass `isVirtualSpecifier(data.entry, data.virtual)` as the `virtual` flag through `resolveEntry()`/`reloadEntryModule()`: a virtual entry skips all filesystem path handling (no `file://` conversion, no `existsSync`/`data:`-URL re-read), so a virtual key **overrides** a real file with the same path. Without the flag, `_importFresh()` re-reads real files via a `data:` URL and cache-busts bare specifiers with a `?__envRunnerReload=<n>` query (detected by `existsSync` on the path part). For virtual specifiers, `_importFresh()` first tries `refreshVirtualModule()` (Bun backend: re-register to bust the cache, then plain re-import) and falls back to the `?__envRunnerReload` query (registerHooks backend)
+- **`src/virtual-loader.ts`** + **`src/common/virtual-modules.ts`** — Virtual-module ESM hooks/registration. See [`VIRTUAL-MODULES.md`](VIRTUAL-MODULES.md)
+- **`src/runners/<name>/`** — Per-runner `runner.ts` (+ `worker.ts`) implementations. See the runner reference docs: [`NODE-RUNNERS.md`](NODE-RUNNERS.md) (node-worker, node-process, bun-process, deno-process, self), [`MINIFLARE.md`](MINIFLARE.md) (miniflare + wrangler), [`VERCEL.md`](VERCEL.md), [`NETLIFY.md`](NETLIFY.md)
+- **`src/loader.ts`** — `loadRunner(name, opts)`: dynamic loader that imports a runner by name (`node-worker` | `node-process` | `bun-process` | `deno-process` | `self` | `miniflare` | `vercel` | `netlify`) and returns an `EnvRunner` instance
+- **`src/manager.ts`** — `RunnerManager`: proxy manager for hot-reload, message queueing, and listener forwarding across runner swaps. The `fetch` field delegates to a protected `_fetch()` method so subclasses can hook request handling (used by `EnvServer` for auto-start). `reload(runner?)`'s argument is optional: with no runner it calls the protected `_createRunner()` factory, which throws on the base class and is overridden by `EnvServer`. `invalidateModule()` sets a dirty flag (`_moduleInvalidated`) and the next `fetch()` lazily flushes it with one `reloadModule()` before serving (`_flushInvalidation()` — concurrent fetches share the reload promise; a failed reload keeps the flag set so the next fetch retries); an explicit `reloadModule()` or a runner swap via `reload()` clears the flag
+- **`src/server.ts`** — `EnvServer` extends `RunnerManager`: high-level API combining runner loading, watch mode (`fs.watch` with 100ms debounce), and auto-reload on file changes. Supports `watch` and `watchPaths` options. The `runner` option is optional and defaults to `"node-worker"`. `start()` is idempotent (a shared `_startPromise`; a failed start resets it so a later call retries) and optional: the first `fetch()` auto-starts via the `_fetch()` override (skipped once closed — fetch after `close()` stays a 503, never respawns)
+- **`src/cli.ts`** — CLI entry point: `env-runner <entry> [--runner] [--port] [--host] [-w/--watch]`
+- **`src/index.ts`** — Public API: re-exports types, `BaseEnvRunner`, concrete runners, `SelfEnvRunner`, `RunnerManager`, `EnvServer`, and `loadRunner`
+
+## Shared lifecycle (`BaseEnvRunner`)
+
+`BaseEnvRunner` implements the shared `EnvRunner` lifecycle:
+
+1. Runner takes an optional `entry` script path (defaults to co-located `worker.ts`/`.mjs`) and spawns it (Worker thread, child process, or in-process)
+2. Entry posts `{ address: { host, port } }` or `{ address: { socketPath } }` when ready
+3. `fetch()` proxies HTTP requests to the address via `httpxy` (retries with exponential backoff: 100ms → 1.6s, up to 5 attempts). Relative URL inputs (e.g. `"/path"`) are resolved against a placeholder `http://localhost` origin via the protected `_resolveFetchInput()` helper — also applied by the `self`, `miniflare`, `vercel`, and `netlify` fetch overrides (which otherwise throw or skip URL-derived headers on relative input)
+4. `upgrade()` proxies WebSocket upgrades
+5. `sendMessage()` / `onMessage()` / `offMessage()` for bidirectional messaging
+6. `waitForReady(timeout?)` returns a promise that resolves when the runner becomes ready (address received)
+7. `rpc(name, data?, opts?)` sends a request-response message over IPC (auto-generates ID, handles timeout, error propagation)
+8. `reloadModule(timeout?)` re-imports the entry module without restarting the worker/process (cache-busted `import()`, IPC teardown/re-init)
+9. `invalidateModule(specifier, timeout?)` invalidates one virtual module (re-running a factory source on the host) plus its transitive virtual importers, so the next `reloadModule()` re-evaluates it even through intermediate virtual modules
+10. `close()` immediately terminates the worker/process and cleans up sockets
+
+`EnvRunner` extends `AsyncDisposable`: `[Symbol.asyncDispose]()` delegates to `close()` (implemented on both `BaseEnvRunner` and `RunnerManager`, inherited by `EnvServer`), so runners and managers work with `await using`. Note that `await using x = ...` does not await the initializer — async factories like `EnvServer.start()` need an inner `await`.
+
+Subclasses implement abstract methods: `sendMessage()`, `_hasRuntime()`, `_closeRuntime()`, `_runtimeType()`, and runtime init.
+
+### RunnerManager
+
+Proxy manager wrapping a runner with hot-reload support:
+
+- `reload(runner?)` — Swaps active runner, closes old one, preserves listeners. Without an argument it creates a runner via the protected `_createRunner()` factory (base class throws; `EnvServer` overrides it, so `envServer.reload()` restarts with a fresh runner built from the server options). A failed factory leaves the current runner attached
+- Message queueing — `sendMessage()` queues when runner not ready, auto-flushes on ready
+- Listener forwarding — `onMessage()`/`offMessage()` persist across runner swaps
+- Hook wrapping — Detects unexpected runner exits, forwards `onReady()`/`onClose()` multi-listener hooks (Set-based, mirrors `onMessage`/`offMessage` pattern)
+- `onClose(listener)`/`offClose(listener)` — Multi-listener close events
+- `onReady(listener)`/`offReady(listener)` — Multi-listener ready events
+- Lazy invalidation reload — `invalidateModule()` marks the manager dirty; the next `fetch()` runs one shared `reloadModule()` before serving (a failed reload keeps the flag set for retry; explicit `reloadModule()`/`reload()` also clears it)
+- Returns 503 from `fetch()`/`upgrade()` when no runner is active
+
+### EnvServer
+
+High-level API extending `RunnerManager` with runner loading and file watching:
+
+- `start()` — Loads runner via `loadRunner()` and optionally starts file watchers. Idempotent and optional: the first `fetch()` auto-starts the server (no auto-start after `close()`)
+- `reload(runner?)` — With no argument creates a fresh runner from the server options (overrides `_createRunner()`); keeps the public `runner` field in sync. `start()` and the watch path go through it
+- `close()` — Stops watchers and closes the runner
+- `watch: true` — Watches the entry file using `fs.watch()` with 100ms debounce; on change, creates a new runner and calls `reload()`
+- `watchPaths` — Additional directories/files to watch (supports `recursive: true`)
+- `onReload(listener)`/`offReload(listener)` — Multi-listener reload events (Set-based)
