@@ -1,6 +1,5 @@
 import type { IncomingMessage, Server as NodeHttpServer } from "node:http";
 import type { Socket } from "node:net";
-import type { Hooks } from "crossws";
 import type { ServerPlugin } from "srvx";
 import type { EnvRunner } from "../types.ts";
 
@@ -15,7 +14,8 @@ import type { EnvRunner } from "../types.ts";
  * - **Bun/Deno** — those runtimes serve natively (`Bun.serve`/`Deno.serve`) and
  *   expose no Node upgrade socket, so the raw passthrough can't work. Terminate
  *   the client WebSocket with crossws and bridge to the worker over a standard
- *   `WebSocket` client instead.
+ *   `WebSocket` client instead, using an async proxy `target` that awaits worker
+ *   readiness (client frames buffer in the meantime) before dialing upstream.
  *
  * `getRunner` is read lazily on every upgrade so the plugin survives reloads —
  * the active runner (and its address) changes when the manager hot-reloads.
@@ -48,7 +48,15 @@ export async function createRunnerWSProxyPlugin(
     : await import("crossws/server/deno");
 
   const proxy = createWebSocketProxy({
-    target: (peer) => {
+    // An upgrade can arrive before the worker has reported its address (e.g.
+    // right after a reload). The async target resolver (crossws >=0.4.7) awaits
+    // readiness while client frames are buffered, instead of stalling the
+    // client handshake. `forwardProtocol` defaults to forwarding the client's
+    // `sec-websocket-protocol` verbatim, so no custom resolver is needed.
+    target: async (peer) => {
+      await getRunner()
+        ?.waitForReady?.()
+        .catch(() => {});
       const addr = getRunner()?.address;
       if (!addr?.port) {
         throw new Error("env runner worker is not ready");
@@ -56,35 +64,7 @@ export async function createRunnerWSProxyPlugin(
       const { pathname, search } = new URL(peer.request.url);
       return `ws://${addr.host || "127.0.0.1"}:${addr.port}${pathname}${search}`;
     },
-    // Resolve the forwarded subprotocol defensively: on Deno the request is no
-    // longer readable inside the `open` hook (after `Deno.upgradeWebSocket()`).
-    forwardProtocol: (peer) => {
-      try {
-        const header = peer.request.headers.get("sec-websocket-protocol");
-        return header
-          ? header
-              .split(",")
-              .map((p) => p.trim())
-              .filter(Boolean)
-          : undefined;
-      } catch {
-        return undefined;
-      }
-    },
   });
 
-  // An upgrade can arrive before the worker has reported its address (e.g. right
-  // after a reload). The `upgrade` hook is awaited by every srvx adapter, so
-  // wait for the runner to become ready before resolving the proxy target.
-  const hooks: Partial<Hooks> = {
-    ...proxy,
-    async upgrade(request) {
-      await getRunner()
-        ?.waitForReady?.()
-        .catch(() => {});
-      return proxy.upgrade?.(request);
-    },
-  };
-
-  return plugin({ resolve: () => hooks });
+  return plugin({ resolve: () => proxy });
 }
