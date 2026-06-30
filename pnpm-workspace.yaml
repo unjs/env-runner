@@ -3,3 +3,9 @@ allowBuilds:
   esbuild: false
   sharp: false
   workerd: true
+
+minimumReleaseAgeExclude:
+  - crossws*
+  - exsolve*
+  - httpxy*
+  - srvx*
