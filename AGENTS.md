@@ -137,7 +137,7 @@ const runner2 = new NodeProcessEnvRunner({
 
 ## Exports
 
-- `env-runner` (`.`) — Types + all runners + `RunnerManager` + `AppEntry` + `createRunnerWSProxyPlugin`
+- `env-runner` (`.`) — Types + all runners + `RunnerManager` + `AppEntry`
 - `env-runner/runners/node-worker` (`./runners/node-worker`) — Direct import of `NodeWorkerEnvRunner`
 - `env-runner/runners/node-worker/worker` (`./runners/node-worker/worker`) — Built-in srvx worker for Worker threads
 - `env-runner/runners/node-process` (`./runners/node-process`) — Direct import of `NodeProcessEnvRunner`
