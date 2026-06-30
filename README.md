@@ -74,20 +74,20 @@ await envServer.reload();
 const server = serve({
   fetch: (request) => envServer.fetch(request),
   // Proxy WebSocket upgrades to the worker (see "WebSocket proxying" below)
-  plugins: [await envServer.wsProxyPlugin()],
+  plugins: [await envServer.wsSrvxPlugin()],
 });
 ```
 
 #### WebSocket proxying
 
 To proxy WebSocket upgrades to the worker, attach the plugin returned by
-`wsProxyPlugin()` (available on both `RunnerManager` and `EnvServer`) to your
+`wsSrvxPlugin()` (available on both `RunnerManager` and `EnvServer`) to your
 [srvx](https://srvx.h3.dev) server:
 
 ```ts
 const server = serve({
   fetch: (request) => envServer.fetch(request),
-  plugins: [await envServer.wsProxyPlugin()],
+  plugins: [await envServer.wsSrvxPlugin()],
 });
 ```
 
@@ -175,7 +175,7 @@ await using runner = new NodeProcessEnvRunner({
 const response = await runner.fetch("/api");
 
 // Proxy a raw WebSocket upgrade to the worker (Node host only — low-level;
-// prefer `manager.wsProxyPlugin()` for cross-runtime proxying)
+// prefer `manager.wsSrvxPlugin()` for cross-runtime proxying)
 runner.upgrade?.({ node: { req, socket, head } });
 
 // Wait for runner to be ready

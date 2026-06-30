@@ -145,7 +145,7 @@ describe("SelfEnvRunner websocket", () => {
   });
 });
 
-describe("wsProxyPlugin", () => {
+describe("wsSrvxPlugin", () => {
   let manager: RunnerManager | undefined;
   let server: Server | undefined;
 
@@ -156,7 +156,7 @@ describe("wsProxyPlugin", () => {
     manager = undefined;
   });
 
-  // The `RunnerManager.wsProxyPlugin()` attaches WebSocket proxying to a public
+  // The `RunnerManager.wsSrvxPlugin()` attaches WebSocket proxying to a public
   // srvx server: on Node this is the raw-socket passthrough, exercised here
   // end-to-end through a real front server (the host process runs on Node).
   it("proxies upgrades to the worker through a srvx server", async () => {
@@ -170,7 +170,7 @@ describe("wsProxyPlugin", () => {
       hostname: "127.0.0.1",
       gracefulShutdown: false,
       fetch: (request) => manager!.fetch(request),
-      plugins: [await manager.wsProxyPlugin()],
+      plugins: [await manager.wsSrvxPlugin()],
     });
     await server.ready();
 

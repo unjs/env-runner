@@ -107,12 +107,12 @@ export class RunnerManager implements EnvRunner, AsyncDisposable {
 
   /**
    * Create a runtime-native WebSocket reverse-proxy plugin for the public srvx
-   * server. Attach it via `serve({ plugins: [await manager.wsProxyPlugin()] })`:
+   * server. Attach it via `serve({ plugins: [await manager.wsSrvxPlugin()] })`:
    * on Node it proxies the raw upgrade socket to the worker, and on Bun/Deno it
    * bridges the WebSocket with crossws. The plugin reads the active runner
    * lazily, so it keeps working across hot-reloads.
    */
-  wsProxyPlugin(): Promise<ServerPlugin> {
+  wsSrvxPlugin(): Promise<ServerPlugin> {
     return createRunnerWSProxyPlugin(() => this);
   }
 

@@ -59,7 +59,7 @@ const server = serve({
   fetch: (request) => envServer.fetch(request),
   // Runtime-native WebSocket upgrade proxying (raw socket on Node, crossws
   // bridge on Bun/Deno).
-  plugins: [await envServer.wsProxyPlugin()],
+  plugins: [await envServer.wsSrvxPlugin()],
 });
 
 await server.ready();
