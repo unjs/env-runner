@@ -57,8 +57,9 @@ export async function registerVirtualModules(
   }
   const { registerHooks, stripTypeScriptTypes } = await import("node:module");
   if (typeof registerHooks === "function") {
+    const isDeno = "Deno" in globalThis;
     let transformSource: ((specifier: string, source: string) => string) | undefined;
-    if ("Deno" in globalThis) {
+    if (isDeno) {
       transformSource = (specifier, source) =>
         _transformSourceForDeno(specifier, source, stripTypeScriptTypes);
       const transformed: Record<string, string> = {};
@@ -74,7 +75,12 @@ export async function registerVirtualModules(
     };
     // Track only after registerHooks succeeds — a throw here must not leave an
     // orphaned registration (no unregister function is returned to remove it).
-    const hooks = registerHooks(createVirtualHooks(virtual, registration.versions));
+    // Deno sources are pre-transformed to plain JS, so the hooks must report the
+    // `module` format (Deno >= 2.9 honors the load format and would otherwise
+    // re-parse a JS source as JSON/TS).
+    const hooks = registerHooks(
+      createVirtualHooks(virtual, registration.versions, undefined, isDeno),
+    );
     _hooksRegistrations.unshift(registration);
     return _once(() => {
       const index = _hooksRegistrations.indexOf(registration);

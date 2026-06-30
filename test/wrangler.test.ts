@@ -47,6 +47,12 @@ interface WranglerCase {
   warns?: string[];
 }
 
+// Loading the real `wrangler` package (+ spinning up miniflare/workerd) on the
+// first installed-case test is a heavy cold start that can exceed Vitest's 5s
+// default. Give the wrangler suites a generous per-test budget (and a matching
+// readiness wait) so the cold start doesn't flake.
+const WRANGLER_TEST_TIMEOUT = 30_000;
+
 let runner: EnvRunner | undefined;
 let tmpDir: string | undefined;
 
@@ -74,7 +80,7 @@ async function runWranglerCase(c: WranglerCase): Promise<any> {
     data: { entry: entryPath },
     ...c.options({ tmpDir, entryPath }),
   });
-  await waitForReady(runner);
+  await waitForReady(runner, WRANGLER_TEST_TIMEOUT);
 
   const res = await runner.fetch("http://localhost/");
   return res.json();
@@ -212,34 +218,42 @@ export default {
 
 describe("MiniflareEnvRunner (wrangler config)", () => {
   for (const c of INSTALLED_CASES) {
-    it(c.name, async () => {
-      const json = await runWranglerCase(c);
-      c.assert(json);
-    });
+    it(
+      c.name,
+      async () => {
+        const json = await runWranglerCase(c);
+        c.assert(json);
+      },
+      WRANGLER_TEST_TIMEOUT,
+    );
   }
 
-  it("defaults wranglerEnv to the CLOUDFLARE_ENV variable", async () => {
-    vi.stubEnv("CLOUDFLARE_ENV", "production");
-    try {
-      const json = await runWranglerCase({
-        name: "cloudflare-env",
-        files: {
-          "wrangler.json": JSON.stringify({
-            name: "test",
-            compatibility_date: "2024-09-01",
-            vars: { TIER: "base" },
-            env: { production: { vars: { TIER: "prod" } } },
-          }),
-        },
-        // No `wranglerEnv` — it should fall back to CLOUDFLARE_ENV.
-        options: () => ({ wrangler: true }),
-        assert: (json) => expect(json.tier).toBe("prod"),
-      });
-      expect(json.tier).toBe("prod");
-    } finally {
-      vi.unstubAllEnvs();
-    }
-  });
+  it(
+    "defaults wranglerEnv to the CLOUDFLARE_ENV variable",
+    async () => {
+      vi.stubEnv("CLOUDFLARE_ENV", "production");
+      try {
+        const json = await runWranglerCase({
+          name: "cloudflare-env",
+          files: {
+            "wrangler.json": JSON.stringify({
+              name: "test",
+              compatibility_date: "2024-09-01",
+              vars: { TIER: "base" },
+              env: { production: { vars: { TIER: "prod" } } },
+            }),
+          },
+          // No `wranglerEnv` — it should fall back to CLOUDFLARE_ENV.
+          options: () => ({ wrangler: true }),
+          assert: (json) => expect(json.tier).toBe("prod"),
+        });
+        expect(json.tier).toBe("prod");
+      } finally {
+        vi.unstubAllEnvs();
+      }
+    },
+    WRANGLER_TEST_TIMEOUT,
+  );
 });
 
 // --- Built-in minimal reader (wrangler not installed) ---

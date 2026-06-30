@@ -60,6 +60,13 @@ export function createVirtualHooks(
   // (non-virtual) imports — see the re-base in `resolve` below. Defaults to the
   // working directory so bare/relative specifiers resolve against the project.
   parentURL: string = _defaultParentURL(),
+  // Always report the `module` (plain ESM) load format, ignoring the specifier
+  // extension. Used by backends that pre-transform every source to plain JS
+  // before registration (Deno — see `registerVirtualModules()`): there a `.json`
+  // source is already a JS wrapper and a `.ts` source already type-stripped, so
+  // honoring the extension-derived `json`/`module-typescript` format makes the
+  // runtime re-parse JS as JSON/TS and fail (Deno >= 2.9 honors the format).
+  forcePlainModule = false,
 ): {
   resolve: ResolveHookSync;
   load: LoadHookSync;
@@ -94,7 +101,7 @@ export function createVirtualHooks(
       const key = _stripQuery(decodeURIComponent(url.slice(VIRTUAL_SCHEME.length)));
       if (Object.hasOwn(virtual, key)) {
         return {
-          format: virtualModuleFormat(key),
+          format: forcePlainModule ? "module" : virtualModuleFormat(key),
           source: virtual[key],
           shortCircuit: true,
         };
