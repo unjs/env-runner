@@ -30,8 +30,9 @@ src/
 │   ├── self/
 │   │   └── runner.ts        # SelfEnvRunner (in-process, no worker)
 │   ├── miniflare/
-│   │   ├── runner.ts        # MiniflareEnvRunner (Cloudflare Workers via miniflare)
-│   │   └── wrangler.ts      # loadWranglerConfig() — wrangler.{json,jsonc,toml} → Miniflare options
+│   │   ├── runner.ts          # MiniflareEnvRunner (Cloudflare Workers via miniflare)
+│   │   ├── wrangler.ts        # loadWranglerConfig() — wrangler.{json,jsonc,toml} → Miniflare options
+│   │   └── wrangler-import.ts # importWrangler() — mockable indirection for the optional wrangler dep
 │   ├── vercel/
 │   │   ├── runner.ts        # VercelEnvRunner (extends NodeWorkerEnvRunner)
 │   │   ├── worker.ts        # Sets Vercel request context symbol, delegates to node-worker

@@ -2,6 +2,8 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
 
+import { importWrangler } from "./wrangler-import.ts";
+
 /** Raw (snake_case) Wrangler config object, mirroring `wrangler.json` contents. */
 export type WranglerInlineConfig = Record<string, unknown>;
 
@@ -87,7 +89,7 @@ export async function loadWranglerConfig(
   // normalized through a short-lived temp file (readConfig is file-based).
   let wrangler: any;
   try {
-    wrangler = await import("wrangler");
+    wrangler = await importWrangler();
   } catch {
     if (!_warnedNoWrangler) {
       _warnedNoWrangler = true;

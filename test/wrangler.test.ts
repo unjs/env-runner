@@ -7,11 +7,11 @@ import type { MiniflareEnvRunnerOptions } from "../src/runners/miniflare/runner.
 import type { EnvRunner } from "../src/index.ts";
 
 // The runner class under test. The installed-path tests use the real `wrangler`
-// package (statically imported below). The fallback describe simulates wrangler
-// not being installed: it `vi.doMock`s `import("wrangler")` to throw, then
-// re-imports `runner.ts` after `vi.resetModules()` so the freshly-loaded
-// module's lazy `import("wrangler")` resolves onto the throwing mock and the
-// runner falls back to its built-in minimal reader.
+// package. The fallback describe simulates wrangler not being installed: it
+// `vi.doMock`s the local `wrangler-import` indirection to throw, then re-imports
+// `runner.ts` after `vi.resetModules()` so the freshly-loaded module's
+// `loadWranglerConfig()` resolves onto the throwing mock and the runner falls
+// back to its built-in minimal reader.
 let Runner: typeof MiniflareEnvRunner = MiniflareEnvRunner;
 
 const _dir = dirname(fileURLToPath(import.meta.url));
@@ -330,18 +330,24 @@ describe("MiniflareEnvRunner (wrangler config, fallback reader)", () => {
   let warn: ReturnType<typeof vi.spyOn>;
 
   beforeAll(async () => {
-    // Make `import("wrangler")` throw, drop the module cache, and re-import
-    // `runner.ts` so its lazy `import("wrangler")` re-resolves onto the
-    // throwing mock (and thus the built-in minimal reader).
-    vi.doMock("wrangler", () => {
-      throw new Error("Cannot find package 'wrangler'");
-    });
+    // Simulate `wrangler` not being installed by mocking the local
+    // `wrangler-import` indirection to throw, then dropping the module cache and
+    // re-importing `runner.ts` so its `loadWranglerConfig()` re-resolves onto the
+    // throwing mock (and thus the built-in minimal reader). Mocking this local
+    // module (rather than the externalized `wrangler` package) is deterministic
+    // across environments — a `vi.doMock("wrangler")` on the dynamic import only
+    // intercepts reliably when the runner inlines, not externalizes, the package.
+    vi.doMock("../src/runners/miniflare/wrangler-import.ts", () => ({
+      importWrangler: () => {
+        throw new Error("Cannot find package 'wrangler'");
+      },
+    }));
     vi.resetModules();
     Runner = (await import("../src/runners/miniflare/runner.ts")).MiniflareEnvRunner;
   });
 
   afterAll(() => {
-    vi.doUnmock("wrangler");
+    vi.doUnmock("../src/runners/miniflare/wrangler-import.ts");
     vi.resetModules();
     Runner = MiniflareEnvRunner;
   });
