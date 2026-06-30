@@ -1,3 +1,4 @@
+import type { ServerPlugin } from "srvx";
 import type {
   EnvRunner,
   RunnerMessageListener,
@@ -5,6 +6,8 @@ import type {
   UpgradeHandler,
   WorkerAddress,
 } from "./types.ts";
+
+import { createRunnerWSProxyPlugin } from "./common/ws-proxy.ts";
 
 /**
  * Manages an active `EnvRunner` instance, proxying all calls to it.
@@ -33,6 +36,10 @@ export class RunnerManager implements EnvRunner, AsyncDisposable {
 
   get closed() {
     return this._closed;
+  }
+
+  get address() {
+    return this._runner?.address;
   }
 
   /**
@@ -98,6 +105,17 @@ export class RunnerManager implements EnvRunner, AsyncDisposable {
     this._runner?.upgrade?.(context);
   };
 
+  /**
+   * Create a runtime-native WebSocket reverse-proxy plugin for the public srvx
+   * server. Attach it via `serve({ plugins: [await manager.wsProxyPlugin()] })`:
+   * on Node it proxies the raw upgrade socket to the worker, and on Bun/Deno it
+   * bridges the WebSocket with crossws. The plugin reads the active runner
+   * lazily, so it keeps working across hot-reloads.
+   */
+  wsProxyPlugin(): Promise<ServerPlugin> {
+    return createRunnerWSProxyPlugin(() => this);
+  }
+
   sendMessage(message: unknown) {
     if (!this._runner || !this._runner.ready) {
       this._messageQueue.push(message);
@@ -120,17 +138,20 @@ export class RunnerManager implements EnvRunner, AsyncDisposable {
     if (this.ready) return Promise.resolve();
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
-        this._messageListeners.delete(listener);
+        this.offMessage(listener);
         reject(new Error("Runner did not become ready in time"));
       }, timeout);
       const listener = (message: any) => {
         if (message?.address || this.ready) {
           clearTimeout(timer);
-          this._messageListeners.delete(listener);
+          this.offMessage(listener);
           resolve();
         }
       };
-      this._messageListeners.add(listener);
+      // Register via `onMessage` so the listener is forwarded to the active
+      // runner (and re-forwarded to a fresh one across reloads); a direct
+      // `_messageListeners` add would never receive the worker's ready message.
+      this.onMessage(listener);
     });
   }
 

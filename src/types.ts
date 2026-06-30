@@ -71,6 +71,9 @@ export interface EnvRunner extends RunnerRPCHooks, AsyncDisposable {
   /** Whether the runner has been closed. */
   readonly closed: boolean;
 
+  /** Address the worker is listening at, once ready (`undefined` before then). */
+  readonly address?: WorkerAddress;
+
   /** Proxy an HTTP request to the worker. */
   fetch: FetchHandler;
 

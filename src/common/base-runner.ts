@@ -62,6 +62,10 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
     return Boolean(!this.closed && this._address && this._hasRuntime());
   }
 
+  get address() {
+    return this._address;
+  }
+
   // #region Public methods
 
   async fetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
@@ -77,6 +81,11 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
   }
 
   async upgrade(context: { node: { req: IncomingMessage; socket: Socket; head: any } }) {
+    // An upgrade can arrive while the worker is still (re)starting; wait for it
+    // to become ready rather than silently dropping the connection.
+    if (!this.ready) {
+      await this.waitForReady().catch(() => {});
+    }
     if (!this.ready || !this._address) {
       return;
     }

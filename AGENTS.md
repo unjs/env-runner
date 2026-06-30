@@ -13,6 +13,7 @@ src/
 ├── common/
 │   ├── base-runner.ts       # BaseEnvRunner abstract class
 │   ├── worker-utils.ts      # AppEntry interface, resolveEntry(), parseServerAddress()
+│   ├── ws-proxy.ts          # createRunnerWSProxyPlugin() — runtime-native WS upgrade proxy (Node raw socket / Bun+Deno crossws bridge)
 │   └── virtual-modules.ts   # registerVirtualModules() — registerHooks()/Bun.plugin wiring shared by node/bun/deno workers
 ├── runners/
 │   ├── node-worker/
@@ -136,7 +137,7 @@ const runner2 = new NodeProcessEnvRunner({
 
 ## Exports
 
-- `env-runner` (`.`) — Types + all runners + `RunnerManager` + `AppEntry`
+- `env-runner` (`.`) — Types + all runners + `RunnerManager` + `AppEntry` + `createRunnerWSProxyPlugin`
 - `env-runner/runners/node-worker` (`./runners/node-worker`) — Direct import of `NodeWorkerEnvRunner`
 - `env-runner/runners/node-worker/worker` (`./runners/node-worker/worker`) — Built-in srvx worker for Worker threads
 - `env-runner/runners/node-process` (`./runners/node-process`) — Direct import of `NodeProcessEnvRunner`
@@ -201,6 +202,7 @@ Runner-specific and deep-dive notes, split out of this file:
 
 - **Co-located runner + worker** — Each runner directory contains both `runner.ts` and `worker.ts` (except `self/` which has no worker). Runners default to their co-located worker via `import.meta.resolve("env-runner/runners/<name>/worker")` when `entry` is omitted
 - **Message-driven readiness** — Workers/processes post `{ address }` to signal ready state
+- **Runtime-native WebSocket proxying** — The public-facing server attaches `RunnerManager.wsProxyPlugin()` (a srvx plugin from `src/common/ws-proxy.ts`). On a **Node** host it proxies the raw upgrade socket to the worker (httpxy passthrough via `runner.upgrade()`, transparent end-to-end); on a **Bun/Deno** host (no Node upgrade socket exists) it terminates the client with crossws and bridges to the worker over a `WebSocket` client. The plugin reads the active runner lazily so it survives hot-reloads. `runner.upgrade()` and the bridge both await readiness internally, so consumers don't poll. Replaced the old Node-only `server.node.server.on("upgrade")` wiring in `cli.ts`
 - **Immediate shutdown** — `close()` immediately terminates the worker/process (no graceful shutdown handshake)
 - **Orphan protection** — node-process/bun-process workers register `process.on("disconnect", () => process.exit(0))` at the top of the worker (before the entry import) so a non-graceful supervisor death (SIGKILL, crash) never leaves an orphan, even mid-import (#23)
 - **Data passing:** Worker threads use `workerData`, processes use `ENV_RUNNER_DATA` env var (JSON), self runner uses in-memory channel, miniflare runner uses in-memory `script` with `unsafeModuleFallbackService` for module resolution

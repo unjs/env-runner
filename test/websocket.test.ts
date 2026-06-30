@@ -3,7 +3,10 @@ import { createServer } from "node:http";
 import { fileURLToPath } from "node:url";
 import { resolve, dirname } from "node:path";
 import { describe, expect, it, afterEach } from "vitest";
+import { serve } from "srvx";
+import type { Server } from "srvx";
 import type { EnvRunner } from "../src/index.ts";
+import { RunnerManager } from "../src/index.ts";
 
 import { NodeWorkerEnvRunner } from "../src/runners/node-worker/runner.ts";
 import { NodeProcessEnvRunner } from "../src/runners/node-process/runner.ts";
@@ -123,6 +126,55 @@ describe("SelfEnvRunner websocket", () => {
 
     const ws = new WebSocket(`ws://127.0.0.1:${address.port}/`);
 
+    const messages: string[] = [];
+    const closed = new Promise<void>((resolve) => {
+      ws.addEventListener("message", (event) => {
+        messages.push(String(event.data));
+        if (messages.length === 1) {
+          ws.send("hello");
+        }
+        if (messages.length === 2) {
+          ws.close();
+        }
+      });
+      ws.addEventListener("close", () => resolve());
+    });
+
+    await closed;
+    expect(messages).toEqual(["welcome", "echo:hello"]);
+  });
+});
+
+describe("wsProxyPlugin", () => {
+  let manager: RunnerManager | undefined;
+  let server: Server | undefined;
+
+  afterEach(async () => {
+    await server?.close();
+    server = undefined;
+    await manager?.close();
+    manager = undefined;
+  });
+
+  // The `RunnerManager.wsProxyPlugin()` attaches WebSocket proxying to a public
+  // srvx server: on Node this is the raw-socket passthrough, exercised here
+  // end-to-end through a real front server (the host process runs on Node).
+  it("proxies upgrades to the worker through a srvx server", async () => {
+    manager = new RunnerManager(
+      new NodeWorkerEnvRunner({ name: "test-ws-proxy", data: { entry: appWebsocketEntry } }),
+    );
+    await manager.waitForReady();
+
+    server = serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      gracefulShutdown: false,
+      fetch: (request) => manager!.fetch(request),
+      plugins: [await manager.wsProxyPlugin()],
+    });
+    await server.ready();
+
+    const ws = new WebSocket(new URL("/", server.url).href.replace(/^http/, "ws"));
     const messages: string[] = [];
     const closed = new Promise<void>((resolve) => {
       ws.addEventListener("message", (event) => {

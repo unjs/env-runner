@@ -17,6 +17,7 @@ export {
   type VirtualModuleSource,
   BaseEnvRunner,
 } from "./common/base-runner.ts";
+export { createRunnerWSProxyPlugin } from "./common/ws-proxy.ts";
 export { RunnerManager } from "./manager.ts";
 export { type EnvServerOptions, EnvServer } from "./server.ts";
 export { type RunnerName, type LoadRunnerOptions, loadRunner } from "./loader.ts";

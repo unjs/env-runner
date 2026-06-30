@@ -25,4 +25,4 @@ Generic test infrastructure and cross-runner suites. Runner-specific test notes 
 
 ## Coverage summary
 
-Tests cover: lifecycle, fetch (GET/POST, relative URLs), WebSocket upgrade, crossws websocket, messaging, hooks, graceful close, inspect output, stdio forwarding (all runners), manager hot-reload, message queueing, miniflare hot-reload, vercel header/env/response injection, netlify header injection, waitForReady, vite helpers, orphan-worker exit on supervisor death, `await using` disposal (all runners + manager)
+Tests cover: lifecycle, fetch (GET/POST, relative URLs), WebSocket upgrade, crossws websocket, `RunnerManager.wsProxyPlugin()` end-to-end through a real srvx server (Node passthrough), messaging, hooks, graceful close, inspect output, stdio forwarding (all runners), manager hot-reload, message queueing, miniflare hot-reload, vercel header/env/response injection, netlify header injection, waitForReady, vite helpers, orphan-worker exit on supervisor death, `await using` disposal (all runners + manager)
