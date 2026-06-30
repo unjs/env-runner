@@ -1,6 +1,30 @@
 # Changelog
 
 
+## v0.1.15
+
+[compare changes](https://github.com/unjs/env-runner/compare/v0.1.14...v0.1.15)
+
+### 🩹 Fixes
+
+- **virtual:** Serve Deno virtual modules as plain ESM format ([c5bfcd3](https://github.com/unjs/env-runner/commit/c5bfcd3))
+- **node-worker,node-process:** Use native crossws adapter on bun/deno ([d8ce2be](https://github.com/unjs/env-runner/commit/d8ce2be))
+
+### 🏡 Chore
+
+- **release:** V0.1.14 ([2d7d17e](https://github.com/unjs/env-runner/commit/2d7d17e))
+- Split agent docs ([4079f03](https://github.com/unjs/env-runner/commit/4079f03))
+- Update deps ([a11bf03](https://github.com/unjs/env-runner/commit/a11bf03))
+
+### ✅ Tests
+
+- **wrangler:** Mock a local indirection to force the fallback reader ([1f09e18](https://github.com/unjs/env-runner/commit/1f09e18))
+- Raise timeouts for runtime cold starts ([283bdae](https://github.com/unjs/env-runner/commit/283bdae))
+
+### ❤️ Contributors
+
+- Pooya Parsa ([@pi0](https://github.com/pi0))
+
 ## v0.1.14
 
 [compare changes](https://github.com/unjs/env-runner/compare/v0.1.13...v0.1.14)
