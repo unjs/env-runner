@@ -1,6 +1,10 @@
 import { parentPort, workerData } from "node:worker_threads";
 import { serve } from "srvx";
-import { plugin as wsPlugin } from "crossws/server/node";
+// Auto-selects the crossws adapter via runtime export conditions (node/bun/deno),
+// matching srvx's own native runtime detection. This keeps the WebSocket adapter
+// in sync with the underlying server when the worker thread runs on Bun or Deno
+// (where srvx uses Bun.serve/Deno.serve) instead of forcing the Node adapter.
+import { plugin as wsPlugin } from "crossws/server";
 import {
   resolveEntry,
   reloadEntryModule,

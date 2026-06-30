@@ -81,7 +81,7 @@ export default {
 };
 ```
 
-The `websocket` property uses [crossws](https://crossws.h3.dev) hooks for cross-platform WebSocket support. Each built-in worker adds the crossws srvx plugin when `websocket` is defined. Node.js workers use `crossws/server/node`, while bun/deno workers use `crossws/server` (auto-selects runtime). The `upgrade` property is a lower-level alternative for raw Node.js socket access.
+The `websocket` property uses [crossws](https://crossws.h3.dev) hooks for cross-platform WebSocket support. Each built-in worker adds the crossws srvx plugin when `websocket` is defined. All built-in workers import `crossws/server`, which auto-selects the runtime adapter (node/bun/deno) via export conditions — matching srvx's own native runtime detection. This keeps the WebSocket adapter in sync with the underlying server: the node-worker/node-process workers inherit the host runtime (worker thread / `fork()`), so they use the native Bun.serve/Deno.serve adapter when env-runner runs on Bun or Deno instead of forcing Node compat. The `upgrade` property is a lower-level alternative for raw Node.js socket access (Node-only).
 
 The `ipc` property enables bidirectional messaging between the entry and the runner:
 
