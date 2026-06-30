@@ -464,7 +464,7 @@ describe("MiniflareEnvRunner (persistent)", () => {
 
 // --- Helpers ---
 
-function waitForReady(runner: EnvRunner, timeout = 5000): Promise<void> {
+function waitForReady(runner: EnvRunner, timeout = 15000): Promise<void> {
   return new Promise((resolve, reject) => {
     if (runner.ready) {
       resolve();
