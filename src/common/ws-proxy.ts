@@ -1,7 +1,7 @@
 import type { IncomingMessage, Server as NodeHttpServer } from "node:http";
 import type { Socket } from "node:net";
 import type { ServerPlugin } from "srvx";
-import type { EnvRunner } from "../types.ts";
+import type { EnvRunner, WorkerAddress } from "../types.ts";
 
 /**
  * Create a runtime-native WebSocket reverse-proxy plugin for the public srvx
@@ -57,14 +57,41 @@ export async function createRunnerWSProxyPlugin(
       await getRunner()
         ?.waitForReady?.()
         .catch(() => {});
-      const addr = getRunner()?.address;
-      if (!addr?.port) {
-        throw new Error("env runner worker is not ready");
-      }
-      const { pathname, search } = new URL(peer.request.url);
-      return `ws://${addr.host || "127.0.0.1"}:${addr.port}${pathname}${search}`;
+      return resolveWSProxyTarget(getRunner()?.address, peer.request.url);
     },
   });
 
   return plugin({ resolve: () => proxy });
+}
+
+
+/**
+ * Build the upstream `ws://` URL the Bun/Deno bridge dials, from the worker's
+ * reported address and the incoming request URL (path + query are preserved).
+ *
+ * Throws when the worker isn't ready yet, or when it listens on a Unix socket:
+ * the bridge dials with a standard `WebSocket` client, which only speaks TCP
+ * (the Node passthrough proxies the raw socket via httpxy and does support it).
+ */
+export function resolveWSProxyTarget(
+  address: WorkerAddress | undefined,
+  requestUrl: string,
+): string {
+  if (!address) {
+    throw new Error("env runner worker is not ready");
+  }
+  if (address.socketPath) {
+    throw new Error(
+      `env runner worker listens on a Unix socket (${address.socketPath}), which the ` +
+        `Bun/Deno WebSocket proxy bridge cannot dial with a TCP \`WebSocket\` client`,
+    );
+  }
+  if (!address.port) {
+    throw new Error("env runner worker is not ready");
+  }
+  // IPv6 literals must be bracketed in a URL authority (`[::1]:port`).
+  const host = address.host || "127.0.0.1";
+  const authority = host.includes(":") ? `[${host}]` : host;
+  const { pathname, search } = new URL(requestUrl);
+  return `ws://${authority}:${address.port}${pathname}${search}`;
 }

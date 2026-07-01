@@ -7,6 +7,7 @@ import { serve } from "srvx";
 import type { Server } from "srvx";
 import type { EnvRunner } from "../src/index.ts";
 import { RunnerManager } from "../src/index.ts";
+import { resolveWSProxyTarget } from "../src/common/ws-proxy.ts";
 
 import { NodeWorkerEnvRunner } from "../src/runners/node-worker/runner.ts";
 import { NodeProcessEnvRunner } from "../src/runners/node-process/runner.ts";
@@ -191,6 +192,44 @@ describe("wsSrvxPlugin", () => {
 
     await closed;
     expect(messages).toEqual(["welcome", "echo:hello"]);
+  });
+});
+
+// The Bun/Deno bridge builds a `ws://` target from the worker address by hand;
+// that branch never runs when the host process is Node (as in CI), so cover the
+// URL construction directly. Guards against the host/port/socket assumptions the
+// end-to-end passthrough test can't reach.
+describe("resolveWSProxyTarget", () => {
+  it("builds a ws:// URL preserving path and query", () => {
+    expect(resolveWSProxyTarget({ host: "127.0.0.1", port: 1234 }, "http://front/foo?x=1")).toBe(
+      "ws://127.0.0.1:1234/foo?x=1",
+    );
+  });
+
+  it("uses the worker's reported host instead of assuming loopback", () => {
+    expect(resolveWSProxyTarget({ host: "192.168.1.5", port: 80 }, "http://front/ws")).toBe(
+      "ws://192.168.1.5:80/ws",
+    );
+  });
+
+  it("falls back to 127.0.0.1 only when no host is reported", () => {
+    expect(resolveWSProxyTarget({ port: 3000 }, "http://front/")).toBe("ws://127.0.0.1:3000/");
+  });
+
+  it("brackets an IPv6 host in the URL authority", () => {
+    expect(resolveWSProxyTarget({ host: "::1", port: 8080 }, "http://front/chat")).toBe(
+      "ws://[::1]:8080/chat",
+    );
+  });
+
+  it("rejects a Unix-socket worker (the TCP bridge can't dial it)", () => {
+    expect(() => resolveWSProxyTarget({ socketPath: "/tmp/worker.sock" }, "http://front/")).toThrow(
+      /Unix socket/,
+    );
+  });
+
+  it("throws when the worker is not ready", () => {
+    expect(() => resolveWSProxyTarget(undefined, "http://front/")).toThrow(/not ready/);
   });
 });
 
