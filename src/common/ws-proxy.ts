@@ -64,7 +64,6 @@ export async function createRunnerWSProxyPlugin(
   return plugin({ resolve: () => proxy });
 }
 
-
 /**
  * Build the upstream `ws://` URL the Bun/Deno bridge dials, from the worker's
  * reported address and the incoming request URL (path + query are preserved).
