@@ -77,7 +77,12 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
         status: 503,
       });
     }
-    return proxyFetch(this._address, this._resolveFetchInput(input), init);
+    const tlsTarget = this._tlsTarget("https");
+    return tlsTarget
+      ? proxyFetch(tlsTarget, this._resolveFetchInput(input), init, {
+          ssl: { rejectUnauthorized: false },
+        })
+      : proxyFetch(this._address, this._resolveFetchInput(input), init);
   }
 
   async upgrade(context: { node: { req: IncomingMessage; socket: Socket; head: any } }) {
@@ -89,8 +94,13 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
     if (!this.ready || !this._address) {
       return;
     }
+    const tlsTarget = this._tlsTarget("wss");
     try {
-      await proxyUpgrade(this._address, context.node.req, context.node.socket, context.node.head);
+      await (tlsTarget
+        ? proxyUpgrade(tlsTarget, context.node.req, context.node.socket, context.node.head, {
+            secure: false,
+          })
+        : proxyUpgrade(this._address, context.node.req, context.node.socket, context.node.head));
     } catch {
       // The worker may refuse the upgrade (e.g. the `upgrade` hook returned a
       // non-101 response to reject the connection). `proxyUpgrade` has already
@@ -215,6 +225,25 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
       return new URL(input, "http://localhost");
     }
     return input;
+  }
+
+  /**
+   * When the worker serves over TLS, build the `https://`/`wss://` URL-string
+   * target httpxy needs to negotiate TLS — the `{ host, port }` object form it
+   * otherwise receives always connects in cleartext. Returns `undefined` for a
+   * cleartext (or Unix-socket) worker so callers keep passing the address object.
+   * Certificate verification is skipped by the caller (a local worker typically
+   * self-signs).
+   */
+  protected _tlsTarget(scheme: "https" | "wss"): string | undefined {
+    const addr = this._address;
+    if (!addr?.tls || addr.socketPath || !addr.port) {
+      return undefined;
+    }
+    // IPv6 literals must be bracketed in a URL authority (`[::1]:port`).
+    const host = addr.host || "127.0.0.1";
+    const authority = host.includes(":") ? `[${host}]` : host;
+    return `${scheme}://${authority}:${addr.port}`;
   }
 
   protected _handleMessage(message: any) {
