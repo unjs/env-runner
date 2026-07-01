@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { createServer } from "node:http";
 import { fileURLToPath } from "node:url";
 import { resolve, dirname } from "node:path";
@@ -254,6 +254,74 @@ describe("resolveWSProxyTarget", () => {
     expect(() => resolveWSProxyTarget(undefined, "http://front/")).toThrow(/not ready/);
   });
 });
+
+// End-to-end coverage for the `createRunnerWSProxyPlugin` Bun/Deno bridge — the
+// crossws terminate-and-redial path that the Node-hosted vitest process never
+// reaches (on Node the plugin uses the raw-socket passthrough instead). Spawns a
+// fixture under bun/deno that carries the plugin in front of a crossws echo
+// worker, then connects a client from Node through it.
+const bridgeHosts = [
+  { name: "Bun", cmd: "bun", args: [] as string[], skip: !hasBun },
+  {
+    name: "Deno",
+    cmd: "deno",
+    args: ["run", "-A", "--node-modules-dir=auto", "--no-lock"],
+    skip: !hasDeno,
+  },
+];
+const bridgeFixture = resolve(_dir, "./fixtures/ws-bridge-server.mjs");
+
+for (const { name, cmd, args, skip } of bridgeHosts) {
+  describe.skipIf(skip)(`wsProxy bridge (${name} host)`, () => {
+    let child: ChildProcess | undefined;
+
+    afterEach(() => {
+      child?.kill();
+      child = undefined;
+    });
+
+    it("terminates the client with crossws and proxies to the worker", async () => {
+      const proc = spawn(cmd, [...args, bridgeFixture], { stdio: ["ignore", "pipe", "pipe"] });
+      child = proc;
+
+      const frontUrl = await new Promise<string>((resolve, reject) => {
+        let out = "";
+        const timer = setTimeout(() => reject(new Error(`bridge did not start:\n${out}`)), 20_000);
+        proc.stdout!.on("data", (d) => {
+          out += String(d);
+          const match = out.match(/READY (\S+)/);
+          if (match?.[1]) {
+            clearTimeout(timer);
+            resolve(match[1]);
+          }
+        });
+        proc.stderr!.on("data", (d) => (out += String(d)));
+        proc.on("exit", (code) => {
+          clearTimeout(timer);
+          reject(new Error(`bridge exited (${code}) before ready:\n${out}`));
+        });
+      });
+
+      const ws = new WebSocket(frontUrl.replace(/^http/, "ws"));
+      const messages: string[] = [];
+      const closed = new Promise<void>((resolve) => {
+        ws.addEventListener("message", (event) => {
+          messages.push(String(event.data));
+          if (messages.length === 1) {
+            ws.send("hello");
+          }
+          if (messages.length === 2) {
+            ws.close();
+          }
+        });
+        ws.addEventListener("close", () => resolve());
+      });
+
+      await closed;
+      expect(messages).toEqual(["welcome", "echo:hello"]);
+    }, 30_000);
+  });
+}
 
 describe("upgrade rejection", () => {
   let runner: EnvRunner | undefined;
