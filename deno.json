@@ -1,0 +1,6 @@
+{
+  "minimumDependencyAge": {
+    "age": "P1D",
+    "exclude": ["npm:crossws", "npm:exsolve", "npm:httpxy", "npm:srvx"]
+  }
+}

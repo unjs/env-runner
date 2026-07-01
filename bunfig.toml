@@ -1,0 +1,5 @@
+[install]
+# Mirror the pnpm `minimumReleaseAgeExclude` policy for the bun-process runner
+# subprocess: exempt the unjs-authored deps from any minimum-release-age gate so
+# a same-day release (e.g. crossws) isn't rejected as "too new".
+minimumReleaseAgeExcludes = ["crossws", "exsolve", "httpxy", "srvx"]
