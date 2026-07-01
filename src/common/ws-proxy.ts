@@ -57,7 +57,10 @@ export async function createRunnerWSProxyPlugin(
       await getRunner()
         ?.waitForReady?.()
         .catch(() => {});
-      return resolveWSProxyTarget(getRunner()?.address, peer.request.url);
+      // Bun's `WebSocket` accepts the `ws+unix://` scheme; Deno's does not.
+      return resolveWSProxyTarget(getRunner()?.address, peer.request.url, {
+        unixScheme: isBun,
+      });
     },
   });
 
@@ -65,25 +68,39 @@ export async function createRunnerWSProxyPlugin(
 }
 
 /**
- * Build the upstream `ws://` URL the Bun/Deno bridge dials, from the worker's
- * reported address and the incoming request URL (path + query are preserved).
+ * Build the upstream URL the Bun/Deno bridge dials, from the worker's reported
+ * address and the incoming request URL (path + query are preserved).
  *
- * Throws when the worker isn't ready yet, or when it listens on a Unix socket:
- * the bridge dials with a standard `WebSocket` client, which only speaks TCP
- * (the Node passthrough proxies the raw socket via httpxy and does support it).
+ * A TCP worker yields a `ws://host:port` URL (`wss://` when `address.tls`). A
+ * Unix-socket worker is
+ * runtime-dependent: Bun's `WebSocket` accepts the npm-`ws`-style
+ * `ws+unix://<socket>:<path>` scheme (and it survives crossws's `new URL()`
+ * wrapping), so pass `unixScheme: true` on a Bun host. Deno's `WebSocket`
+ * rejects that scheme — its only Unix path is the unstable `client` option,
+ * which crossws doesn't forward — so we throw there. (The Node passthrough
+ * proxies the raw socket via httpxy and supports Unix sockets regardless.)
+ *
+ * Also throws when the worker isn't ready yet (no address / no port).
  */
 export function resolveWSProxyTarget(
   address: WorkerAddress | undefined,
   requestUrl: string,
+  opts: { unixScheme?: boolean } = {},
 ): string {
   if (!address) {
     throw new Error("env runner worker is not ready");
   }
+  const { pathname, search } = new URL(requestUrl);
+  const scheme = address.tls ? "wss" : "ws";
   if (address.socketPath) {
-    throw new Error(
-      `env runner worker listens on a Unix socket (${address.socketPath}), which the ` +
-        `Bun/Deno WebSocket proxy bridge cannot dial with a TCP \`WebSocket\` client`,
-    );
+    if (!opts.unixScheme) {
+      throw new Error(
+        `env runner worker listens on a Unix socket (${address.socketPath}); this runtime's ` +
+          `\`WebSocket\` client cannot dial it, so the proxy bridge is TCP-only here`,
+      );
+    }
+    // Bun: `ws+unix://<absolute-socket-path>:<request-path>`.
+    return `${scheme}+unix://${address.socketPath}:${pathname}${search}`;
   }
   if (!address.port) {
     throw new Error("env runner worker is not ready");
@@ -91,6 +108,5 @@ export function resolveWSProxyTarget(
   // IPv6 literals must be bracketed in a URL authority (`[::1]:port`).
   const host = address.host || "127.0.0.1";
   const authority = host.includes(":") ? `[${host}]` : host;
-  const { pathname, search } = new URL(requestUrl);
-  return `ws://${authority}:${address.port}${pathname}${search}`;
+  return `${scheme}://${authority}:${address.port}${pathname}${search}`;
 }
