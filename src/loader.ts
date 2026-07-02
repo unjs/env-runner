@@ -18,7 +18,7 @@ export interface LoadRunnerOptions {
   data?: EnvRunnerData;
   execArgv?: string[];
   /** Allow proxying to a TLS worker with an unverifiable certificate. */
-  insecure?: boolean;
+  insecureTLS?: boolean;
   /** Additional runner-specific options (passed through to the runner constructor). */
   [key: string]: unknown;
 }

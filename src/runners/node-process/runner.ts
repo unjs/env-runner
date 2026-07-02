@@ -22,7 +22,7 @@ export class NodeProcessEnvRunner extends BaseEnvRunner {
     data?: EnvRunnerData;
     execArgv?: string[];
     /** Allow proxying to a TLS worker with an unverifiable certificate. */
-    insecure?: boolean;
+    insecureTLS?: boolean;
   }) {
     _defaultEntry ||= fileURLToPath(import.meta.resolve("env-runner/runners/node-process/worker"));
     super({ ...opts, workerEntry: opts.workerEntry || _defaultEntry });

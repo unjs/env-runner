@@ -40,7 +40,7 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
   protected _virtualSources?: VirtualModules;
   protected _hooks: Partial<WorkerHooks>;
   protected _address?: WorkerAddress;
-  protected _insecure: boolean;
+  protected _insecureTLS: boolean;
   protected _messageListeners: Set<(data: unknown) => void>;
   protected _pendingRequests: Set<(cause?: unknown) => void>;
   protected _virtualResolved?: Promise<void>;
@@ -55,13 +55,13 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
      * a self-signed local cert). Off by default: the runner verifies the
      * worker's certificate, so an unverifiable one fails the connection.
      */
-    insecure?: boolean;
+    insecureTLS?: boolean;
   }) {
     this._name = opts.name;
     this._workerEntry = opts.workerEntry;
     this._data = opts.data;
     this._hooks = opts.hooks || {};
-    this._insecure = opts.insecure ?? false;
+    this._insecureTLS = opts.insecureTLS ?? false;
     this._messageListeners = new Set();
     this._pendingRequests = new Set();
   }
@@ -91,7 +91,7 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
           tlsTarget,
           this._resolveFetchInput(input),
           init,
-          this._insecure ? { ssl: { rejectUnauthorized: false } } : undefined,
+          this._insecureTLS ? { ssl: { rejectUnauthorized: false } } : undefined,
         )
       : proxyFetch(this._address, this._resolveFetchInput(input), init);
   }
@@ -117,7 +117,7 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
             context.node.req,
             context.node.socket,
             context.node.head,
-            this._insecure ? { secure: false } : undefined,
+            this._insecureTLS ? { secure: false } : undefined,
           )
         : proxyUpgrade(this._address, context.node.req, context.node.socket, context.node.head));
     } catch {
@@ -252,7 +252,7 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
    * otherwise receives always connects in cleartext. Returns `undefined` for a
    * cleartext (or Unix-socket) worker so callers keep passing the address object.
    * The certificate is verified unless the runner was constructed with
-   * `insecure: true` (opt-in for self-signed local certs).
+   * `insecureTLS: true` (opt-in for self-signed local certs).
    */
   protected _tlsTarget(scheme: "https" | "wss"): string | undefined {
     const addr = this._address;

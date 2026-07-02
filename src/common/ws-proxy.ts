@@ -67,7 +67,7 @@ export async function createRunnerWSProxyPlugin(
         .catch(() => {});
       // Bun's `WebSocket` accepts the `ws+unix://` scheme; Deno's does not.
       // A TLS worker is always dialed with certificate verification on: crossws
-      // exposes no cert-skip hook, so the `insecure` opt-in (honored by the Node
+      // exposes no cert-skip hook, so the `insecureTLS` opt-in (honored by the Node
       // passthrough) can't be applied here.
       return resolveWSProxyTarget(getRunner()?.address, peer.request.url, {
         unixScheme: isBun,

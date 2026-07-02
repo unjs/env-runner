@@ -6,13 +6,13 @@ import { BaseEnvRunner } from "../src/common/base-runner.ts";
 // that `base-runner` imports transitively is unreliable under coverage
 // instrumentation + shared test workers (it silently fails to intercept, so the
 // real httpxy runs and hits the network). Instead we assert the pure target /
-// option decision (`_tlsTarget`, the `insecure` flag) and the socket-cleanup
+// option decision (`_tlsTarget`, the `insecureTLS` flag) and the socket-cleanup
 // behavior directly, which is where all the logic under review lives.
 
 class TestRunner extends BaseEnvRunner {
   #hasRuntime: boolean;
-  constructor(address?: WorkerAddress, insecure = false, hasRuntime = true) {
-    super({ name: "tls-test", workerEntry: "unused", insecure });
+  constructor(address?: WorkerAddress, insecureTLS = false, hasRuntime = true) {
+    super({ name: "tls-test", workerEntry: "unused", insecureTLS });
     if (address) this._address = address;
     this.#hasRuntime = hasRuntime;
   }
@@ -28,8 +28,8 @@ class TestRunner extends BaseEnvRunner {
   tlsTarget(scheme: "https" | "wss") {
     return this._tlsTarget(scheme);
   }
-  get insecureFlag() {
-    return this._insecure;
+  get insecureTLSFlag() {
+    return this._insecureTLS;
   }
 }
 
@@ -71,13 +71,13 @@ describe("BaseEnvRunner._tlsTarget", () => {
   });
 });
 
-describe("BaseEnvRunner insecure opt-in", () => {
+describe("BaseEnvRunner insecureTLS opt-in", () => {
   it("defaults to verifying the worker certificate", () => {
-    expect(new TestRunner({ host: "127.0.0.1", port: 443, tls: true }).insecureFlag).toBe(false);
+    expect(new TestRunner({ host: "127.0.0.1", port: 443, tls: true }).insecureTLSFlag).toBe(false);
   });
 
-  it("stores the `insecure` opt-in", () => {
-    expect(new TestRunner({ host: "127.0.0.1", port: 443, tls: true }, true).insecureFlag).toBe(
+  it("stores the `insecureTLS` opt-in", () => {
+    expect(new TestRunner({ host: "127.0.0.1", port: 443, tls: true }, true).insecureTLSFlag).toBe(
       true,
     );
   });

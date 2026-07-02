@@ -104,13 +104,13 @@ waits for the worker to become ready before proxying. Your entry module should
 expose WebSocket hooks via the `websocket` field (see [Workers](#workers)).
 
 When the worker serves over TLS, the runner verifies its certificate by default.
-To allow a self-signed/unverifiable local certificate, opt in with `insecure`
+To allow a self-signed/unverifiable local certificate, opt in with `insecureTLS`
 (supported by every runner, `EnvServer`, and `loadRunner`). This is honored on
 the Node passthrough (`fetch` and raw-socket `upgrade`); the Bun/Deno WebSocket
 bridge always verifies, since crossws exposes no cert-skip hook.
 
 ```ts
-const envServer = new EnvServer({ entry: "./server.ts", insecure: true });
+const envServer = new EnvServer({ entry: "./server.ts", insecureTLS: true });
 ```
 
 ### Manager (`RunnerManager`)

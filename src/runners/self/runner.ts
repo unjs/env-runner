@@ -26,7 +26,7 @@ export class SelfEnvRunner extends BaseEnvRunner {
     hooks?: WorkerHooks;
     data?: EnvRunnerData;
     /** Allow proxying to a TLS worker with an unverifiable certificate. */
-    insecure?: boolean;
+    insecureTLS?: boolean;
   }) {
     super({ ...opts, workerEntry: "" });
     this.#init();

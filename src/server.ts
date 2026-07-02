@@ -23,7 +23,7 @@ export interface EnvServerOptions {
    * self-signed local cert). Off by default — the worker's certificate is
    * verified.
    */
-  insecure?: boolean;
+  insecureTLS?: boolean;
   /** Enable watch mode to auto-reload on entry file changes. */
   watch?: boolean;
   /** Additional paths to watch (directories or files). */
@@ -110,7 +110,7 @@ export class EnvServer extends RunnerManager {
       hooks: this._opts.hooks,
       data: { ...this._opts.data, entry: this._opts.entry },
       execArgv: this._opts.execArgv,
-      insecure: this._opts.insecure,
+      insecureTLS: this._opts.insecureTLS,
     });
   }
 
