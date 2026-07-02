@@ -31,12 +31,20 @@ export async function createRunnerWSProxyPlugin(
   // the listener after `ready()`. `runner.upgrade()` waits for the worker.
   if (!isBun && !isDeno) {
     return (server) => {
-      void server.ready().then(() => {
-        const httpServer = server.node?.server as NodeHttpServer | undefined;
-        httpServer?.on("upgrade", (req: IncomingMessage, socket: Socket, head: Buffer) => {
-          getRunner()?.upgrade?.({ node: { req, socket, head } });
+      void server
+        .ready()
+        .then(() => {
+          const httpServer = server.node?.server as NodeHttpServer | undefined;
+          httpServer?.on("upgrade", (req: IncomingMessage, socket: Socket, head: Buffer) => {
+            getRunner()?.upgrade?.({ node: { req, socket, head } });
+          });
+        })
+        .catch(() => {
+          // The server never finished listening (e.g. the port is in use), so
+          // there's nothing to attach the upgrade handler to. The consumer's own
+          // `serve()`/`server.ready()` surfaces the failure; swallow here to
+          // avoid an unhandled rejection from this fire-and-forget hook.
         });
-      });
     };
   }
 
@@ -58,6 +66,9 @@ export async function createRunnerWSProxyPlugin(
         ?.waitForReady?.()
         .catch(() => {});
       // Bun's `WebSocket` accepts the `ws+unix://` scheme; Deno's does not.
+      // A TLS worker is always dialed with certificate verification on: crossws
+      // exposes no cert-skip hook, so the `insecure` opt-in (honored by the Node
+      // passthrough) can't be applied here.
       return resolveWSProxyTarget(getRunner()?.address, peer.request.url, {
         unixScheme: isBun,
       });
@@ -105,8 +116,10 @@ export function resolveWSProxyTarget(
   if (!address.port) {
     throw new Error("env runner worker is not ready");
   }
-  // IPv6 literals must be bracketed in a URL authority (`[::1]:port`).
+  // IPv6 literals must be bracketed in a URL authority (`[::1]:port`), but
+  // `parseServerAddress()` reports the host from `URL.hostname`, which is
+  // already bracketed — only wrap a bare literal.
   const host = address.host || "127.0.0.1";
-  const authority = host.includes(":") ? `[${host}]` : host;
+  const authority = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
   return `${scheme}://${authority}:${address.port}${pathname}${search}`;
 }

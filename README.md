@@ -103,6 +103,16 @@ It reads the active runner lazily, so it keeps working across hot-reloads, and
 waits for the worker to become ready before proxying. Your entry module should
 expose WebSocket hooks via the `websocket` field (see [Workers](#workers)).
 
+When the worker serves over TLS, the runner verifies its certificate by default.
+To allow a self-signed/unverifiable local certificate, opt in with `insecure`
+(supported by every runner, `EnvServer`, and `loadRunner`). This is honored on
+the Node passthrough (`fetch` and raw-socket `upgrade`); the Bun/Deno WebSocket
+bridge always verifies, since crossws exposes no cert-skip hook.
+
+```ts
+const envServer = new EnvServer({ entry: "./server.ts", insecure: true });
+```
+
 ### Manager (`RunnerManager`)
 
 Proxy manager for hot-reload with message queueing and listener forwarding:

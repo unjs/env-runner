@@ -21,7 +21,13 @@ export class SelfEnvRunner extends BaseEnvRunner {
   #entry?: AppEntry;
   #wsAdapter?: NodeWSAdapter;
 
-  constructor(opts: { name: string; hooks?: WorkerHooks; data?: EnvRunnerData }) {
+  constructor(opts: {
+    name: string;
+    hooks?: WorkerHooks;
+    data?: EnvRunnerData;
+    /** Allow proxying to a TLS worker with an unverifiable certificate. */
+    insecure?: boolean;
+  }) {
     super({ ...opts, workerEntry: "" });
     this.#init();
   }

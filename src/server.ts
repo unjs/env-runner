@@ -18,6 +18,12 @@ export interface EnvServerOptions {
   data?: Record<string, unknown>;
   /** Custom exec arguments (e.g. `--inspect`). */
   execArgv?: string[];
+  /**
+   * Allow proxying to a TLS worker with an unverifiable certificate (e.g. a
+   * self-signed local cert). Off by default — the worker's certificate is
+   * verified.
+   */
+  insecure?: boolean;
   /** Enable watch mode to auto-reload on entry file changes. */
   watch?: boolean;
   /** Additional paths to watch (directories or files). */
@@ -104,6 +110,7 @@ export class EnvServer extends RunnerManager {
       hooks: this._opts.hooks,
       data: { ...this._opts.data, entry: this._opts.entry },
       execArgv: this._opts.execArgv,
+      insecure: this._opts.insecure,
     });
   }
 

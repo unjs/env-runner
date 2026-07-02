@@ -29,6 +29,8 @@ export class DenoProcessEnvRunner extends BaseEnvRunner {
     hooks?: WorkerHooks;
     data?: EnvRunnerData;
     execArgv?: string[];
+    /** Allow proxying to a TLS worker with an unverifiable certificate. */
+    insecure?: boolean;
   }) {
     _defaultEntry ||= fileURLToPath(import.meta.resolve("env-runner/runners/deno-process/worker"));
     super({ ...opts, workerEntry: opts.workerEntry || _defaultEntry });

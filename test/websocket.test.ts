@@ -216,8 +216,15 @@ describe("resolveWSProxyTarget", () => {
     expect(resolveWSProxyTarget({ port: 3000 }, "http://front/")).toBe("ws://127.0.0.1:3000/");
   });
 
-  it("brackets an IPv6 host in the URL authority", () => {
+  it("brackets a bare IPv6 host in the URL authority", () => {
     expect(resolveWSProxyTarget({ host: "::1", port: 8080 }, "http://front/chat")).toBe(
+      "ws://[::1]:8080/chat",
+    );
+  });
+
+  it("does not double-bracket an already-bracketed IPv6 host", () => {
+    // `parseServerAddress()` reports `URL.hostname`, which is already bracketed.
+    expect(resolveWSProxyTarget({ host: "[::1]", port: 8080 }, "http://front/chat")).toBe(
       "ws://[::1]:8080/chat",
     );
   });

@@ -40,6 +40,7 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
   protected _virtualSources?: VirtualModules;
   protected _hooks: Partial<WorkerHooks>;
   protected _address?: WorkerAddress;
+  protected _insecure: boolean;
   protected _messageListeners: Set<(data: unknown) => void>;
   protected _pendingRequests: Set<(cause?: unknown) => void>;
   protected _virtualResolved?: Promise<void>;
@@ -49,11 +50,18 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
     workerEntry: string;
     hooks?: WorkerHooks;
     data?: EnvRunnerData;
+    /**
+     * Allow proxying to a TLS worker whose certificate can't be verified (e.g.
+     * a self-signed local cert). Off by default: the runner verifies the
+     * worker's certificate, so an unverifiable one fails the connection.
+     */
+    insecure?: boolean;
   }) {
     this._name = opts.name;
     this._workerEntry = opts.workerEntry;
     this._data = opts.data;
     this._hooks = opts.hooks || {};
+    this._insecure = opts.insecure ?? false;
     this._messageListeners = new Set();
     this._pendingRequests = new Set();
   }
@@ -79,9 +87,12 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
     }
     const tlsTarget = this._tlsTarget("https");
     return tlsTarget
-      ? proxyFetch(tlsTarget, this._resolveFetchInput(input), init, {
-          ssl: { rejectUnauthorized: false },
-        })
+      ? proxyFetch(
+          tlsTarget,
+          this._resolveFetchInput(input),
+          init,
+          this._insecure ? { ssl: { rejectUnauthorized: false } } : undefined,
+        )
       : proxyFetch(this._address, this._resolveFetchInput(input), init);
   }
 
@@ -92,14 +103,22 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
       await this.waitForReady().catch(() => {});
     }
     if (!this.ready || !this._address) {
+      // The worker never came up (crash during init, timeout, closed). Nothing
+      // downstream owns this raw socket, so destroy it instead of leaking the
+      // fd and leaving the client hanging until its own timeout.
+      context.node.socket.destroy();
       return;
     }
     const tlsTarget = this._tlsTarget("wss");
     try {
       await (tlsTarget
-        ? proxyUpgrade(tlsTarget, context.node.req, context.node.socket, context.node.head, {
-            secure: false,
-          })
+        ? proxyUpgrade(
+            tlsTarget,
+            context.node.req,
+            context.node.socket,
+            context.node.head,
+            this._insecure ? { secure: false } : undefined,
+          )
         : proxyUpgrade(this._address, context.node.req, context.node.socket, context.node.head));
     } catch {
       // The worker may refuse the upgrade (e.g. the `upgrade` hook returned a
@@ -232,17 +251,19 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
    * target httpxy needs to negotiate TLS — the `{ host, port }` object form it
    * otherwise receives always connects in cleartext. Returns `undefined` for a
    * cleartext (or Unix-socket) worker so callers keep passing the address object.
-   * Certificate verification is skipped by the caller (a local worker typically
-   * self-signs).
+   * The certificate is verified unless the runner was constructed with
+   * `insecure: true` (opt-in for self-signed local certs).
    */
   protected _tlsTarget(scheme: "https" | "wss"): string | undefined {
     const addr = this._address;
     if (!addr?.tls || addr.socketPath || !addr.port) {
       return undefined;
     }
-    // IPv6 literals must be bracketed in a URL authority (`[::1]:port`).
+    // IPv6 literals must be bracketed in a URL authority (`[::1]:port`), but
+    // `parseServerAddress()` reports the host from `URL.hostname`, which is
+    // already bracketed — only wrap a bare literal.
     const host = addr.host || "127.0.0.1";
-    const authority = host.includes(":") ? `[${host}]` : host;
+    const authority = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
     return `${scheme}://${authority}:${addr.port}`;
   }
 
