@@ -322,7 +322,7 @@ for (const runnerDef of runners) {
 
     it("waitForReady resolves when runner becomes ready", async () => {
       runner = create(opts("test-wait-ready"));
-      await runner.waitForReady(15_000);
+      await runner.waitForReady();
       expect(runner.ready).toBe(true);
     });
 
@@ -330,7 +330,7 @@ for (const runnerDef of runners) {
       runner = create(opts("test-wait-ready-imm"));
       await waitForReady(runner);
       // Already ready — should resolve immediately
-      await runner.waitForReady(15_000);
+      await runner.waitForReady();
       expect(runner.ready).toBe(true);
     });
 
@@ -385,7 +385,7 @@ for (const { name, create, skip } of reloadRunners) {
       writeFileSync(entryPath, `export default { fetch() { return new Response("v1"); } };`);
 
       runner = create({ name: "test-reload", data: { entry: entryPath } });
-      await runner.waitForReady(15_000);
+      await runner.waitForReady();
 
       const res1 = await runner.fetch("http://localhost/");
       expect(await res1.text()).toBe("v1");
@@ -420,7 +420,7 @@ export default {
           if (msg?.type === "ready" && msg.version === 1) resolve(msg);
         });
       });
-      await runner.waitForReady(15_000);
+      await runner.waitForReady();
       await readyV1;
 
       writeFileSync(entryPath, makeEntry(2));
@@ -470,7 +470,7 @@ for (const { name, create, selfRunner } of upgradeRunners) {
     if (selfRunner) {
       it("calls entry.upgrade directly", async () => {
         runner = create({ name: "test-upgrade", data: { entry: appUpgradeEntry } });
-        await runner.waitForReady(15_000);
+        await runner.waitForReady();
 
         // For SelfEnvRunner, verify upgrade is callable with mock objects
         const { PassThrough } = await import("node:stream");
@@ -502,7 +502,7 @@ for (const { name, create, selfRunner } of upgradeRunners) {
             },
           },
         });
-        await runner.waitForReady(15_000);
+        await runner.waitForReady();
         expect(address).toBeDefined();
 
         // Send an HTTP upgrade request to the worker's server directly
@@ -570,7 +570,7 @@ for (const { name, create, skip } of rpcRunners) {
 
     it("resolves with response data", async () => {
       runner = create({ name: "test-rpc", data: { entry: appRpcEntry } });
-      await runner.waitForReady(15_000);
+      await runner.waitForReady();
 
       const result = await runner.rpc<string>("greet", "world");
       expect(result).toBe("hello world");
@@ -578,14 +578,14 @@ for (const { name, create, skip } of rpcRunners) {
 
     it("rejects when worker returns an error", async () => {
       runner = create({ name: "test-rpc-error", data: { entry: appRpcEntry } });
-      await runner.waitForReady(15_000);
+      await runner.waitForReady();
 
       await expect(runner.rpc("fail")).rejects.toThrow("something went wrong");
     });
 
     it("rejects on timeout", async () => {
       runner = create({ name: "test-rpc-timeout", data: { entry: appRpcEntry } });
-      await runner.waitForReady(15_000);
+      await runner.waitForReady();
 
       // "slow" handler responds after 2s, so a 100ms timeout should fire first
       await expect(runner.rpc("slow", undefined, { timeout: 100 })).rejects.toThrow("timed out");
@@ -593,7 +593,7 @@ for (const { name, create, skip } of rpcRunners) {
 
     it("handles concurrent rpc calls", async () => {
       runner = create({ name: "test-rpc-concurrent", data: { entry: appRpcEntry } });
-      await runner.waitForReady(15_000);
+      await runner.waitForReady();
 
       const results = await Promise.all([
         runner.rpc<string>("greet", "a"),

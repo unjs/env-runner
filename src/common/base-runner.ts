@@ -139,7 +139,7 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
     this._messageListeners.delete(listener);
   }
 
-  waitForReady(timeout = 5000): Promise<void> {
+  waitForReady(timeout = 15_000): Promise<void> {
     if (this.ready) return Promise.resolve();
     if (this.closed) return Promise.reject(new Error("Runner closed before becoming ready"));
     return new Promise((resolve, reject) => {
