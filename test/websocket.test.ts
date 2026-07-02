@@ -66,7 +66,7 @@ for (const { name, create, skip } of websocketRunners) {
           },
         },
       });
-      await runner!.waitForReady();
+      await runner!.waitForReady(15_000);
       expect(address).toBeDefined();
 
       const host = address.host || "127.0.0.1";
@@ -111,7 +111,7 @@ describe("SelfEnvRunner websocket", () => {
       name: "test-ws-self",
       data: { entry: appWebsocketEntry },
     });
-    await runner.waitForReady();
+    await runner.waitForReady(15_000);
 
     // Create a minimal HTTP server to forward upgrade events to the self runner
     server = createServer();
@@ -164,7 +164,7 @@ describe("wsSrvxPlugin", () => {
     manager = new RunnerManager(
       new NodeWorkerEnvRunner({ name: "test-ws-proxy", data: { entry: appWebsocketEntry } }),
     );
-    await manager.waitForReady();
+    await manager.waitForReady(15_000);
 
     server = serve({
       port: 0,
@@ -358,7 +358,7 @@ describe("upgrade rejection", () => {
         name: "test-ws-reject",
         data: { entry: appWebsocketRejectEntry },
       });
-      await runner.waitForReady();
+      await runner.waitForReady(15_000);
 
       // Front HTTP server forwarding upgrade events through the runner (proxy).
       server = createServer();
