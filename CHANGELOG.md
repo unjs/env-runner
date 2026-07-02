@@ -1,6 +1,18 @@
 # Changelog
 
 
+## v0.1.16
+
+[compare changes](https://github.com/unjs/env-runner/compare/v0.1.15...v0.1.16)
+
+### 🚀 Enhancements
+
+- Runtime-native WebSocket upgrade proxying ([#33](https://github.com/unjs/env-runner/pull/33))
+
+### ❤️ Contributors
+
+- Pi0x <x@pi0.io>
+
 ## v0.1.15
 
 [compare changes](https://github.com/unjs/env-runner/compare/v0.1.14...v0.1.15)
