@@ -102,8 +102,16 @@ export class RunnerManager implements EnvRunner, AsyncDisposable {
     return this._pendingModuleReload;
   }
 
-  upgrade: UpgradeHandler = (context) => {
-    this._runner?.upgrade?.(context);
+  upgrade: UpgradeHandler = async (context) => {
+    const runner = await this._waitForRunner();
+    if (!runner?.upgrade) {
+      // No active runner (e.g. a crash/reload gap) owns this raw upgrade socket,
+      // so destroy it instead of leaking the fd and hanging the client until its
+      // own timeout. The runner's own `upgrade()` handles the ready-but-late case.
+      context.node.socket.destroy();
+      return;
+    }
+    await runner.upgrade(context);
   };
 
   /**

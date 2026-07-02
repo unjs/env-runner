@@ -15,8 +15,6 @@ export class NetlifyEnvRunner extends NodeWorkerEnvRunner {
     workerEntry?: string;
     hooks?: WorkerHooks;
     data?: EnvRunnerData;
-    /** Allow proxying to a TLS worker with an unverifiable certificate. */
-    insecureTLS?: boolean;
   }) {
     _defaultEntry ||= fileURLToPath(import.meta.resolve("env-runner/runners/netlify/worker"));
     super({ ...opts, workerEntry: opts.workerEntry || _defaultEntry });

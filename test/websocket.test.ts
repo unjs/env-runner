@@ -229,20 +229,6 @@ describe("resolveWSProxyTarget", () => {
     );
   });
 
-  it("uses wss:// when the worker serves over TLS", () => {
-    expect(
-      resolveWSProxyTarget({ host: "example.com", port: 443, tls: true }, "http://front/ws"),
-    ).toBe("wss://example.com:443/ws");
-  });
-
-  it("uses wss+unix:// for a TLS Unix-socket worker on Bun", () => {
-    expect(
-      resolveWSProxyTarget({ socketPath: "/tmp/worker.sock", tls: true }, "http://front/ws", {
-        unixScheme: true,
-      }),
-    ).toBe("wss+unix:///tmp/worker.sock:/ws");
-  });
-
   it("emits a ws+unix:// target for a Unix-socket worker on Bun", () => {
     expect(
       resolveWSProxyTarget({ socketPath: "/tmp/worker.sock" }, "http://front/chat?x=1", {

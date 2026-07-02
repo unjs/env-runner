@@ -40,8 +40,6 @@ export interface MiniflareEnvRunnerOptions {
   name: string;
   hooks?: WorkerHooks;
   data?: EnvRunnerData;
-  /** Allow proxying to a TLS worker with an unverifiable certificate. */
-  insecureTLS?: boolean;
   /** Options passed directly to the Miniflare constructor. */
   miniflareOptions?: Record<string, unknown>;
   /**

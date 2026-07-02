@@ -66,9 +66,6 @@ export async function createRunnerWSProxyPlugin(
         ?.waitForReady?.()
         .catch(() => {});
       // Bun's `WebSocket` accepts the `ws+unix://` scheme; Deno's does not.
-      // A TLS worker is always dialed with certificate verification on: crossws
-      // exposes no cert-skip hook, so the `insecureTLS` opt-in (honored by the Node
-      // passthrough) can't be applied here.
       return resolveWSProxyTarget(getRunner()?.address, peer.request.url, {
         unixScheme: isBun,
       });
@@ -82,8 +79,7 @@ export async function createRunnerWSProxyPlugin(
  * Build the upstream URL the Bun/Deno bridge dials, from the worker's reported
  * address and the incoming request URL (path + query are preserved).
  *
- * A TCP worker yields a `ws://host:port` URL (`wss://` when `address.tls`). A
- * Unix-socket worker is
+ * A TCP worker yields a `ws://host:port` URL. A Unix-socket worker is
  * runtime-dependent: Bun's `WebSocket` accepts the npm-`ws`-style
  * `ws+unix://<socket>:<path>` scheme (and it survives crossws's `new URL()`
  * wrapping), so pass `unixScheme: true` on a Bun host. Deno's `WebSocket`
@@ -102,7 +98,6 @@ export function resolveWSProxyTarget(
     throw new Error("env runner worker is not ready");
   }
   const { pathname, search } = new URL(requestUrl);
-  const scheme = address.tls ? "wss" : "ws";
   if (address.socketPath) {
     if (!opts.unixScheme) {
       throw new Error(
@@ -111,7 +106,7 @@ export function resolveWSProxyTarget(
       );
     }
     // Bun: `ws+unix://<absolute-socket-path>:<request-path>`.
-    return `${scheme}+unix://${address.socketPath}:${pathname}${search}`;
+    return `ws+unix://${address.socketPath}:${pathname}${search}`;
   }
   if (!address.port) {
     throw new Error("env runner worker is not ready");
@@ -121,5 +116,5 @@ export function resolveWSProxyTarget(
   // already bracketed — only wrap a bare literal.
   const host = address.host || "127.0.0.1";
   const authority = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
-  return `${scheme}://${authority}:${address.port}${pathname}${search}`;
+  return `ws://${authority}:${address.port}${pathname}${search}`;
 }

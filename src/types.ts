@@ -42,13 +42,11 @@ export interface RunnerRPCHooks {
 /**
  * Address reported by the worker once it is ready.
  *
- * Either a TCP `host`/`port` pair or a Unix `socketPath`. Set `tls: true` when
- * the worker serves over TLS, so proxies target it with `https`/`wss` instead
- * of `http`/`ws`.
+ * Either a TCP `host`/`port` pair or a Unix `socketPath`.
  */
 export type WorkerAddress =
-  | { host?: string; port: number; socketPath?: undefined; tls?: boolean }
-  | { host?: undefined; port?: undefined; socketPath: string; tls?: boolean };
+  | { host?: string; port: number; socketPath?: undefined }
+  | { host?: undefined; port?: undefined; socketPath: string };
 
 /** Lifecycle hooks for observing runner state changes. */
 export interface WorkerHooks {

@@ -26,8 +26,6 @@ export class VercelEnvRunner extends NodeWorkerEnvRunner {
     workerEntry?: string;
     hooks?: WorkerHooks;
     data?: EnvRunnerData;
-    /** Allow proxying to a TLS worker with an unverifiable certificate. */
-    insecureTLS?: boolean;
   }) {
     _defaultEntry ||= fileURLToPath(import.meta.resolve("env-runner/runners/vercel/worker"));
     super({ ...opts, workerEntry: opts.workerEntry || _defaultEntry });
