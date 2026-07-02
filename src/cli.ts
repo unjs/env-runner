@@ -57,13 +57,12 @@ const server = serve({
   hostname: values.host,
   gracefulShutdown: false,
   fetch: (request) => envServer.fetch(request),
+  // Runtime-native WebSocket upgrade proxying (raw socket on Node, crossws
+  // bridge on Bun/Deno).
+  plugins: [await envServer.wsSrvxPlugin()],
 });
 
 await server.ready();
-
-server.node?.server?.on("upgrade", (req, socket, head) => {
-  envServer.upgrade({ node: { req, socket, head } });
-});
 
 // Graceful shutdown
 for (const signal of ["SIGINT", "SIGTERM"] as const) {

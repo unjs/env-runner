@@ -1,3 +1,4 @@
+import type { ServerPlugin } from "srvx";
 import type {
   EnvRunner,
   RunnerMessageListener,
@@ -5,6 +6,8 @@ import type {
   UpgradeHandler,
   WorkerAddress,
 } from "./types.ts";
+
+import { createRunnerWSProxyPlugin } from "./common/ws-proxy.ts";
 
 /**
  * Manages an active `EnvRunner` instance, proxying all calls to it.
@@ -20,6 +23,7 @@ export class RunnerManager implements EnvRunner, AsyncDisposable {
   private _pendingModuleReload: Promise<void> | undefined;
   private _closeListeners = new Set<(runner: EnvRunner, cause?: unknown) => void>();
   private _readyListeners = new Set<(runner: EnvRunner, address?: WorkerAddress) => void>();
+  private _readyRejectors = new Set<() => void>();
 
   constructor(runner?: EnvRunner) {
     if (runner) {
@@ -33,6 +37,10 @@ export class RunnerManager implements EnvRunner, AsyncDisposable {
 
   get closed() {
     return this._closed;
+  }
+
+  get address() {
+    return this._runner?.address;
   }
 
   /**
@@ -94,9 +102,28 @@ export class RunnerManager implements EnvRunner, AsyncDisposable {
     return this._pendingModuleReload;
   }
 
-  upgrade: UpgradeHandler = (context) => {
-    this._runner?.upgrade?.(context);
+  upgrade: UpgradeHandler = async (context) => {
+    const runner = await this._waitForRunner();
+    if (!runner?.upgrade) {
+      // No active runner (e.g. a crash/reload gap) owns this raw upgrade socket,
+      // so destroy it instead of leaking the fd and hanging the client until its
+      // own timeout. The runner's own `upgrade()` handles the ready-but-late case.
+      context.node.socket.destroy();
+      return;
+    }
+    await runner.upgrade(context);
   };
+
+  /**
+   * Create a runtime-native WebSocket reverse-proxy plugin for the public srvx
+   * server. Attach it via `serve({ plugins: [await manager.wsSrvxPlugin()] })`:
+   * on Node it proxies the raw upgrade socket to the worker, and on Bun/Deno it
+   * bridges the WebSocket with crossws. The plugin reads the active runner
+   * lazily, so it keeps working across hot-reloads.
+   */
+  wsSrvxPlugin(): Promise<ServerPlugin> {
+    return createRunnerWSProxyPlugin(() => this);
+  }
 
   sendMessage(message: unknown) {
     if (!this._runner || !this._runner.ready) {
@@ -116,21 +143,36 @@ export class RunnerManager implements EnvRunner, AsyncDisposable {
     this._runner?.offMessage(listener);
   }
 
-  waitForReady(timeout = 5000): Promise<void> {
+  waitForReady(timeout = 15_000): Promise<void> {
     if (this.ready) return Promise.resolve();
+    if (this._closed) return Promise.reject(new Error("Runner closed before becoming ready"));
     return new Promise((resolve, reject) => {
+      const cleanup = () => {
+        clearTimeout(timer);
+        this.offMessage(listener);
+        this._readyRejectors.delete(onClose);
+      };
       const timer = setTimeout(() => {
-        this._messageListeners.delete(listener);
+        cleanup();
         reject(new Error("Runner did not become ready in time"));
       }, timeout);
       const listener = (message: any) => {
         if (message?.address || this.ready) {
-          clearTimeout(timer);
-          this._messageListeners.delete(listener);
+          cleanup();
           resolve();
         }
       };
-      this._messageListeners.add(listener);
+      // Reject promptly if the manager is closed mid-wait instead of letting the
+      // caller wait out the full timeout on a manager that will never be ready.
+      const onClose = () => {
+        cleanup();
+        reject(new Error("Runner closed before becoming ready"));
+      };
+      // Register via `onMessage` so the listener is forwarded to the active
+      // runner (and re-forwarded to a fresh one across reloads); a direct
+      // `_messageListeners` add would never receive the worker's ready message.
+      this.onMessage(listener);
+      this._readyRejectors.add(onClose);
     });
   }
 
@@ -186,6 +228,9 @@ export class RunnerManager implements EnvRunner, AsyncDisposable {
   async close() {
     this._closed = true;
     this._messageQueue.length = 0;
+    // Fail any in-flight `waitForReady()` callers promptly.
+    for (const rejectReady of this._readyRejectors) rejectReady();
+    this._readyRejectors.clear();
     const runner = this._runner;
     this._detach();
     if (runner) {

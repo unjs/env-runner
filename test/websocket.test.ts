@@ -1,9 +1,13 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { createServer } from "node:http";
 import { fileURLToPath } from "node:url";
 import { resolve, dirname } from "node:path";
 import { describe, expect, it, afterEach } from "vitest";
+import { serve } from "srvx";
+import type { Server } from "srvx";
 import type { EnvRunner } from "../src/index.ts";
+import { RunnerManager } from "../src/index.ts";
+import { resolveWSProxyTarget } from "../src/common/ws-proxy.ts";
 
 import { NodeWorkerEnvRunner } from "../src/runners/node-worker/runner.ts";
 import { NodeProcessEnvRunner } from "../src/runners/node-process/runner.ts";
@@ -141,6 +145,168 @@ describe("SelfEnvRunner websocket", () => {
     expect(messages).toEqual(["welcome", "echo:hello"]);
   });
 });
+
+describe("wsSrvxPlugin", () => {
+  let manager: RunnerManager | undefined;
+  let server: Server | undefined;
+
+  afterEach(async () => {
+    await server?.close();
+    server = undefined;
+    await manager?.close();
+    manager = undefined;
+  });
+
+  // The `RunnerManager.wsSrvxPlugin()` attaches WebSocket proxying to a public
+  // srvx server: on Node this is the raw-socket passthrough, exercised here
+  // end-to-end through a real front server (the host process runs on Node).
+  it("proxies upgrades to the worker through a srvx server", async () => {
+    manager = new RunnerManager(
+      new NodeWorkerEnvRunner({ name: "test-ws-proxy", data: { entry: appWebsocketEntry } }),
+    );
+    await manager.waitForReady();
+
+    server = serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      gracefulShutdown: false,
+      fetch: (request) => manager!.fetch(request),
+      plugins: [await manager.wsSrvxPlugin()],
+    });
+    await server.ready();
+
+    const ws = new WebSocket(new URL("/", server.url).href.replace(/^http/, "ws"));
+    const messages: string[] = [];
+    const closed = new Promise<void>((resolve) => {
+      ws.addEventListener("message", (event) => {
+        messages.push(String(event.data));
+        if (messages.length === 1) {
+          ws.send("hello");
+        }
+        if (messages.length === 2) {
+          ws.close();
+        }
+      });
+      ws.addEventListener("close", () => resolve());
+    });
+
+    await closed;
+    expect(messages).toEqual(["welcome", "echo:hello"]);
+  });
+});
+
+// The Bun/Deno bridge builds a `ws://` target from the worker address by hand;
+// that branch never runs when the host process is Node (as in CI), so cover the
+// URL construction directly. Guards against the host/port/socket assumptions the
+// end-to-end passthrough test can't reach.
+describe("resolveWSProxyTarget", () => {
+  it("builds a ws:// URL preserving path and query", () => {
+    expect(resolveWSProxyTarget({ host: "127.0.0.1", port: 1234 }, "http://front/foo?x=1")).toBe(
+      "ws://127.0.0.1:1234/foo?x=1",
+    );
+  });
+
+  it("uses the worker's reported host instead of assuming loopback", () => {
+    expect(resolveWSProxyTarget({ host: "192.168.1.5", port: 80 }, "http://front/ws")).toBe(
+      "ws://192.168.1.5:80/ws",
+    );
+  });
+
+  it("falls back to 127.0.0.1 only when no host is reported", () => {
+    expect(resolveWSProxyTarget({ port: 3000 }, "http://front/")).toBe("ws://127.0.0.1:3000/");
+  });
+
+  it("brackets a bare IPv6 host in the URL authority", () => {
+    expect(resolveWSProxyTarget({ host: "::1", port: 8080 }, "http://front/chat")).toBe(
+      "ws://[::1]:8080/chat",
+    );
+  });
+
+  it("does not double-bracket an already-bracketed IPv6 host", () => {
+    // `parseServerAddress()` reports `URL.hostname`, which is already bracketed.
+    expect(resolveWSProxyTarget({ host: "[::1]", port: 8080 }, "http://front/chat")).toBe(
+      "ws://[::1]:8080/chat",
+    );
+  });
+
+  it("emits a ws+unix:// target for a Unix-socket worker (dialed uniformly by crossws)", () => {
+    expect(resolveWSProxyTarget({ socketPath: "/tmp/worker.sock" }, "http://front/chat?x=1")).toBe(
+      "ws+unix:///tmp/worker.sock:/chat?x=1",
+    );
+  });
+
+  it("throws when the worker is not ready", () => {
+    expect(() => resolveWSProxyTarget(undefined, "http://front/")).toThrow(/not ready/);
+  });
+});
+
+// End-to-end coverage for the `createRunnerWSProxyPlugin` Bun/Deno bridge — the
+// crossws terminate-and-redial path that the Node-hosted vitest process never
+// reaches (on Node the plugin uses the raw-socket passthrough instead). Spawns a
+// fixture under bun/deno that carries the plugin in front of a crossws echo
+// worker, then connects a client from Node through it.
+const bridgeHosts = [
+  { name: "Bun", cmd: "bun", args: [] as string[], skip: !hasBun },
+  {
+    name: "Deno",
+    cmd: "deno",
+    args: ["run", "-A", "--node-modules-dir=auto", "--no-lock"],
+    skip: !hasDeno,
+  },
+];
+const bridgeFixture = resolve(_dir, "./fixtures/ws-bridge-server.mjs");
+
+for (const { name, cmd, args, skip } of bridgeHosts) {
+  describe.skipIf(skip)(`wsProxy bridge (${name} host)`, () => {
+    let child: ChildProcess | undefined;
+
+    afterEach(() => {
+      child?.kill();
+      child = undefined;
+    });
+
+    it("terminates the client with crossws and proxies to the worker", async () => {
+      const proc = spawn(cmd, [...args, bridgeFixture], { stdio: ["ignore", "pipe", "pipe"] });
+      child = proc;
+
+      const frontUrl = await new Promise<string>((resolve, reject) => {
+        let out = "";
+        const timer = setTimeout(() => reject(new Error(`bridge did not start:\n${out}`)), 20_000);
+        proc.stdout!.on("data", (d) => {
+          out += String(d);
+          const match = out.match(/READY (\S+)/);
+          if (match?.[1]) {
+            clearTimeout(timer);
+            resolve(match[1]);
+          }
+        });
+        proc.stderr!.on("data", (d) => (out += String(d)));
+        proc.on("exit", (code) => {
+          clearTimeout(timer);
+          reject(new Error(`bridge exited (${code}) before ready:\n${out}`));
+        });
+      });
+
+      const ws = new WebSocket(frontUrl.replace(/^http/, "ws"));
+      const messages: string[] = [];
+      const closed = new Promise<void>((resolve) => {
+        ws.addEventListener("message", (event) => {
+          messages.push(String(event.data));
+          if (messages.length === 1) {
+            ws.send("hello");
+          }
+          if (messages.length === 2) {
+            ws.close();
+          }
+        });
+        ws.addEventListener("close", () => resolve());
+      });
+
+      await closed;
+      expect(messages).toEqual(["welcome", "echo:hello"]);
+    }, 30_000);
+  });
+}
 
 describe("upgrade rejection", () => {
   let runner: EnvRunner | undefined;

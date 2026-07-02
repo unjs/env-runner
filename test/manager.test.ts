@@ -243,6 +243,14 @@ describe("RunnerManager", () => {
     expect(manager.ready).toBe(true);
   });
 
+  it("waitForReady rejects promptly when the manager closes mid-wait", async () => {
+    manager = new RunnerManager();
+    // No runner attached, so this would otherwise wait out the full timeout.
+    const readyPromise = manager.waitForReady(15000);
+    await manager.close();
+    await expect(readyPromise).rejects.toThrow(/closed before becoming ready/);
+  });
+
   it("supports `await using` disposal (Symbol.asyncDispose)", async () => {
     const runner = createRunner("async-dispose");
     runners.push(runner);

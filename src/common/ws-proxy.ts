@@ -1,0 +1,109 @@
+import type { IncomingMessage, Server as NodeHttpServer } from "node:http";
+import type { Socket } from "node:net";
+import type { ServerPlugin } from "srvx";
+import type { EnvRunner, WorkerAddress } from "../types.ts";
+
+/**
+ * Create a runtime-native WebSocket reverse-proxy plugin for the public srvx
+ * server, forwarding upgrades to whichever runner is currently active.
+ *
+ * - **Node** — the `http.Server` `"upgrade"` event + raw-socket passthrough
+ *   (httpxy, via `runner.upgrade()`). Transparent and single-framed: the worker
+ *   performs the actual handshake, so subprotocol/extension negotiation stays
+ *   end-to-end between the client and the worker.
+ * - **Bun/Deno** — those runtimes serve natively (`Bun.serve`/`Deno.serve`) and
+ *   expose no Node upgrade socket, so the raw passthrough can't work. Terminate
+ *   the client WebSocket with crossws and bridge to the worker over crossws's
+ *   own `WebSocket` client instead (dials `ws://` and `ws+unix://` uniformly on
+ *   Node/Bun/Deno), using an async proxy `target` that awaits worker readiness
+ *   (client frames buffer in the meantime) before dialing upstream.
+ *
+ * `getRunner` is read lazily on every upgrade so the plugin survives reloads —
+ * the active runner (and its address) changes when the manager hot-reloads.
+ */
+export async function createRunnerWSProxyPlugin(
+  getRunner: () => EnvRunner | undefined,
+): Promise<ServerPlugin> {
+  const isBun = "Bun" in globalThis;
+  const isDeno = "Deno" in globalThis;
+
+  // Node: raw-socket passthrough via the runner's `upgrade()` primitive. The
+  // underlying http server only exists once the server is listening, so attach
+  // the listener after `ready()`. `runner.upgrade()` waits for the worker.
+  if (!isBun && !isDeno) {
+    return (server) => {
+      void server
+        .ready()
+        .then(() => {
+          const httpServer = server.node?.server as NodeHttpServer | undefined;
+          httpServer?.on("upgrade", (req: IncomingMessage, socket: Socket, head: Buffer) => {
+            getRunner()?.upgrade?.({ node: { req, socket, head } });
+          });
+        })
+        .catch(() => {
+          // The server never finished listening (e.g. the port is in use), so
+          // there's nothing to attach the upgrade handler to. The consumer's own
+          // `serve()`/`server.ready()` surfaces the failure; swallow here to
+          // avoid an unhandled rejection from this fire-and-forget hook.
+        });
+    };
+  }
+
+  // Bun/Deno: terminate the client WebSocket with crossws and bridge it to the
+  // worker with a standard `WebSocket` client.
+  const { createWebSocketProxy } = await import("crossws");
+  const { plugin } = isBun
+    ? await import("crossws/server/bun")
+    : await import("crossws/server/deno");
+
+  const proxy = createWebSocketProxy({
+    // An upgrade can arrive before the worker has reported its address (e.g.
+    // right after a reload). The async target resolver (crossws >=0.4.7) awaits
+    // readiness while client frames are buffered, instead of stalling the
+    // client handshake. `forwardProtocol` defaults to forwarding the client's
+    // `sec-websocket-protocol` verbatim, so no custom resolver is needed.
+    target: async (peer) => {
+      await getRunner()
+        ?.waitForReady?.()
+        .catch(() => {});
+      return resolveWSProxyTarget(getRunner()?.address, peer.request.url);
+    },
+  });
+
+  return plugin({ resolve: () => proxy });
+}
+
+/**
+ * Build the upstream URL the Bun/Deno bridge dials, from the worker's reported
+ * address and the incoming request URL (path + query are preserved).
+ *
+ * A TCP worker yields a `ws://host:port` URL; a Unix-socket worker yields the
+ * npm-`ws`-style `ws+unix://<socket>:<path>` scheme. crossws's own `WebSocket`
+ * client (the proxy's default) dials both uniformly on Node/Bun/Deno, so no
+ * runtime gating is needed here. (Deno additionally needs `--unstable-net` for
+ * Unix-socket dialing.)
+ *
+ * Throws when the worker isn't ready yet (no address / no port).
+ */
+export function resolveWSProxyTarget(
+  address: WorkerAddress | undefined,
+  requestUrl: string,
+): string {
+  if (!address) {
+    throw new Error("env runner worker is not ready");
+  }
+  const { pathname, search } = new URL(requestUrl);
+  if (address.socketPath) {
+    // `ws+unix://<absolute-socket-path>:<request-path>`.
+    return `ws+unix://${address.socketPath}:${pathname}${search}`;
+  }
+  if (!address.port) {
+    throw new Error("env runner worker is not ready");
+  }
+  // IPv6 literals must be bracketed in a URL authority (`[::1]:port`), but
+  // `parseServerAddress()` reports the host from `URL.hostname`, which is
+  // already bracketed — only wrap a bare literal.
+  const host = address.host || "127.0.0.1";
+  const authority = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
+  return `ws://${authority}:${address.port}${pathname}${search}`;
+}

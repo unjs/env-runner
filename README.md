@@ -73,8 +73,35 @@ await envServer.reload();
 // Use with any HTTP server
 const server = serve({
   fetch: (request) => envServer.fetch(request),
+  // Proxy WebSocket upgrades to the worker (see "WebSocket proxying" below)
+  plugins: [await envServer.wsSrvxPlugin()],
 });
 ```
+
+#### WebSocket proxying
+
+To proxy WebSocket upgrades to the worker, attach the plugin returned by
+`wsSrvxPlugin()` (available on both `RunnerManager` and `EnvServer`) to your
+[srvx](https://srvx.h3.dev) server:
+
+```ts
+const server = serve({
+  fetch: (request) => envServer.fetch(request),
+  plugins: [await envServer.wsSrvxPlugin()],
+});
+```
+
+The plugin picks the proxy strategy by **host** runtime:
+
+- **Node** — proxies the raw upgrade socket to the worker (transparent
+  passthrough; subprotocol/extension negotiation stays end-to-end).
+- **Bun/Deno** — those runtimes serve natively and expose no Node upgrade
+  socket, so the client WebSocket is terminated with [crossws](https://crossws.h3.dev)
+  and bridged to the worker over a standard `WebSocket` client.
+
+It reads the active runner lazily, so it keeps working across hot-reloads, and
+waits for the worker to become ready before proxying. Your entry module should
+expose WebSocket hooks via the `websocket` field (see [Workers](#workers)).
 
 ### Manager (`RunnerManager`)
 
@@ -147,7 +174,8 @@ await using runner = new NodeProcessEnvRunner({
 // Relative URLs are resolved against a placeholder origin
 const response = await runner.fetch("/api");
 
-// Proxy WebSocket upgrades
+// Proxy a raw WebSocket upgrade to the worker (Node host only — low-level;
+// prefer `manager.wsSrvxPlugin()` for cross-runtime proxying)
 runner.upgrade?.({ node: { req, socket, head } });
 
 // Wait for runner to be ready

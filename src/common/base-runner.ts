@@ -62,6 +62,10 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
     return Boolean(!this.closed && this._address && this._hasRuntime());
   }
 
+  get address() {
+    return this._address;
+  }
+
   // #region Public methods
 
   async fetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
@@ -77,7 +81,16 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
   }
 
   async upgrade(context: { node: { req: IncomingMessage; socket: Socket; head: any } }) {
+    // An upgrade can arrive while the worker is still (re)starting; wait for it
+    // to become ready rather than silently dropping the connection.
+    if (!this.ready) {
+      await this.waitForReady().catch(() => {});
+    }
     if (!this.ready || !this._address) {
+      // The worker never came up (crash during init, timeout, closed). Nothing
+      // downstream owns this raw socket, so destroy it instead of leaking the
+      // fd and leaving the client hanging until its own timeout.
+      context.node.socket.destroy();
       return;
     }
     try {
@@ -101,7 +114,7 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
     this._messageListeners.delete(listener);
   }
 
-  waitForReady(timeout = 5000): Promise<void> {
+  waitForReady(timeout = 15_000): Promise<void> {
     if (this.ready) return Promise.resolve();
     if (this.closed) return Promise.reject(new Error("Runner closed before becoming ready"));
     return new Promise((resolve, reject) => {
