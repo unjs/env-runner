@@ -9,8 +9,8 @@ importers:
   .:
     dependencies:
       crossws:
-        specifier: ^0.4.7
-        version: 0.4.7(srvx@0.11.18)
+        specifier: ^0.4.8
+        version: 0.4.8(srvx@0.11.19)
       exsolve:
         specifier: ^1.1.0
         version: 1.1.0
@@ -18,8 +18,8 @@ importers:
         specifier: ^0.5.4
         version: 0.5.4
       srvx:
-        specifier: ^0.11.18
-        version: 0.11.18
+        specifier: ^0.11.19
+        version: 0.11.19
     devDependencies:
       '@netlify/runtime':
         specifier: ^4.1.25
@@ -1418,8 +1418,8 @@ packages:
     resolution: {integrity: sha512-uV2QOWP2nWzsy2aMp8aRibhi9dlzF5Hgh5SHaB9OiTGEyDTiJJyx0uy51QXdyWbtAHNua4XJzUKca3OzKUd3vA==}
     engines: {node: '>= 8'}
 
-  crossws@0.4.7:
-    resolution: {integrity: sha512-N+BXE5AetLJ3/glz4DYLirKApAWg+V2guueoMenvAGVvqF/IA1PAzMYqYS+UfBkdz3tDXoQIevDaaxLy1Ch/4w==}
+  crossws@0.4.8:
+    resolution: {integrity: sha512-ENmlSJYxDd/Z91zkabdfZMYk4zIwGEOYpTpBSx8esSOtip/VE3h1am56FAjExa9nV95k/x8PFib0TjUkLPXQJg==}
     peerDependencies:
       srvx: '>=0.11.5'
     peerDependenciesMeta:
@@ -1947,8 +1947,8 @@ packages:
     resolution: {integrity: sha512-UXWMKhLOwVKb728IUtQPXxfYU+usdybtUrK/8uGE8CQMvrhOpwvzDBwj0QhSL7MQc7vIsISBG8VQ8+IDQxpfQA==}
     engines: {node: '>=0.10.0'}
 
-  srvx@0.11.18:
-    resolution: {integrity: sha512-7/EW5sPdC1bU7iq1tgTvCZqUQDkJdsqIVzYqBv7SuBfQQ10oWkKj4KYNOw0H4Ig26bXuUYDA7XTKxB+/HC5SRw==}
+  srvx@0.11.19:
+    resolution: {integrity: sha512-tvHYSerecoVfQBBEtiUg+KnsP0q5hr0g2EQohoBylmJTAAj5gm5HH9kEV+L1mJu0s5m6gsZ7I0Qp/UhM1sCVgA==}
     engines: {node: '>=20.16.0'}
     hasBin: true
 
@@ -3198,9 +3198,9 @@ snapshots:
       shebang-command: 2.0.0
       which: 2.0.2
 
-  crossws@0.4.7(srvx@0.11.18):
+  crossws@0.4.8(srvx@0.11.19):
     optionalDependencies:
-      srvx: 0.11.18
+      srvx: 0.11.19
 
   debug@4.4.3:
     dependencies:
@@ -3749,7 +3749,7 @@ snapshots:
 
   source-map-js@1.2.1: {}
 
-  srvx@0.11.18: {}
+  srvx@0.11.19: {}
 
   stackback@0.0.2: {}
 

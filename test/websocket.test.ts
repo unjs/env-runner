@@ -229,17 +229,9 @@ describe("resolveWSProxyTarget", () => {
     );
   });
 
-  it("emits a ws+unix:// target for a Unix-socket worker on Bun", () => {
-    expect(
-      resolveWSProxyTarget({ socketPath: "/tmp/worker.sock" }, "http://front/chat?x=1", {
-        unixScheme: true,
-      }),
-    ).toBe("ws+unix:///tmp/worker.sock:/chat?x=1");
-  });
-
-  it("rejects a Unix-socket worker when the runtime lacks ws+unix (Deno)", () => {
-    expect(() => resolveWSProxyTarget({ socketPath: "/tmp/worker.sock" }, "http://front/")).toThrow(
-      /Unix socket/,
+  it("emits a ws+unix:// target for a Unix-socket worker (dialed uniformly by crossws)", () => {
+    expect(resolveWSProxyTarget({ socketPath: "/tmp/worker.sock" }, "http://front/chat?x=1")).toBe(
+      "ws+unix:///tmp/worker.sock:/chat?x=1",
     );
   });
 
