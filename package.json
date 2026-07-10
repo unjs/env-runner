@@ -43,35 +43,35 @@
     "typecheck": "tsgo --noEmit --skipLibCheck"
   },
   "dependencies": {
-    "crossws": "^0.4.8",
+    "crossws": "^0.4.9",
     "exsolve": "^1.1.0",
     "httpxy": "^0.5.4",
-    "srvx": "^0.11.19"
+    "srvx": "^0.11.21"
   },
   "devDependencies": {
     "@netlify/runtime": "^4.1.25",
-    "@types/node": "^26.0.1",
-    "@typescript/native-preview": "7.0.0-dev.20260629.1",
+    "@types/node": "^26.1.0",
+    "@typescript/native-preview": "7.0.0-dev.20260706.1",
     "@vercel/queue": "^0.3.1",
-    "@vitest/coverage-v8": "^4.1.9",
+    "@vitest/coverage-v8": "^4.1.10",
     "automd": "^0.4.3",
     "changelogen": "^0.6.2",
     "cjs-module-lexer": "^2.2.0",
     "env-runner-fixture": "link:",
-    "es-module-lexer": "^2.2.0",
-    "miniflare": "^4.20260625.0",
+    "es-module-lexer": "^2.3.0",
+    "miniflare": "^4.20260701.0",
     "obuild": "^0.4.37",
-    "oxfmt": "^0.56.0",
-    "oxlint": "^1.71.0",
+    "oxfmt": "^0.58.0",
+    "oxlint": "^1.73.0",
     "typescript": "^6.0.3",
-    "vitest": "^4.1.9",
-    "wrangler": "^4.105.0"
+    "vitest": "^4.1.10",
+    "wrangler": "^4.107.0"
   },
   "peerDependencies": {
-    "@netlify/runtime": "^4.1.23",
-    "@vercel/queue": ">=0.2.0",
-    "miniflare": "^4.20260515.0",
-    "wrangler": "^4.0.0"
+    "@netlify/runtime": "^4.1.25",
+    "@vercel/queue": ">=0.3.1",
+    "miniflare": "^4.20260701.0",
+    "wrangler": "^4.107.0"
   },
   "peerDependenciesMeta": {
     "miniflare": {
@@ -87,5 +87,5 @@
       "optional": true
     }
   },
-  "packageManager": "pnpm@11.9.0"
+  "packageManager": "pnpm@11.10.0"
 }
