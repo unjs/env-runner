@@ -45,12 +45,8 @@ serve({
 
   // Runtime-specific options
   node: { maxHeaderSize: 32768 },
-  bun: {
-    /* bun serve opts */
-  },
-  deno: {
-    /* deno serve opts */
-  },
+  bun: {/* bun serve opts */},
+  deno: {/* deno serve opts */},
 });
 ```
 
