@@ -8,6 +8,7 @@ Extends `NodeWorkerEnvRunner` to simulate a Vercel deployment environment.
 - **`src/runners/vercel/worker.ts`** — Sets Vercel env vars and `Symbol.for("@vercel/request-context")` on globalThis, delegates to node-worker worker
 - **`src/runners/vercel/oidc.ts`** — `_checkVercelOidcToken()` decodes `VERCEL_OIDC_TOKEN` (JWT `exp` claim, no signature check) and returns `{ status: "missing" | "valid" | "expired" | "invalid", expiresAt? }`. `warnIfVercelOidcTokenInvalid()` logs a one-time dev warning hinting the user to run `vercel env pull`. Called from the `VercelEnvRunner` constructor
 - **`src/runners/vercel/queue-dev.ts`** — Bridge for local Vercel Queues delivery. `await registerVercelQueueConsumer({ topic, handler, consumerGroup?, visibilityTimeoutSeconds?, retry?, retryAfterSeconds? })` lets framework plugins bind a topic to a dispatcher; the first call lazy-loads `@vercel/queue` and constructs a shared `QueueClient`. Resolves to an unregister function. Re-registering the same `consumerGroup` on a topic replaces the handler via the SDK's own `consumerGroup` keying (HMR-safe; the unregister for a replaced registration becomes a no-op). `retryAfterSeconds` is a shorthand for `retry: () => ({ afterSeconds })`; pass `retry` for richer directives like `{ acknowledge: true }`
+- **`src/runners/vercel/image.ts`** — `createVercelImageHandler()`: handles `/_vercel/image` requests using IPX for image optimization. Supports `url`, `w`, `h`, `q`, `f`, `fit`, `blur`, `cache` query params. Validates remote URLs against `domains`/`remotePatterns`, local URLs against `localPatterns`, blocks SVG by default. Falls back to unoptimized proxy when `ipx` is not installed
 
 ## How it works
 
@@ -40,9 +41,27 @@ All headers are only injected when not already present in the request/response.
 
 **Local Vercel Queues delivery:** Frameworks running inside the worker `await registerVercelQueueConsumer({ topic, handler, consumerGroup?, visibilityTimeoutSeconds?, retry?, retryAfterSeconds? })` from `env-runner/runners/vercel/queue-dev` (e.g. Nitro forwards delivered messages to its `vercel:queue` runtime hook). The first call lazy-imports `@vercel/queue`, constructs a shared `QueueClient`, and registers a dev consumer via `registerDevConsumer`. Subsequent calls reuse the client; re-registering the same `consumerGroup` on a topic replaces the handler in place (HMR-safe). `retryAfterSeconds` is shorthand for a constant-delay retry; pass `retry: (error, metadata) => RetryDirective` for richer directives (`{ afterSeconds }`, `{ acknowledge: true }`, or `undefined` to propagate). If `@vercel/queue` is not installed or is too old to expose `registerDevConsumer`, a one-time warning is logged and registrations resolve to a no-op unregister — dev startup is never blocked.
 
+**Image optimization (`/_vercel/image`):** Intercepts requests to `/_vercel/image` and processes images using IPX (optional `ipx` peer dependency). Supports Vercel's image optimization query parameters:
+
+- `url` (required) — source image URL (local path or absolute URL)
+- `w` (required) — output width in pixels
+- `q` (optional, default 75) — quality 1–100
+- `f` (optional) — output format as MIME type (`image/webp`, `image/avif`, etc.)
+- `h` (optional) — output height in pixels
+- `fit` (optional) — resize mode (`cover`, `contain`, `fill`, `inside`, `outside`)
+- `blur` (optional) — blur amount
+- `cache` (optional) — cache TTL override in seconds
+
+Format auto-detection from `Accept` header when `f` is not provided (prefers avif > webp). Response includes `Vary: Accept` for proper cache keying. Local images are fetched from the worker; remote images are fetched directly. When `ipx` is not installed, warns once and falls back to proxying the unoptimized source image.
+
+**URL validation:** Remote URLs are validated against `domains` (exact hostname match) and `remotePatterns` (protocol, hostname glob, port, pathname glob). Returns 400 when a remote URL doesn't match. Local URLs can be restricted via `localPatterns`. SVG sources are blocked by default (400) unless `dangerouslyAllowSVG` is true.
+
+Constructor accepts optional `images` config (`VercelImageConfig`) matching the Vercel Build Output API `images` property: `sizes`, `domains`, `remotePatterns`, `localPatterns`, `qualities`, `formats`, `minimumCacheTTL`, `dangerouslyAllowSVG`, `contentSecurityPolicy`, `contentDispositionType`.
+
 ## Testing
 
 - Vercel suites (`test/vercel.test.ts` and the Vercel entry in `test/runners.test.ts`) stub a fake far-future `VERCEL_OIDC_TOKEN` via `vi.stubEnv` so the OIDC check doesn't log warnings (real env token takes precedence)
-- **`test/vercel.test.ts`** — Tests for `VercelEnvRunner`: request header injection (`x-vercel-deployment-url`, `x-vercel-id`, `x-vercel-forwarded-for`, `x-forwarded-for`, `x-real-ip`, `x-forwarded-proto`, `x-forwarded-host`), response header injection (`server`, `x-vercel-id`, `x-vercel-cache`), environment variables (`VERCEL`, `VERCEL_ENV`, `VERCEL_REGION`, `NOW_REGION`), header preservation, pre-existing header respect
+- **`test/vercel.test.ts`** — Tests for `VercelEnvRunner`: request header injection (`x-vercel-deployment-url`, `x-vercel-id`, `x-vercel-forwarded-for`, `x-forwarded-for`, `x-real-ip`, `x-forwarded-proto`, `x-forwarded-host`), response header injection (`server`, `x-vercel-id`, `x-vercel-cache`), environment variables (`VERCEL`, `VERCEL_ENV`, `VERCEL_REGION`, `NOW_REGION`), header preservation, pre-existing header respect, image optimization (`/_vercel/image` with format detection, Accept header negotiation, parameter validation, cache-control/Vary/Content-Length headers, SVG blocking, remote URL domain/pattern validation, sizes/qualities config enforcement)
 - Test fixture in `test/fixtures/app-headers.mjs` — Entry that echoes all request headers as JSON for vercel header injection tests
 - Test fixture in `test/fixtures/app-env.mjs` — Entry that echoes request headers and selected environment variables as JSON
+- Test fixture in `test/fixtures/app-image.mjs` — Entry that serves a 1x1 PNG at `/test.png` for vercel image optimization tests

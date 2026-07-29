@@ -5,9 +5,14 @@ import { fileURLToPath } from "node:url";
 
 import type { EnvRunnerData } from "../../common/base-runner.ts";
 import { NodeWorkerEnvRunner } from "../node-worker/runner.ts";
+import {
+  type VercelImageConfig,
+  type VercelImageHandler,
+  createVercelImageHandler,
+} from "./image.ts";
 import { warnIfVercelOidcTokenInvalid } from "./oidc.ts";
 
-export type { EnvRunnerData };
+export type { EnvRunnerData, VercelImageConfig };
 
 let _defaultEntry: string;
 
@@ -21,15 +26,20 @@ function generateVercelId(): string {
 }
 
 export class VercelEnvRunner extends NodeWorkerEnvRunner {
+  private _imageHandler?: VercelImageHandler;
+  private _imageConfig?: VercelImageConfig;
+
   constructor(opts: {
     name: string;
     workerEntry?: string;
     hooks?: WorkerHooks;
     data?: EnvRunnerData;
+    images?: VercelImageConfig;
   }) {
     _defaultEntry ||= fileURLToPath(import.meta.resolve("env-runner/runners/vercel/worker"));
     super({ ...opts, workerEntry: opts.workerEntry || _defaultEntry });
     warnIfVercelOidcTokenInvalid();
+    this._imageConfig = opts.images;
   }
 
   override async fetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
@@ -62,19 +72,37 @@ export class VercelEnvRunner extends NodeWorkerEnvRunner {
       headers.set("x-real-ip", clientIp);
     }
 
+    let requestUrl: URL | undefined;
     try {
-      const url = new URL(input instanceof Request ? input.url : input.toString());
+      requestUrl = new URL(input instanceof Request ? input.url : input.toString());
       if (!headers.has("x-forwarded-proto")) {
-        headers.set("x-forwarded-proto", url.protocol.replace(":", ""));
+        headers.set("x-forwarded-proto", requestUrl.protocol.replace(":", ""));
       }
       if (!headers.has("x-forwarded-host")) {
-        headers.set("x-forwarded-host", headers.get("host") || url.host);
+        headers.set("x-forwarded-host", headers.get("host") || requestUrl.host);
       }
     } catch {
       // URL parsing failed, skip proto/host headers
     }
 
-    const res = await super.fetch(input, { ...init, headers });
+    let res: Response;
+    if (requestUrl?.pathname === "/_vercel/image") {
+      if (!this._address) {
+        await this.waitForReady().catch(() => {});
+      }
+      if (!this._address) {
+        return new Response("vercel env runner is unavailable", { status: 503 });
+      }
+      this._imageHandler ||= createVercelImageHandler({
+        getAddress: () => this._address,
+        config: this._imageConfig,
+      });
+      res = await this._imageHandler.handle(new Request(requestUrl, { headers }));
+    } else if (input instanceof Request) {
+      res = await super.fetch(new Request(input, { ...init, headers }));
+    } else {
+      res = await super.fetch(input, { ...init, headers });
+    }
 
     // Inject Vercel response headers
     const resHeaders = new Headers(res.headers);
@@ -93,6 +121,12 @@ export class VercelEnvRunner extends NodeWorkerEnvRunner {
       statusText: res.statusText,
       headers: resHeaders,
     });
+  }
+
+  override async close(cause?: unknown) {
+    this._imageHandler?.close();
+    this._imageHandler = undefined;
+    await super.close(cause);
   }
 
   protected override _runtimeType() {

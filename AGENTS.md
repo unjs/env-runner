@@ -38,7 +38,8 @@ src/
 │   │   ├── runner.ts        # VercelEnvRunner (extends NodeWorkerEnvRunner)
 │   │   ├── worker.ts        # Sets Vercel request context symbol, delegates to node-worker
 │   │   ├── oidc.ts          # VERCEL_OIDC_TOKEN check + dev-time warning
-│   │   └── queue-dev.ts     # Local Vercel Queues delivery bridge (registerDevConsumer)
+│   │   ├── queue-dev.ts     # Local Vercel Queues delivery bridge (registerDevConsumer)
+│   │   └── image.ts         # /_vercel/image optimization handler (IPX-based)
 │   └── netlify/
 │       ├── runner.ts        # NetlifyEnvRunner (extends NodeWorkerEnvRunner)
 │       └── worker.ts        # Sets global Netlify context, delegates to node-worker
@@ -183,6 +184,7 @@ Generic test infrastructure, cross-runner suites (`runners.test.ts`, `manager.te
 - `cjs-module-lexer` / `es-module-lexer` — CJS named-export detection and ESM import-specifier parsing in the miniflare module fallback service (devDependencies inlined into `dist` by obuild)
 - `@netlify/runtime` — Netlify compute runtime (optional peer dependency, used by `NetlifyEnvRunner` worker for full `globalThis.Netlify` + `globalThis.caches` setup)
 - `wrangler` — Cloudflare Wrangler (optional peer dependency, used by `MiniflareEnvRunner`'s `wrangler` option to load a `wrangler.{json,jsonc,toml}` config via `unstable_readConfig` + `unstable_getMiniflareWorkerOptions`; a built-in minimal plain-JSON reader is used when it's absent)
+- `ipx` — Image optimization (optional peer dependency, used by `VercelEnvRunner` for `/_vercel/image` endpoint)
 
 ## Reference docs (`.agents/`)
 
@@ -191,7 +193,7 @@ Runner-specific and deep-dive notes, split out of this file:
 - [`.agents/ARCHITECTURE.md`](.agents/ARCHITECTURE.md) — detailed core source-file notes, the shared `BaseEnvRunner` lifecycle, `RunnerManager`/`EnvServer`
 - [`.agents/NODE-RUNNERS.md`](.agents/NODE-RUNNERS.md) — node-worker, node-process, bun-process, deno-process, and self runners (+ orphan tests)
 - [`.agents/MINIFLARE.md`](.agents/MINIFLARE.md) — Miniflare internals (`unsafeEvalBinding`, `unsafeModuleFallbackService`, service bindings) **and** the `MiniflareEnvRunner` + wrangler config + tests
-- [`.agents/VERCEL.md`](.agents/VERCEL.md) — `VercelEnvRunner` (env vars, header injection, OIDC, Vercel Queues) + tests
+- [`.agents/VERCEL.md`](.agents/VERCEL.md) — `VercelEnvRunner` (env vars, header injection, OIDC, Vercel Queues, image optimization) + tests
 - [`.agents/NETLIFY.md`](.agents/NETLIFY.md) — `NetlifyEnvRunner` (header injection) + tests
 - [`.agents/VIRTUAL-MODULES.md`](.agents/VIRTUAL-MODULES.md) — virtual modules across Node/Bun/Deno/Miniflare + tests
 - [`.agents/TESTS.md`](.agents/TESTS.md) — generic test infrastructure, cross-runner suites, shared fixtures

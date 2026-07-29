@@ -59,6 +59,7 @@
     "cjs-module-lexer": "^2.2.0",
     "env-runner-fixture": "link:",
     "es-module-lexer": "^2.2.0",
+    "ipx": "^4.0.0-alpha.1",
     "miniflare": "^4.20260625.0",
     "obuild": "^0.4.37",
     "oxfmt": "^0.56.0",
@@ -70,6 +71,7 @@
   "peerDependencies": {
     "@netlify/runtime": "^4.1.23",
     "@vercel/queue": ">=0.2.0",
+    "ipx": "^4.0.0-alpha.1",
     "miniflare": "^4.20260515.0",
     "wrangler": "^4.0.0"
   },
@@ -81,6 +83,9 @@
       "optional": true
     },
     "@vercel/queue": {
+      "optional": true
+    },
+    "ipx": {
       "optional": true
     },
     "wrangler": {
