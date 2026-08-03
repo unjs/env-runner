@@ -1,6 +1,8 @@
 import { fileURLToPath } from "node:url";
 import { resolve, dirname } from "node:path";
 import { describe, expect, it, afterEach, beforeAll, afterAll, vi } from "vitest";
+import { serve } from "srvx";
+import type { Server } from "srvx";
 import { VercelEnvRunner } from "../src/runners/vercel/runner.ts";
 
 // Fake unsigned JWT with a far-future `exp` to silence the Vercel OIDC token warning
@@ -164,27 +166,79 @@ describe("VercelEnvRunner", () => {
     expect(env.NOW_REGION).toBeUndefined();
   });
 
-  // /_vercel/image optimization tests
+  // `cli.ts` hands the front server's own request object straight to `fetch()`.
+  // srvx's request passes `instanceof Request` but the undici `Request`
+  // constructor refuses to clone it, so `fetch()` must forward it untouched.
+  describe("host-runtime request objects", () => {
+    let server: Server | undefined;
+
+    afterEach(async () => {
+      await server?.close();
+      server = undefined;
+    });
+
+    it("forwards a srvx request without re-wrapping it", async () => {
+      runner = new VercelEnvRunner({ name: "test-srvx-req", data: { entry: headersEntry } });
+      await runner.waitForReady();
+
+      server = serve({
+        port: 0,
+        hostname: "127.0.0.1",
+        gracefulShutdown: false,
+        fetch: (request) => runner!.fetch(request),
+      });
+      await server.ready();
+
+      const res = await fetch(new URL("/", server.url));
+      expect(res.status).toBe(200);
+      // The injected headers still reach the worker through `proxyFetch()`
+      const headers = await res.json();
+      expect(headers["x-vercel-id"]).toMatch(/^dev1::/);
+      expect(headers["x-vercel-deployment-url"]).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
+    });
+
+    it("forwards a srvx request to the image handler", async () => {
+      runner = new VercelEnvRunner({ name: "test-srvx-img", data: { entry: imageEntry } });
+      await runner.waitForReady();
+
+      server = serve({
+        port: 0,
+        hostname: "127.0.0.1",
+        gracefulShutdown: false,
+        fetch: (request) => runner!.fetch(request),
+      });
+      await server.ready();
+
+      const res = await fetch(new URL("/_vercel/image?url=/test.png&w=1&q=75", server.url));
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toMatch(/^image\//);
+    });
+  });
+
+  // Wiring only — the handler's own validation/optimization matrix lives in
+  // `test/vercel-image.test.ts`, which runs without spawning a worker.
   describe("image optimization", () => {
-    it("returns optimized image for local source", async () => {
+    it("optimizes a local source served by the worker", async () => {
       runner = new VercelEnvRunner({ name: "test-img", data: { entry: imageEntry } });
       await runner.waitForReady();
       const res = await runner.fetch("http://localhost/_vercel/image?url=/test.png&w=1&q=75");
       expect(res.status).toBe(200);
       expect(res.headers.get("content-type")).toMatch(/^image\//);
+      expect(Number(res.headers.get("content-length"))).toBeGreaterThan(0);
     });
 
-    it("returns correct format when f param is provided", async () => {
-      runner = new VercelEnvRunner({ name: "test-img-fmt", data: { entry: imageEntry } });
+    it("injects the Vercel response headers on image responses", async () => {
+      runner = new VercelEnvRunner({ name: "test-img-headers", data: { entry: imageEntry } });
       await runner.waitForReady();
-      const res = await runner.fetch(
-        "http://localhost/_vercel/image?url=/test.png&w=1&q=75&f=image/webp",
-      );
-      expect(res.status).toBe(200);
-      expect(res.headers.get("content-type")).toBe("image/webp");
+      const res = await runner.fetch("http://localhost/_vercel/image?url=/test.png&w=1&q=75");
+      expect(res.headers.get("server")).toBe("Vercel");
+      expect(res.headers.get("x-vercel-id")).toMatch(/^dev1::/);
+      expect(res.headers.get("x-vercel-cache")).toBe("MISS");
+      expect(res.headers.get("cache-control")).toBe("public, max-age=60, s-maxage=60");
+      expect(res.headers.get("vary")).toBe("Accept");
     });
 
-    it("auto-detects format from Accept header", async () => {
+    it("forwards request headers to the handler", async () => {
       runner = new VercelEnvRunner({ name: "test-img-accept", data: { entry: imageEntry } });
       await runner.waitForReady();
       const res = await runner.fetch(
@@ -196,163 +250,17 @@ describe("VercelEnvRunner", () => {
       expect(res.headers.get("content-type")).toBe("image/webp");
     });
 
-    it("returns 400 for missing url param", async () => {
-      runner = new VercelEnvRunner({ name: "test-img-nourl", data: { entry: imageEntry } });
-      await runner.waitForReady();
-      const res = await runner.fetch("http://localhost/_vercel/image?w=100&q=75");
-      expect(res.status).toBe(400);
-    });
-
-    it("returns 400 for missing w param", async () => {
-      runner = new VercelEnvRunner({ name: "test-img-now", data: { entry: imageEntry } });
-      await runner.waitForReady();
-      const res = await runner.fetch("http://localhost/_vercel/image?url=/test.png&q=75");
-      expect(res.status).toBe(400);
-    });
-
-    it("includes vercel response headers on image responses", async () => {
-      runner = new VercelEnvRunner({ name: "test-img-headers", data: { entry: imageEntry } });
-      await runner.waitForReady();
-      const res = await runner.fetch("http://localhost/_vercel/image?url=/test.png&w=1&q=75");
-      expect(res.headers.get("server")).toBe("Vercel");
-      expect(res.headers.get("x-vercel-id")).toMatch(/^dev1::/);
-      expect(res.headers.get("x-vercel-cache")).toBe("MISS");
-    });
-
-    it("sets cache-control header", async () => {
-      runner = new VercelEnvRunner({ name: "test-img-cache", data: { entry: imageEntry } });
-      await runner.waitForReady();
-      const res = await runner.fetch("http://localhost/_vercel/image?url=/test.png&w=1&q=75");
-      expect(res.headers.get("cache-control")).toMatch(/max-age=\d+/);
-    });
-
-    it("sets Vary: Accept header for format negotiation", async () => {
-      runner = new VercelEnvRunner({ name: "test-img-vary", data: { entry: imageEntry } });
-      await runner.waitForReady();
-      const res = await runner.fetch("http://localhost/_vercel/image?url=/test.png&w=1&q=75");
-      expect(res.headers.get("vary")).toBe("Accept");
-    });
-
-    it("sets Content-Length header", async () => {
-      runner = new VercelEnvRunner({ name: "test-img-cl", data: { entry: imageEntry } });
-      await runner.waitForReady();
-      const res = await runner.fetch("http://localhost/_vercel/image?url=/test.png&w=1&q=75");
-      const cl = res.headers.get("content-length");
-      expect(cl).toBeTruthy();
-      expect(Number(cl)).toBeGreaterThan(0);
-    });
-
-    it("blocks SVG sources by default", async () => {
-      runner = new VercelEnvRunner({ name: "test-img-svg", data: { entry: imageEntry } });
-      await runner.waitForReady();
-      const res = await runner.fetch("http://localhost/_vercel/image?url=/icon.svg&w=100&q=75");
-      expect(res.status).toBe(400);
-      expect(await res.text()).toContain("image type is not allowed");
-    });
-
-    it("allows SVG when dangerouslyAllowSVG is true", async () => {
-      runner = new VercelEnvRunner({
-        name: "test-img-svg-allow",
-        data: { entry: imageEntry },
-        images: { dangerouslyAllowSVG: true },
-      });
-      await runner.waitForReady();
-      // The fixture doesn't actually serve SVG, but validation should pass
-      // (will fail at IPX level, not at our validation)
-      const res = await runner.fetch("http://localhost/_vercel/image?url=/icon.svg&w=100&q=75");
-      // Should not be 400 "image type is not allowed"
-      expect(await res.text()).not.toContain("image type is not allowed");
-    });
-
-    it("returns 400 for disallowed remote URL when domains configured", async () => {
-      runner = new VercelEnvRunner({
-        name: "test-img-remote-blocked",
-        data: { entry: imageEntry },
-        images: { domains: ["allowed.invalid"] },
-      });
+    it("preserves the request method", async () => {
+      runner = new VercelEnvRunner({ name: "test-img-head", data: { entry: imageEntry } });
       await runner.waitForReady();
       const res = await runner.fetch(
-        "http://localhost/_vercel/image?url=https://evil.invalid/img.png&w=100&q=75",
+        new Request("http://localhost/_vercel/image?url=/test.png&w=1&q=75", { method: "HEAD" }),
       );
-      expect(res.status).toBe(400);
-      expect(await res.text()).toContain('"url" parameter is not allowed');
+      expect(res.status).toBe(200);
+      expect(await res.arrayBuffer()).toHaveProperty("byteLength", 0);
     });
 
-    it("allows remote URL when domain matches", async () => {
-      runner = new VercelEnvRunner({
-        name: "test-img-remote-allowed",
-        data: { entry: imageEntry },
-        images: { domains: ["allowed.invalid"] },
-      });
-      await runner.waitForReady();
-      // Will pass validation but fail to fetch (no such host)
-      const res = await runner.fetch(
-        "http://localhost/_vercel/image?url=https://allowed.invalid/img.png&w=100&q=75",
-      );
-      // Should NOT be 400 "url parameter is not allowed"
-      expect(await res.text()).not.toContain('"url" parameter is not allowed');
-    });
-
-    it("validates against remotePatterns (glob format)", async () => {
-      runner = new VercelEnvRunner({
-        name: "test-img-remote-pattern",
-        data: { entry: imageEntry },
-        images: {
-          remotePatterns: [{ protocol: "https", hostname: "cdn.invalid" }],
-        },
-      });
-      await runner.waitForReady();
-
-      // Blocked: different hostname
-      const blocked = await runner.fetch(
-        "http://localhost/_vercel/image?url=https://other.invalid/img.png&w=100&q=75",
-      );
-      expect(blocked.status).toBe(400);
-
-      // Allowed: matching pattern (will fail to fetch but passes validation)
-      const allowed = await runner.fetch(
-        "http://localhost/_vercel/image?url=https://cdn.invalid/img.png&w=100&q=75",
-      );
-      expect(await allowed.text()).not.toContain('"url" parameter is not allowed');
-    });
-
-    it("validates against remotePatterns (Build Output API regex format)", async () => {
-      runner = new VercelEnvRunner({
-        name: "test-img-remote-regex",
-        data: { entry: imageEntry },
-        images: {
-          remotePatterns: [
-            {
-              protocol: "https",
-              hostname: "^cdn\\.invalid$",
-              pathname: "^/assets/.*$",
-            },
-          ],
-        },
-      });
-      await runner.waitForReady();
-
-      // Blocked: wrong hostname
-      const blocked1 = await runner.fetch(
-        "http://localhost/_vercel/image?url=https://other.invalid/assets/img.png&w=100&q=75",
-      );
-      expect(blocked1.status).toBe(400);
-      expect(await blocked1.text()).toContain('"url" parameter is not allowed');
-
-      // Blocked: wrong pathname
-      const blocked2 = await runner.fetch(
-        "http://localhost/_vercel/image?url=https://cdn.invalid/other/img.png&w=100&q=75",
-      );
-      expect(blocked2.status).toBe(400);
-
-      // Allowed: matches regex pattern (will fail to fetch but passes validation)
-      const allowed = await runner.fetch(
-        "http://localhost/_vercel/image?url=https://cdn.invalid/assets/img.png&w=100&q=75",
-      );
-      expect(await allowed.text()).not.toContain('"url" parameter is not allowed');
-    });
-
-    it("returns 400 for width not in configured sizes", async () => {
+    it("passes the images config through to the handler", async () => {
       runner = new VercelEnvRunner({
         name: "test-img-sizes",
         data: { entry: imageEntry },
@@ -361,32 +269,32 @@ describe("VercelEnvRunner", () => {
       await runner.waitForReady();
       const res = await runner.fetch("http://localhost/_vercel/image?url=/test.png&w=100&q=75");
       expect(res.status).toBe(400);
-      expect(await res.text()).toContain('"w" must be one of');
+      expect(await res.text()).toBe('"w" must be one of: 64, 128, 256');
     });
 
-    it("returns 400 for quality not in configured qualities", async () => {
-      runner = new VercelEnvRunner({
-        name: "test-img-qualities",
-        data: { entry: imageEntry },
-        images: { qualities: [50, 75, 100] },
-      });
+    it("propagates handler errors with the Vercel response headers", async () => {
+      runner = new VercelEnvRunner({ name: "test-img-nourl", data: { entry: imageEntry } });
       await runner.waitForReady();
-      const res = await runner.fetch("http://localhost/_vercel/image?url=/test.png&w=1&q=60");
+      const res = await runner.fetch("http://localhost/_vercel/image?w=100&q=75");
       expect(res.status).toBe(400);
-      expect(await res.text()).toContain('"q" must be one of');
+      expect(await res.text()).toBe('"url" parameter is required');
+      expect(res.headers.get("server")).toBe("Vercel");
     });
 
-    it("allows remote images when no domain restrictions configured", async () => {
-      runner = new VercelEnvRunner({
-        name: "test-img-remote-open",
-        data: { entry: imageEntry },
-      });
+    it("revalidates with if-none-match end to end", async () => {
+      runner = new VercelEnvRunner({ name: "test-img-etag", data: { entry: imageEntry } });
       await runner.waitForReady();
-      // No domains/remotePatterns = allow all (will fail to actually fetch)
-      const res = await runner.fetch(
-        "http://localhost/_vercel/image?url=https://any.invalid/img.png&w=100&q=75",
+      const res = await runner.fetch("http://localhost/_vercel/image?url=/test.png&w=1&q=75");
+      const etag = res.headers.get("etag");
+      expect(etag).toBeTruthy();
+
+      const revalidated = await runner.fetch(
+        new Request("http://localhost/_vercel/image?url=/test.png&w=1&q=75", {
+          headers: { "if-none-match": etag! },
+        }),
       );
-      expect(await res.text()).not.toContain('"url" parameter is not allowed');
+      expect(revalidated.status).toBe(304);
+      expect(revalidated.headers.get("cache-control")).toBe("public, max-age=60, s-maxage=60");
     });
   });
 });

@@ -151,6 +151,7 @@ const runner2 = new NodeProcessEnvRunner({
 - `env-runner/runners/miniflare` (`./runners/miniflare`) — Direct import of `MiniflareEnvRunner`
 - `env-runner/runners/vercel` (`./runners/vercel`) — Direct import of `VercelEnvRunner`
 - `env-runner/runners/vercel/worker` (`./runners/vercel/worker`) — Vercel worker (sets request context, delegates to node-worker)
+- `env-runner/runners/vercel/image` (`./runners/vercel/image`) — `createVercelImageHandler()` + `VercelImageConfig`, mountable without a `VercelEnvRunner` (also re-exported from `env-runner`)
 - `env-runner/runners/netlify` (`./runners/netlify`) — Direct import of `NetlifyEnvRunner`
 - `env-runner/runners/netlify/worker` (`./runners/netlify/worker`) — Netlify worker (sets global Netlify context, delegates to node-worker)
 - `env-runner/vite` (`./vite`) — Vite Environment API helpers (`createViteHotChannel`, `createViteTransport`)

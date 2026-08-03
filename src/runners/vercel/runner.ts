@@ -48,6 +48,15 @@ export class VercelEnvRunner extends NodeWorkerEnvRunner {
 
     const requestId = generateVercelId();
 
+    // Both dispatch paths need the worker address, and `x-vercel-deployment-url`
+    // is derived from it — so wait for readiness before injecting headers rather
+    // than silently dropping that header on the first request to a cold runner.
+    // `waitForReady()` rejects immediately once the runner is closed, so a worker
+    // that never came up still fails fast.
+    if (!this._address) {
+      await this.waitForReady().catch(() => {});
+    }
+
     if (this._address && this._address.port != null && !headers.has("x-vercel-deployment-url")) {
       const host = this._address.host || "127.0.0.1";
       headers.set("x-vercel-deployment-url", `http://${host}:${this._address.port}`);
@@ -86,21 +95,28 @@ export class VercelEnvRunner extends NodeWorkerEnvRunner {
     }
 
     let res: Response;
-    if (requestUrl?.pathname === "/_vercel/image") {
-      if (!this._address) {
-        await this.waitForReady().catch(() => {});
-      }
-      if (!this._address) {
-        return new Response("vercel env runner is unavailable", { status: 503 });
-      }
+    if (!this._address) {
+      // Same body the base runner produces, but routed through the response-header
+      // injection below so a 503 still looks like a Vercel response.
+      res = new Response(`${this._runtimeType()} env runner is unavailable`, { status: 503 });
+    } else if (requestUrl?.pathname === "/_vercel/image") {
       this._imageHandler ||= createVercelImageHandler({
         getAddress: () => this._address,
         config: this._imageConfig,
       });
-      res = await this._imageHandler.handle(new Request(requestUrl, { headers }));
-    } else if (input instanceof Request) {
-      res = await super.fetch(new Request(input, { ...init, headers }));
+      // Built from `requestUrl` rather than re-wrapping `input`: the incoming
+      // request may be a host-runtime request object (e.g. srvx's) that the
+      // undici `Request` constructor refuses to clone.
+      res = await this._imageHandler.handle(
+        new Request(requestUrl, {
+          method: (input instanceof Request ? input.method : init?.method) || "GET",
+          headers,
+          signal: input instanceof Request ? input.signal : init?.signal,
+        }),
+      );
     } else {
+      // `input` is forwarded as-is: `proxyFetch()` merges `init` over a `Request`'s
+      // own fields, so the injected `headers` win without cloning `input`.
       res = await super.fetch(input, { ...init, headers });
     }
 
