@@ -38,22 +38,29 @@ export interface VercelImageConfig {
 const DEFAULT_MAX_AGE = 60;
 const DEFAULT_QUALITY = 75;
 
+// Shared by request validation, the ipx path, the unoptimized fallback and the ipx
+// error mapping, so all four answer a given failure with the same body. These are
+// the messages Next.js' image optimizer uses; Vercel's own `/_vercel/image`
+// answers every rejection with a generic `INVALID_IMAGE_OPTIMIZE_REQUEST` page,
+// which says nothing useful in dev.
+const MESSAGES = {
+  notAllowed: '"url" parameter is not allowed',
+  notAnImage: '"url" parameter is valid but upstream is not an image',
+  typeNotAllowed: '"url" parameter is valid but image type is not allowed',
+  upstreamInvalid: '"url" parameter is valid but upstream response is invalid',
+} as const;
+
 type IPXModule = typeof import("ipx");
 
-let _ipxModule: IPXModule | undefined;
-let _ipxLoaded = false;
+let _ipxPromise: Promise<IPXModule | undefined> | undefined;
 
-async function loadIPX(): Promise<IPXModule | undefined> {
-  if (_ipxLoaded) return _ipxModule;
-  _ipxLoaded = true;
-  try {
-    _ipxModule = await import("ipx");
-  } catch {
+function loadIPX(): Promise<IPXModule | undefined> {
+  return (_ipxPromise ||= import("ipx").catch(() => {
     console.warn(
       "ipx is not installed. Install it for Vercel image optimization: npx nypm i -D ipx",
     );
-  }
-  return _ipxModule;
+    return undefined;
+  }));
 }
 
 // `VercelEnvRunner` extends `NodeWorkerEnvRunner`, which always listens on TCP
@@ -82,12 +89,28 @@ function isRemoteUrl(url: string): boolean {
 // Patterns come from config and are re-tested on every request, so compile once.
 const _patternCache = new Map<string, RegExp>();
 
+// Denies the rule it came from instead of matching everything. Safe to share:
+// without a `g`/`y` flag, `.test()` keeps no per-regex state.
+const NEVER_MATCH = /(?!)/;
+
 function patternToRegExp(pattern: string): RegExp {
   let compiled = _patternCache.get(pattern);
   if (compiled) return compiled;
   if (pattern.startsWith("^") && pattern.endsWith("$")) {
-    compiled = new RegExp(pattern);
+    // Build Output API patterns are raw user-authored regex, so a typo is a
+    // `SyntaxError` — which threw straight out of `handle()` via
+    // `validateLocalUrl()`, and was silently swallowed as a blanket deny by
+    // `validateRemoteUrl()`'s `catch`. Warn once (the cache below makes it once
+    // per pattern) and fail closed, so one bad rule can't take down the endpoint.
+    try {
+      compiled = new RegExp(pattern);
+    } catch {
+      console.warn(`[env-runner] ignoring invalid Vercel image pattern: ${pattern}`);
+      compiled = NEVER_MATCH;
+    }
   } else {
+    // The glob branch can't throw: `[` and `]` are escaped below, so no
+    // character class — the one unterminated construct a glob could produce — forms.
     let re = "^";
     for (let i = 0; i < pattern.length; i++) {
       const ch = pattern.charAt(i);
@@ -134,12 +157,14 @@ function validateRemoteUrl(sourceUrl: string, config?: VercelImageConfig): boole
   return false;
 }
 
-function validateLocalUrl(sourceUrl: string, config?: VercelImageConfig): boolean {
+// Takes the parsed (and therefore normalized) local URL rather than the raw string:
+// see `parseImageRequest()` for why the two must not diverge.
+function validateLocalUrl(sourceUrl: URL, config?: VercelImageConfig): boolean {
   if (!config?.localPatterns?.length) return true;
-  const [pathname = "", search] = sourceUrl.split("?");
+  const search = sourceUrl.search.replace(/^\?/, "");
   return config.localPatterns.some((p) => {
-    if (p.pathname && !matchPattern(p.pathname, pathname)) return false;
-    if (p.search !== undefined && (search || "") !== p.search.replace(/^\?/, "")) return false;
+    if (p.pathname && !matchPattern(p.pathname, sourceUrl.pathname)) return false;
+    if (p.search !== undefined && search !== p.search.replace(/^\?/, "")) return false;
     return true;
   });
 }
@@ -158,15 +183,14 @@ function literalHostnames(config?: VercelImageConfig): string[] | undefined {
 }
 
 function isSvgSource(url: string): boolean {
-  const path = url.startsWith("/")
-    ? url
-    : (() => {
-        try {
-          return new URL(url).pathname;
-        } catch {
-          return url;
-        }
-      })();
+  let path = url;
+  if (!url.startsWith("/")) {
+    try {
+      path = new URL(url).pathname;
+    } catch {
+      // Not a valid absolute URL either; fall back to matching the raw string.
+    }
+  }
   return /\.svgz?(\?|$)/i.test(path);
 }
 
@@ -197,17 +221,71 @@ function applySecurityHeaders(
     headers.set("content-security-policy", "default-src 'none'");
   }
   if (config?.contentDispositionType) {
-    // Quotes and backslashes are stripped rather than escaped: they would
-    // otherwise terminate the quoted `filename` and mangle the whole header.
-    const filename = sourceUrl.split("/").pop()?.split("?")[0]?.replaceAll(/["\\]/g, "") || "image";
-    headers.set("content-disposition", `${config.contentDispositionType}; filename="${filename}"`);
+    headers.set(
+      "content-disposition",
+      contentDisposition(config.contentDispositionType, sourceUrl),
+    );
   }
+}
+
+// A quoted `filename` can carry neither quotes/backslashes (they terminate or
+// escape the value) nor anything above U+00FF: `Headers.set()` throws on a
+// non-ByteString value, and that `TypeError` escaped `handle()` as an unhandled
+// rejection for any source with a non-Latin1 name (`/日本.png`). So quotes are
+// stripped, everything outside printable ASCII is replaced, and the real name is
+// carried by RFC 5987 `filename*` — appended only when it differs, so the common
+// case stays byte-identical to what Vercel sends.
+function contentDisposition(type: string, sourceUrl: string): string {
+  const segment = sourceUrl.split("?")[0]!.split("/").pop() || "";
+  let name = segment;
+  try {
+    // A local source is normalized (and therefore percent-encoded) by the time it
+    // gets here, so decode it back into the name the user recognizes.
+    name = decodeURIComponent(segment);
+  } catch {
+    // Malformed percent-encoding; keep the raw segment.
+  }
+  name = name.replaceAll(/["\\]/g, "") || "image";
+  const ascii = name.replaceAll(/[^\u0020-\u007E]/g, "_");
+  const value = `${type}; filename="${ascii}"`;
+  return ascii === name ? value : `${value}; filename*=UTF-8''${encodeURIComponent(name)}`;
+}
+
+// Content-type is the source of truth for the SVG block, not the URL: a source
+// whose URL doesn't look like SVG can still resolve to `image/svg+xml`, so both
+// the ipx path and the unoptimized fallback re-check it on the response.
+function blockSvgOutput(contentType: string, config?: VercelImageConfig): Response | undefined {
+  // `image/svg` (without the `+xml`) as well: browsers do not render it, but there
+  // is no reason for the check to be narrower than the media types it is guarding.
+  if (!config?.dangerouslyAllowSVG && /^image\/svg\b/i.test(contentType)) {
+    return new Response(MESSAGES.typeNotAllowed, { status: 400 });
+  }
+  return undefined;
+}
+
+// Shared by the ipx path and the unoptimized fallback. `overwriteCacheControl`
+// captures their one real difference: ipx's `cache-control` reflects Vercel's own
+// `minimumCacheTTL` semantics and always wins, while the fallback only fills it in
+// when the upstream didn't already set one.
+function finalizeImageHeaders(
+  headers: Headers,
+  sourceUrl: string,
+  config: VercelImageConfig | undefined,
+  maxAge: number,
+  overwriteCacheControl: boolean,
+): void {
+  if (overwriteCacheControl || !headers.has("cache-control")) {
+    headers.set("cache-control", `public, max-age=${maxAge}, s-maxage=${maxAge}`);
+  }
+  ensureVaryAccept(headers);
+  applySecurityHeaders(headers, sourceUrl, config);
 }
 
 // --- Request parsing ---
 
 interface ParsedImageRequest {
   sourceUrl: string;
+  isLocal: boolean;
   modifiers: Record<string, string | number>;
 }
 
@@ -215,7 +293,10 @@ function badRequest(message: string): Response {
   return new Response(message, { status: 400 });
 }
 
-/** Strips the `image/` prefix so `f=webp` and `f=image/webp` compare equal. */
+/**
+ * Strips the `image/` prefix so a configured `formats` entry (`image/webp`, as the
+ * Build Output API writes it) compares equal to a negotiation candidate (`webp`).
+ */
 function bareFormat(format: string): string {
   return format.replace(/^image\//, "");
 }
@@ -239,15 +320,28 @@ const IPX_ERROR_MESSAGES: Record<number, string> = {
   // The only reachable 400s are undecodable sources (`IPX_INVALID_IMAGE`,
   // `IPX_INVALID_SVG`): the modifiers ipx receives are width/quality/format, all
   // already validated by `parseImageRequest()`.
-  400: '"url" parameter is valid but upstream is not an image',
-  403: '"url" parameter is not allowed',
-  404: '"url" parameter is valid but upstream response is invalid',
+  400: MESSAGES.notAnImage,
+  403: MESSAGES.notAllowed,
+  404: MESSAGES.upstreamInvalid,
   // DNS failure, redirect loop, bad redirect
-  502: '"url" parameter is valid but upstream response is invalid',
+  502: MESSAGES.upstreamInvalid,
 };
 
-function ipxError(status: number): Response {
-  return new Response(IPX_ERROR_MESSAGES[status] || "Image optimization failed", { status });
+// `new Response(body, { status })` throws for a null-body status (204/304) and a
+// `RangeError` for anything outside 200-599, either of which would escape
+// `handle()`. Statuses that reach here come from an upstream response or from a
+// thrown error's `status`/`statusCode`, so neither is trustworthy on its own.
+function errorStatus(status: unknown, fallback: number): number {
+  return typeof status === "number" && Number.isInteger(status) && status >= 400 && status <= 599
+    ? status
+    : fallback;
+}
+
+function ipxError(status: unknown): Response {
+  const resolved = errorStatus(status, 500);
+  return new Response(IPX_ERROR_MESSAGES[resolved] || "Image optimization failed", {
+    status: resolved,
+  });
 }
 
 /**
@@ -262,7 +356,7 @@ function parseImageRequest(
   accept: string,
   config: VercelImageConfig | undefined,
 ): ParsedImageRequest | Response {
-  const sourceUrl = url.searchParams.get("url");
+  let sourceUrl = url.searchParams.get("url");
   if (!sourceUrl) {
     return badRequest('"url" parameter is required');
   }
@@ -302,96 +396,131 @@ function parseImageRequest(
     }
   }
 
-  const allowedFormats = config?.formats?.map(bareFormat);
-  const f = url.searchParams.get("f");
-  const format = f ? bareFormat(f) : undefined;
-  if (format && allowedFormats?.length && !allowedFormats.includes(format)) {
-    return badRequest(`"f" must be one of: ${config!.formats!.join(", ")}`);
-  }
-
   // Reject protocol-relative URLs to avoid local/remote ambiguity
   if (sourceUrl.startsWith("//")) {
-    return badRequest('"url" parameter is not allowed');
+    return badRequest(MESSAGES.notAllowed);
   }
 
   const isLocal = sourceUrl.startsWith("/");
-  const isRemote = isRemoteUrl(sourceUrl);
-  if (!isLocal && !isRemote) {
-    return badRequest('"url" parameter is not allowed');
-  }
-  if (isRemote && !validateRemoteUrl(sourceUrl, config)) {
-    return badRequest('"url" parameter is not allowed');
-  }
-  if (isLocal && !validateLocalUrl(sourceUrl, config)) {
-    return badRequest('"url" parameter is not allowed');
+  if (isLocal) {
+    // A local source is normalized before it is validated *and* before it becomes
+    // the fetch id, so the allowlist sees exactly the path the worker will be asked
+    // for. Matching the raw string instead let `/assets/../secret.png` satisfy a
+    // `/assets/**` rule and then resolve to `/secret.png` once fetched, and the
+    // hand-rolled `split("?")` hid everything after a second `?` from a `search`
+    // rule (`/a.png?v=1?evil=2` passed `search: "?v=1"`).
+    const localUrl = new URL(sourceUrl, "http://localhost");
+    sourceUrl = localUrl.pathname + localUrl.search;
+    if (!validateLocalUrl(localUrl, config)) {
+      return badRequest(MESSAGES.notAllowed);
+    }
+  } else if (isRemoteUrl(sourceUrl)) {
+    if (!validateRemoteUrl(sourceUrl, config)) {
+      return badRequest(MESSAGES.notAllowed);
+    }
+  } else {
+    return badRequest(MESSAGES.notAllowed);
   }
 
   // Block SVG unless explicitly allowed
   if (!config?.dangerouslyAllowSVG && isSvgSource(sourceUrl)) {
-    return badRequest('"url" parameter is valid but image type is not allowed');
+    return badRequest(MESSAGES.typeNotAllowed);
   }
 
   const modifiers: Record<string, string | number> = { width, quality };
 
-  // Format: explicit param > Accept header negotiation
-  const resolvedFormat = format ?? negotiateFormat(accept, allowedFormats);
+  // The output format is negotiated from `Accept` and nothing else, matching the
+  // deployed endpoint: it honors `url`, `w` and `q`, and ignores every other query
+  // param. A param that pinned the format here would be a transform that works in
+  // dev and silently disappears in production — the same reason `h`/`fit`/`blur`
+  // are not supported.
+  const resolvedFormat = negotiateFormat(accept, config?.formats?.map(bareFormat));
   if (resolvedFormat) {
     modifiers.format = resolvedFormat;
   }
 
-  return { sourceUrl, modifiers };
+  return { sourceUrl, isLocal, modifiers };
 }
 
 // --- Unoptimized fallback ---
 
+// Everything else the upstream sent is dropped. `fetch` has already decoded the
+// body, so forwarding `content-encoding` (and the compressed `content-length`
+// beside it) left the client unable to decode what it received — and a `set-cookie`
+// from a remote image origin has no business being served under the app's own.
+const PASSTHROUGH_HEADERS = ["content-type", "etag", "last-modified", "cache-control"];
+
+function imageHeadersFrom(upstream: Headers): Headers {
+  const headers = new Headers();
+  for (const name of PASSTHROUGH_HEADERS) {
+    const value = upstream.get(name);
+    if (value) headers.set(name, value);
+  }
+  // Only describes the body about to be served when nothing was encoded on the wire.
+  if (!upstream.has("content-encoding")) {
+    const length = upstream.get("content-length");
+    if (length) headers.set("content-length", length);
+  }
+  return headers;
+}
+
+// An upstream body that is never read keeps its socket checked out of undici's pool
+// until the response is garbage collected.
+function discardBody(res: Response): void {
+  res.body?.cancel().catch(() => {});
+}
+
 async function fetchUnoptimized(
   sourceUrl: string,
+  isLocal: boolean,
   getAddress: () => WorkerAddress | undefined,
   config: VercelImageConfig | undefined,
   maxAge: number,
 ): Promise<Response> {
   let res: Response;
   try {
-    if (sourceUrl.startsWith("/")) {
+    if (isLocal) {
       const address = getAddress();
       if (!address) {
         return new Response("Runner not ready", { status: 503 });
       }
+      // Redirects are followed here, matching `workerStorage.getData()` on the ipx
+      // path: a framework may legitimately redirect its own asset paths.
       res = await fetch(resolveWorkerUrl(address, sourceUrl));
     } else {
-      res = await fetch(sourceUrl);
+      // `validateRemoteUrl()` only gated this URL, and a redirect leaves it — an
+      // allowlisted host could bounce the fetch to an internal address. The ipx path
+      // re-validates every hop via `ipxHttpStorage({ domains })`, so refuse them
+      // here rather than let the fallback be the weaker path (`blockPrivateIPs`
+      // is an ipx-only knob and does not apply to this `fetch`).
+      res = await fetch(sourceUrl, { redirect: "error" });
     }
   } catch {
-    // Connection refused, DNS failure, aborted upstream
-    return new Response('"url" parameter is valid but upstream response is invalid', {
-      status: 502,
-    });
+    // Connection refused, DNS failure, aborted upstream, refused redirect
+    return new Response(MESSAGES.upstreamInvalid, { status: 502 });
   }
 
-  // A failed upstream is a missing or broken source, not a content-type problem
+  // A failed upstream is a missing or broken source, not a content-type problem.
+  // Its status is reused only when it is one a `Response` can carry (a `304` from a
+  // worker answering an unconditional request would otherwise throw).
   if (!res.ok) {
-    return new Response('"url" parameter is valid but upstream response is invalid', {
-      status: res.status,
-    });
+    discardBody(res);
+    return new Response(MESSAGES.upstreamInvalid, { status: errorStatus(res.status, 502) });
   }
 
-  const headers = new Headers(res.headers);
-  const contentType = headers.get("content-type") || "";
+  const contentType = res.headers.get("content-type") || "";
   if (!/^image\//i.test(contentType)) {
-    return new Response('"url" parameter is valid but upstream is not an image', {
-      status: 400,
-    });
+    discardBody(res);
+    return new Response(MESSAGES.notAnImage, { status: 400 });
   }
-  if (!config?.dangerouslyAllowSVG && /^image\/svg\+xml\b/i.test(contentType)) {
-    return new Response('"url" parameter is valid but image type is not allowed', {
-      status: 400,
-    });
+  const svgBlock = blockSvgOutput(contentType, config);
+  if (svgBlock) {
+    discardBody(res);
+    return svgBlock;
   }
-  ensureVaryAccept(headers);
-  if (!headers.has("cache-control")) {
-    headers.set("cache-control", `public, max-age=${maxAge}, s-maxage=${maxAge}`);
-  }
-  applySecurityHeaders(headers, sourceUrl, config);
+
+  const headers = imageHeadersFrom(res.headers);
+  finalizeImageHeaders(headers, sourceUrl, config, maxAge, false);
 
   return new Response(res.body, {
     status: res.status,
@@ -507,10 +636,10 @@ export function createVercelImageHandler(opts: {
       if (parsed instanceof Response) {
         return parsed;
       }
-      const { sourceUrl } = parsed;
+      const { sourceUrl, isLocal } = parsed;
 
       // Only local sources go through the worker; a remote source never touches it.
-      if (sourceUrl.startsWith("/")) {
+      if (isLocal) {
         const socketError = rejectSocketAddress(getAddress());
         if (socketError) {
           return socketError;
@@ -519,7 +648,7 @@ export function createVercelImageHandler(opts: {
 
       const createFetchHandler = await getFetchHandlerFactory();
       if (!createFetchHandler) {
-        return fetchUnoptimized(sourceUrl, getAddress, config, maxAge);
+        return fetchUnoptimized(sourceUrl, isLocal, getAddress, config, maxAge);
       }
 
       let res: Response;
@@ -529,7 +658,7 @@ export function createVercelImageHandler(opts: {
         // Unexpected: ipx converts its own HTTPErrors into responses. Log the detail,
         // since the body is normalized like every other error.
         console.warn("[env-runner] vercel image optimization failed:", error);
-        return ipxError(error.status || error.statusCode || 500);
+        return ipxError(error.status ?? error.statusCode);
       }
 
       // 404 for a missing source, 403 for a forbidden host/IP, 400 for an undecodable
@@ -539,22 +668,18 @@ export function createVercelImageHandler(opts: {
       }
 
       // Defense in depth: block SVG output even if the URL check was bypassed
-      if (
-        !config?.dangerouslyAllowSVG &&
-        /^image\/svg\+xml\b/i.test(res.headers.get("content-type") || "")
-      ) {
-        return new Response('"url" parameter is valid but image type is not allowed', {
-          status: 400,
-        });
-      }
+      const svgBlock = blockSvgOutput(res.headers.get("content-type") || "", config);
+      if (svgBlock) return svgBlock;
 
       const headers = new Headers(res.headers);
-      headers.set("cache-control", `public, max-age=${maxAge}, s-maxage=${maxAge}`);
-      ensureVaryAccept(headers);
-      applySecurityHeaders(headers, sourceUrl, config);
+      finalizeImageHeaders(headers, sourceUrl, config, maxAge, true);
 
-      if (res.status === 304) {
-        return new Response(null, { status: 304, headers });
+      // ipx (via h3) already nulls the body for 304s and for HEAD requests, in
+      // both cases keeping the `content-length` it computed from the full image.
+      // Buffering `res.arrayBuffer()` below would read that as empty and clobber
+      // a correct header with `0`, so a null body always short-circuits first.
+      if (res.body === null) {
+        return new Response(null, { status: res.status, headers });
       }
 
       // Buffered so `content-length` is always set (ipx has the whole image in

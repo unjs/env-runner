@@ -36,6 +36,22 @@ describe("VercelEnvRunner", () => {
     expect(runner.ready).toBe(true);
   });
 
+  // `#initWorker()` calls `close()` synchronously from inside `super()` for a
+  // missing entry — before any field of this subclass exists. Dereferencing the
+  // image handler there threw out of `close()` before it had set `closed`, so the
+  // runner stayed "not ready, not closed" and every `fetch()` waited out the full
+  // `waitForReady()` timeout instead of answering 503.
+  it("closes synchronously when the worker entry is missing", async () => {
+    const broken = new VercelEnvRunner({
+      name: "test-missing-entry",
+      workerEntry: "/non/existent/path.js",
+    });
+    expect(broken.closed).toBe(true);
+    const res = await broken.fetch("http://localhost/");
+    expect(res.status).toBe(503);
+    expect(res.headers.get("server")).toBe("Vercel");
+  });
+
   it("fetches from runner", async () => {
     runner = new VercelEnvRunner({ name: "test-fetch", data: { entry: appEntry } });
     await runner.waitForReady();

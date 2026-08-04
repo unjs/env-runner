@@ -1,6 +1,7 @@
 import type { AddressInfo } from "node:net";
 
 import { createServer, type Server } from "node:http";
+import { gzipSync } from "node:zlib";
 import { serve } from "srvx";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
@@ -31,9 +32,23 @@ beforeAll(async () => {
     // Decoded so a path with percent-encoded characters (see the
     // content-disposition escaping test) is matched by its literal form
     const path = decodeURIComponent((req.url || "").split("?")[0]!);
-    if (path === '/od"d.png') {
+    if (path === '/od"d.png' || path === "/日本.png") {
       res.writeHead(200, { "content-type": "image/png" });
       res.end(req.method === "HEAD" ? undefined : PNG_1x1);
+    } else if (path === "/gzipped.png") {
+      // `fetch` decodes this before the fallback path sees it, so the upstream
+      // `content-encoding`/`content-length` no longer describe the served body
+      const gz = gzipSync(PNG_1x1);
+      res.writeHead(200, {
+        "content-type": "image/png",
+        "content-encoding": "gzip",
+        "content-length": String(gz.length),
+        "set-cookie": "sid=abc; Path=/",
+      });
+      res.end(req.method === "HEAD" ? undefined : gz);
+    } else if (path === "/notmodified.png") {
+      // A worker answering an unconditional request with 304
+      res.writeHead(304).end();
     } else if (path === "/test.png" || path === "/assets/test.png") {
       res.writeHead(200, { "content-type": "image/png" });
       res.end(req.method === "HEAD" ? undefined : PNG_1x1);
@@ -43,6 +58,10 @@ beforeAll(async () => {
     } else if (path === "/note.txt") {
       res.writeHead(200, { "content-type": "text/plain" });
       res.end(req.method === "HEAD" ? undefined : "not an image");
+    } else if (path === "/redirect.png") {
+      // Stands in for an allowlisted host bouncing the fetch elsewhere
+      res.writeHead(302, { location: `http://127.0.0.1:${port}/test.png` });
+      res.end();
     } else {
       res.writeHead(404).end();
     }
@@ -159,23 +178,20 @@ describe("createVercelImageHandler", () => {
       expect(res.status).toBe(200);
     });
 
-    it("rejects a format outside the configured formats", async () => {
-      const res = await get(
-        makeHandler({ formats: ["image/webp"] }),
-        "url=/test.png&w=8&f=image/avif",
-      );
-      expect(res.status).toBe(400);
-      expect(await res.text()).toBe('"f" must be one of: image/webp');
-    });
-
-    it("compares f against formats without the image/ prefix", async () => {
-      // `f=webp` and `f=image/webp` must both satisfy `formats: ["image/webp"]`
-      for (const f of ["webp", "image/webp"]) {
-        const res = await get(makeHandler({ formats: ["image/webp"] }), `url=/test.png&w=8&f=${f}`);
+    // The deployed endpoint honors `url`, `w` and `q` and ignores everything else —
+    // verified against a Vercel-hosted `/_vercel/image`, where `f=image/webp` under
+    // `accept: image/png` still returns PNG. Anything that pinned the format here
+    // would be a dev-only transform that vanishes in production.
+    it.each(["f=image/webp", "f=webp", "h=8", "fit=cover", "blur=5", "unknown=1"])(
+      "ignores %s",
+      async (param) => {
+        const res = await get(makeHandler(), `url=/test.png&w=8&${param}`, {
+          accept: "image/png,*/*",
+        });
         expect(res.status).toBe(200);
-        expect(res.headers.get("content-type")).toBe("image/webp");
-      }
-    });
+        expect(res.headers.get("content-type")).toBe("image/png");
+      },
+    );
 
     it.each(["//evil.example/x.png", "data:image/png;base64,AAAA", "ftp://x.example/a.png"])(
       "rejects a non-local, non-http url (%s)",
@@ -284,6 +300,83 @@ describe("createVercelImageHandler", () => {
       expect(res.status).toBe(400);
       expect(await res.text()).toBe('"url" parameter is not allowed');
     });
+
+    // The pattern is matched against the normalized path, not the raw string:
+    // `/assets/../test.png` lexically satisfies `/assets/**` but resolves to
+    // `/test.png` once fetched, which the same config denies outright
+    it("denies a traversal that escapes localPatterns", async () => {
+      const res = await get(
+        makeHandler({ localPatterns: [{ pathname: "/assets/**" }] }),
+        `url=${encodeURIComponent("/assets/../test.png")}&w=8`,
+      );
+      expect(res.status).toBe(400);
+      expect(await res.text()).toBe('"url" parameter is not allowed');
+    });
+
+    // Everything after the *first* `?` is the query, so a `search` rule cannot be
+    // satisfied by the first of two query strings
+    it("denies a search that only matches up to a second ?", async () => {
+      const config: VercelImageConfig = {
+        localPatterns: [{ pathname: "/test.png", search: "?v=1" }],
+      };
+      const allowed = await get(
+        makeHandler(config),
+        `url=${encodeURIComponent("/test.png?v=1")}&w=8`,
+      );
+      expect(allowed.status).toBe(200);
+
+      const denied = await get(
+        makeHandler(config),
+        `url=${encodeURIComponent("/test.png?v=1?evil=2")}&w=8`,
+      );
+      expect(denied.status).toBe(400);
+      expect(await denied.text()).toBe('"url" parameter is not allowed');
+    });
+  });
+
+  describe("malformed config patterns", () => {
+    // A `SyntaxError` from `new RegExp()` used to escape `handle()` here, since
+    // `validateLocalUrl()` has no `catch` of its own — every request for that
+    // config then failed as an unhandled throw rather than a `Response`.
+    it("denies rather than throwing on an invalid localPatterns regex", async () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const handler = makeHandler({ localPatterns: [{ pathname: "^/assets/[a-z$" }] });
+
+      const res = await get(handler, "url=/assets/test.png&w=8");
+      expect(res.status).toBe(400);
+      expect(await res.text()).toBe('"url" parameter is not allowed');
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("invalid Vercel image pattern"));
+
+      // Compiled patterns are cached, so the warning is not repeated per request
+      await get(handler, "url=/assets/test.png&w=8");
+      expect(warn).toHaveBeenCalledTimes(1);
+      warn.mockRestore();
+    });
+
+    // `validateRemoteUrl()`'s `catch` already turned this into a deny, but silently
+    // — the warning is what makes a typo'd pattern diagnosable rather than a
+    // mystery "not allowed" on every remote image.
+    it("warns and denies on an invalid remotePatterns regex", async () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const res = await get(
+        makeHandler({ remotePatterns: [{ hostname: "^127\\.0\\.[a-z$" }] }),
+        `url=${encodeURIComponent(`http://127.0.0.1:${port}/test.png`)}&w=8`,
+      );
+      expect(res.status).toBe(400);
+      expect(await res.text()).toBe('"url" parameter is not allowed');
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("invalid Vercel image pattern"));
+      warn.mockRestore();
+    });
+
+    it("still matches the valid patterns alongside an invalid one", async () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const res = await get(
+        makeHandler({ localPatterns: [{ pathname: "^/bad/[a-z$" }, { pathname: "/assets/**" }] }),
+        "url=/assets/test.png&w=8",
+      );
+      expect(res.status).toBe(200);
+      warn.mockRestore();
+    });
   });
 
   describe("svg", () => {
@@ -316,6 +409,23 @@ describe("createVercelImageHandler", () => {
       expect(Number(res.headers.get("content-length"))).toBe((await res.arrayBuffer()).byteLength);
     });
 
+    // ipx nulls the body for HEAD while keeping the length it computed from the
+    // full image; buffering that empty body would report `content-length: 0`.
+    it("keeps the real content-length on a HEAD request", async () => {
+      const handler = makeHandler();
+      const expected = Number(
+        (await get(handler, "url=/test.png&w=8")).headers.get("content-length"),
+      );
+      expect(expected).toBeGreaterThan(0);
+
+      const res = await handler.handle(
+        new Request("http://localhost/_vercel/image?url=/test.png&w=8", { method: "HEAD" }),
+      );
+      expect(res.status).toBe(200);
+      expect(Number(res.headers.get("content-length"))).toBe(expected);
+      expect(await res.text()).toBe("");
+    });
+
     it("sets a baseline CSP", async () => {
       const res = await get(makeHandler(), "url=/test.png&w=8");
       expect(res.headers.get("content-security-policy")).toBe("default-src 'none'");
@@ -327,6 +437,26 @@ describe("createVercelImageHandler", () => {
         "url=/test.png&w=8",
       );
       expect(res.headers.get("content-disposition")).toBe('attachment; filename="test.png"');
+    });
+
+    // A raw non-Latin1 filename cannot go in a header value at all: `Headers.set()`
+    // throws, and that `TypeError` used to escape `handle()` entirely
+    it.each([
+      ["local", () => `url=${encodeURIComponent("/日本.png")}&w=8`],
+      ["remote", () => `url=${encodeURIComponent(`http://127.0.0.1:${port}/日本.png`)}&w=8`],
+    ])("carries a non-ASCII %s filename in filename*", async (_kind, query) => {
+      const res = await get(
+        makeHandler({
+          contentDispositionType: "attachment",
+          domains: ["127.0.0.1"],
+          blockPrivateIPs: false,
+        }),
+        query(),
+      );
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-disposition")).toBe(
+        `attachment; filename="__.png"; filename*=UTF-8''${encodeURIComponent("日本.png")}`,
+      );
     });
 
     it("strips quotes from the content-disposition filename", async () => {
@@ -491,6 +621,53 @@ describe("createVercelImageHandler without ipx", () => {
     const handler = await makeBareHandler();
     const res = await get(handler, "url=/test.png&w=8");
     expect(res.headers.get("content-security-policy")).toBe("default-src 'none'");
+  });
+
+  // The allowlist gates only the requested URL, so following a redirect would let
+  // an allowlisted host serve an unvalidated address under the app's origin. The
+  // ipx path re-validates each hop; this path refuses them instead.
+  it("refuses to follow a redirect from a remote source", async () => {
+    const handler = await makeBareHandler({ domains: ["127.0.0.1"] });
+    const res = await get(
+      handler,
+      `url=${encodeURIComponent(`http://127.0.0.1:${port}/redirect.png`)}&w=8`,
+    );
+    expect(res.status).toBe(502);
+    expect(await res.text()).toBe('"url" parameter is valid but upstream response is invalid');
+  });
+
+  it("still follows a redirect from a local source", async () => {
+    const handler = await makeBareHandler();
+    const res = await get(handler, "url=/redirect.png&w=8");
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("image/png");
+  });
+
+  // `fetch` has already decoded the body by the time it is re-served, so forwarding
+  // the upstream `content-encoding` left the client unable to decode it
+  it("drops content-encoding and the stale content-length", async () => {
+    const handler = await makeBareHandler();
+    const res = await get(handler, "url=/gzipped.png&w=8");
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-encoding")).toBeNull();
+    const body = await res.arrayBuffer();
+    expect(body.byteLength).toBe(PNG_1x1.byteLength);
+    const length = res.headers.get("content-length");
+    if (length !== null) expect(Number(length)).toBe(body.byteLength);
+  });
+
+  it("does not forward set-cookie from the upstream", async () => {
+    const handler = await makeBareHandler();
+    const res = await get(handler, "url=/gzipped.png&w=8");
+    expect(res.headers.getSetCookie()).toEqual([]);
+  });
+
+  // `new Response(body, { status: 304 })` throws, so the status cannot be reused
+  it("reports an upstream 304 as 502 rather than throwing", async () => {
+    const handler = await makeBareHandler();
+    const res = await get(handler, "url=/notmodified.png&w=8");
+    expect(res.status).toBe(502);
+    expect(await res.text()).toBe('"url" parameter is valid but upstream response is invalid');
   });
 
   it("rejects non-GET/HEAD before touching the upstream", async () => {
