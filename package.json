@@ -27,6 +27,7 @@
     "./runners/vercel": "./dist/runners/vercel/runner.mjs",
     "./runners/vercel/worker": "./dist/runners/vercel/worker.mjs",
     "./runners/vercel/queue-dev": "./dist/runners/vercel/queue-dev.mjs",
+    "./runners/vercel/image": "./dist/runners/vercel/image.mjs",
     "./runners/netlify": "./dist/runners/netlify/runner.mjs",
     "./runners/netlify/worker": "./dist/runners/netlify/worker.mjs",
     "./vite": "./dist/vite.mjs"
@@ -59,6 +60,7 @@
     "cjs-module-lexer": "^2.2.0",
     "env-runner-fixture": "link:",
     "es-module-lexer": "^2.2.0",
+    "ipx": "^4.0.0-beta.1",
     "miniflare": "^4.20260625.0",
     "obuild": "^0.4.37",
     "oxfmt": "^0.56.0",
@@ -70,6 +72,7 @@
   "peerDependencies": {
     "@netlify/runtime": "^4.1.23",
     "@vercel/queue": ">=0.2.0",
+    "ipx": "^4.0.0-beta.1",
     "miniflare": "^4.20260515.0",
     "wrangler": "^4.0.0"
   },
@@ -81,6 +84,9 @@
       "optional": true
     },
     "@vercel/queue": {
+      "optional": true
+    },
+    "ipx": {
       "optional": true
     },
     "wrangler": {

@@ -5,9 +5,14 @@ import { fileURLToPath } from "node:url";
 
 import type { EnvRunnerData } from "../../common/base-runner.ts";
 import { NodeWorkerEnvRunner } from "../node-worker/runner.ts";
+import {
+  type VercelImageConfig,
+  type VercelImageHandler,
+  createVercelImageHandler,
+} from "./image.ts";
 import { warnIfVercelOidcTokenInvalid } from "./oidc.ts";
 
-export type { EnvRunnerData };
+export type { EnvRunnerData, VercelImageConfig };
 
 let _defaultEntry: string;
 
@@ -21,15 +26,20 @@ function generateVercelId(): string {
 }
 
 export class VercelEnvRunner extends NodeWorkerEnvRunner {
+  private _imageHandler?: VercelImageHandler;
+  private _imageConfig?: VercelImageConfig;
+
   constructor(opts: {
     name: string;
     workerEntry?: string;
     hooks?: WorkerHooks;
     data?: EnvRunnerData;
+    images?: VercelImageConfig;
   }) {
     _defaultEntry ||= fileURLToPath(import.meta.resolve("env-runner/runners/vercel/worker"));
     super({ ...opts, workerEntry: opts.workerEntry || _defaultEntry });
     warnIfVercelOidcTokenInvalid();
+    this._imageConfig = opts.images;
   }
 
   override async fetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
@@ -37,6 +47,15 @@ export class VercelEnvRunner extends NodeWorkerEnvRunner {
     const headers = new Headers(input instanceof Request ? input.headers : init?.headers);
 
     const requestId = generateVercelId();
+
+    // Both dispatch paths need the worker address, and `x-vercel-deployment-url`
+    // is derived from it — so wait for readiness before injecting headers rather
+    // than silently dropping that header on the first request to a cold runner.
+    // `waitForReady()` rejects immediately once the runner is closed, so a worker
+    // that never came up still fails fast.
+    if (!this._address) {
+      await this.waitForReady().catch(() => {});
+    }
 
     if (this._address && this._address.port != null && !headers.has("x-vercel-deployment-url")) {
       const host = this._address.host || "127.0.0.1";
@@ -62,19 +81,44 @@ export class VercelEnvRunner extends NodeWorkerEnvRunner {
       headers.set("x-real-ip", clientIp);
     }
 
+    let requestUrl: URL | undefined;
     try {
-      const url = new URL(input instanceof Request ? input.url : input.toString());
+      requestUrl = new URL(input instanceof Request ? input.url : input.toString());
       if (!headers.has("x-forwarded-proto")) {
-        headers.set("x-forwarded-proto", url.protocol.replace(":", ""));
+        headers.set("x-forwarded-proto", requestUrl.protocol.replace(":", ""));
       }
       if (!headers.has("x-forwarded-host")) {
-        headers.set("x-forwarded-host", headers.get("host") || url.host);
+        headers.set("x-forwarded-host", headers.get("host") || requestUrl.host);
       }
     } catch {
       // URL parsing failed, skip proto/host headers
     }
 
-    const res = await super.fetch(input, { ...init, headers });
+    let res: Response;
+    if (!this._address) {
+      // Same body the base runner produces, but routed through the response-header
+      // injection below so a 503 still looks like a Vercel response.
+      res = new Response(`${this._runtimeType()} env runner is unavailable`, { status: 503 });
+    } else if (requestUrl?.pathname === "/_vercel/image") {
+      this._imageHandler ||= createVercelImageHandler({
+        getAddress: () => this._address,
+        config: this._imageConfig,
+      });
+      // Built from `requestUrl` rather than re-wrapping `input`: the incoming
+      // request may be a host-runtime request object (e.g. srvx's) that the
+      // undici `Request` constructor refuses to clone.
+      res = await this._imageHandler.handle(
+        new Request(requestUrl, {
+          method: (input instanceof Request ? input.method : init?.method) || "GET",
+          headers,
+          signal: input instanceof Request ? input.signal : init?.signal,
+        }),
+      );
+    } else {
+      // `input` is forwarded as-is: `proxyFetch()` merges `init` over a `Request`'s
+      // own fields, so the injected `headers` win without cloning `input`.
+      res = await super.fetch(input, { ...init, headers });
+    }
 
     // Inject Vercel response headers
     const resHeaders = new Headers(res.headers);
@@ -93,6 +137,12 @@ export class VercelEnvRunner extends NodeWorkerEnvRunner {
       statusText: res.statusText,
       headers: resHeaders,
     });
+  }
+
+  override async close(cause?: unknown) {
+    this._imageHandler?.close();
+    this._imageHandler = undefined;
+    await super.close(cause);
   }
 
   protected override _runtimeType() {

@@ -32,4 +32,11 @@ export {
   MiniflareEnvRunner,
 } from "./runners/miniflare/runner.ts";
 export { VercelEnvRunner } from "./runners/vercel/runner.ts";
+export {
+  type VercelImageConfig,
+  type VercelImageHandler,
+  type VercelLocalPattern,
+  type VercelRemotePattern,
+  createVercelImageHandler,
+} from "./runners/vercel/image.ts";
 export { NetlifyEnvRunner } from "./runners/netlify/runner.ts";
