@@ -1,6 +1,26 @@
 # Changelog
 
 
+## v0.2.0
+
+[compare changes](https://github.com/unjs/env-runner/compare/v0.1.16...v0.2.0)
+
+### 🚀 Enhancements
+
+- ⚠️  Require explicit runtime deps ([dbc9cbb](https://github.com/unjs/env-runner/commit/dbc9cbb))
+
+### 🏡 Chore
+
+- Update deps ([7fef0a6](https://github.com/unjs/env-runner/commit/7fef0a6))
+
+#### ⚠️ Breaking Changes
+
+- ⚠️  Require explicit runtime deps ([dbc9cbb](https://github.com/unjs/env-runner/commit/dbc9cbb))
+
+### ❤️ Contributors
+
+- Pooya Parsa ([@pi0](https://github.com/pi0))
+
 ## v0.1.16
 
 [compare changes](https://github.com/unjs/env-runner/compare/v0.1.15...v0.1.16)
