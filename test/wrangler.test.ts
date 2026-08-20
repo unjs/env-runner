@@ -1,18 +1,18 @@
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { writeFileSync, mkdtempSync, rmSync } from "node:fs";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import * as miniflare from "miniflare";
+import * as wrangler from "wrangler";
 import { MiniflareEnvRunner } from "../src/runners/miniflare/runner.ts";
 import type { MiniflareEnvRunnerOptions } from "../src/runners/miniflare/runner.ts";
 import type { EnvRunner } from "../src/index.ts";
 
-// The runner class under test. The installed-path tests use the real `wrangler`
-// package. The fallback describe simulates wrangler not being installed: it
-// `vi.doMock`s the local `wrangler-import` indirection to throw, then re-imports
-// `runner.ts` after `vi.resetModules()` so the freshly-loaded module's
-// `loadWranglerConfig()` resolves onto the throwing mock and the runner falls
-// back to its built-in minimal reader.
-let Runner: typeof MiniflareEnvRunner = MiniflareEnvRunner;
+// `wranglerModule` is an explicit runner option, so the two paths need no
+// module mocking: the installed-path cases pass the real `wrangler` package,
+// the fallback cases pass `false` to skip it (an omitted option would fall
+// back to `import("wrangler")`, which resolves here) and exercise the
+// built-in minimal reader.
 
 const _dir = dirname(fileURLToPath(import.meta.url));
 
@@ -41,6 +41,10 @@ interface WranglerCase {
   files?: Record<string, string>;
   /** Extra runner options (e.g. `wrangler`, `wranglerEnv`, `miniflareOptions`). */
   options: (ctx: { tmpDir: string; entryPath: string }) => Partial<MiniflareEnvRunnerOptions>;
+  /** Pass the real `wrangler` package (full fidelity) instead of the minimal reader. */
+  withWrangler?: boolean;
+  /** Pass `wrangler` as a module specifier instead of an imported module. */
+  wranglerSpecifier?: string;
   /** Assert on the JSON the worker returned. */
   assert: (json: any) => void;
   /** Substrings expected among `console.warn` messages (fallback path only). */
@@ -75,9 +79,11 @@ async function runWranglerCase(c: WranglerCase): Promise<any> {
     writeFileSync(join(tmpDir, filename), contents);
   }
 
-  runner = new Runner({
+  runner = new MiniflareEnvRunner({
     name: c.name,
+    miniflare,
     data: { entry: entryPath },
+    wranglerModule: c.wranglerSpecifier ?? (c.withWrangler ? wrangler : false),
     ...c.options({ tmpDir, entryPath }),
   });
   await waitForReady(runner, WRANGLER_TEST_TIMEOUT);
@@ -101,6 +107,20 @@ const INSTALLED_CASES: WranglerCase[] = [
     },
     options: ({ tmpDir }) => ({ wrangler: join(tmpDir, "wrangler.jsonc") }),
     assert: (json) => expect(json).toEqual({ greeting: "from-wrangler", tier: "base" }),
+  },
+  {
+    name: "accepts a module specifier for `wranglerModule`",
+    wranglerSpecifier: "wrangler",
+    files: {
+      "wrangler.jsonc": `{
+        // only the real wrangler package can parse JSONC
+        "name": "test",
+        "compatibility_date": "2024-09-01",
+        "vars": { "GREETING": "from-specifier" },
+      }`,
+    },
+    options: ({ tmpDir }) => ({ wrangler: join(tmpDir, "wrangler.jsonc") }),
+    assert: (json) => expect(json.greeting).toBe("from-specifier"),
   },
   {
     name: "auto-discovers wrangler config next to the entry (wrangler: true)",
@@ -221,7 +241,7 @@ describe("MiniflareEnvRunner (wrangler config)", () => {
     it(
       c.name,
       async () => {
-        const json = await runWranglerCase(c);
+        const json = await runWranglerCase({ ...c, withWrangler: true });
         c.assert(json);
       },
       WRANGLER_TEST_TIMEOUT,
@@ -246,6 +266,7 @@ describe("MiniflareEnvRunner (wrangler config)", () => {
           // No `wranglerEnv` — it should fall back to CLOUDFLARE_ENV.
           options: () => ({ wrangler: true }),
           assert: (json) => expect(json.tier).toBe("prod"),
+          withWrangler: true,
         });
         expect(json.tier).toBe("prod");
       } finally {
@@ -270,7 +291,6 @@ const FALLBACK_CASES: WranglerCase[] = [
     },
     options: ({ tmpDir }) => ({ wrangler: join(tmpDir, "wrangler.json") }),
     assert: (json) => expect(json).toEqual({ greeting: "from-minimal", tier: "base" }),
-    warns: ["'wrangler' is not installed"],
   },
   {
     name: "skips a JSONC config (needs wrangler) and warns",
@@ -328,29 +348,6 @@ const FALLBACK_CASES: WranglerCase[] = [
 
 describe("MiniflareEnvRunner (wrangler config, fallback reader)", () => {
   let warn: ReturnType<typeof vi.spyOn>;
-
-  beforeAll(async () => {
-    // Simulate `wrangler` not being installed by mocking the local
-    // `wrangler-import` indirection to throw, then dropping the module cache and
-    // re-importing `runner.ts` so its `loadWranglerConfig()` re-resolves onto the
-    // throwing mock (and thus the built-in minimal reader). Mocking this local
-    // module (rather than the externalized `wrangler` package) is deterministic
-    // across environments — a `vi.doMock("wrangler")` on the dynamic import only
-    // intercepts reliably when the runner inlines, not externalizes, the package.
-    vi.doMock("../src/runners/miniflare/wrangler-import.ts", () => ({
-      importWrangler: () => {
-        throw new Error("Cannot find package 'wrangler'");
-      },
-    }));
-    vi.resetModules();
-    Runner = (await import("../src/runners/miniflare/runner.ts")).MiniflareEnvRunner;
-  });
-
-  afterAll(() => {
-    vi.doUnmock("../src/runners/miniflare/wrangler-import.ts");
-    vi.resetModules();
-    Runner = MiniflareEnvRunner;
-  });
 
   beforeEach(() => {
     warn = vi.spyOn(console, "warn").mockImplementation(() => {});

@@ -25,6 +25,7 @@ import { NodeProcessEnvRunner } from "../src/runners/node-process/runner.ts";
 import { BunProcessEnvRunner } from "../src/runners/bun-process/runner.ts";
 import { DenoProcessEnvRunner } from "../src/runners/deno-process/runner.ts";
 import { SelfEnvRunner } from "../src/runners/self/runner.ts";
+import * as miniflare from "miniflare";
 import { MiniflareEnvRunner } from "../src/runners/miniflare/runner.ts";
 import { VercelEnvRunner } from "../src/runners/vercel/runner.ts";
 import { NetlifyEnvRunner } from "../src/runners/netlify/runner.ts";
@@ -57,7 +58,7 @@ const runners = [
   },
   {
     name: "MiniflareEnvRunner",
-    create: (opts: any) => new MiniflareEnvRunner(opts),
+    create: (opts: any) => new MiniflareEnvRunner({ miniflare, ...opts }),
     skipWorkerEntry: true,
     extraOpts: {},
   },
@@ -555,7 +556,7 @@ const rpcRunners = [
   },
   {
     name: "MiniflareEnvRunner",
-    create: (opts: any) => new MiniflareEnvRunner(opts),
+    create: (opts: any) => new MiniflareEnvRunner({ miniflare, ...opts }),
   },
 ];
 

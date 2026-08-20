@@ -22,6 +22,14 @@ export interface EnvServerOptions {
   watch?: boolean;
   /** Additional paths to watch (directories or files). */
   watchPaths?: string[];
+  /**
+   * Extra runner-specific constructor options, spread into the runner.
+   *
+   * Runners that build on external packages take them as explicit options —
+   * e.g. `{ miniflare }` for the `miniflare` runner (env-runner never imports
+   * those packages itself).
+   */
+  runnerOptions?: Record<string, unknown>;
 }
 
 export class EnvServer extends RunnerManager {
@@ -100,6 +108,7 @@ export class EnvServer extends RunnerManager {
 
   protected override async _createRunner() {
     return loadRunner(this._opts.runner || "node-worker", {
+      ...this._opts.runnerOptions,
       name: this._opts.name || this._opts.entry,
       hooks: this._opts.hooks,
       data: { ...this._opts.data, entry: this._opts.entry },

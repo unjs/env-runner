@@ -8,6 +8,7 @@ import { NodeWorkerEnvRunner } from "../src/runners/node-worker/runner.ts";
 import { NodeProcessEnvRunner } from "../src/runners/node-process/runner.ts";
 import { BunProcessEnvRunner } from "../src/runners/bun-process/runner.ts";
 import { DenoProcessEnvRunner } from "../src/runners/deno-process/runner.ts";
+import * as miniflare from "miniflare";
 import { MiniflareEnvRunner } from "../src/runners/miniflare/runner.ts";
 
 function hasRuntime(cmd: string): boolean {
@@ -65,7 +66,7 @@ const runners = [
   // (workerd), with `.ts`/`.mts` sources type-stripped on the host.
   {
     name: "MiniflareEnvRunner",
-    create: (opts: any) => new MiniflareEnvRunner(opts),
+    create: (opts: any) => new MiniflareEnvRunner({ miniflare, ...opts }),
     miniflare: true,
   },
 ];
@@ -435,6 +436,7 @@ describe("MiniflareEnvRunner virtual module invalidation", () => {
   it("does not rewrite string literals that merely mention an invalidated key", async () => {
     let counter = 0;
     const runner = new MiniflareEnvRunner({
+      miniflare,
       name: "virtual-invalidate-literal",
       data: {
         entry: "#entry",
@@ -471,9 +473,19 @@ describe("MiniflareEnvRunner virtual module invalidation", () => {
     };
     // Mirror a RunnerManager swap: the new runner attaches to the cached
     // instance first, then the old one closes (refCount stays > 0).
-    const first = new MiniflareEnvRunner({ name: "virtual-persistent", persistent: true, data });
+    const first = new MiniflareEnvRunner({
+      miniflare,
+      name: "virtual-persistent",
+      persistent: true,
+      data,
+    });
     await first.waitForReady();
-    const second = new MiniflareEnvRunner({ name: "virtual-persistent", persistent: true, data });
+    const second = new MiniflareEnvRunner({
+      miniflare,
+      name: "virtual-persistent",
+      persistent: true,
+      data,
+    });
     try {
       await second.waitForReady();
       await first.close();
@@ -498,6 +510,7 @@ describe("MiniflareEnvRunner virtual module limitations", () => {
   it("fails fast for named exports with a virtual entry", async () => {
     let closeCause: unknown;
     const runner = new MiniflareEnvRunner({
+      miniflare,
       name: "virtual-do",
       exports: { Counter: {} },
       hooks: {

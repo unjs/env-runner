@@ -13,6 +13,7 @@ src/
 ├── common/
 │   ├── base-runner.ts       # BaseEnvRunner abstract class
 │   ├── worker-utils.ts      # AppEntry interface, resolveEntry(), parseServerAddress()
+│   ├── runtime-deps.ts     # resolveRuntimeDep()/resolveRuntimeDepSpecifier() — shared "module | specifier | false" resolver for runtime deps
 │   ├── ws-proxy.ts          # createRunnerWSProxyPlugin() — runtime-native WS upgrade proxy (Node raw socket / Bun+Deno crossws bridge)
 │   └── virtual-modules.ts   # registerVirtualModules() — registerHooks()/Bun.plugin wiring shared by node/bun/deno workers
 ├── runners/
@@ -32,8 +33,7 @@ src/
 │   │   └── runner.ts        # SelfEnvRunner (in-process, no worker)
 │   ├── miniflare/
 │   │   ├── runner.ts          # MiniflareEnvRunner (Cloudflare Workers via miniflare)
-│   │   ├── wrangler.ts        # loadWranglerConfig() — wrangler.{json,jsonc,toml} → Miniflare options
-│   │   └── wrangler-import.ts # importWrangler() — mockable indirection for the optional wrangler dep
+│   │   └── wrangler.ts        # loadWranglerConfig() — wrangler.{json,jsonc,toml} → Miniflare options
 │   ├── vercel/
 │   │   ├── runner.ts        # VercelEnvRunner (extends NodeWorkerEnvRunner)
 │   │   ├── worker.ts        # Sets Vercel request context symbol, delegates to node-worker
@@ -137,7 +137,7 @@ const runner2 = new NodeProcessEnvRunner({
 
 ## Exports
 
-- `env-runner` (`.`) — Types + all runners + `RunnerManager` + `AppEntry`
+- `env-runner` (`.`) — Types + all runners + `RunnerManager` + `AppEntry` + `resolveRuntimeDep`/`RuntimeDep`
 - `env-runner/runners/node-worker` (`./runners/node-worker`) — Direct import of `NodeWorkerEnvRunner`
 - `env-runner/runners/node-worker/worker` (`./runners/node-worker/worker`) — Built-in srvx worker for Worker threads
 - `env-runner/runners/node-process` (`./runners/node-process`) — Direct import of `NodeProcessEnvRunner`
@@ -179,10 +179,13 @@ Generic test infrastructure, cross-runner suites (`runners.test.ts`, `manager.te
 - `crossws` — Cross-platform WebSocket hooks (used by built-in workers for `websocket` entry key)
 - `httpxy` — HTTP/WebSocket proxy
 - `srvx` — Universal server framework (used by built-in workers)
-- `miniflare` — Cloudflare Workers simulator (optional peer dependency, required for `MiniflareEnvRunner`)
+- `miniflare` — Cloudflare Workers simulator (**not a dependency**; the app installs it and passes the imported module _or a specifier_ as `MiniflareEnvRunner`'s `miniflare` option — omitting it falls back to an optional import, and only failing both throws)
 - `cjs-module-lexer` / `es-module-lexer` — CJS named-export detection and ESM import-specifier parsing in the miniflare module fallback service (devDependencies inlined into `dist` by obuild)
-- `@netlify/runtime` — Netlify compute runtime (optional peer dependency, used by `NetlifyEnvRunner` worker for full `globalThis.Netlify` + `globalThis.caches` setup)
-- `wrangler` — Cloudflare Wrangler (optional peer dependency, used by `MiniflareEnvRunner`'s `wrangler` option to load a `wrangler.{json,jsonc,toml}` config via `unstable_readConfig` + `unstable_getMiniflareWorkerOptions`; a built-in minimal plain-JSON reader is used when it's absent)
+- `@netlify/runtime` — Netlify compute runtime (**not a dependency**; the app installs it and passes a _specifier_ via `NetlifyEnvRunner`'s `netlifyRuntime` option — an imported module cannot cross the worker boundary — which the worker imports for full `globalThis.Netlify` + `globalThis.caches` setup; with no specifier the worker imports `@netlify/runtime` optionally and falls back to a shim)
+- `@vercel/queue` — Vercel Queues SDK (**not a dependency**; the caller passes the imported module _or a specifier_ as `registerVercelQueueConsumer`'s `sdk` option — omitting it falls back to a memoized optional import, and registration no-ops with a one-time warning if that fails)
+- `wrangler` — Cloudflare Wrangler (**not a dependency**; passed as the imported module _or a specifier_ via `MiniflareEnvRunner`'s optional `wranglerModule` option to load a `wrangler.{json,jsonc,toml}` config via `unstable_readConfig` + `unstable_getMiniflareWorkerOptions`, else imported optionally; a built-in minimal plain-JSON reader is used when it's absent, and `wranglerModule: false` forces it)
+
+> **No peer dependencies.** `package.json` declares none. Every runner takes the packages it needs as an explicit constructor option, resolved through the shared `resolveRuntimeDep()` helper in `src/common/runtime-deps.ts`: each option accepts the **imported module**, a **specifier** (string/`URL`, resolved from cwd via `exsolve` so bare names hit the app's `node_modules`), or `false` to opt out, and falls back to an optional import of the package name — throwing (`miniflare`, via `required: true`) or degrading (wrangler → minimal reader, netlify → shim, queue → warn-once no-op) only when nothing works. `netlifyRuntime` is the exception: its package must be imported _inside_ the worker, so `resolveRuntimeDepSpecifier()` narrows it to a specifier (or `false`) and rejects a module instance with an actionable error. `build.config.mjs` marks `miniflare`, `wrangler`, `@netlify/runtime`, and `@vercel/queue` external (obuild externalizes `dependencies` + `peerDependencies`, so without peer deps this list is required).
 
 ## Reference docs (`.agents/`)
 
@@ -209,4 +212,5 @@ Runner-specific and deep-dive notes, split out of this file:
 - **Stdio forwarding** — All runners forward entry stdout/stderr to the host process: node-process and bun-process pipe child streams to `process.stdout`/`process.stderr`, deno-process forwards non-IPC stdout lines (stdout doubles as NDJSON IPC) and pipes stderr, worker threads use Node.js's built-in forwarding, miniflare uses its default runtime stdio handler
 - **Socket cleanup** — `_closeSocket()` avoids deleting Windows named pipes and abstract sockets
 - **Custom inspect** — `[Symbol.for('nodejs.util.inspect.custom')]()` shows pending/ready/closed status
+- **Explicit external dependencies with an optional-import fallback** — All runtime-dep options go through `resolveRuntimeDep()` (`src/common/runtime-deps.ts`) and share one contract: imported module | specifier | `false` | omitted. Host-side deps (`miniflare`, `wranglerModule`, `registerVercelQueueConsumer`'s `sdk`) resolve to a module; worker-side deps that cannot receive a live instance across the boundary (`netlifyRuntime`) go through `resolveRuntimeDepSpecifier()` on the host and `resolveRuntimeDep()` again inside the worker. When an option is omitted, an optional import of the package name is tried and only errors (miniflare) or degrades (wrangler → minimal reader, netlify → shim, queue → warn-once no-op) if that fails too. `false` explicitly opts out. `EnvServer`'s `runnerOptions` and `loadRunner`'s untyped passthrough carry these options to the runner constructor
 - **Adding a new runner** — Create `src/runners/<name>/runner.ts` extending `BaseEnvRunner`, optionally add `worker.ts`, add export path in `package.json`, add to `loaders` map in `src/loader.ts`, re-export from `src/index.ts`

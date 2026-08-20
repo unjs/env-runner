@@ -41,6 +41,8 @@ npx env-runner app.ts
 | `--host <host>`   | Host to bind to                                                                                   | `localhost`    |
 | `-w, --watch`     | Watch entry file for changes and auto-reload                                                      |                |
 
+`--runner miniflare` needs `miniflare` installed in your project — the runner imports it optionally when no module is passed.
+
 ### Server (`EnvServer`)
 
 High-level API that combines runner loading, file watching, and auto-reload:
@@ -54,6 +56,8 @@ const envServer = new EnvServer({
   entry: "./app.ts",
   watch: true,
   watchPaths: ["./src"],
+  // Runner-specific constructor options, e.g. `{ miniflare }` for `runner: "miniflare"`
+  runnerOptions: {},
 });
 
 envServer.onReady((_runner, address) => {
@@ -156,6 +160,29 @@ import { MiniflareEnvRunner } from "env-runner/runners/miniflare";
 import { VercelEnvRunner } from "env-runner/runners/vercel";
 import { NetlifyEnvRunner } from "env-runner/runners/netlify";
 ```
+
+#### Runtime dependencies
+
+`env-runner` declares **no peer dependencies**. Runners that build on external packages take them as explicit options instead, and every such option accepts the **same three shapes**:
+
+| Value                                                                       | Meaning                                                                                                     |
+| --------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| the imported module (`import * as miniflare from "miniflare"`)              | the version you installed is the version that runs                                                          |
+| a specifier — `"miniflare"`, `import.meta.resolve("miniflare")`, or a `URL` | resolved from the current working directory, so bare specifiers hit your `node_modules`, not `env-runner`'s |
+| `false`                                                                     | opt out of the package entirely                                                                             |
+
+Omitting the option falls back to an optional dynamic import of the package; only then does the runner error (`miniflare`) or degrade (minimal wrangler reader, Netlify shim, queue no-op).
+
+| Runner      | Package            | Option                                   | Without it                            |
+| ----------- | ------------------ | ---------------------------------------- | ------------------------------------- |
+| `miniflare` | `miniflare`        | `miniflare`                              | throws — the runner cannot run        |
+| `miniflare` | `wrangler`         | `wranglerModule`                         | built-in minimal JSON reader          |
+| `vercel`    | `@vercel/queue`    | `sdk` (on `registerVercelQueueConsumer`) | warn-once no-op                       |
+| `netlify`   | `@netlify/runtime` | `netlifyRuntime`                         | lightweight `globalThis.Netlify` shim |
+
+`netlifyRuntime` is the one exception to the table above: the runtime has to start **inside** the worker thread, where a live module instance cannot be handed over, so it accepts a specifier (or `false`) only.
+
+The shared resolver is exported as `resolveRuntimeDep()` (type `RuntimeDep<T>`) if you build runners of your own.
 
 All runners implement the [`EnvRunner`](./src/types.ts) interface:
 
@@ -315,16 +342,20 @@ On `MiniflareEnvRunner` there is no in-worker registration: the runner's module 
 
 #### Miniflare Runner
 
-Run your app in the Cloudflare Workers runtime using [miniflare](https://github.com/cloudflare/workers-sdk/tree/main/packages/miniflare):
+Run your app in the Cloudflare Workers runtime using [miniflare](https://github.com/cloudflare/workers-sdk/tree/main/packages/miniflare).
+
+`env-runner` declares no peer dependencies — install `miniflare` yourself and pass it to the runner (see [Runtime dependencies](#runtime-dependencies)):
 
 ```bash
 npm install miniflare
 ```
 
 ```ts
+import * as miniflare from "miniflare";
 import { MiniflareEnvRunner } from "env-runner/runners/miniflare";
 
 await using runner = new MiniflareEnvRunner({
+  miniflare,
   name: "my-worker",
   data: { entry: "./worker.ts" },
   miniflareOptions: {
@@ -336,7 +367,7 @@ await using runner = new MiniflareEnvRunner({
 const response = await runner.fetch("http://localhost/api");
 ```
 
-The `miniflareOptions` object is passed directly to the [Miniflare constructor](https://developers.cloudflare.com/workers/testing/miniflare/) — you can configure bindings, KV, D1, Durable Objects, and any other Miniflare option.
+Passing `miniflare` explicitly is preferred — the version you install is then the version that runs. A specifier works too (`miniflare: "miniflare"`). If you omit it, the runner imports `miniflare` itself and only fails (with an actionable error) when the package isn't installed either. The `miniflareOptions` object is passed directly to the [Miniflare constructor](https://developers.cloudflare.com/workers/testing/miniflare/) — you can configure bindings, KV, D1, Durable Objects, and any other Miniflare option.
 
 When you don't set a `compatibilityDate` (via `miniflareOptions` or a wrangler config), it defaults to the date supported by the installed `workerd` binary rather than today's date — the binary always lags the calendar slightly, and pinning a future date makes `workerd` refuse to start.
 
@@ -348,6 +379,7 @@ Set the `wrangler` option to load a Cloudflare [Wrangler config](https://develop
 import { MiniflareEnvRunner } from "env-runner/runners/miniflare";
 
 await using runner = new MiniflareEnvRunner({
+  miniflare,
   name: "my-worker",
   data: { entry: "./worker.ts" },
   wrangler: true, // auto-discover wrangler.{json,jsonc,toml} next to the entry, then cwd
@@ -362,6 +394,7 @@ You can also pass an **inline** config object (raw `wrangler.json` shape) instea
 
 ```ts
 await using runner = new MiniflareEnvRunner({
+  miniflare,
   name: "my-worker",
   data: { entry: "./worker.ts" },
   wrangler: {
@@ -375,7 +408,22 @@ await using runner = new MiniflareEnvRunner({
 
 When an inline config is passed, a `wrangler.{json,jsonc,toml}` file is still auto-discovered (next to the entry, then cwd) and loaded, and the inline config is **merged on top of it** — inline values win per key, binding records (e.g. `vars`) merge, and `compatibilityFlags` are unioned. This lets you keep a committed `wrangler` file and override a few fields programmatically.
 
-When the [`wrangler`](https://www.npmjs.com/package/wrangler) package is installed (an optional peer dependency), it is used for full fidelity — TOML, `env` inheritance, `.dev.vars`, and every binding type. When `wrangler` is **not** installed, a built-in minimal reader handles plain JSON files and inline objects (common fields only) and logs a one-time warning; JSONC and TOML files are skipped with a warning (they need `wrangler` to parse). Values you pass in `miniflareOptions` always take precedence over config-derived ones — binding records (e.g. `bindings`) merge per key, and `compatibilityFlags` are merged.
+Pass the [`wrangler`](https://www.npmjs.com/package/wrangler) package as `wranglerModule` — the imported module or a specifier — for full fidelity: TOML, `env` inheritance, `.dev.vars`, and every binding type.
+
+```ts
+import * as miniflare from "miniflare";
+import * as wrangler from "wrangler";
+
+await using runner = new MiniflareEnvRunner({
+  miniflare,
+  wranglerModule: wrangler,
+  name: "my-worker",
+  data: { entry: "./worker.ts" },
+  wrangler: true,
+});
+```
+
+Without `wranglerModule`, `wrangler` is imported optionally; if that fails too, a built-in minimal reader handles plain JSON files and inline objects (common fields only) and JSONC/TOML files are skipped with a warning (they need `wrangler` to parse). Pass `wranglerModule: false` to always use the minimal reader. Values you pass in `miniflareOptions` always take precedence over config-derived ones — binding records (e.g. `bindings`) merge per key, and `compatibilityFlags` are merged.
 
 #### Module Transform Pipeline
 
@@ -385,6 +433,7 @@ Pass a `transformRequest` callback to route module resolution through Vite's (or
 import { MiniflareEnvRunner } from "env-runner/runners/miniflare";
 
 await using runner = new MiniflareEnvRunner({
+  miniflare,
   name: "my-worker",
   data: { entry: "./worker.ts" },
   // Route module resolution through Vite's transform pipeline
@@ -424,6 +473,7 @@ To explicitly declare exports or override auto-detection:
 
 ```ts
 await using runner = new MiniflareEnvRunner({
+  miniflare,
   name: "my-worker",
   data: { entry: "./worker.ts" },
   // Explicit exports (merged with auto-detected ones)
@@ -453,6 +503,7 @@ By default, `close()` disposes the Miniflare instance. With `persistent: true`, 
 
 ```ts
 const runner1 = new MiniflareEnvRunner({
+  miniflare,
   name: "my-worker",
   data: { entry: "./worker.ts" },
   persistent: true,
@@ -463,6 +514,7 @@ const runner1 = new MiniflareEnvRunner({
 await runner1.close();
 
 const runner2 = new MiniflareEnvRunner({
+  miniflare,
   name: "my-worker",
   data: { entry: "./worker.ts" },
   persistent: true,
@@ -484,6 +536,25 @@ await using runner = new VercelEnvRunner({
 });
 ```
 
+#### Vercel Queues (local delivery)
+
+Framework integrations running inside the vercel runner can bind a topic to a handler for local delivery. Pass [`@vercel/queue`](https://www.npmjs.com/package/@vercel/queue) as `sdk` — the imported module or a specifier (omit it and the SDK is imported optionally; if it isn't installed, registration warns once and becomes a no-op so dev startup is never blocked):
+
+```ts
+import * as sdk from "@vercel/queue";
+import { registerVercelQueueConsumer } from "env-runner/runners/vercel/queue-dev";
+
+const unregister = await registerVercelQueueConsumer({
+  sdk,
+  topic: "orders",
+  handler: (message, metadata) => dispatch(message, metadata),
+  consumerGroup: "my-framework", // re-registering the same group replaces the handler (HMR-safe)
+  retryAfterSeconds: 5, // or `retry: (error, metadata) => ({ acknowledge: true })`
+});
+```
+
+One `QueueClient` is constructed per SDK instance and shared across registrations.
+
 #### Netlify Runner
 
 Simulates a Netlify deployment environment with automatic header injection (`x-nf-client-connection-ip`, `x-nf-account-id`, `x-nf-site-id`, `x-nf-deploy-id`, `x-nf-deploy-context`, `x-nf-geo`, `x-nf-request-id`, forwarding headers) and `globalThis.Netlify` setup:
@@ -496,6 +567,18 @@ await using runner = new NetlifyEnvRunner({
   data: { entry: "./app.ts" },
 });
 ```
+
+For the full compute runtime — `globalThis.Netlify` with context plus `globalThis.caches` — install [`@netlify/runtime`](https://www.npmjs.com/package/@netlify/runtime) and point the runner at it with `netlifyRuntime`:
+
+```ts
+await using runner = new NetlifyEnvRunner({
+  name: "my-app",
+  netlifyRuntime: import.meta.resolve("@netlify/runtime"),
+  data: { entry: "./app.ts" },
+});
+```
+
+The runtime has to start inside the worker thread, so this is the one runtime-dependency option that takes a module _specifier_ rather than an imported instance — a live module cannot cross that boundary. A bare specifier (`"@netlify/runtime"`) is resolved from the current working directory. If it cannot be imported, the runner warns and falls back to the shim, and `netlifyRuntime: false` forces the shim outright.
 
 ### Vite Environment API
 
@@ -536,6 +619,7 @@ import { MiniflareEnvRunner } from "env-runner/runners/miniflare";
 import { createViteHotChannel } from "env-runner/vite";
 
 const runner = new MiniflareEnvRunner({
+  miniflare,
   name: "worker",
   data: { entry: "./src/worker.ts" },
   transformRequest: (id) => devEnvironment.transformRequest(id),

@@ -11,6 +11,8 @@ import { proxyUpgrade } from "httpxy";
 import { BaseEnvRunner } from "../../common/base-runner.ts";
 import type { EnvRunnerData } from "../../common/base-runner.ts";
 import { isVirtualSpecifier } from "../../common/worker-utils.ts";
+import { resolveRuntimeDep } from "../../common/runtime-deps.ts";
+import type { RuntimeDep } from "../../common/runtime-deps.ts";
 import {
   expandVirtualInvalidation,
   stripVirtualTypeScript,
@@ -18,9 +20,9 @@ import {
 } from "../../virtual-loader.ts";
 import { generateWrapper, IPC_BINDING } from "./wrapper.ts";
 import { isPlainObject, loadWranglerConfig } from "./wrangler.ts";
-import type { WranglerInlineConfig } from "./wrangler.ts";
+import type { WranglerInlineConfig, WranglerModule } from "./wrangler.ts";
 
-export type { WranglerInlineConfig } from "./wrangler.ts";
+export type { WranglerInlineConfig, WranglerModule } from "./wrangler.ts";
 import type { IncomingMessage } from "node:http";
 import type { Socket } from "node:net";
 
@@ -36,10 +38,46 @@ export interface MiniflareExportInfo {
   type?: "DurableObject" | "WorkerEntrypoint" | "class";
 }
 
+/**
+ * The `miniflare` package, as imported by the consumer.
+ *
+ * `miniflare` is not a dependency of `env-runner` — pass the module namespace
+ * (`import * as miniflare from "miniflare"`) so the dependency stays owned by
+ * the application. The runner only falls back to importing it itself when this
+ * is omitted.
+ */
+export interface MiniflareModule {
+  Miniflare: new (options: any) => any;
+  /**
+   * Newest compatibility date supported by the installed `workerd` binary,
+   * clamped to today. Used as the default `compatibilityDate`.
+   */
+  supportedCompatibilityDate?: string;
+  [key: string]: unknown;
+}
+
 export interface MiniflareEnvRunnerOptions {
   name: string;
   hooks?: WorkerHooks;
   data?: EnvRunnerData;
+  /**
+   * The `miniflare` package: the imported module, or a specifier for it.
+   *
+   * ```ts
+   * import * as miniflare from "miniflare";
+   * new MiniflareEnvRunner({ name: "app", miniflare, data: { entry } });
+   *
+   * // or, equivalently
+   * new MiniflareEnvRunner({ name: "app", miniflare: "miniflare", data: { entry } });
+   * ```
+   *
+   * Passing it explicitly is preferred (`miniflare` is not a dependency of
+   * `env-runner`, so the version you install is the version that runs). Bare
+   * specifiers resolve from the current working directory. When omitted, the
+   * runner falls back to importing `miniflare` itself and only fails if that
+   * is unavailable too.
+   */
+  miniflare?: RuntimeDep<MiniflareModule>;
   /** Options passed directly to the Miniflare constructor. */
   miniflareOptions?: Record<string, unknown>;
   /**
@@ -92,12 +130,12 @@ export interface MiniflareEnvRunnerOptions {
    *   merged on top of it (inline wins per key, binding records merge,
    *   `compatibilityFlags` are unioned).
    *
-   * The installed `wrangler` package is preferred (full fidelity: TOML,
+   * The `wrangler` package is used for full fidelity when available (TOML,
    * `env` inheritance, `.dev.vars`, every binding type; an inline config is
-   * normalized through a short-lived temp file). When `wrangler` is not
-   * installed, a built-in minimal reader handles plain JSON files and inline
-   * objects (common fields only) and a one-time warning is logged. JSONC and
-   * TOML files without `wrangler` are skipped with a warning. Values from
+   * normalized through a short-lived temp file) — passed explicitly as
+   * `wranglerModule`, or imported optionally. Otherwise a built-in minimal
+   * reader handles plain JSON files and inline objects (common fields only);
+   * JSONC and TOML files are skipped with a warning. Values from
    * `miniflareOptions` always win over config-derived ones; binding records
    * (e.g. `bindings`) merge per key and `compatibilityFlags` are unioned.
    */
@@ -107,6 +145,16 @@ export interface MiniflareEnvRunnerOptions {
    * Defaults to the `CLOUDFLARE_ENV` environment variable.
    */
   wranglerEnv?: string;
+  /**
+   * The imported `wrangler` package (`import * as wrangler from "wrangler"`),
+   * used to parse the {@link MiniflareEnvRunnerOptions.wrangler} config with
+   * full fidelity. When omitted, `import("wrangler")` is tried, and a built-in
+   * minimal reader (plain JSON configs and inline objects) handles the rest.
+   *
+   * Pass `false` to skip the `wrangler` package entirely and always use the
+   * built-in minimal reader.
+   */
+  wranglerModule?: RuntimeDep<WranglerModule>;
 }
 
 const IPC_PATH = "/__env_runner_ipc";
@@ -140,9 +188,12 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
   #exportConditions: string[];
   #wrangler: boolean | string | WranglerInlineConfig;
   #wranglerEnv?: string;
+  #wranglerModule?: RuntimeDep<WranglerModule>;
+  #miniflareModule?: RuntimeDep<MiniflareModule>;
 
   constructor(opts: MiniflareEnvRunnerOptions) {
     super({ ...opts, workerEntry: "" });
+    this.#miniflareModule = opts.miniflare;
     this.#miniflareOptions = opts.miniflareOptions || {};
     this.#transformRequest = opts.transformRequest;
     this.#persistent = opts.persistent ?? false;
@@ -152,6 +203,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
     this.#wrangler = opts.wrangler ?? false;
     // Default the wrangler `--env` to the `CLOUDFLARE_ENV` variable.
     this.#wranglerEnv = opts.wranglerEnv ?? process.env.CLOUDFLARE_ENV;
+    this.#wranglerModule = opts.wranglerModule;
     this._initWithVirtualData(() => this.#init());
   }
 
@@ -325,6 +377,23 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
 
   // #region Private methods
 
+  /**
+   * The `miniflare` package to run with: the explicitly passed module when
+   * given, otherwise `import("miniflare")`. Throws only when neither is
+   * available (or the passed module isn't miniflare).
+   */
+  async #resolveMiniflare(): Promise<MiniflareModule> {
+    this.#miniflareModule = (await resolveRuntimeDep<MiniflareModule>({
+      name: "miniflare",
+      option: "miniflare",
+      value: this.#miniflareModule,
+      expect: "Miniflare",
+      required: true,
+      hint: 'MiniflareEnvRunner cannot run without it (`import * as miniflare from "miniflare"`).',
+    }))!;
+    return this.#miniflareModule as MiniflareModule;
+  }
+
   #init() {
     this.#initAsync().catch((error) => {
       console.error("Miniflare runner init error:", error);
@@ -388,7 +457,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
   }
 
   async #initAsync() {
-    const { Miniflare, supportedCompatibilityDate } = await import("miniflare");
+    const { Miniflare, supportedCompatibilityDate } = await this.#resolveMiniflare();
 
     const entryPath = this._data?.entry as string | undefined;
     const virtual = await this.#prepareVirtualModules();
@@ -396,7 +465,12 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
 
     // Optional wrangler config → Miniflare options (compat date/flags +
     // bindings). User-provided `miniflareOptions` win; flags are merged.
-    const wranglerOptions = await loadWranglerConfig(this.#wrangler, this.#wranglerEnv, entryPath);
+    const wranglerOptions = await loadWranglerConfig(
+      this.#wrangler,
+      this.#wranglerEnv,
+      entryPath,
+      this.#wranglerModule,
+    );
 
     const userFlags = (this.#miniflareOptions.compatibilityFlags as string[]) || [];
     const wranglerFlags = (wranglerOptions?.compatibilityFlags as string[]) || [];

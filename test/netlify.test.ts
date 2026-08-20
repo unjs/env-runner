@@ -1,14 +1,24 @@
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { resolve, dirname } from "node:path";
-import { describe, expect, it, afterEach } from "vitest";
+import { describe, expect, it, afterAll, afterEach, beforeAll, vi } from "vitest";
 import { NetlifyEnvRunner } from "../src/runners/netlify/runner.ts";
 
 const _dir = dirname(fileURLToPath(import.meta.url));
 const headersEntry = resolve(_dir, "./fixtures/app-headers.mjs");
 const appEntry = resolve(_dir, "./fixtures/app.mjs");
+const netlifyEntry = resolve(_dir, "./fixtures/app-netlify.mjs");
+const runtimeStub = resolve(_dir, "./fixtures/netlify-runtime-stub.mjs");
 
 describe("NetlifyEnvRunner", () => {
   let runner: NetlifyEnvRunner | undefined;
+
+  beforeAll(() => {
+    vi.stubEnv("ENV_RUNNER_NETLIFY_TEST", "from-host");
+  });
+
+  afterAll(() => {
+    vi.unstubAllEnvs();
+  });
 
   afterEach(async () => {
     await runner?.close();
@@ -143,5 +153,69 @@ describe("NetlifyEnvRunner", () => {
     expect(headers["x-nf-client-connection-ip"]).toBe("10.0.0.1");
     expect(headers["x-nf-site-id"]).toBe("my-site");
     expect(headers["x-nf-deploy-context"]).toBe("production");
+  });
+
+  it("installs a lightweight Netlify shim with `netlifyRuntime: false`", async () => {
+    runner = new NetlifyEnvRunner({
+      name: "test-shim",
+      netlifyRuntime: false,
+      data: { entry: netlifyEntry },
+    });
+    await runner.waitForReady();
+    const globals = await (await runner.fetch("http://localhost/")).json();
+    expect(globals.hasNetlify).toBe(true);
+    expect(globals.envGet).toBe("function");
+    expect(globals.startedRuntime).toBe(null);
+  });
+
+  it("starts the runtime from the `netlifyRuntime` specifier", async () => {
+    runner = new NetlifyEnvRunner({
+      name: "test-runtime",
+      netlifyRuntime: pathToFileURL(runtimeStub).href,
+      data: { entry: netlifyEntry },
+    });
+    await runner.waitForReady();
+    const globals = await (await runner.fetch("http://localhost/")).json();
+    expect(globals.startedRuntime).toEqual({
+      deployID: "0",
+      siteID: "0",
+      hasGetRequestContext: true,
+      hasCacheContext: true,
+    });
+    // The env accessor handed to the runtime reads the worker's process env.
+    expect(globals.envReadsProcessEnv).toBe("from-host");
+  });
+
+  it("imports `@netlify/runtime` optionally when no specifier is given", async () => {
+    runner = new NetlifyEnvRunner({ name: "test-optional", data: { entry: netlifyEntry } });
+    await runner.waitForReady();
+    const globals = await (await runner.fetch("http://localhost/")).json();
+    expect(globals.hasNetlify).toBe(true);
+    expect(globals.envGet).toBe("function");
+  });
+
+  it("resolves a bare `netlifyRuntime` specifier from the cwd", async () => {
+    runner = new NetlifyEnvRunner({
+      name: "test-runtime-bare",
+      netlifyRuntime: "@netlify/runtime",
+      data: { entry: netlifyEntry },
+    });
+    await runner.waitForReady();
+    const globals = await (await runner.fetch("http://localhost/")).json();
+    expect(globals.hasNetlify).toBe(true);
+    expect(globals.envGet).toBe("function");
+  });
+
+  // The worker warns on its own (forwarded) stderr before installing the shim.
+  it("falls back to the shim when the runtime specifier cannot be imported", async () => {
+    runner = new NetlifyEnvRunner({
+      name: "test-runtime-missing",
+      netlifyRuntime: "@netlify/definitely-not-installed",
+      data: { entry: netlifyEntry },
+    });
+    await runner.waitForReady();
+    const globals = await (await runner.fetch("http://localhost/")).json();
+    expect(globals.hasNetlify).toBe(true);
+    expect(globals.startedRuntime).toBe(null);
   });
 });

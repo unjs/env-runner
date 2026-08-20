@@ -1,14 +1,25 @@
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
+import { resolveRuntimeDep } from "../../common/runtime-deps.ts";
+import type { RuntimeDep } from "../../common/runtime-deps.ts";
 
-import { importWrangler } from "./wrangler-import.ts";
+/**
+ * The `wrangler` package, as imported by the consumer.
+ *
+ * `wrangler` is not a dependency of `env-runner` — pass the module namespace
+ * (`import * as wrangler from "wrangler"`) or a specifier for it, so the
+ * dependency stays owned by the application. It is only imported here as a
+ * fallback when neither is passed.
+ */
+export interface WranglerModule {
+  unstable_readConfig?: (...args: any[]) => any;
+  unstable_getMiniflareWorkerOptions?: (...args: any[]) => any;
+  [key: string]: unknown;
+}
 
 /** Raw (snake_case) Wrangler config object, mirroring `wrangler.json` contents. */
 export type WranglerInlineConfig = Record<string, unknown>;
-
-// One-time warning when `wrangler` is requested but not installed.
-let _warnedNoWrangler = false;
 
 const WRANGLER_CONFIG_FILENAMES = ["wrangler.json", "wrangler.jsonc", "wrangler.toml"];
 
@@ -47,15 +58,20 @@ function isInlineWranglerConfig(opt: unknown): opt is WranglerInlineConfig {
  * (`true`), or an inline raw config object. When an inline config is passed,
  * a config file is still auto-discovered (next to the entry, then cwd) and
  * loaded — the inline config is merged on top of it (inline wins per key,
- * binding records merge, `compatibilityFlags` are unioned). Prefers the
- * installed `wrangler` package; falls back to a built-in minimal JSON reader
- * (with a one-time warning) when it isn't available. Returns `undefined`
- * when `wrangler` is disabled or no config could be loaded.
+ * binding records merge, `compatibilityFlags` are unioned).
+ *
+ * When `wranglerModule` (the imported `wrangler` package or a specifier for
+ * it) is supplied it is used for full fidelity; otherwise `wrangler` is
+ * imported optionally, and a built-in minimal JSON reader handles plain JSON
+ * files and inline objects if that fails. Pass `false` to force the minimal
+ * reader. Returns `undefined` when `wrangler` is disabled or no config could
+ * be loaded.
  */
 export async function loadWranglerConfig(
   opt: boolean | string | WranglerInlineConfig,
   env: string | undefined,
   entryPath?: string,
+  wranglerModule?: RuntimeDep<WranglerModule>,
 ): Promise<Record<string, unknown> | undefined> {
   if (!opt) {
     return undefined;
@@ -84,21 +100,16 @@ export async function loadWranglerConfig(
     configPath = findWranglerConfig(entryPath);
   }
 
-  // Prefer the real `wrangler` package for full fidelity (TOML, env
-  // inheritance, .dev.vars, every binding type). An inline config is
-  // normalized through a short-lived temp file (readConfig is file-based).
-  let wrangler: any;
-  try {
-    wrangler = await importWrangler();
-  } catch {
-    if (!_warnedNoWrangler) {
-      _warnedNoWrangler = true;
-      console.warn(
-        "[env-runner] 'wrangler' is not installed; using the built-in minimal config reader " +
-          "(plain JSON, common fields only). Install 'wrangler' for full fidelity " +
-          "(JSONC, TOML, env inheritance, all binding types).",
-      );
-    }
+  // Use the `wrangler` package for full fidelity (TOML, env inheritance,
+  // .dev.vars, every binding type) — the caller-provided module when given,
+  // otherwise an optional import. An inline config is normalized through a
+  // short-lived temp file (readConfig is file-based).
+  const wrangler = await resolveRuntimeDep<WranglerModule>({
+    name: "wrangler",
+    option: "wranglerModule",
+    value: wranglerModule,
+  });
+  if (!wrangler?.unstable_readConfig || !wrangler.unstable_getMiniflareWorkerOptions) {
     const fileOptions = configPath ? readWranglerConfigMinimal(configPath, env) : undefined;
     const inlineOptions = inline
       ? mapWranglerConfigToMiniflare(applyWranglerEnv(inline, env))

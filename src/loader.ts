@@ -17,7 +17,11 @@ export interface LoadRunnerOptions {
   hooks?: WorkerHooks;
   data?: EnvRunnerData;
   execArgv?: string[];
-  /** Additional runner-specific options (passed through to the runner constructor). */
+  /**
+   * Additional runner-specific options (passed through to the runner
+   * constructor) — e.g. `miniflare` (the imported `miniflare` package) for the
+   * `miniflare` runner, which this package never imports itself.
+   */
   [key: string]: unknown;
 }
 
@@ -31,7 +35,12 @@ const loaders: Record<RunnerName, () => Promise<RunnerConstructor>> = {
   "deno-process": () =>
     import("env-runner/runners/deno-process").then((m) => m.DenoProcessEnvRunner),
   self: () => import("env-runner/runners/self").then((m) => m.SelfEnvRunner),
-  miniflare: () => import("env-runner/runners/miniflare").then((m) => m.MiniflareEnvRunner),
+  miniflare: () =>
+    // `MiniflareEnvRunner` requires an explicit `miniflare` module option,
+    // which reaches it through `LoadRunnerOptions`' untyped passthrough.
+    import("env-runner/runners/miniflare").then(
+      (m) => m.MiniflareEnvRunner as unknown as RunnerConstructor,
+    ),
   vercel: () => import("env-runner/runners/vercel").then((m) => m.VercelEnvRunner),
   netlify: () => import("env-runner/runners/netlify").then((m) => m.NetlifyEnvRunner),
 };

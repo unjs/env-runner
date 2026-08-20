@@ -1,6 +1,7 @@
 import type { WorkerHooks } from "../../types.ts";
 
 import { fileURLToPath } from "node:url";
+import { resolveRuntimeDepSpecifier } from "../../common/runtime-deps.ts";
 
 import type { EnvRunnerData } from "../../common/base-runner.ts";
 import { NodeWorkerEnvRunner } from "../node-worker/runner.ts";
@@ -9,15 +10,46 @@ export type { EnvRunnerData };
 
 let _defaultEntry: string;
 
+export interface NetlifyEnvRunnerOptions {
+  name: string;
+  workerEntry?: string;
+  hooks?: WorkerHooks;
+  data?: EnvRunnerData;
+  /**
+   * Module specifier for the `@netlify/runtime` package, used inside the
+   * worker to call `startRuntime()` (full `globalThis.Netlify` + `caches`
+   * setup). `env-runner` does not depend on `@netlify/runtime`.
+   *
+   * Unlike the other runtime-dependency options, this one takes a **specifier
+   * only**: the runtime has to be instantiated inside the worker thread, and a
+   * live module instance cannot cross that boundary.
+   *
+   * ```ts
+   * new NetlifyEnvRunner({
+   *   name: "app",
+   *   netlifyRuntime: import.meta.resolve("@netlify/runtime"),
+   *   data: { entry },
+   * });
+   * ```
+   *
+   * A bare specifier (e.g. `"@netlify/runtime"`) is resolved from the current
+   * working directory. When omitted, the worker tries
+   * `import("@netlify/runtime")` and falls back to a lightweight
+   * `globalThis.Netlify` shim (env access only) if it isn't installed. Pass
+   * `false` to always use the shim.
+   */
+  netlifyRuntime?: string | URL | false;
+}
+
 export class NetlifyEnvRunner extends NodeWorkerEnvRunner {
-  constructor(opts: {
-    name: string;
-    workerEntry?: string;
-    hooks?: WorkerHooks;
-    data?: EnvRunnerData;
-  }) {
+  constructor(opts: NetlifyEnvRunnerOptions) {
     _defaultEntry ||= fileURLToPath(import.meta.resolve("env-runner/runners/netlify/worker"));
-    super({ ...opts, workerEntry: opts.workerEntry || _defaultEntry });
+    const netlifyRuntime = resolveNetlifyRuntime(opts.netlifyRuntime);
+    super({
+      ...opts,
+      workerEntry: opts.workerEntry || _defaultEntry,
+      data: netlifyRuntime === undefined ? opts.data : { ...opts.data, netlifyRuntime },
+    });
   }
 
   override async fetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
@@ -88,4 +120,20 @@ export class NetlifyEnvRunner extends NodeWorkerEnvRunner {
   protected override _runtimeType() {
     return "netlify";
   }
+}
+
+/**
+ * Normalize the `netlifyRuntime` option into an absolute specifier the worker
+ * thread can import (its own resolution base is inside `env-runner`, not the
+ * user's project). Unresolvable specifiers are passed through as-is so the
+ * worker's own import error surfaces the real reason.
+ */
+function resolveNetlifyRuntime(
+  runtime: string | URL | false | undefined,
+): string | false | undefined {
+  // `false` reaches the worker as-is (force the shim); `undefined` lets the
+  // worker try its own optional `@netlify/runtime` import. Anything else is
+  // resolved to an absolute specifier the worker can import, since a bare one
+  // would otherwise resolve against env-runner rather than the app.
+  return resolveRuntimeDepSpecifier(runtime, "netlifyRuntime");
 }

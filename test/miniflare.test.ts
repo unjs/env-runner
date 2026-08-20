@@ -1,7 +1,8 @@
 import { fileURLToPath } from "node:url";
 import { resolve, dirname, join } from "node:path";
 import { writeFileSync, mkdtempSync, rmSync } from "node:fs";
-import { describe, expect, it, afterEach } from "vitest";
+import { describe, expect, it, afterEach, vi } from "vitest";
+import * as miniflare from "miniflare";
 import { MiniflareEnvRunner } from "../src/runners/miniflare/runner.ts";
 import type { EnvRunner } from "../src/index.ts";
 
@@ -18,6 +19,7 @@ describe("MiniflareEnvRunner (custom exports)", () => {
 
   it("fetch waits for initialization instead of returning 503", async () => {
     runner = new MiniflareEnvRunner({
+      miniflare,
       name: "test-fetch-before-ready",
       data: { entry: workerDoEntry },
       miniflareOptions: {
@@ -32,8 +34,20 @@ describe("MiniflareEnvRunner (custom exports)", () => {
     expect(await res.json()).toEqual({ count: 0 });
   });
 
+  it("accepts a module specifier for the `miniflare` option", async () => {
+    runner = new MiniflareEnvRunner({
+      miniflare: "miniflare",
+      name: "test-miniflare-specifier",
+      data: { entry: workerDoEntry },
+      miniflareOptions: { durableObjects: { COUNTER: "Counter" } },
+    });
+    const res = await runner.fetch("http://localhost/counter");
+    expect(res.status).toBe(200);
+  });
+
   it("supports Durable Object exports", async () => {
     runner = new MiniflareEnvRunner({
+      miniflare,
       name: "test-do",
       data: { entry: workerDoEntry },
       miniflareOptions: {
@@ -62,6 +76,7 @@ describe("MiniflareEnvRunner (custom exports)", () => {
 
   it("preserves IPC alongside custom exports", async () => {
     runner = new MiniflareEnvRunner({
+      miniflare,
       name: "test-do-ipc",
       data: { entry: workerDoEntry },
       miniflareOptions: {
@@ -111,6 +126,7 @@ describe("MiniflareEnvRunner (hot-reload)", () => {
     writeFileSync(entryPath, `export default { fetch() { return new Response("v1"); } };`);
 
     runner = new MiniflareEnvRunner({
+      miniflare,
       name: "test-reload",
       data: { entry: entryPath },
     });
@@ -151,6 +167,7 @@ export default {
     );
 
     runner = new MiniflareEnvRunner({
+      miniflare,
       name: "test-reload-ipc",
       data: { entry: entryPath },
     });
@@ -225,6 +242,7 @@ describe("MiniflareEnvRunner (transformRequest)", () => {
     );
 
     runner = new MiniflareEnvRunner({
+      miniflare,
       name: "test-transform",
       data: { entry: entryPath },
       transformRequest: async (id) => {
@@ -251,6 +269,7 @@ describe("MiniflareEnvRunner (transformRequest)", () => {
 
     const transformedIds: string[] = [];
     runner = new MiniflareEnvRunner({
+      miniflare,
       name: "test-transform-fallback",
       data: { entry: entryPath },
       transformRequest: async (id) => {
@@ -311,6 +330,7 @@ export default {
 
     // No manual durableObjects config — auto-detected from `export class Counter`
     runner = new MiniflareEnvRunner({
+      miniflare,
       name: "test-auto-do",
       data: { entry: entryPath },
     });
@@ -327,6 +347,7 @@ export default {
 
   it("skips auto-detection when exports is false", async () => {
     runner = new MiniflareEnvRunner({
+      miniflare,
       name: "test-no-auto-do",
       data: { entry: workerDoEntry },
       exports: false,
@@ -359,6 +380,7 @@ describe("MiniflareEnvRunner (error capture)", () => {
     writeFileSync(entryPath, `export default { fetch() { throw new Error("test boom"); } };`);
 
     runner = new MiniflareEnvRunner({
+      miniflare,
       name: "test-error-capture",
       data: { entry: entryPath },
     });
@@ -380,6 +402,7 @@ describe("MiniflareEnvRunner (error capture)", () => {
     writeFileSync(entryPath, `export default { fetch() { throw new Error("raw boom"); } };`);
 
     runner = new MiniflareEnvRunner({
+      miniflare,
       name: "test-no-capture",
       data: { entry: entryPath },
       captureErrors: false,
@@ -411,6 +434,7 @@ describe("MiniflareEnvRunner (persistent)", () => {
     writeFileSync(entryPath, `export default { fetch() { return new Response("v1"); } };`);
 
     const runner1 = new MiniflareEnvRunner({
+      miniflare,
       name: "test-persistent-1",
       data: { entry: entryPath },
       persistent: true,
@@ -428,6 +452,7 @@ describe("MiniflareEnvRunner (persistent)", () => {
 
     // Create runner2 with same config — should reuse Miniflare instance
     const runner2 = new MiniflareEnvRunner({
+      miniflare,
       name: "test-persistent-2",
       data: { entry: entryPath },
       persistent: true,
@@ -448,6 +473,7 @@ describe("MiniflareEnvRunner (persistent)", () => {
     writeFileSync(entryPath, `export default { fetch() { return new Response("ok"); } };`);
 
     const runner = new MiniflareEnvRunner({
+      miniflare,
       name: "test-dispose",
       data: { entry: entryPath },
       persistent: true,
@@ -459,6 +485,59 @@ describe("MiniflareEnvRunner (persistent)", () => {
 
     await runner.dispose();
     expect(runner.closed).toBe(true);
+  });
+});
+
+describe("MiniflareEnvRunner (explicit miniflare dependency)", () => {
+  it("falls back to importing `miniflare` when the option is omitted", async () => {
+    const runner = new MiniflareEnvRunner({ name: "no-option", data: { entry: workerDoEntry } });
+    try {
+      await waitForReady(runner);
+      expect(runner.ready).toBe(true);
+    } finally {
+      await runner.close();
+    }
+  });
+
+  it("closes with a clear error when the passed module is not miniflare", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const runner = new MiniflareEnvRunner({
+        name: "bad-module",
+        miniflare: {} as any,
+        data: { entry: workerDoEntry },
+      });
+      await expect(waitForReady(runner, 2000)).rejects.toThrow();
+      expect(runner.closed).toBe(true);
+      expect(String(error.mock.calls[0]?.[1])).toMatch(/does not export `Miniflare`/);
+    } finally {
+      error.mockRestore();
+    }
+  });
+
+  it("uses the passed module instead of importing `miniflare` itself", async () => {
+    let seen: unknown;
+    const spy = {
+      ...miniflare,
+      Miniflare: class extends miniflare.Miniflare {
+        constructor(options: any) {
+          seen = options;
+          super(options);
+        }
+      },
+    };
+    const runner = new MiniflareEnvRunner({
+      name: "injected",
+      miniflare: spy as any,
+      data: { entry: workerDoEntry },
+    });
+    try {
+      await waitForReady(runner);
+      expect(seen).toBeTruthy();
+      expect((await (await runner.fetch("http://localhost/")).text()).length).toBeGreaterThan(0);
+    } finally {
+      await runner.close();
+    }
   });
 });
 
