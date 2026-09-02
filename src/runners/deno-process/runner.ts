@@ -5,6 +5,7 @@ import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import { BaseEnvRunner } from "../../common/base-runner.ts";
+import { hostEnv } from "../../common/host-env.ts";
 import type { EnvRunnerData } from "../../common/base-runner.ts";
 
 export type { EnvRunnerData as DenoProcessEnvRunnerData } from "../../common/base-runner.ts";
@@ -75,11 +76,10 @@ export class DenoProcessEnvRunner extends BaseEnvRunner {
       return;
     }
 
-    const env = {
-      ...process.env,
+    const env = hostEnv({
       ENV_RUNNER_NAME: this._name,
       ENV_RUNNER_DATA: JSON.stringify(this._data || {}),
-    };
+    });
 
     const child = spawn(
       "deno",

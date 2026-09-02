@@ -7,6 +7,7 @@ import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 
 import { BaseEnvRunner } from "../../common/base-runner.ts";
+import { hostEnv } from "../../common/host-env.ts";
 import type { EnvRunnerData } from "../../common/base-runner.ts";
 
 export type { EnvRunnerData as BunProcessEnvRunnerData } from "../../common/base-runner.ts";
@@ -111,11 +112,10 @@ export class BunProcessEnvRunner extends BaseEnvRunner {
       return;
     }
 
-    const env = {
-      ...process.env,
+    const env = hostEnv({
       ENV_RUNNER_NAME: this._name,
       ENV_RUNNER_DATA: JSON.stringify(this._data || {}),
-    };
+    });
 
     if (_isBun) {
       this.#initBunProcess(execArgv, env);

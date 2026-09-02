@@ -36,10 +36,15 @@ Spawns a Deno child process via Node.js `child_process.spawn()` with `deno run -
 
 Runs entry code in the same process (no IPC, no forking). Uses an in-memory channel registry stored on `process.__envRunners` (Map). Entry modules retrieve their channel via query string: `import(entry + '?__envRunnerId=<id>')`. Communication uses `queueMicrotask()` to avoid synchronous re-entrancy. Exposes `SelfRunnerChannel` interface with `data`, `send()`, and `onMessage()`.
 
+### Terminal capabilities
+
+All four spawning runners build their env with `hostEnv()` (`src/common/host-env.ts`) instead of a bare `{ ...process.env }`, so worker-side code sees `FORCE_COLOR=1` and `COLUMNS` when the host is an interactive terminal (#37). `SelfEnvRunner` runs in the host process and needs nothing.
+
 ## Testing
 
 The cross-runner parameterized suite (`test/runners.test.ts`) covers these runners too — see [`TESTS.md`](TESTS.md). Virtual-module tests live in [`VIRTUAL-MODULES.md`](VIRTUAL-MODULES.md).
 
+- **`test/host-env.test.ts`** — `hostEnv()` unit tests (TTY propagation, `NO_COLOR`/explicit-value precedence, non-TTY host) plus integration tests asserting `FORCE_COLOR`/`COLUMNS` reach the worker for node-worker and node-process (#37)
 - **`test/orphan.test.ts`** — Regression tests for orphaned workers (#23): SIGKILLs the supervisor process and asserts the worker stops serving HTTP, plus mid-import variants asserting the worker exits even when the supervisor dies during a slow entry import (node-process, bun-process under both Node and Bun hosts)
 - Test fixture in `test/fixtures/app-pid.mjs` — Entry that responds with the worker `process.pid` for orphan tests
 - Test fixture in `test/fixtures/orphan-supervisor.mjs` — Standalone supervisor process that spawns a runner, prints worker pid/address, and stays alive until SIGKILLed (for orphan tests)

@@ -14,6 +14,7 @@ src/
 │   ├── base-runner.ts       # BaseEnvRunner abstract class
 │   ├── worker-utils.ts      # AppEntry interface, resolveEntry(), parseServerAddress()
 │   ├── runtime-deps.ts     # resolveRuntimeDep()/resolveRuntimeDepSpecifier() — shared "module | specifier | false" resolver for runtime deps
+│   ├── host-env.ts          # hostEnv() — worker/child env: host env + FORCE_COLOR/COLUMNS from the host TTY
 │   ├── ws-proxy.ts          # createRunnerWSProxyPlugin() — runtime-native WS upgrade proxy (Node raw socket / Bun+Deno crossws bridge)
 │   └── virtual-modules.ts   # registerVirtualModules() — registerHooks()/Bun.plugin wiring shared by node/bun/deno workers
 ├── runners/
@@ -209,6 +210,7 @@ Runner-specific and deep-dive notes, split out of this file:
 - **Immediate shutdown** — `close()` immediately terminates the worker/process (no graceful shutdown handshake)
 - **Orphan protection** — node-process/bun-process workers register `process.on("disconnect", () => process.exit(0))` at the top of the worker (before the entry import) so a non-graceful supervisor death (SIGKILL, crash) never leaves an orphan, even mid-import (#23)
 - **Data passing:** Worker threads use `workerData`, processes use `ENV_RUNNER_DATA` env var (JSON), self runner uses in-memory channel, miniflare runner uses in-memory `script` with `unsafeModuleFallbackService` for module resolution
+- **Terminal capabilities** — Worker threads and child processes get a pipe for stdout, so `isTTY`/`columns` are `undefined` inside them and standard color detection strips ANSI even though the output lands on the host terminal (#37). All four spawning runners build their env with `hostEnv()` (`src/common/host-env.ts`), which inherits `process.env` and adds `FORCE_COLOR=1` (when the host is a TTY and neither `FORCE_COLOR` nor `NO_COLOR` is already set) plus `COLUMNS` (a spawn-time snapshot; resizes are not propagated)
 - **Stdio forwarding** — All runners forward entry stdout/stderr to the host process: node-process and bun-process pipe child streams to `process.stdout`/`process.stderr`, deno-process forwards non-IPC stdout lines (stdout doubles as NDJSON IPC) and pipes stderr, worker threads use Node.js's built-in forwarding, miniflare uses its default runtime stdio handler
 - **Socket cleanup** — `_closeSocket()` avoids deleting Windows named pipes and abstract sockets
 - **Custom inspect** — `[Symbol.for('nodejs.util.inspect.custom')]()` shows pending/ready/closed status

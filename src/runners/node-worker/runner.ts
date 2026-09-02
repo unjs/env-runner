@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
 
 import { BaseEnvRunner } from "../../common/base-runner.ts";
+import { hostEnv } from "../../common/host-env.ts";
 import type { EnvRunnerData } from "../../common/base-runner.ts";
 
 export type { EnvRunnerData };
@@ -66,9 +67,7 @@ export class NodeWorkerEnvRunner extends BaseEnvRunner {
     }
 
     const worker = new Worker(this._workerEntry, {
-      env: {
-        ...process.env,
-      },
+      env: hostEnv(),
       workerData: {
         name: this._name,
         ...this._data,

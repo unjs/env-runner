@@ -9,6 +9,14 @@ export default {
       return Response.json({ body, method: request.method });
     }
 
+    if (url.pathname === "/env") {
+      return Response.json({
+        FORCE_COLOR: process.env.FORCE_COLOR ?? null,
+        COLUMNS: process.env.COLUMNS ?? null,
+        NO_COLOR: process.env.NO_COLOR ?? null,
+      });
+    }
+
     if (url.pathname === "/log") {
       const marker = url.searchParams.get("marker");
       console.log(`stdout:${marker}`);
