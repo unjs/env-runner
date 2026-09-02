@@ -1,6 +1,18 @@
 # Changelog
 
 
+## v0.2.1
+
+[compare changes](https://github.com/unjs/env-runner/compare/v0.2.0...v0.2.1)
+
+### 🚀 Enhancements
+
+- Propagate host terminal capabilities to workers ([1c4c7f6](https://github.com/unjs/env-runner/commit/1c4c7f6))
+
+### ❤️ Contributors
+
+- Pooya Parsa ([@pi0](https://github.com/pi0))
+
 ## v0.2.0
 
 [compare changes](https://github.com/unjs/env-runner/compare/v0.1.16...v0.2.0)
