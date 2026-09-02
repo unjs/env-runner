@@ -43,28 +43,28 @@
     "typecheck": "tsc --noEmit --skipLibCheck"
   },
   "dependencies": {
-    "crossws": "^0.4.11",
+    "crossws": "^0.4.12",
     "exsolve": "^1.1.1",
     "httpxy": "^0.5.5",
     "srvx": "^0.12.7"
   },
   "devDependencies": {
-    "@netlify/runtime": "^5",
-    "@types/node": "^26.2.0",
-    "@vercel/queue": "^0.4",
+    "@netlify/runtime": "^5.0.2",
+    "@types/node": "^26.4.0",
+    "@vercel/queue": "^0.5.1",
     "@vitest/coverage-v8": "^4.1.11",
     "automd": "^0.4.3",
     "changelogen": "^0.6.2",
     "cjs-module-lexer": "^2.2.1",
     "env-runner-fixture": "link:",
     "es-module-lexer": "^2.3.2",
-    "miniflare": "^4",
+    "miniflare": "^4.20260730.0",
     "obuild": "^0.4.38",
-    "oxfmt": ">=0.64.0",
-    "oxlint": "^1.79.0",
+    "oxfmt": ">=0.65.0",
+    "oxlint": "^1.80.0",
     "typescript": "^7",
     "vitest": "^4.1.11",
-    "wrangler": "^4.124.0"
+    "wrangler": "^4.127.1"
   },
-  "packageManager": "pnpm@11.22.0"
+  "packageManager": "pnpm@11.25.0"
 }
