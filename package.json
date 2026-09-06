@@ -46,11 +46,11 @@
     "crossws": "^0.4.12",
     "exsolve": "^1.1.1",
     "httpxy": "^0.5.5",
-    "srvx": "^1.0.0"
+    "srvx": "^1.0.3"
   },
   "devDependencies": {
-    "@netlify/runtime": "^5.0.2",
-    "@types/node": "^26.4.0",
+    "@netlify/runtime": "^5.0.3",
+    "@types/node": "^26.4.1",
     "@vercel/queue": "^0.5.1",
     "@vitest/coverage-v8": "^4.1.11",
     "automd": "^0.4.3",
@@ -59,12 +59,12 @@
     "env-runner-fixture": "link:",
     "es-module-lexer": "^2.3.2",
     "miniflare": "^4.20260730.0",
-    "obuild": "^0.4.38",
-    "oxfmt": "^0.65.0",
-    "oxlint": "^1.80.0",
+    "obuild": "^0.4.39",
+    "oxfmt": "^0.66.0",
+    "oxlint": "^1.81.0",
     "typescript": "^7.0.2",
     "vitest": "^4.1.11",
-    "wrangler": "^4.127.1"
+    "wrangler": "^4.129.0"
   },
   "packageManager": "pnpm@11.25.0"
 }
