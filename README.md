@@ -365,6 +365,8 @@ await using runner = new MiniflareEnvRunner({
 });
 
 const response = await runner.fetch("http://localhost/api");
+// Request inputs also preserve methods, headers, streaming bodies and cancellation.
+// An optional RequestInit overrides the corresponding Request properties.
 ```
 
 Passing `miniflare` explicitly is preferred — the version you install is then the version that runs. A specifier works too (`miniflare: "miniflare"`). If you omit it, the runner imports `miniflare` itself and only fails (with an actionable error) when the package isn't installed either. The `miniflareOptions` object is passed directly to the [Miniflare constructor](https://developers.cloudflare.com/workers/testing/miniflare/) — you can configure bindings, KV, D1, Durable Objects, and any other Miniflare option.

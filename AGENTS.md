@@ -155,6 +155,8 @@ const runner2 = new NodeProcessEnvRunner({
 - `env-runner/runners/netlify/worker` (`./runners/netlify/worker`) — Netlify worker (sets global Netlify context, delegates to node-worker)
 - `env-runner/vite` (`./vite`) — Vite Environment API helpers (`createViteHotChannel`, `createViteTransport`)
 
+Miniflare Request dispatch preserves method, headers, streaming bodies and cancellation, including explicit RequestInit overrides. Regression coverage lives in `test/miniflare-request.test.ts`.
+
 ## Testing
 
 Generic test infrastructure, cross-runner suites (`runners.test.ts`, `manager.test.ts`, `server.test.ts`, `vite.test.ts`), and shared fixtures: [`.agents/TESTS.md`](.agents/TESTS.md). Runner-specific test notes live with each runner doc:
