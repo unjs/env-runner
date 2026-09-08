@@ -460,6 +460,33 @@ describe("MiniflareEnvRunner virtual module invalidation", () => {
     }
   });
 
+  // Dynamic import specifiers are versioned too — including the template
+  // literal form, whose offsets span the quotes (unlike a static import).
+  it("rewrites a template-literal dynamic import specifier", async () => {
+    let counter = 0;
+    const runner = new MiniflareEnvRunner({
+      miniflare,
+      name: "virtual-invalidate-dynamic",
+      data: {
+        entry: "#entry",
+        virtual: {
+          "#entry": `const config = (await import(\`#config.json\`)).default;
+            export default { fetch: () => new Response(String(config.count)) };`,
+          "#config.json": () => JSON.stringify({ count: counter++ }),
+        },
+      },
+    });
+    try {
+      await runner.waitForReady();
+      expect(await (await runner.fetch("http://localhost/")).text()).toBe("0");
+      await runner.invalidateModule("#config.json");
+      await runner.reloadModule();
+      expect(await (await runner.fetch("http://localhost/")).text()).toBe("1");
+    } finally {
+      await runner.close();
+    }
+  });
+
   it("invalidation works across runners sharing a persistent instance", async () => {
     let counter = 0;
     const data = {

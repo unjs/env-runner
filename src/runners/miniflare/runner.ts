@@ -894,15 +894,16 @@ function applyVirtualVersions(code: string, versions: ReadonlyMap<string, number
   let out = "";
   let last = 0;
   for (const imp of imports) {
-    let specifier: string | undefined = imp.n;
-    // `n` is unset for template-literal dynamic imports; extract a plain
-    // `import(`...`)` literal (no substitutions) manually.
-    if (specifier === undefined && imp.d > -1) {
-      const expr = code.slice(imp.s, imp.e);
-      if (expr.length > 1 && expr[0] === "`" && expr.endsWith("`") && !expr.includes("${")) {
-        specifier = expr.slice(1, -1);
-      }
+    if (imp.type === "import-meta") {
+      continue;
     }
+    const dynamic = imp.type === "dynamic";
+    // A template-literal dynamic import with substitutions is reported as a
+    // glob specifier (each `${...}` collapsed to `*`), never a real key.
+    if (dynamic && imp.glob) {
+      continue;
+    }
+    const specifier = imp.specifier;
     const version = specifier === undefined ? undefined : versions.get(specifier);
     if (!version) {
       continue;
@@ -910,8 +911,8 @@ function applyVirtualVersions(code: string, versions: ReadonlyMap<string, number
     const versioned = `${specifier}?v=${version}`;
     // Static import/re-export offsets exclude the quotes; dynamic import
     // offsets span the full specifier expression including them.
-    out += code.slice(last, imp.s) + (imp.d > -1 ? JSON.stringify(versioned) : versioned);
-    last = imp.e;
+    out += code.slice(last, imp.start) + (dynamic ? JSON.stringify(versioned) : versioned);
+    last = imp.end;
   }
   return out + code.slice(last);
 }

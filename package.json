@@ -57,7 +57,7 @@
     "changelogen": "^0.6.2",
     "cjs-module-lexer": "^2.2.1",
     "env-runner-fixture": "link:",
-    "es-module-lexer": "^2.3.2",
+    "es-module-lexer": "^3.0.1",
     "miniflare": "^4.20260730.0",
     "obuild": "^0.4.39",
     "oxfmt": ">=0.67.0",
