@@ -3,10 +3,21 @@ const IPC_PATH = "/__env_runner_ipc";
 /** Service binding name used for cross-request IPC (worker → runner). */
 export const IPC_BINDING = "__ENV_RUNNER_IPC";
 
+/** Binding name for workerd's `UnsafeEval` API (used to import the entry). */
+export const UNSAFE_EVAL_BINDING = "__ENV_RUNNER_UNSAFE_EVAL__";
+
 /**
  * Generates a wrapper module that imports the user entry and adds IPC glue.
  *
  * The user module is expected to export `fetch` and optionally `ipc`.
+ *
+ * Requests are handled like srvx's Cloudflare adapter (`srvx/cloudflare`):
+ * `plugins` run against a server-like object, `error` and `middleware` wrap
+ * `fetch`, and the request is augmented with `runtime` (`{ name: "cloudflare",
+ * cloudflare: { env, context } }`), `ip` (`cf-connecting-ip`) and `waitUntil`.
+ * `fetch` still receives `(request, env, ctx)` for Workers-style entries. The
+ * `env` the entry sees never contains env-runner's internal bindings.
+ *
  * The wrapper uses a persistent WebSocket pair for bidirectional IPC:
  * - Init: `fetch` with `upgrade: websocket` creates a WebSocketPair
  * - Messages: JSON over the WebSocket (no per-message `dispatchFetch`)
@@ -41,7 +52,7 @@ export function generateWrapper(
 
   const fetchBody = captureErrors
     ? /* js */ `try {
-      return await entryFetch(request, env, ctx);
+      return await __server.fetch(request, env, ctx);
     } catch (e) {
       const error = e instanceof Error ? e : new Error(String(e));
       const body = JSON.stringify({
@@ -54,7 +65,7 @@ export function generateWrapper(
         headers: { "Content-Type": "application/json", "X-Env-Runner-Error": "1" },
       });
     }`
-    : `return entryFetch(request, env, ctx);`;
+    : `return __server.fetch(request, env, ctx);`;
 
   return /* js */ `import __process from "node:process";
 if (!globalThis.process) { globalThis.process = __process; }
@@ -63,11 +74,86 @@ ${explicitExports}
 
 const __IPC_PATH = "${IPC_PATH}";
 const __IPC_BINDING = "${IPC_BINDING}";
+const __UNSAFE_EVAL_BINDING = "${UNSAFE_EVAL_BINDING}";
 const __entryPath = ${JSON.stringify(entryPath)};
 let __userEntry;
+let __server;
 let __ipcInitialized = false;
 let __serverWs;
 let __currentEnv;
+
+const __userEnvs = new WeakMap();
+
+// \`env\` without env-runner's internal bindings (cached per env object).
+function __userEnv(env) {
+  let userEnv = __userEnvs.get(env);
+  if (!userEnv) {
+    userEnv = { ...env };
+    delete userEnv[__IPC_BINDING];
+    delete userEnv[__UNSAFE_EVAL_BINDING];
+    __userEnvs.set(env, userEnv);
+  }
+  return userEnv;
+}
+
+// Mirrors srvx's CloudflareServer (srvx/cloudflare): plugins, then the
+// \`error\` handler as the outermost middleware, then the middleware chain.
+function __createServer(entry) {
+  const server = {
+    runtime: "cloudflare",
+    options: {
+      ...entry,
+      middleware: [...(entry.middleware || [])],
+      fetch: entry.fetch
+        ? (request) =>
+            entry.fetch(request, request.runtime?.cloudflare?.env, request.runtime?.cloudflare?.context)
+        : () => new Response("No fetch handler exported", { status: 500 }),
+    },
+    serve() {},
+    ready: () => Promise.resolve(server),
+    close: () => Promise.resolve(),
+  };
+  for (const plugin of entry.plugins || []) {
+    plugin(server);
+  }
+  const errorHandler = server.options.error;
+  if (errorHandler) {
+    server.options.middleware.unshift((_request, next) => {
+      try {
+        const res = next();
+        return typeof res?.then === "function" ? res.then(undefined, (error) => errorHandler(error)) : res;
+      } catch (error) {
+        return errorHandler(error);
+      }
+    });
+  }
+  let handler = server.options.fetch;
+  const middleware = server.options.middleware;
+  for (let i = middleware.length - 1; i >= 0; i--) {
+    const mw = middleware[i];
+    const next = handler;
+    handler = (request) => mw(request, () => next(request));
+  }
+  server.fetch = (request, env, context) => {
+    const userEnv = __userEnv(env);
+    Object.defineProperties(request, {
+      waitUntil: { value: context.waitUntil.bind(context) },
+      runtime: {
+        enumerable: true,
+        value: { name: "cloudflare", cloudflare: { env: userEnv, context } },
+      },
+      ip: {
+        enumerable: true,
+        configurable: true,
+        get() {
+          return request.headers.get("cf-connecting-ip");
+        },
+      },
+    });
+    return handler(request);
+  };
+  return server;
+}
 
 async function __loadEntry(env, path) {
   globalThis.__ENV_RUNNER_UNSAFE_EVAL__ = env.__ENV_RUNNER_UNSAFE_EVAL__;
@@ -110,10 +196,12 @@ async function __handleWsMessage(env, data) {
     const version = msg.version || 0;
     try {
       const newEntry = await __loadEntry(env, __entryPath + "?t=" + version);
+      const newServer = __createServer(newEntry);
       if (__userEntry?.ipc?.onClose) {
         await __userEntry.ipc.onClose();
       }
       __userEntry = newEntry;
+      __server = newServer;
       __crosswsAdapter = undefined;
       __ipcInitialized = false;
       if (__userEntry.ipc?.onOpen) {
@@ -156,7 +244,9 @@ export default {
     if (url.pathname === __IPC_PATH && request.headers.get("upgrade") === "websocket") {
       try {
         if (!__userEntry) {
-          __userEntry = await __loadEntry(env, __entryPath);
+          const entry = await __loadEntry(env, __entryPath);
+          __server = __createServer(entry);
+          __userEntry = entry;
         }
       } catch (e) {
         return new Response("Failed to load entry: " + String(e), { status: 500 });
@@ -190,13 +280,9 @@ export default {
     // Handle WebSocket upgrade via crossws cloudflare adapter
     if (__userEntry.websocket && request.headers.get("upgrade") === "websocket") {
       const adapter = await __initCrossws(env, __userEntry.websocket);
-      return adapter.handleUpgrade(request, env, ctx);
+      return adapter.handleUpgrade(request, __userEnv(env), ctx);
     }
 
-    const entryFetch = __userEntry.fetch;
-    if (!entryFetch) {
-      return new Response("No fetch handler exported", { status: 500 });
-    }
     __currentEnv = env;
     try {
       ${fetchBody}

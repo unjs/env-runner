@@ -18,7 +18,7 @@ import {
   stripVirtualTypeScript,
   virtualModuleFormat,
 } from "../../virtual-loader.ts";
-import { generateWrapper, IPC_BINDING } from "./wrapper.ts";
+import { generateWrapper, IPC_BINDING, UNSAFE_EVAL_BINDING } from "./wrapper.ts";
 import { isPlainObject, loadWranglerConfig } from "./wrangler.ts";
 import type { WranglerInlineConfig, WranglerModule } from "./wrangler.ts";
 
@@ -563,7 +563,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
       }
 
       // Enable unsafeEval for hot-reload support (re-import entry without restart)
-      options.unsafeEvalBinding = "__ENV_RUNNER_UNSAFE_EVAL__";
+      options.unsafeEvalBinding = UNSAFE_EVAL_BINDING;
 
       // Service binding for cross-request IPC (worker → runner).
       // In workerd, the WebSocket created during IPC handshake cannot be used

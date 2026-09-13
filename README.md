@@ -371,6 +371,8 @@ const response = await runner.fetch("http://localhost/api");
 
 Passing `miniflare` explicitly is preferred — the version you install is then the version that runs. A specifier works too (`miniflare: "miniflare"`). If you omit it, the runner imports `miniflare` itself and only fails (with an actionable error) when the package isn't installed either. The `miniflareOptions` object is passed directly to the [Miniflare constructor](https://developers.cloudflare.com/workers/testing/miniflare/) — you can configure bindings, KV, D1, Durable Objects, and any other Miniflare option.
 
+The entry uses the same `AppEntry` format as the other runners. Requests are handled like srvx's Cloudflare adapter (`srvx/cloudflare`): the entry's `plugins`, `middleware` and `error` handler are applied, and the request carries `request.runtime` (`{ name: "cloudflare", cloudflare: { env, context } }`), `request.ip` (from `cf-connecting-ip`) and `request.waitUntil()`. For Workers-style entries, `fetch` still receives `(request, env, ctx)`. env-runner's internal bindings are never exposed on `env`. Listener-level srvx options (`maxRequestBodySize`, `trustProxy`, `node`/`bun`/`deno`, ...) do not apply to miniflare.
+
 When you don't set a `compatibilityDate` (via `miniflareOptions` or a wrangler config), it defaults to the date supported by the installed `workerd` binary rather than today's date — the binary always lags the calendar slightly, and pinning a future date makes `workerd` refuse to start.
 
 #### Wrangler Config

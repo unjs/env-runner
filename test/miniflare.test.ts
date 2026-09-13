@@ -8,6 +8,7 @@ import type { EnvRunner } from "../src/index.ts";
 
 const _dir = dirname(fileURLToPath(import.meta.url));
 const workerDoEntry = resolve(_dir, "./fixtures/worker-do.mjs");
+const workerSrvxEntry = resolve(_dir, "./fixtures/worker-srvx.mjs");
 
 describe("MiniflareEnvRunner (custom exports)", () => {
   let runner: EnvRunner | undefined;
@@ -102,6 +103,46 @@ describe("MiniflareEnvRunner (custom exports)", () => {
     });
     runner.sendMessage({ type: "echo", data: "with-do" });
     expect(await reply).toEqual({ type: "echo-reply", data: "with-do" });
+  });
+});
+
+describe("MiniflareEnvRunner (srvx cloudflare context)", () => {
+  let runner: EnvRunner | undefined;
+
+  afterEach(async () => {
+    await runner?.close();
+    runner = undefined;
+  });
+
+  it("augments the request and applies middleware, plugins and error", async () => {
+    runner = new MiniflareEnvRunner({
+      miniflare,
+      name: "test-srvx-context",
+      data: { entry: workerSrvxEntry },
+      miniflareOptions: { bindings: { FOO: "bar" } },
+    });
+    await waitForReady(runner);
+
+    const res = await runner.fetch("http://localhost/", {
+      headers: { "cf-connecting-ip": "198.51.100.7" },
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("x-middleware")).toBe("1");
+    expect(res.headers.get("x-plugin")).toBe("cloudflare");
+    expect(await res.json()).toEqual({
+      runtime: "cloudflare",
+      runtimeEnvKeys: ["FOO"],
+      hasContext: true,
+      ip: "198.51.100.7",
+      waitUntil: "function",
+      envKeys: ["FOO"],
+      envIsRuntimeEnv: true,
+      ctx: "function",
+    });
+
+    const errRes = await runner.fetch("http://localhost/throw");
+    expect(errRes.status).toBe(599);
+    expect(await errRes.text()).toBe("handled: boom");
   });
 });
 

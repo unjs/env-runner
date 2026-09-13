@@ -34,6 +34,7 @@ src/
 │   │   └── runner.ts        # SelfEnvRunner (in-process, no worker)
 │   ├── miniflare/
 │   │   ├── runner.ts          # MiniflareEnvRunner (Cloudflare Workers via miniflare)
+│   │   ├── wrapper.ts         # generateWrapper() — in-memory workerd wrapper (IPC glue + srvx/cloudflare-style request handling)
 │   │   └── wrangler.ts        # loadWranglerConfig() — wrangler.{json,jsonc,toml} → Miniflare options
 │   ├── vercel/
 │   │   ├── runner.ts        # VercelEnvRunner (extends NodeWorkerEnvRunner)
@@ -159,6 +160,8 @@ const runner2 = new NodeProcessEnvRunner({
 - `env-runner/vite` (`./vite`) — Vite Environment API helpers (`createViteHotChannel`, `createViteTransport`)
 
 Miniflare Request dispatch preserves method, headers, streaming bodies and cancellation, including explicit RequestInit overrides. Regression coverage lives in `test/miniflare-request.test.ts`.
+
+The miniflare wrapper handles requests like `srvx/cloudflare` (#50): it applies the entry's `plugins`/`middleware`/`error`, augments the request with `runtime` (`{ name: "cloudflare", cloudflare: { env, context } }`), `ip` and `waitUntil`, and strips the internal `__ENV_RUNNER_IPC`/`__ENV_RUNNER_UNSAFE_EVAL__` bindings from the `env` the entry sees. See [`.agents/MINIFLARE.md`](.agents/MINIFLARE.md).
 
 ## Testing
 
