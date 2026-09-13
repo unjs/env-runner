@@ -16,13 +16,78 @@ export interface AppEntryIPC {
   onClose?: () => void | Promise<void>;
 }
 
-export interface AppEntry {
+/**
+ * User entry module shape. Besides `fetch` and the env-runner specific hooks
+ * (`upgrade`, `websocket`, `ipc`), any srvx `ServerOptions` (e.g. `error`,
+ * `maxRequestBodySize`, `trustProxy`, `node`/`bun`/`deno`) is forwarded to
+ * `serve()` by the built-in workers. The listener-related keys in
+ * {@link RESERVED_SERVER_OPTIONS} are owned by the worker (it sits behind the
+ * runner's proxy) and are ignored if set.
+ */
+export interface AppEntry extends Omit<ServerOptions, "fetch"> {
   fetch: ServerOptions["fetch"];
   upgrade?: (context: UpgradeContext) => void;
   websocket?: Partial<Hooks>;
-  middleware?: ServerOptions["middleware"];
-  plugins?: ServerOptions["plugins"];
   ipc?: AppEntryIPC;
+}
+
+/**
+ * srvx options the built-in workers always control themselves: the worker
+ * listens on a random loopback port behind the runner's proxy, so the entry
+ * must not be able to relocate or TLS-terminate it.
+ */
+export const RESERVED_SERVER_OPTIONS = [
+  "port",
+  "hostname",
+  "protocol",
+  "tls",
+  "silent",
+  "manual",
+  "gracefulShutdown",
+] as const satisfies (keyof ServerOptions)[];
+
+/**
+ * Listener/TLS keys inside the runtime-specific option objects. srvx spreads
+ * `node`/`bun`/`deno` *after* its resolved port/host/tls, so these would
+ * otherwise bypass {@link RESERVED_SERVER_OPTIONS}. `node.http2` is dropped
+ * too: srvx requires a TLS certificate for it, which the worker never has.
+ */
+export const RESERVED_RUNTIME_OPTIONS = {
+  node: ["port", "host", "path", "http2", "cert", "key", "passphrase"],
+  bun: ["port", "hostname", "unix", "tls"],
+  deno: ["port", "hostname", "path", "cert", "key"],
+} as const satisfies Record<"node" | "bun" | "deno", readonly string[]>;
+
+/**
+ * Build the srvx `serve()` options for a user entry: forwards every srvx
+ * option exported by the entry, drops env-runner specific keys (`fetch`,
+ * `upgrade`, `websocket`, `ipc`) and pins the worker-owned listener options
+ * (top-level and nested in `node`/`bun`/`deno`). Callers add `fetch` (bound
+ * lazily so module reloads swap the handler) and the crossws plugin themselves.
+ */
+export function toServerOptions(entry: AppEntry): Omit<ServerOptions, "fetch"> {
+  const { fetch: _fetch, upgrade: _upgrade, websocket: _websocket, ipc: _ipc, ...options } = entry;
+  for (const key of RESERVED_SERVER_OPTIONS) {
+    delete options[key];
+  }
+  for (const runtime of Object.keys(
+    RESERVED_RUNTIME_OPTIONS,
+  ) as (keyof typeof RESERVED_RUNTIME_OPTIONS)[]) {
+    if (options[runtime]) {
+      const runtimeOptions: Record<string, unknown> = { ...options[runtime] };
+      for (const key of RESERVED_RUNTIME_OPTIONS[runtime]) {
+        delete runtimeOptions[key];
+      }
+      options[runtime] = runtimeOptions;
+    }
+  }
+  return {
+    ...options,
+    port: 0,
+    hostname: "127.0.0.1",
+    silent: true,
+    gracefulShutdown: false,
+  };
 }
 
 /**

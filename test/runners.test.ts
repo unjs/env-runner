@@ -606,6 +606,67 @@ for (const { name, create, skip } of rpcRunners) {
   });
 }
 
+// --- srvx server options forwarding (#49) ---
+
+const appServerOptionsEntry = resolve(_dir, "./fixtures/app-server-options.mjs");
+
+const serverOptionsRunners = [
+  { name: "NodeWorkerEnvRunner", create: (opts: any) => new NodeWorkerEnvRunner(opts) },
+  { name: "NodeProcessEnvRunner", create: (opts: any) => new NodeProcessEnvRunner(opts) },
+  {
+    name: "BunProcessEnvRunner",
+    create: (opts: any) => new BunProcessEnvRunner(opts),
+    skip: !hasBun,
+  },
+  {
+    name: "DenoProcessEnvRunner",
+    create: (opts: any) => new DenoProcessEnvRunner(opts),
+    skip: !hasDeno,
+  },
+];
+
+for (const { name, create, skip } of serverOptionsRunners) {
+  describe.skipIf(skip)(`${name} server options`, () => {
+    let runner: EnvRunner | undefined;
+
+    afterEach(async () => {
+      await runner?.close();
+      runner = undefined;
+    });
+
+    it("forwards srvx options from the entry to serve()", async () => {
+      runner = create({ name: "server-options", data: { entry: appServerOptionsEntry } });
+      await waitForReady(runner);
+
+      // `error` handler
+      const errRes = await runner.fetch("/throw");
+      expect(errRes.status).toBe(599);
+      expect(await errRes.text()).toBe("handled: boom");
+
+      // `maxRequestBodySize`
+      const okRes = await runner.fetch("/", { method: "POST", body: "x".repeat(16) });
+      expect(okRes.status).toBe(200);
+      expect(await okRes.text()).toBe("ok:16");
+      const tooLarge = await runner.fetch("/", { method: "POST", body: "x".repeat(17) });
+      // Bun enforces the limit natively (empty 413 body); Node/Deno reject the
+      // body read and route through the entry's `error` handler.
+      expect(tooLarge.status).toBe(413);
+
+      // `trustProxy`
+      const ipRes = await runner.fetch("/ip", { headers: { "x-forwarded-for": "198.51.100.7" } });
+      expect(await ipRes.text()).toBe("198.51.100.7");
+    });
+
+    it("ignores worker-owned listener options (top-level and node/bun/deno)", async () => {
+      runner = create({ name: "server-options", data: { entry: appServerOptionsEntry } });
+      await waitForReady(runner);
+      expect(runner.address).toMatchObject({ host: "127.0.0.1" });
+      expect(runner.address?.port).not.toBe(1);
+      expect(runner.address?.port).toBeGreaterThan(0);
+    });
+  });
+}
+
 // --- Helpers ---
 
 function waitForReady(runner: EnvRunner, timeout = 15000): Promise<void> {

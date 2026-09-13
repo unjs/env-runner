@@ -689,6 +689,14 @@ export default {
   },
   middleware: [], // Optional srvx middleware
   plugins: [], // Optional srvx plugins
+  // Any other srvx ServerOptions are forwarded to serve() as-is, e.g.:
+  error(error) {
+    return new Response(error.message, { status: 500 });
+  },
+  maxRequestBodySize: 1024 * 1024,
+  trustProxy: true,
+  node: { keepAliveTimeout: 5000 },
+  bun: { idleTimeout: 30 },
   ipc: {
     onOpen({ sendMessage }) {
       // IPC channel is ready — send messages back to the runner
@@ -711,6 +719,8 @@ The built-in worker automatically:
 2. Starts a [srvx](https://srvx.h3.dev) server on a random port
 3. Reports the address back to the runner via IPC
 4. Handles graceful shutdown
+
+Every other [srvx `ServerOptions`](https://srvx.h3.dev/guide/options) key exported by the entry (`error`, `maxRequestBodySize`, `trustProxy`, `reusePort`, the runtime-specific `node` / `bun` / `deno` objects, ...) is forwarded to `serve()` unchanged, so one `server.ts` can carry the same options in dev and production. The listener options are owned by the worker, which sits behind the runner's proxy, and are ignored if set: `port`, `hostname`, `protocol`, `tls`, `silent`, `manual` and `gracefulShutdown` — as well as their equivalents nested in `node` (`port`, `host`, `path`, `cert`, `key`, `passphrase`, and `http2`, which srvx only supports with TLS), `bun` (`port`, `hostname`, `unix`, `tls`) and `deno` (`port`, `hostname`, `path`, `cert`, `key`). Custom workers can reuse the same logic via the exported `toServerOptions(entry)` helper.
 
 For advanced use cases, you can provide a custom worker entry:
 

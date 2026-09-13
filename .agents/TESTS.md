@@ -21,6 +21,7 @@ Generic test infrastructure and cross-runner suites. Runner-specific test notes 
 - Test app fixture in `test/fixtures/app-rpc.mjs` — Entry with RPC handler for `rpc()` method tests
 - Test fixture in `test/fixtures/app-upgrade.mjs` — Entry with WebSocket upgrade handler for upgrade tests
 - Test fixture in `test/fixtures/app-websocket.mjs` — Entry with crossws WebSocket hooks for websocket tests
+- Test fixture in `test/fixtures/app-server-options.mjs` — Entry exporting srvx `ServerOptions` (`error`, `maxRequestBodySize`, `trustProxy`) plus worker-owned keys (`port`, `hostname`, ..., and nested `node`/`bun`/`deno` port/host + `node.http2`) that must be ignored; used by the `server options` describe blocks in `runners.test.ts` (node-worker, node-process, bun-process, deno-process) for #49
 
 - Test fixture in `test/fixtures/queue-sdk-stub.mjs` — Stand-in `@vercel/queue` package imported by specifier in the `sdk`-as-specifier test
 
@@ -28,4 +29,4 @@ Generic test infrastructure and cross-runner suites. Runner-specific test notes 
 
 ## Coverage summary
 
-Tests cover: lifecycle, fetch (GET/POST, relative URLs), WebSocket upgrade, crossws websocket, `RunnerManager.wsSrvxPlugin()` end-to-end through a real srvx server (Node passthrough), messaging, hooks, graceful close, inspect output, stdio forwarding (all runners), manager hot-reload, message queueing, miniflare hot-reload, vercel header/env/response injection, netlify header injection and `netlifyRuntime` startup, waitForReady, vite helpers, orphan-worker exit on supervisor death, `await using` disposal (all runners + manager)
+Tests cover: lifecycle, fetch (GET/POST, relative URLs), srvx option forwarding from the entry (#49), WebSocket upgrade, crossws websocket, `RunnerManager.wsSrvxPlugin()` end-to-end through a real srvx server (Node passthrough), messaging, hooks, graceful close, inspect output, stdio forwarding (all runners), manager hot-reload, message queueing, miniflare hot-reload, vercel header/env/response injection, netlify header injection and `netlifyRuntime` startup, waitForReady, vite helpers, orphan-worker exit on supervisor death, `await using` disposal (all runners + manager)

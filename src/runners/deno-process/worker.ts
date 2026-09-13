@@ -1,10 +1,11 @@
-import { serve } from "srvx";
+import { serve, type Server } from "srvx";
 import { plugin as wsPlugin } from "crossws/server";
 import {
   resolveEntry,
   reloadEntryModule,
   parseServerAddress,
   isVirtualSpecifier,
+  toServerOptions,
   type AppEntry,
 } from "../../common/worker-utils.ts";
 import { registerVirtualModules, handleInvalidateModule } from "../../common/virtual-modules.ts";
@@ -23,9 +24,18 @@ const virtualEntry = isVirtualSpecifier(data.entry, data.virtual);
 
 let unregisterVirtualModules: () => void;
 let entry: AppEntry;
+let server: Server;
 try {
   unregisterVirtualModules = await registerVirtualModules(data.virtual);
   entry = await resolveEntry(data.entry, virtualEntry);
+  // The entry's own srvx options are forwarded, so `serve()` can throw on a
+  // bad option — keep it inside the init-error path for an actionable message.
+  server = serve({
+    ...toServerOptions(entry),
+    fetch: (request) => entry.fetch(request),
+    plugins: [...(entry.plugins || []), ...(entry.websocket ? [wsPlugin(entry.websocket)] : [])],
+  });
+  await server.ready();
 } catch (error: any) {
   // Report a structured error before exiting so the runner closes with a
   // meaningful cause instead of an uncaught rejection + bare exit code.
@@ -34,18 +44,6 @@ try {
   console.error(`[env-runner] worker init failed: ${message}`);
   process.exit(1);
 }
-
-const server = serve({
-  port: 0,
-  hostname: "127.0.0.1",
-  silent: true,
-  fetch: (request) => entry.fetch(request),
-  middleware: entry.middleware,
-  plugins: [...(entry.plugins || []), ...(entry.websocket ? [wsPlugin(entry.websocket)] : [])],
-  gracefulShutdown: false,
-});
-
-await server.ready();
 
 if (entry.upgrade) {
   server.node?.server?.on("upgrade", (req, socket, head) => {

@@ -20,7 +20,14 @@ export {
 export { RunnerManager } from "./manager.ts";
 export { type EnvServerOptions, EnvServer } from "./server.ts";
 export { type RunnerName, type LoadRunnerOptions, loadRunner } from "./loader.ts";
-export { type AppEntry, type AppEntryIPC, type AppEntryIPCContext } from "./common/worker-utils.ts";
+export {
+  toServerOptions,
+  RESERVED_SERVER_OPTIONS,
+  RESERVED_RUNTIME_OPTIONS,
+  type AppEntry,
+  type AppEntryIPC,
+  type AppEntryIPCContext,
+} from "./common/worker-utils.ts";
 export { resolveRuntimeDep, type RuntimeDep } from "./common/runtime-deps.ts";
 export {
   type DenoProcessEnvRunnerData,

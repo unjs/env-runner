@@ -75,6 +75,7 @@ export default {
   upgrade?: (context: { node: { req: IncomingMessage, socket: Socket, head: Buffer } }) => void,  // Optional raw WebSocket upgrade handler (Node.js only)
   middleware?: [],  // Optional srvx middleware
   plugins?: [],     // Optional srvx plugins
+  ...ServerOptions, // Any other srvx option (error, maxRequestBodySize, trustProxy, node/bun/deno, ...) is forwarded to serve()
   ipc?: {
     onOpen?: (ctx: { sendMessage: (message: unknown) => void }) => void,
     onMessage?: (message: unknown) => void,
@@ -82,6 +83,8 @@ export default {
   },
 };
 ```
+
+`AppEntry` extends `Omit<ServerOptions, "fetch">` (#49): the built-in workers spread the entry into srvx `serve()` via `toServerOptions()` (`src/common/worker-utils.ts`), which strips the env-runner keys (`fetch`, `upgrade`, `websocket`, `ipc`) and pins the worker-owned listener options listed in `RESERVED_SERVER_OPTIONS` — `port` (0), `hostname` (`127.0.0.1`), `silent`, `gracefulShutdown` (false), plus `protocol`, `tls` and `manual`, which are dropped — since the worker sits behind the runner's proxy. srvx spreads the runtime objects `node`/`bun`/`deno` _after_ its resolved port/host/tls, so the listener/TLS keys inside them (`RESERVED_RUNTIME_OPTIONS`: `node.port/host/path/cert/key/passphrase` and `node.http2`, which srvx rejects without TLS; `bun.port/hostname/unix/tls`; `deno.port/hostname/path/cert/key`) are removed from a shallow copy too. Everything else (`error`, `maxRequestBodySize`, `trustProxy`, `reusePort`, remaining `node`/`bun`/`deno` keys, ...) reaches srvx unchanged. `serve()` + `server.ready()` run inside the worker's init-error try block, so a bad forwarded option reports `init-error` instead of a readiness timeout. Like `middleware`/`plugins`, these options are read once at server start; `reloadModule()` only swaps the `fetch` handler. `toServerOptions`, `RESERVED_SERVER_OPTIONS` and `RESERVED_RUNTIME_OPTIONS` are exported from `env-runner` for custom workers.
 
 The `websocket` property uses [crossws](https://crossws.h3.dev) hooks for cross-platform WebSocket support. Each built-in worker adds the crossws srvx plugin when `websocket` is defined. All built-in workers import `crossws/server`, which auto-selects the runtime adapter (node/bun/deno) via export conditions — matching srvx's own native runtime detection. This keeps the WebSocket adapter in sync with the underlying server: the node-worker/node-process workers inherit the host runtime (worker thread / `fork()`), so they use the native Bun.serve/Deno.serve adapter when env-runner runs on Bun or Deno instead of forcing Node compat. The `upgrade` property is a lower-level alternative for raw Node.js socket access (Node-only).
 
@@ -115,8 +118,8 @@ const runner2 = new NodeProcessEnvRunner({
 ### How workers work
 
 1. Worker receives `data.entry` path (via `workerData` or `ENV_RUNNER_DATA`)
-2. Dynamically imports the user's entry module (`resolveEntry()`); if this (or `registerVirtualModules()`) throws, the worker sends `{ event: "init-error", error }`, logs one concise `[env-runner] worker init failed: ...` line, and exits 1 — no uncaught-rejection stack dump on forwarded stderr
-3. Starts a srvx server with `port: 0` on `127.0.0.1`, adding crossws srvx plugin if `entry.websocket` is defined
+2. Dynamically imports the user's entry module (`resolveEntry()`); if this (or `registerVirtualModules()`, or the `serve()`/`ready()` in step 3) throws, the worker sends `{ event: "init-error", error }`, logs one concise `[env-runner] worker init failed: ...` line, and exits 1 — no uncaught-rejection stack dump on forwarded stderr
+3. Starts a srvx server with `port: 0` on `127.0.0.1` (`toServerOptions(entry)` — forwards the entry's other srvx options), adding crossws srvx plugin if `entry.websocket` is defined
 4. Wires `entry.upgrade()` to the underlying Node.js HTTP server's `upgrade` event (if defined)
 5. Calls `entry.ipc.onOpen()` with `{ sendMessage }` if IPC hooks are defined
 6. Reports `{ address: { host, port } }` via IPC
@@ -138,7 +141,7 @@ const runner2 = new NodeProcessEnvRunner({
 
 ## Exports
 
-- `env-runner` (`.`) — Types + all runners + `RunnerManager` + `AppEntry` + `resolveRuntimeDep`/`RuntimeDep`
+- `env-runner` (`.`) — Types + all runners + `RunnerManager` + `AppEntry` + `toServerOptions`/`RESERVED_SERVER_OPTIONS`/`RESERVED_RUNTIME_OPTIONS` + `resolveRuntimeDep`/`RuntimeDep`
 - `env-runner/runners/node-worker` (`./runners/node-worker`) — Direct import of `NodeWorkerEnvRunner`
 - `env-runner/runners/node-worker/worker` (`./runners/node-worker/worker`) — Built-in srvx worker for Worker threads
 - `env-runner/runners/node-process` (`./runners/node-process`) — Direct import of `NodeProcessEnvRunner`
