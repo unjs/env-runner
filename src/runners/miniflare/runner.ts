@@ -135,13 +135,19 @@ export interface MiniflareEnvRunnerOptions {
    * (compatibility date/flags and bindings: `vars`, KV, R2, D1, Durable
    * Objects, queues).
    *
-   * - `true` — auto-discover `wrangler.{json,jsonc,toml}` next to the entry
-   *   file, then in the current working directory.
+   * - `true` — auto-discover `wrangler.{json,jsonc,toml}`: when the entry
+   *   file is inside the current working directory, walk up from the entry's
+   *   directory to the filesystem root; otherwise (e.g. an entry hoisted
+   *   under `node_modules/.pnpm`) check only the entry's own directory, then
+   *   walk up from the cwd. The nearest directory wins, and within a
+   *   directory `wrangler.json` > `wrangler.jsonc` > `wrangler.toml` (wrangler
+   *   itself tries each filename all the way up before the next). A config
+   *   found above the entry dir/cwd is logged once.
    * - `string` — explicit path to a wrangler config file.
    * - `object` — an inline raw (snake_case) wrangler config, as you would
    *   write in `wrangler.json` (no file needed). A config file is still
    *   loaded ({@link MiniflareEnvRunnerOptions.wranglerConfigPath}, else
-   *   auto-discovered next to the entry, then cwd) and the inline config is
+   *   auto-discovered as for `true`) and the inline config is
    *   merged on top of it (inline wins per key, binding records merge,
    *   `compatibilityFlags` are unioned). When the inline config doesn't
    *   define the selected {@link MiniflareEnvRunnerOptions.wranglerEnv}, its
@@ -152,7 +158,18 @@ export interface MiniflareEnvRunnerOptions {
    * config with a single warning naming them: `assets`, service bindings,
    * queue consumers, workflows, tail consumers, and Durable Object bindings
    * to another script (`script_name`). Pass them via `miniflareOptions` to
-   * opt in.
+   * opt in. A Durable Object binding whose `script_name` equals the effective
+   * worker `name` — the inline config's `name` when set, else the file's,
+   * suffixed `-<env>` when a {@link MiniflareEnvRunnerOptions.wranglerEnv} is
+   * selected and its env section sets no `name` (e.g. `app-staging`) — is
+   * local, as in `wrangler dev`, and kept.
+   *
+   * With the `wrangler` package, wrangler's own config warnings (unexpected
+   * keys, an `--env` the config doesn't define, ...) are shown for a config
+   * file once per file version and env per process, not on every reload.
+   * Warnings for inline configs stay hidden. Like `wrangler dev`, wrangler
+   * then also runs its npm update check for unexpected keys (cached for a
+   * day; may print a "newer version of Wrangler" hint).
    *
    * Local state is shared with `wrangler dev`: `defaultPersistRoot` defaults
    * to `<dir>/.wrangler/state/v3`, where `<dir>` is the directory of the
@@ -185,6 +202,22 @@ export interface MiniflareEnvRunnerOptions {
    * Defaults to the `CLOUDFLARE_ENV` environment variable.
    */
   wranglerEnv?: string;
+  /**
+   * Custom `.env` files to load local dev vars/secrets from, like
+   * `getPlatformProxy({ envFiles })` — forwarded to wrangler's
+   * `unstable_getMiniflareWorkerOptions(config, env, { envFiles })`. Paths
+   * resolve against the loaded config file's directory (else the current
+   * working directory); later files override earlier ones. When non-empty,
+   * `.dev.vars` is not read. When unset, wrangler's defaults apply
+   * (`.dev.vars[.<env>]`, else `.env`, `.env.local`, `.env.<env>`,
+   * `.env.<env>.local`). An empty array still reads `.dev.vars[.<env>]` but
+   * no `.env*` files.
+   *
+   * Only applies when the `wrangler` package is used (see
+   * {@link MiniflareEnvRunnerOptions.wranglerModule}); the built-in minimal
+   * reader loads no dev-var files and warns once that the option is ignored.
+   */
+  wranglerEnvFiles?: string[];
   /**
    * The imported `wrangler` package (`import * as wrangler from "wrangler"`),
    * used to parse the {@link MiniflareEnvRunnerOptions.wrangler} config with
@@ -229,6 +262,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
   #wrangler: boolean | string | WranglerInlineConfig;
   #wranglerEnv?: string;
   #wranglerConfigPath?: string;
+  #wranglerEnvFiles?: string[];
   #compatibilityDate?: string;
   #wranglerModule?: RuntimeDep<WranglerModule>;
   #miniflareModule?: RuntimeDep<MiniflareModule>;
@@ -247,6 +281,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
     this.#wranglerEnv = opts.wranglerEnv ?? process.env.CLOUDFLARE_ENV;
     this.#wranglerModule = opts.wranglerModule;
     this.#wranglerConfigPath = opts.wranglerConfigPath;
+    this.#wranglerEnvFiles = opts.wranglerEnvFiles;
     this.#compatibilityDate = opts.compatibilityDate;
     this._initWithVirtualData(() => this.#init());
   }
@@ -519,6 +554,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
       entryPath,
       configPath: this.#wranglerConfigPath,
       wranglerModule: this.#wranglerModule,
+      envFiles: this.#wranglerEnvFiles,
     });
 
     const userFlags = (this.#miniflareOptions.compatibilityFlags as string[]) || [];
@@ -555,7 +591,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
         ],
         supportedCompatibilityDate,
       ),
-      compatibilityFlags: [...new Set(["nodejs_compat", ...wranglerFlags, ...userFlags])],
+      compatibilityFlags: resolveCompatibilityFlags(wranglerFlags, userFlags),
       // Expose a direct socket so we can proxy WebSocket upgrades via workerd
       unsafeDirectSockets: [{ host: "127.0.0.1", port: 0 }, ...userDirectSockets],
     };
@@ -628,6 +664,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
         dynamicOnly: true,
         captureErrors: this.#captureErrors,
         exports: detectedExports,
+        nodeCompat: !(options.compatibilityFlags as string[]).includes("no_nodejs_compat"),
       });
       options.scriptPath = entryDir + "/__env_runner_wrapper.mjs";
       // Use "/" as modulesRoot so absolute paths don't produce ".." relative paths
@@ -938,6 +975,27 @@ function resolveCompatibilityDate(
     return supported;
   }
   return date;
+}
+
+/**
+ * Union wrangler-derived and user compatibility flags, defaulting
+ * `nodejs_compat` on unless either opts out with `no_nodejs_compat` (workerd
+ * refuses to start with both: "mutually contradictory"). User flags win the
+ * pair: a user `no_nodejs_compat` drops a wrangler `nodejs_compat` and vice versa.
+ */
+function resolveCompatibilityFlags(wranglerFlags: string[], userFlags: string[]): string[] {
+  const opposite = (flag: string) =>
+    flag === "nodejs_compat"
+      ? "no_nodejs_compat"
+      : flag === "no_nodejs_compat"
+        ? "nodejs_compat"
+        : undefined;
+  const flags = [
+    ...wranglerFlags.filter((flag) => !userFlags.includes(opposite(flag)!)),
+    ...userFlags,
+  ];
+  const defaults = flags.includes("no_nodejs_compat") ? [] : ["nodejs_compat"];
+  return [...new Set([...defaults, ...flags])];
 }
 
 function _isDateString(value: string): boolean {

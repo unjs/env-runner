@@ -32,8 +32,21 @@ export const UNSAFE_EVAL_BINDING = "__ENV_RUNNER_UNSAFE_EVAL__";
  */
 export function generateWrapper(
   entryPath: string,
-  opts?: { dynamicOnly?: boolean; captureErrors?: boolean; exports?: string[] },
+  opts?: {
+    dynamicOnly?: boolean;
+    captureErrors?: boolean;
+    exports?: string[];
+    /** Import `node:process` as the `process` global (needs `nodejs_compat`). Default: `true`. */
+    nodeCompat?: boolean;
+  },
 ): string {
+  // Without `nodejs_compat` (`no_nodejs_compat`), `node:process` can't resolve
+  // and would stop workerd from starting.
+  const processShim =
+    opts?.nodeCompat === false
+      ? ""
+      : `import __process from "node:process";
+if (!globalThis.process) { globalThis.process = __process; }`;
   // When dynamicOnly is set, skip static `export *` to avoid miniflare's
   // ModuleLocator walking the entry's import tree at startup. All module
   // loading goes through dynamic import() via unsafeEvalBinding instead.
@@ -67,8 +80,7 @@ export function generateWrapper(
     }`
     : `return __server.fetch(request, env, ctx);`;
 
-  return /* js */ `import __process from "node:process";
-if (!globalThis.process) { globalThis.process = __process; }
+  return /* js */ `${processShim}
 ${staticReExport}
 ${explicitExports}
 

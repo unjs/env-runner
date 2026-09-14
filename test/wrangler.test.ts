@@ -6,6 +6,7 @@ import * as miniflare from "miniflare";
 import * as wrangler from "wrangler";
 import { MiniflareEnvRunner } from "../src/runners/miniflare/runner.ts";
 import type { MiniflareEnvRunnerOptions } from "../src/runners/miniflare/runner.ts";
+import { loadWranglerConfig } from "../src/runners/miniflare/wrangler.ts";
 import type { EnvRunner } from "../src/index.ts";
 
 // `wranglerModule` is an explicit runner option, so the two paths need no
@@ -23,6 +24,13 @@ const ENV_ENTRY = `export default {
       greeting: env.GREETING ?? null,
       tier: env.TIER ?? null,
     });
+  },
+};`;
+
+// Entry that just responds (for tests asserting on runner options).
+const OK_ENTRY = `export default {
+  fetch() {
+    return Response.json({ ok: true });
   },
 };`;
 
@@ -716,6 +724,810 @@ const FALLBACK_CASES: WranglerCase[] = [
 
 describe("MiniflareEnvRunner (wrangler config, fallback reader)", () => {
   defineWranglerCases([...SHARED_CASES, ...FALLBACK_CASES], false);
+});
+
+// --- `loadWranglerConfig()` and runner integration details ---
+
+describe("wrangler config loading", () => {
+  const COMPAT_DATE = "2025-01-01";
+  const CONFIG_NAMES = ["wrangler.json", "wrangler.jsonc", "wrangler.toml"];
+  const BACKENDS = [
+    { name: "wrangler package", wranglerModule: wrangler },
+    { name: "minimal reader", wranglerModule: false as const },
+  ];
+
+  let dir: string;
+  let warn: ReturnType<typeof vi.spyOn>;
+  let info: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(_dir, ".tmp-wrangler-load-"));
+    warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    // Parent-dir config notices and wrangler's "Using secrets defined in .dev.vars".
+    info = vi.spyOn(console, "info").mockImplementation(() => {});
+    vi.spyOn(console, "log").mockImplementation(() => {});
+  });
+
+  afterEach(async () => {
+    await runner?.close();
+    runner = undefined;
+    vi.restoreAllMocks();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  function write(files: Record<string, string | object>): void {
+    for (const [name, contents] of Object.entries(files)) {
+      const file = join(dir, name);
+      mkdirSync(dirname(file), { recursive: true });
+      writeFileSync(file, typeof contents === "string" ? contents : JSON.stringify(contents));
+    }
+  }
+
+  function warnings(): string[] {
+    return warn.mock.calls.map((call: unknown[]) => String(call[0]));
+  }
+
+  // Inline-only loads without depending on the host filesystem: a missing
+  // `configPath` skips auto-discovery (which walks up to `/`), and a stubbed cwd
+  // anchors wrangler's dev-vars lookup in the temp dir.
+  function pinInlineOnly(): { configPath: string } {
+    vi.spyOn(process, "cwd").mockReturnValue(dir);
+    return { configPath: join(dir, "missing-wrangler.json") };
+  }
+
+  function wranglerJson(config: Record<string, unknown>): string {
+    return JSON.stringify({ name: "test", compatibility_date: "2024-09-01", ...config });
+  }
+
+  // Start a runner on a trivial entry and return the options it passed to Miniflare.
+  async function startRunner(
+    options: Partial<MiniflareEnvRunnerOptions>,
+  ): Promise<Record<string, any>> {
+    const entryPath = join(dir, "worker.mjs");
+    writeFileSync(entryPath, OK_ENTRY);
+    let mfOptions: Record<string, any> = {};
+    class CapturingMiniflare extends miniflare.Miniflare {
+      constructor(opts: any) {
+        mfOptions = opts;
+        super(opts);
+      }
+    }
+    runner = new MiniflareEnvRunner({
+      name: "wrangler-load",
+      miniflare: { ...miniflare, Miniflare: CapturingMiniflare },
+      data: { entry: entryPath },
+      wranglerModule: false,
+      miniflareOptions: { kvPersist: false },
+      ...options,
+    });
+    // Shorter than the test timeout so a startup regression fails readably.
+    await runner.waitForReady(15_000);
+    const res = await runner.fetch("http://localhost/");
+    expect(await res.json()).toEqual({ ok: true });
+    return mfOptions;
+  }
+
+  describe.each(BACKENDS)("$name", ({ wranglerModule }) => {
+    describe("config discovery walks up parent directories", () => {
+      it(
+        "finds a config above both the entry dir and the cwd",
+        async () => {
+          write({
+            "wrangler.json": { compatibility_date: COMPAT_DATE, vars: { GREETING: "root" } },
+          });
+          mkdirSync(join(dir, "apps/web/src"), { recursive: true });
+          vi.spyOn(process, "cwd").mockReturnValue(join(dir, "apps/web"));
+          const result = await loadWranglerConfig({
+            wrangler: true,
+            entryPath: join(dir, "apps/web/src/worker.mjs"),
+            wranglerModule,
+          });
+          expect(result.configFile).toBe(join(dir, "wrangler.json"));
+          expect(result.options?.bindings).toMatchObject({ GREETING: "root" });
+          expect(warnings().some((m) => m.includes("none found"))).toBe(false);
+        },
+        WRANGLER_TEST_TIMEOUT,
+      );
+
+      it("prefers the nearest directory, then json > jsonc > toml within it", async () => {
+        write({
+          "wrangler.json": { vars: { GREETING: "root" } },
+          "apps/wrangler.json": { vars: { GREETING: "apps" } },
+          "apps/wrangler.jsonc": "{}",
+          "apps/wrangler.toml": "",
+        });
+        mkdirSync(join(dir, "apps/web/src"), { recursive: true });
+        vi.spyOn(process, "cwd").mockReturnValue(dir);
+        const result = await loadWranglerConfig({
+          wrangler: true,
+          entryPath: join(dir, "apps/web/src/worker.mjs"),
+          wranglerModule,
+        });
+        expect(result.configFile).toBe(join(dir, "apps/wrangler.json"));
+      });
+
+      it("announces a config found in a parent of the entry dir once", async () => {
+        write({ "apps/web/wrangler.json": { vars: { GREETING: "web" } } });
+        mkdirSync(join(dir, "apps/web/src/deep"), { recursive: true });
+        vi.spyOn(process, "cwd").mockReturnValue(dir);
+        const load = () =>
+          loadWranglerConfig({
+            wrangler: true,
+            entryPath: join(dir, "apps/web/src/deep/worker.mjs"),
+            wranglerModule,
+          });
+        expect((await load()).configFile).toBe(join(dir, "apps/web/wrangler.json"));
+        expect((await load()).configFile).toBe(join(dir, "apps/web/wrangler.json"));
+        const announced = info.mock.calls.filter((c: unknown[]) =>
+          String(c[0]).includes(join(dir, "apps/web/wrangler.json")),
+        );
+        expect(announced).toHaveLength(1);
+        expect(String(announced[0]![0])).toContain("wrangler config from a parent directory");
+      });
+
+      it.each([
+        ["hoisted under node_modules/.pnpm", "node_modules/.pnpm/fw@1.0.0/node_modules/fw/dist"],
+        ["in a sibling package", "pkgs/lib/dist"],
+      ])(
+        "prefers the cwd's config over an ancestor of an out-of-cwd entry (%s)",
+        async (_label, entryDir) => {
+          write({
+            "wrangler.json": { vars: { GREETING: "root" } },
+            "apps/web/wrangler.json": { vars: { GREETING: "web" } },
+          });
+          mkdirSync(join(dir, entryDir), { recursive: true });
+          vi.spyOn(process, "cwd").mockReturnValue(join(dir, "apps/web"));
+          const result = await loadWranglerConfig({
+            wrangler: true,
+            entryPath: join(dir, entryDir, "entry.mjs"),
+            wranglerModule,
+          });
+          expect(result.configFile).toBe(join(dir, "apps/web/wrangler.json"));
+        },
+      );
+
+      it("uses a config in an out-of-cwd entry's own directory", async () => {
+        write({
+          "pkgs/lib/dist/wrangler.json": { vars: { GREETING: "entry" } },
+          "apps/web/wrangler.json": { vars: { GREETING: "web" } },
+        });
+        vi.spyOn(process, "cwd").mockReturnValue(join(dir, "apps/web"));
+        const result = await loadWranglerConfig({
+          wrangler: true,
+          entryPath: join(dir, "pkgs/lib/dist/entry.mjs"),
+          wranglerModule,
+        });
+        expect(result.configFile).toBe(join(dir, "pkgs/lib/dist/wrangler.json"));
+      });
+
+      it("falls back to the cwd's ancestors when the entry's have none", async () => {
+        const outside = mkdtempSync(join(_dir, ".tmp-wrangler-load-entry-"));
+        try {
+          write({ "b/wrangler.json": { vars: { GREETING: "cwd" } } });
+          mkdirSync(join(dir, "b/c/d"), { recursive: true });
+          vi.spyOn(process, "cwd").mockReturnValue(join(dir, "b/c/d"));
+          const result = await loadWranglerConfig({
+            wrangler: true,
+            entryPath: join(outside, "worker.mjs"),
+            wranglerModule,
+          });
+          expect(result.configFile).toBe(join(dir, "b/wrangler.json"));
+        } finally {
+          rmSync(outside, { recursive: true, force: true });
+        }
+      });
+
+      it("warns when no config exists up to the filesystem root", async (ctx) => {
+        // Only meaningful when no ancestor of the temp dir has a wrangler config.
+        for (let parent = dir; ; parent = dirname(parent)) {
+          if (CONFIG_NAMES.some((name) => existsSync(join(parent, name)))) {
+            ctx.skip();
+          }
+          if (dirname(parent) === parent) break;
+        }
+        mkdirSync(join(dir, "x/y"), { recursive: true });
+        vi.spyOn(process, "cwd").mockReturnValue(join(dir, "x/y"));
+        const result = await loadWranglerConfig({
+          wrangler: true,
+          entryPath: join(dir, "x/y/worker.mjs"),
+          wranglerModule,
+        });
+        expect(result).toEqual({});
+        expect(
+          warnings().some((m) =>
+            m.includes(
+              "none found (searched the entry's directory, then from the cwd up to the filesystem root)",
+            ),
+          ),
+        ).toBe(true);
+      });
+    });
+
+    describe("self-referencing Durable Objects", () => {
+      it("keeps bindings whose script_name is the config's own name", async () => {
+        write({
+          "wrangler.json": {
+            name: "app",
+            compatibility_date: COMPAT_DATE,
+            durable_objects: {
+              bindings: [
+                { name: "SELF_DO", class_name: "Counter", script_name: "app" },
+                { name: "LOCAL", class_name: "Greeter" },
+                { name: "EXTERNAL", class_name: "Other", script_name: "other-worker" },
+              ],
+            },
+            migrations: [{ tag: "v1", new_sqlite_classes: ["Counter"] }],
+          },
+        });
+        const { options } = await loadWranglerConfig({
+          wrangler: join(dir, "wrangler.json"),
+          wranglerModule,
+        });
+        const dos = options?.durableObjects as Record<string, any>;
+        expect(Object.keys(dos).sort()).toEqual(["LOCAL", "SELF_DO"]);
+        if (wranglerModule) {
+          // `scriptName` is stripped, other fields (e.g. `useSQLite`) survive.
+          expect(dos.SELF_DO).not.toHaveProperty("scriptName");
+          expect(dos.SELF_DO).toMatchObject({ className: "Counter", useSQLite: true });
+        } else {
+          expect(dos.SELF_DO).toEqual({ className: "Counter" });
+        }
+        expect(wranglerModule ? dos.LOCAL.className : dos.LOCAL).toBe("Greeter");
+        const dropped = droppedWarnings(warnings());
+        expect(dropped).toHaveLength(1);
+        expect(dropped[0]).toContain('EXTERNAL → script "other-worker"');
+        expect(dropped[0]).not.toContain("SELF_DO");
+      });
+
+      it("matches the env-normalized worker name (`<name>-<env>`)", async () => {
+        write({
+          "wrangler.json": {
+            name: "app",
+            compatibility_date: COMPAT_DATE,
+            env: {
+              staging: {
+                durable_objects: {
+                  bindings: [
+                    { name: "SELF_DO", class_name: "Counter", script_name: "app-staging" },
+                    { name: "TOP", class_name: "Greeter", script_name: "app" },
+                  ],
+                },
+              },
+            },
+          },
+        });
+        const { options } = await loadWranglerConfig({
+          wrangler: join(dir, "wrangler.json"),
+          env: "staging",
+          wranglerModule,
+        });
+        expect(Object.keys(options?.durableObjects as object)).toEqual(["SELF_DO"]);
+        expect(droppedWarnings(warnings())[0]).toContain('TOP → script "app"');
+      });
+
+      it("suffixes the name with `-<env>` even when the config has no such env section", async () => {
+        write({
+          "wrangler.json": {
+            name: "app",
+            compatibility_date: COMPAT_DATE,
+            durable_objects: {
+              bindings: [
+                { name: "SELF_DO", class_name: "Counter", script_name: "app-staging" },
+                { name: "TOP", class_name: "Greeter", script_name: "app" },
+              ],
+            },
+          },
+        });
+        const { options } = await loadWranglerConfig({
+          wrangler: join(dir, "wrangler.json"),
+          env: "staging",
+          wranglerModule,
+        });
+        expect(Object.keys(options?.durableObjects as object)).toEqual(["SELF_DO"]);
+        expect(droppedWarnings(warnings())[0]).toContain('TOP → script "app"');
+      });
+
+      it("matches file + inline bindings against the effective (merged) worker name", async () => {
+        write({
+          "wrangler.json": {
+            name: "app",
+            compatibility_date: COMPAT_DATE,
+            durable_objects: {
+              bindings: [{ name: "FILE_SELF", class_name: "Counter", script_name: "app" }],
+            },
+          },
+        });
+        // No inline `name`: the file's name applies to inline bindings too.
+        const unnamed = await loadWranglerConfig({
+          wrangler: {
+            durable_objects: {
+              bindings: [{ name: "INLINE_SELF", class_name: "Greeter", script_name: "app" }],
+            },
+          },
+          configPath: join(dir, "wrangler.json"),
+          wranglerModule,
+        });
+        expect(Object.keys(unnamed.options?.durableObjects as object).sort()).toEqual([
+          "FILE_SELF",
+          "INLINE_SELF",
+        ]);
+        expect(droppedWarnings(warnings())).toHaveLength(0);
+
+        // An inline `name` renames the worker: the file's `script_name: "app"`
+        // now points at another worker.
+        const renamed = await loadWranglerConfig({
+          wrangler: {
+            name: "renamed",
+            durable_objects: {
+              bindings: [{ name: "INLINE_SELF", class_name: "Greeter", script_name: "renamed" }],
+            },
+          },
+          configPath: join(dir, "wrangler.json"),
+          wranglerModule,
+        });
+        expect(Object.keys(renamed.options?.durableObjects as object)).toEqual(["INLINE_SELF"]);
+        expect(droppedWarnings(warnings())[0]).toContain('FILE_SELF → script "app"');
+      });
+
+      it("keeps self-referencing bindings from an inline config", async () => {
+        vi.spyOn(process, "cwd").mockReturnValue(dir);
+        const { options } = await loadWranglerConfig({
+          wrangler: {
+            name: "inline-app",
+            compatibility_date: COMPAT_DATE,
+            durable_objects: {
+              bindings: [{ name: "SELF_DO", class_name: "Counter", script_name: "inline-app" }],
+            },
+          },
+          wranglerModule,
+        });
+        expect(Object.keys(options?.durableObjects as object)).toEqual(["SELF_DO"]);
+        expect(droppedWarnings(warnings())).toHaveLength(0);
+      });
+
+      it(
+        "binds a self-referencing Durable Object in the running worker",
+        async () => {
+          write({
+            "worker.mjs": `import { DurableObject } from "cloudflare:workers";
+  export class Counter extends DurableObject {
+    count = 0;
+    hit() { return ++this.count; }
+  }
+  export default {
+    async fetch(request, env) {
+      const stub = env.SELF_DO.get(env.SELF_DO.idFromName("a"));
+      await stub.hit();
+      return Response.json({ count: await stub.hit(), autoWired: typeof env.COUNTER });
+    },
+  };`,
+            "wrangler.json": {
+              name: "app",
+              compatibility_date: COMPAT_DATE,
+              durable_objects: {
+                bindings: [{ name: "SELF_DO", class_name: "Counter", script_name: "app" }],
+              },
+            },
+          });
+          runner = new MiniflareEnvRunner({
+            name: "self-do",
+            miniflare,
+            data: { entry: join(dir, "worker.mjs") },
+            wrangler: join(dir, "wrangler.json"),
+            wranglerModule,
+            // Re-export `Counter` from the wrapper (and try to auto-wire it).
+            exports: true,
+            miniflareOptions: { defaultPersistRoot: join(dir, ".state") },
+          });
+          await waitForReady(runner, WRANGLER_TEST_TIMEOUT);
+          const res = await runner.fetch("http://localhost/");
+          // The DO is instantiated and called; `Counter` is already bound by
+          // SELF_DO, so no duplicate `COUNTER` binding is auto-wired.
+          expect(await res.json()).toEqual({ count: 2, autoWired: "undefined" });
+          expect(droppedWarnings(warnings())).toHaveLength(0);
+        },
+        WRANGLER_TEST_TIMEOUT,
+      );
+    });
+  });
+
+  describe("inline config keeps nested file options", () => {
+    it(
+      "does not clobber the file's `send_email` with the inline `email: { send_email: [] }`",
+      async () => {
+        write({ "wrangler.json": wranglerJson({ send_email: [{ name: "MAIL" }] }) });
+        const { options } = await loadWranglerConfig({
+          wrangler: { vars: { A: "1" } },
+          configPath: join(dir, "wrangler.json"),
+          wranglerModule: wrangler,
+        });
+        expect(options?.email).toEqual({ send_email: [{ name: "MAIL" }] });
+        expect(options?.bindings).toEqual({ A: "1" });
+      },
+      WRANGLER_TEST_TIMEOUT,
+    );
+
+    it(
+      "drops all-empty wrapper options but keeps `{}`-valued bindings and JSON vars",
+      async () => {
+        const { options } = await loadWranglerConfig({
+          wrangler: {
+            compatibility_date: "2024-09-01",
+            vars: { LIST: [] },
+            worker_loaders: [{ binding: "LOADER" }],
+          },
+          ...pinInlineOnly(),
+          wranglerModule: wrangler,
+        });
+        expect(options).not.toHaveProperty("email");
+        expect(options?.bindings).toEqual({ LIST: [] });
+        expect(options?.workerLoaders).toEqual({ LOADER: {} });
+      },
+      WRANGLER_TEST_TIMEOUT,
+    );
+  });
+
+  describe("`no_nodejs_compat`", () => {
+    it(
+      "does not force `nodejs_compat` when a wrangler config opts out",
+      async () => {
+        const mfOptions = await startRunner({
+          wrangler: { compatibility_date: "2024-09-23", compatibility_flags: ["no_nodejs_compat"] },
+        });
+        expect(mfOptions.compatibilityFlags).toEqual(["no_nodejs_compat"]);
+      },
+      WRANGLER_TEST_TIMEOUT,
+    );
+
+    it(
+      "does not force `nodejs_compat` when a wrangler config opts out (wrangler package)",
+      async () => {
+        const mfOptions = await startRunner({
+          wrangler: { compatibility_date: "2024-09-23", compatibility_flags: ["no_nodejs_compat"] },
+          wranglerConfigPath: pinInlineOnly().configPath,
+          wranglerModule: wrangler,
+        });
+        expect(mfOptions.compatibilityFlags).toEqual(["no_nodejs_compat"]);
+      },
+      WRANGLER_TEST_TIMEOUT,
+    );
+
+    it(
+      "lets a user `no_nodejs_compat` drop a wrangler `nodejs_compat`",
+      async () => {
+        const mfOptions = await startRunner({
+          wrangler: { compatibility_date: "2024-09-23", compatibility_flags: ["nodejs_compat"] },
+          miniflareOptions: { kvPersist: false, compatibilityFlags: ["no_nodejs_compat"] },
+        });
+        expect(mfOptions.compatibilityFlags).toEqual(["no_nodejs_compat"]);
+      },
+      WRANGLER_TEST_TIMEOUT,
+    );
+
+    it(
+      "does not force `nodejs_compat` when miniflareOptions opt out",
+      async () => {
+        const mfOptions = await startRunner({
+          miniflareOptions: {
+            compatibilityDate: "2024-09-23",
+            compatibilityFlags: ["no_nodejs_compat"],
+          },
+        });
+        expect(mfOptions.compatibilityFlags).toEqual(["no_nodejs_compat"]);
+      },
+      WRANGLER_TEST_TIMEOUT,
+    );
+
+    it(
+      "still defaults to `nodejs_compat`",
+      async () => {
+        const mfOptions = await startRunner({
+          miniflareOptions: { compatibilityFlags: ["global_fetch_strictly_public"] },
+        });
+        expect(mfOptions.compatibilityFlags).toEqual([
+          "nodejs_compat",
+          "global_fetch_strictly_public",
+        ]);
+      },
+      WRANGLER_TEST_TIMEOUT,
+    );
+  });
+
+  describe("inline config dev vars", () => {
+    it(
+      "loads `.dev.vars` from cwd for an inline-only config",
+      async () => {
+        write({ ".dev.vars": "SECRET=from-dev-vars\n" });
+        const { options, configFile } = await loadWranglerConfig({
+          wrangler: { compatibility_date: "2024-09-01", vars: { SECRET: "inline", OTHER: "x" } },
+          ...pinInlineOnly(),
+          wranglerModule: wrangler,
+        });
+        expect(configFile).toBeUndefined();
+        expect(options?.bindings).toEqual({ SECRET: "from-dev-vars", OTHER: "x" });
+      },
+      WRANGLER_TEST_TIMEOUT,
+    );
+
+    it(
+      "does not let inline `vars` override the file's `.dev.vars` secrets",
+      async () => {
+        write({
+          "config/wrangler.json": wranglerJson({ vars: { SECRET: "file", TIER: "file" } }),
+          "config/.dev.vars": "SECRET=from-dev-vars\n",
+        });
+        const { options } = await loadWranglerConfig({
+          wrangler: { vars: { SECRET: "inline", GREETING: "inline" } },
+          configPath: join(dir, "config/wrangler.json"),
+          wranglerModule: wrangler,
+        });
+        expect(options?.bindings).toEqual({
+          SECRET: "from-dev-vars",
+          TIER: "file",
+          GREETING: "inline",
+        });
+      },
+      WRANGLER_TEST_TIMEOUT,
+    );
+
+    it(
+      "uses `.dev.vars.<env>` even when the inline config doesn't define the env",
+      async () => {
+        write({
+          "config/wrangler.json": wranglerJson({
+            vars: { SECRET: "file" },
+            env: { staging: { vars: { SECRET: "file-staging" } } },
+          }),
+          "config/.dev.vars": "SECRET=from-dev-vars\n",
+          "config/.dev.vars.staging": "SECRET=from-dev-vars-staging\n",
+        });
+        const { options } = await loadWranglerConfig({
+          wrangler: { vars: { SECRET: "inline" } },
+          configPath: join(dir, "config/wrangler.json"),
+          env: "staging",
+          wranglerModule: wrangler,
+        });
+        expect(options?.bindings).toEqual({ SECRET: "from-dev-vars-staging" });
+      },
+      WRANGLER_TEST_TIMEOUT,
+    );
+
+    it(
+      "loads `.env` from the config file's dir for an inline config",
+      async () => {
+        write({
+          "config/wrangler.json": wranglerJson({}),
+          "config/.env": "SECRET=from-dot-env\n",
+        });
+        const { options } = await loadWranglerConfig({
+          wrangler: { vars: { SECRET: "inline" } },
+          configPath: join(dir, "config/wrangler.json"),
+          wranglerModule: wrangler,
+        });
+        expect(options?.bindings).toEqual({ SECRET: "from-dot-env" });
+      },
+      WRANGLER_TEST_TIMEOUT,
+    );
+
+    it(
+      "does not leak undeclared `.dev.vars` keys through an inline config",
+      async () => {
+        write({
+          "wrangler.json": wranglerJson({
+            vars: { TIER: "file" },
+            secrets: { required: ["API_KEY"] },
+            kv_namespaces: [{ binding: "CACHE" }],
+          }),
+          ".dev.vars": "API_KEY=real\nJUNK=leaked\nCACHE=oops\n",
+        });
+        const load = (inline?: Record<string, unknown>) =>
+          loadWranglerConfig({
+            wrangler: inline ?? true,
+            configPath: join(dir, "wrangler.json"),
+            wranglerModule: wrangler,
+          });
+        const fileOnly = await load();
+        expect(fileOnly.options?.bindings).toEqual({ TIER: "file", API_KEY: "real" });
+        const merged = await load({ vars: { X: "1" } });
+        expect(merged.options?.bindings).toEqual({ TIER: "file", API_KEY: "real", X: "1" });
+        expect(merged.options?.kvNamespaces).toHaveProperty("CACHE");
+      },
+      WRANGLER_TEST_TIMEOUT,
+    );
+
+    it(
+      "reads the inline config under the file's `secrets` (process.env secrets win over inline vars)",
+      async () => {
+        write({
+          "wrangler.json": wranglerJson({ secrets: { required: ["API_KEY"] } }),
+        });
+        vi.stubEnv("API_KEY", "from-process-env");
+        try {
+          const { options } = await loadWranglerConfig({
+            wrangler: { vars: { API_KEY: "inline" } },
+            configPath: join(dir, "wrangler.json"),
+            wranglerModule: wrangler,
+          });
+          expect(options?.bindings).toEqual({ API_KEY: "from-process-env" });
+        } finally {
+          vi.unstubAllEnvs();
+        }
+      },
+      WRANGLER_TEST_TIMEOUT,
+    );
+
+    it(
+      "does not leak `.dev.vars` keys that name another binding type without `secrets`",
+      async () => {
+        write({
+          "wrangler.json": wranglerJson({ kv_namespaces: [{ binding: "CACHE" }] }),
+          ".dev.vars": "API_KEY=real\nCACHE=oops\n",
+        });
+        const { options } = await loadWranglerConfig({
+          wrangler: { vars: { X: "1" } },
+          configPath: join(dir, "wrangler.json"),
+          wranglerModule: wrangler,
+        });
+        expect(options?.bindings).toEqual({ API_KEY: "real", X: "1" });
+      },
+      WRANGLER_TEST_TIMEOUT,
+    );
+
+    it(
+      "anchors inline dev vars at a config file that fails to load",
+      async () => {
+        write({
+          "config/wrangler.json": wranglerJson({ vars: "not-an-object" }),
+          "config/.dev.vars": "SECRET=from-config-dir\n",
+          ".dev.vars": "SECRET=from-cwd\n",
+        });
+        vi.spyOn(process, "cwd").mockReturnValue(dir);
+        const { options, configFile } = await loadWranglerConfig({
+          wrangler: { compatibility_date: "2024-09-01", vars: { SECRET: "inline" } },
+          configPath: join(dir, "config/wrangler.json"),
+          wranglerModule: wrangler,
+        });
+        expect(configFile).toBeUndefined();
+        expect(options?.bindings).toEqual({ SECRET: "from-config-dir" });
+      },
+      WRANGLER_TEST_TIMEOUT,
+    );
+  });
+
+  describe("wrangler warnings (wrangler package)", () => {
+    const MISSING_ENV = 'No environment found in configuration with name "nope"';
+
+    it("surfaces warnings for a config file once per file version and env", async () => {
+      const config = { name: "app", compatibility_date: COMPAT_DATE };
+      write({ "wrangler.json": config });
+      const load = (env: string) =>
+        loadWranglerConfig({
+          wrangler: join(dir, "wrangler.json"),
+          env,
+          wranglerModule: wrangler,
+        });
+      const count = () => warnings().filter((m) => m.includes(MISSING_ENV)).length;
+
+      await load("nope");
+      expect(count()).toBe(1);
+      // Re-init / hot reload with the same file: not repeated.
+      await load("nope");
+      expect(count()).toBe(1);
+      // Editing the file shows them again.
+      write({ "wrangler.json": { ...config, vars: { CHANGED: "1" } } });
+      await load("nope");
+      expect(count()).toBe(2);
+      // A relative `wranglerConfigPath` for the same file shares the dedupe key.
+      vi.spyOn(process, "cwd").mockReturnValue(dir);
+      await loadWranglerConfig({
+        wrangler: true,
+        configPath: "./wrangler.json",
+        env: "nope",
+        wranglerModule: wrangler,
+      });
+      expect(count()).toBe(2);
+    });
+
+    it("keeps wrangler warnings hidden for inline configs", async () => {
+      vi.spyOn(process, "cwd").mockReturnValue(dir);
+      await loadWranglerConfig({
+        wrangler: { compatibility_date: COMPAT_DATE, not_a_wrangler_key: true },
+        wranglerModule: wrangler,
+      });
+      expect(warnings().some((m) => m.includes("env-runner-wrangler-"))).toBe(false);
+      expect(warnings().some((m) => m.includes("not_a_wrangler_key"))).toBe(false);
+    });
+  });
+
+  describe("wranglerEnvFiles (minimal reader)", () => {
+    it("warns once that envFiles are ignored without the wrangler package", async () => {
+      write({ "wrangler.json": { name: "app", vars: { GREETING: "hi" } } });
+      const load = () =>
+        loadWranglerConfig({
+          wrangler: join(dir, "wrangler.json"),
+          envFiles: [".env.custom"],
+          wranglerModule: false,
+        });
+      const count = () =>
+        warnings().filter((m) => m.includes("`wranglerEnvFiles` requires")).length;
+      expect((await load()).options?.bindings).toEqual({ GREETING: "hi" });
+      await load();
+      expect(count()).toBe(1);
+    });
+  });
+
+  describe("wranglerEnvFiles (wrangler package)", () => {
+    function writeProject() {
+      write({
+        "config/wrangler.json": {
+          name: "app",
+          compatibility_date: COMPAT_DATE,
+          vars: { GREETING: "from-config" },
+        },
+        "config/.dev.vars": "TIER=from-dev-vars\n",
+        "config/.env.custom": "GREETING=from-env-file\n",
+        "config/.env.override": "GREETING=from-override\n",
+      });
+    }
+
+    it("loads custom env files relative to the config dir instead of .dev.vars", async () => {
+      writeProject();
+      const load = (envFiles?: string[]) =>
+        loadWranglerConfig({
+          wrangler: join(dir, "config/wrangler.json"),
+          envFiles,
+          wranglerModule: wrangler,
+        });
+
+      // Default: `.dev.vars` is read.
+      expect((await load()).options?.bindings).toMatchObject({
+        GREETING: "from-config",
+        TIER: "from-dev-vars",
+      });
+      // Custom files: `.dev.vars` skipped, later files override earlier ones.
+      const custom = (await load([".env.custom", ".env.override"])).options?.bindings as Record<
+        string,
+        unknown
+      >;
+      expect(custom).toMatchObject({ GREETING: "from-override" });
+      expect(custom).not.toHaveProperty("TIER");
+
+      // `[]`: `.dev.vars` is still read, but no default `.env*` files.
+      write({ "config/.env": "EXTRA=from-dotenv\n" });
+      expect((await load([])).options?.bindings).toMatchObject({ TIER: "from-dev-vars" });
+      rmSync(join(dir, "config/.dev.vars"));
+      const empty = (await load([])).options?.bindings as Record<string, unknown>;
+      expect(empty).not.toHaveProperty("EXTRA");
+      // ...whereas unset falls back to `.env` when there is no `.dev.vars`.
+      expect((await load()).options?.bindings).toMatchObject({ EXTRA: "from-dotenv" });
+    });
+
+    it(
+      "plumbs the runner's wranglerEnvFiles option to the worker env",
+      async () => {
+        writeProject();
+        write({
+          "worker.mjs": `export default {
+    fetch(request, env) {
+      return Response.json({ greeting: env.GREETING ?? null, tier: env.TIER ?? null });
+    },
+  };`,
+        });
+        runner = new MiniflareEnvRunner({
+          name: "env-files",
+          miniflare,
+          data: { entry: join(dir, "worker.mjs") },
+          wrangler: join(dir, "config/wrangler.json"),
+          wranglerEnvFiles: [".env.custom"],
+          wranglerModule: wrangler,
+        });
+        await waitForReady(runner, WRANGLER_TEST_TIMEOUT);
+        const res = await runner.fetch("http://localhost/");
+        expect(await res.json()).toEqual({ greeting: "from-env-file", tier: null });
+      },
+      WRANGLER_TEST_TIMEOUT,
+    );
+  });
 });
 
 // --- Helpers ---

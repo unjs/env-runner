@@ -375,6 +375,8 @@ The entry uses the same `AppEntry` format as the other runners. Requests are han
 
 When you don't set a compatibility date, it defaults to the date supported by the installed `workerd` binary rather than today's date — the binary always lags the calendar slightly, and pinning a future date makes `workerd` refuse to start. Set the runner's `compatibilityDate` option to pin one, or to `"latest"` to use the installed `workerd`'s supported date explicitly (no need to import `miniflare` for `supportedCompatibilityDate`). Precedence: `miniflareOptions.compatibilityDate` > `compatibilityDate` > the wrangler config's `compatibility_date` > the supported date. Whatever the source, a date newer than the installed `workerd` supports falls back to the supported date with a warning (like `wrangler dev`).
 
+The runner enables the `nodejs_compat` compatibility flag by default. Set `no_nodejs_compat` (in the wrangler config's `compatibility_flags` or in `miniflareOptions.compatibilityFlags`) to opt out; the generated wrapper then avoids Node.js built-ins. If the two sources disagree, `miniflareOptions` wins.
+
 #### Wrangler Config
 
 Set the `wrangler` option to load a Cloudflare [Wrangler config](https://developers.cloudflare.com/workers/wrangler/configuration/) (`wrangler.json` / `wrangler.jsonc` / `wrangler.toml`) into the Miniflare options — compatibility date/flags and bindings (`vars`, KV, R2, D1, Durable Objects, queues):
@@ -386,12 +388,14 @@ await using runner = new MiniflareEnvRunner({
   miniflare,
   name: "my-worker",
   data: { entry: "./worker.ts" },
-  wrangler: true, // auto-discover wrangler.{json,jsonc,toml} next to the entry, then cwd
+  wrangler: true, // auto-discover wrangler.{json,jsonc,toml} (see below)
   // wrangler: "./config/wrangler.toml", // or an explicit path
   // wranglerEnv: "production",          // select a `[env.production]` block
   // compatibilityDate: "latest",        // override the config's compatibility_date
 });
 ```
+
+Auto-discovery searches parent directories: when the entry file is inside the current working directory, it walks up from the entry's directory to the filesystem root (so a config at a monorepo root is found for an entry in `apps/web/src/`); when the entry lives elsewhere (e.g. a framework entry hoisted under `node_modules/.pnpm`), only the entry's own directory is checked before walking up from the cwd, so the cwd's config is never shadowed by one above the entry. The nearest directory wins; within one directory `wrangler.json` is preferred over `wrangler.jsonc`, then `wrangler.toml` (unlike `wrangler`, which looks for each filename all the way up before trying the next). A config found in a parent directory is logged once.
 
 `wranglerEnv` selects a named Wrangler environment (`--env`). When omitted, it defaults to the `CLOUDFLARE_ENV` environment variable, so `CLOUDFLARE_ENV=production` selects the `production` env without passing the option.
 
@@ -411,7 +415,7 @@ await using runner = new MiniflareEnvRunner({
 });
 ```
 
-When an inline config is passed, a `wrangler.{json,jsonc,toml}` file is still auto-discovered (next to the entry, then cwd) and loaded, and the inline config is **merged on top of it** — inline values win per key, binding records (e.g. `vars`) merge, and `compatibilityFlags` are unioned. This lets you keep a committed `wrangler` file and override a few fields programmatically. If the inline config doesn't define the selected `wranglerEnv`, its top level is used as-is (the file's env still applies), and a config that fails to load only warns without discarding the other one.
+When an inline config is passed, a `wrangler.{json,jsonc,toml}` file is still auto-discovered (as above) and loaded, and the inline config is **merged on top of it** — inline values win per key, binding records (e.g. `vars`) merge, and `compatibilityFlags` are unioned. This lets you keep a committed `wrangler` file and override a few fields programmatically. If the inline config doesn't define the selected `wranglerEnv`, its top level is used as-is (the file's env still applies), and a config that fails to load only warns without discarding the other one.
 
 Set `wranglerConfigPath` to load a specific config file instead of auto-discovering one — with `wrangler: true` or an inline config (which still merges on top), and without changing the working directory:
 
@@ -427,7 +431,7 @@ await using runner = new MiniflareEnvRunner({
 
 A missing `wranglerConfigPath` file warns (an inline config is still applied). When `wrangler` is itself a string path, that path wins and `wranglerConfigPath` is ignored.
 
-The runner hosts a single fetch-only worker, so config entries it can't run are **dropped**: `assets`, `services`, `queues.consumers`, `workflows`, `tail_consumers`/`streaming_tail_consumers`, and Durable Object bindings to another script (`script_name`). Durable Object bindings to classes exported by your entry are kept, and merged with [auto-detected exports](#auto-detected-exports). Pass any of the dropped options via `miniflareOptions` to opt back in.
+The runner hosts a single fetch-only worker, so config entries it can't run are **dropped**: `assets`, `services`, `queues.consumers`, `workflows`, `tail_consumers`/`streaming_tail_consumers`, and Durable Object bindings to another script (`script_name`). Durable Object bindings to classes exported by your entry are kept — including bindings whose `script_name` is the worker's own `name` (the inline config's `name` when set, else the file's; with `wranglerEnv` suffixed `-<env>` unless the env section sets a `name`, e.g. `my-worker-staging`), which are local in `wrangler dev` too — and merged with [auto-detected exports](#auto-detected-exports). Pass any of the dropped options via `miniflareOptions` to opt back in.
 
 Whenever `wrangler` is enabled (`true`, a path, or an inline config), local state (KV, D1, R2, Durable Objects, ...) persists under `<dir>/.wrangler/state/v3` — the same place `wrangler dev` uses, so both share data. `<dir>` is the directory of the loaded config file, else of the requested config path (`wrangler` string or `wranglerConfigPath`, even if the file is missing), else the current working directory (e.g. inline-only configs, or `wrangler: true` with no file found). Set `miniflareOptions.defaultPersistRoot` (or any `*Persist` option, e.g. `kvPersist: false`) to opt out.
 
@@ -446,9 +450,26 @@ await using runner = new MiniflareEnvRunner({
 });
 ```
 
+With the `wrangler` package, wrangler's own config warnings (e.g. unexpected/misspelled keys, or a `wranglerEnv` the config doesn't define) are printed for a config file — once per file version and env, so hot reloads don't repeat them. Inline configs are validated without printing wrangler's warnings (load errors still warn). As in `wrangler dev`, unexpected keys also trigger wrangler's npm update check (cached for a day), which may print a "newer version of Wrangler available" hint.
+
+Set `wranglerEnvFiles` to load local dev vars/secrets from custom `.env` files, like `getPlatformProxy({ envFiles })`:
+
+```ts
+await using runner = new MiniflareEnvRunner({
+  miniflare,
+  wranglerModule: wrangler,
+  name: "my-worker",
+  data: { entry: "./worker.ts" },
+  wrangler: true,
+  wranglerEnvFiles: [".env", ".env.development"], // relative to the config file's dir
+});
+```
+
+Paths resolve against the loaded config file's directory (else the current working directory) and later files override earlier ones. When set (non-empty), `.dev.vars` is not read; when unset, wrangler's defaults apply (`.dev.vars[.<env>]`, else `.env*`); an empty array reads `.dev.vars` but no `.env*` files. `wranglerEnvFiles` only applies when the `wrangler` package is used — the built-in minimal reader loads no dev-var files and warns once that the option is ignored.
+
 Without `wranglerModule`, `wrangler` is imported optionally; if that fails too, a built-in minimal reader handles plain JSON files and inline objects (common fields only) and JSONC/TOML files are skipped with a warning (they need `wrangler` to parse). Pass `wranglerModule: false` to always use the minimal reader. Values you pass in `miniflareOptions` always take precedence over config-derived ones — binding records (e.g. `bindings`) merge per key, and `compatibilityFlags` are merged.
 
-Config options a single dev worker can't run — `services`, `assets`, `queues.consumers`, `workflows`, `tail_consumers`/`streaming_tail_consumers`, and `durable_objects` bindings with a `script_name` — are ignored with one warning listing them (e.g. `services (MY_SERVICE)`); pass the equivalent Miniflare options via `miniflareOptions` to opt in.
+Config options a single dev worker can't run — `services`, `assets`, `queues.consumers`, `workflows`, `tail_consumers`/`streaming_tail_consumers`, and `durable_objects` bindings with a `script_name` naming another worker — are ignored with one warning listing them (e.g. `services (MY_SERVICE)`); pass the equivalent Miniflare options via `miniflareOptions` to opt in.
 
 #### Module Transform Pipeline
 
