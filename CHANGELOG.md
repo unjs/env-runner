@@ -1,6 +1,33 @@
 # Changelog
 
 
+## v0.2.3
+
+[compare changes](https://github.com/unjs/env-runner/compare/v0.2.2...v0.2.3)
+
+### 🚀 Enhancements
+
+- **miniflare:** Simplify wrangler config integrations ([ae61b10](https://github.com/unjs/env-runner/commit/ae61b10))
+- **miniflare:** Default persist root for `wrangler: true` and inline configs ([1a94350](https://github.com/unjs/env-runner/commit/1a94350))
+
+### 🩹 Fixes
+
+- **miniflare:** Isolate inline wrangler config env and warn on dropped options ([fcf37ec](https://github.com/unjs/env-runner/commit/fcf37ec))
+- **miniflare:** Fix wrangler config loading bugs and gaps ([4d3cf91](https://github.com/unjs/env-runner/commit/4d3cf91))
+- **vercel:** Inject x-vercel-deployment-url for requests before runner is ready ([94066a6](https://github.com/unjs/env-runner/commit/94066a6))
+- **deno-process:** Use node ipc channel ([1550d5e](https://github.com/unjs/env-runner/commit/1550d5e))
+- **miniflare:** Align minimal wrangler reader with wrangler ([bc62267](https://github.com/unjs/env-runner/commit/bc62267))
+
+### 🏡 Chore
+
+- Compact agents docs ([e97c1ee](https://github.com/unjs/env-runner/commit/e97c1ee))
+- Compact comments ([05acde4](https://github.com/unjs/env-runner/commit/05acde4))
+- Update lockfile ([78b2491](https://github.com/unjs/env-runner/commit/78b2491))
+
+### ❤️ Contributors
+
+- Pooya Parsa ([@pi0](https://github.com/pi0))
+
 ## v0.2.2
 
 [compare changes](https://github.com/unjs/env-runner/compare/v0.2.1...v0.2.2)
