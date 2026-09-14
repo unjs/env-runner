@@ -90,12 +90,12 @@ Overview lives in [`../AGENTS.md`](../AGENTS.md); virtual modules on miniflare i
 - **Empty placeholders** — wrangler returns `{}`/`[]` for every unused binding type and always `email: { send_email: [] }`; those (and wrappers whose values are all `[]`) are skipped so they don't shallow-merge over a populated file value. `{}` values (`workerLoaders: { LOADER: {} }`) and `[]` JSON vars are kept.
 - **One dropped-option warning per load** naming config key + binding names (DOs as `NAME → script "x"`), deduped across file + inline; nothing for placeholders. The minimal reader reports the raw keys too, for parity.
 
-### Dev vars / secrets (wrangler package only)
+### Dev vars / secrets (wrangler package)
 
 - The inline read's `userConfigPath` is re-anchored to the config file (if it exists, even if it failed to load; else cwd) so wrangler's `getVarsForDev` loads `.dev.vars`/`.dev.vars.<env>`/`.env*` for the inline part too; the selected `env` is passed there for the lookup.
 - `.dev.vars` beats `vars` within each read, so inline `vars` can't override file dev-var secrets.
 - If the file declares `secrets` and the inline config doesn't, the inline read uses the file's `secrets` (only declared keys + `process.env`), and inline dev-var bindings are filtered to those declared inline or produced by the file read — otherwise `.dev.vars` keys the file excluded (or names of other binding types) would leak back in.
-- **`wranglerEnvFiles`** → `envFiles` for both reads; paths resolve against the config file's dir (inline: re-anchored file, else cwd). Non-empty: skips `.dev.vars`, loads the listed `.env` files (later wins). `[]`: reads `.dev.vars` but no `.env*`. Minimal reader ignores it and warns once.
+- **`wranglerEnvFiles`** → `envFiles` for both reads; paths resolve against the config file's dir (inline: re-anchored file, else cwd). Non-empty: skips `.dev.vars`, loads the listed `.env` files (later wins). `[]`: reads `.dev.vars` but no `.env*`.
 - Known noise: wrangler hard-codes `silent: false`, so `Using secrets defined in .dev.vars` logs once per read (twice for file + inline, again each re-init). Silencing it would require overriding wrangler's global logger level — left as is.
 
 ### Wrangler warnings
@@ -105,8 +105,13 @@ Overview lives in [`../AGENTS.md`](../AGENTS.md); virtual modules on miniflare i
 
 ### Minimal reader (no `wrangler` package, or `wranglerModule: false`)
 
-- Plain JSON files only — JSONC/TOML are skipped with a warning (auto-discovery still lists them). No dev vars.
-- Shallow `--env` override, then maps common fields: `compatibility_*`, `vars` → `bindings`, `kv_namespaces`/`r2_buckets`/`d1_databases`/`queues.producers`, `durable_objects.bindings` (same `script_name` filtering).
+Mirrors wrangler (`normalizeAndValidateEnvironment`, `convertConfigToBindings({ usePreviewIds: true })`, `getDurableObjectClassNameToUseSQLiteMap`, `getVarsForDev`) for the fields it maps; `test/wrangler.test.ts` "matches wrangler semantics" runs the same assertions on both backends.
+
+- JSON/JSONC files (`parseJSONC()`: comments + trailing commas, both extensions, like wrangler); TOML is skipped with a warning.
+- **`--env`** — `WRANGLER_NON_INHERITABLE_KEYS` (bindings, `vars`, `secrets`, ...) are not inherited from the top level; other fields (`compatibility_*`, `migrations`, `exports`) are. A file whose `env` map lacks the selected env fails to load (`failed to load wrangler config`); with no `env` map the top level applies. File-only wrangler-style warnings (non-inherited top-level keys, missing env) share `claimWranglerWarnings()` dedupe. Inline configs lacking the env use their top level (as in the package path).
+- Maps `compatibility_*`, `vars` → `bindings`, KV/R2/D1 (preview id → id → binding name), `queues.producers`, `durable_objects.bindings` → `{ className, scriptName?, useSQLite? }` (same `script_name` filtering), and migrated classes without a binding → `additionalUnboundDurableObjects`.
+- **Dev vars** (`dotenv.ts`: `util.parseEnv` + a `dotenv-expand` port) — loaded once for the merged file + inline result from the config file's dir (else cwd), honoring `wranglerEnvFiles`, `CLOUDFLARE_LOAD_DEV_VARS_FROM_DOT_ENV`, `CLOUDFLARE_INCLUDE_PROCESS_ENV`. `.dev.vars` beats `vars`; names of KV/R2/D1/queue/DO bindings are never replaced. If either config declares `secrets`, only declared vars + `secrets.required` keys are taken (and `process.env` is included); missing required secrets warn.
+- Other binding keys (`MINIMAL_UNSUPPORTED_BINDING_KEYS`: `hyperdrive`, `ai`, `ratelimits`, `wasm_modules`, ...) are ignored with one warning suggesting `wrangler`, deduped across file + inline.
 
 ### Persist root
 

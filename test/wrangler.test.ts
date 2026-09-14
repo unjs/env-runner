@@ -669,18 +669,12 @@ const FALLBACK_CASES: WranglerCase[] = [
     assert: (json) => expect(json).toEqual({ greeting: "from-minimal", tier: "base" }),
   },
   {
-    name: "skips a JSONC config (needs wrangler) and warns",
+    name: "reads a JSONC config",
     files: {
-      "wrangler.jsonc": `{ /* comment */ "name": "test", "vars": { "GREETING": "from-jsonc" } }`,
+      "wrangler.jsonc": `{ /* comment */ "name": "test", "compatibility_date": "2024-09-01", "vars": { "GREETING": "from-jsonc", }, }`,
     },
-    // JSONC is skipped by the minimal reader, so pin a supported date here.
-    options: ({ tmpDir }) => ({
-      wrangler: join(tmpDir, "wrangler.jsonc"),
-      miniflareOptions: { compatibilityDate: "2024-09-01" },
-    }),
-    // JSONC was skipped — no binding reached the worker.
-    assert: (json) => expect(json.greeting).toBeNull(),
-    warns: ["supports plain JSON only"],
+    options: ({ tmpDir }) => ({ wrangler: join(tmpDir, "wrangler.jsonc") }),
+    assert: (json) => expect(json.greeting).toBe("from-jsonc"),
   },
   {
     name: "maps an inline config object without wrangler installed",
@@ -718,7 +712,7 @@ const FALLBACK_CASES: WranglerCase[] = [
     }),
     // TOML was skipped — no binding reached the worker.
     assert: (json) => expect(json.greeting).toBeNull(),
-    warns: ["supports plain JSON only"],
+    warns: ["supports JSON/JSONC only"],
   },
 ];
 
@@ -965,14 +959,10 @@ describe("wrangler config loading", () => {
         });
         const dos = options?.durableObjects as Record<string, any>;
         expect(Object.keys(dos).sort()).toEqual(["LOCAL", "SELF_DO"]);
-        if (wranglerModule) {
-          // `scriptName` is stripped, other fields (e.g. `useSQLite`) survive.
-          expect(dos.SELF_DO).not.toHaveProperty("scriptName");
-          expect(dos.SELF_DO).toMatchObject({ className: "Counter", useSQLite: true });
-        } else {
-          expect(dos.SELF_DO).toEqual({ className: "Counter" });
-        }
-        expect(wranglerModule ? dos.LOCAL.className : dos.LOCAL).toBe("Greeter");
+        // `scriptName` is stripped, other fields (e.g. `useSQLite`) survive.
+        expect(dos.SELF_DO).not.toHaveProperty("scriptName");
+        expect(dos.SELF_DO).toMatchObject({ className: "Counter", useSQLite: true });
+        expect(dos.LOCAL.className).toBe("Greeter");
         const dropped = droppedWarnings(warnings());
         expect(dropped).toHaveLength(1);
         expect(dropped[0]).toContain('EXTERNAL → script "other-worker"');
@@ -1128,6 +1118,214 @@ describe("wrangler config loading", () => {
         },
         WRANGLER_TEST_TIMEOUT,
       );
+    });
+
+    describe("matches wrangler semantics", () => {
+      const BINDINGS_CONFIG = {
+        name: "app",
+        compatibility_date: COMPAT_DATE,
+        kv_namespaces: [{ binding: "KV", id: "kv-id", preview_id: "kv-preview" }],
+        r2_buckets: [
+          { binding: "R2", bucket_name: "bucket", preview_bucket_name: "bucket-preview" },
+        ],
+        d1_databases: [{ binding: "D1", database_id: "db-id", preview_database_id: "db-preview" }],
+        durable_objects: { bindings: [{ name: "SQL_DO", class_name: "Sql" }] },
+        migrations: [{ tag: "v1", new_sqlite_classes: ["Sql", "Unbound"] }],
+      };
+
+      // The package returns `{ id }` records, the minimal reader plain ids.
+      const localId = (value: unknown) =>
+        typeof value === "string" ? value : (value as { id: string }).id;
+
+      it(
+        "does not inherit top-level bindings into a named env",
+        async () => {
+          write({
+            "wrangler.json": {
+              ...BINDINGS_CONFIG,
+              vars: { TOP: "1" },
+              env: { staging: { vars: { STAGE: "1" } } },
+            },
+          });
+          const { options } = await loadWranglerConfig({
+            wrangler: join(dir, "wrangler.json"),
+            env: "staging",
+            wranglerModule,
+          });
+          expect(options?.bindings).toEqual({ STAGE: "1" });
+          for (const key of ["kvNamespaces", "r2Buckets", "d1Databases", "durableObjects"]) {
+            expect(options).not.toHaveProperty(key);
+          }
+          // Inheritable `migrations` still register the classes' storage.
+          expect(options?.additionalUnboundDurableObjects).toEqual([
+            { className: "Sql", useSQLite: true },
+            { className: "Unbound", useSQLite: true },
+          ]);
+        },
+        WRANGLER_TEST_TIMEOUT,
+      );
+
+      it("fails to load a file whose `env` map lacks the selected env", async () => {
+        write({ "wrangler.json": { ...BINDINGS_CONFIG, env: { staging: {} } } });
+        const result = await loadWranglerConfig({
+          wrangler: join(dir, "wrangler.json"),
+          env: "prod",
+          wranglerModule,
+        });
+        expect(result.configFile).toBeUndefined();
+        expect(result.options?.kvNamespaces).toBeUndefined();
+        expect(
+          warnings().some(
+            (m) =>
+              m.includes("failed to load wrangler config") &&
+              m.includes('No environment found in configuration with name "prod"'),
+          ),
+        ).toBe(true);
+      });
+
+      it("uses preview ids and SQLite storage like `wrangler dev`", async () => {
+        write({ "wrangler.json": BINDINGS_CONFIG });
+        const { options } = await loadWranglerConfig({
+          wrangler: join(dir, "wrangler.json"),
+          wranglerModule,
+        });
+        const o = options as Record<string, any>;
+        expect(localId(o.kvNamespaces.KV)).toBe("kv-preview");
+        expect(localId(o.r2Buckets.R2)).toBe("bucket-preview");
+        expect(localId(o.d1Databases.D1)).toBe("db-preview");
+        expect(o.durableObjects.SQL_DO).toMatchObject({ className: "Sql", useSQLite: true });
+        expect(o.additionalUnboundDurableObjects).toEqual([
+          { className: "Unbound", useSQLite: true },
+        ]);
+      });
+
+      it("reads comments and trailing commas in wrangler.json", async () => {
+        write({
+          "wrangler.json": `{
+  // comment with "quotes" and a trailing comma,
+  "name": "app", /* block */
+  "compatibility_date": "${COMPAT_DATE}",
+  "vars": { "URL": "http://example.com/*not-a-comment*/", "LIST": [1, 2,], },
+}`,
+        });
+        const { options, configFile } = await loadWranglerConfig({
+          wrangler: join(dir, "wrangler.json"),
+          wranglerModule,
+        });
+        expect(configFile).toBe(join(dir, "wrangler.json"));
+        expect(options?.bindings).toEqual({
+          URL: "http://example.com/*not-a-comment*/",
+          LIST: [1, 2],
+        });
+      });
+
+      it(
+        "loads `.dev.vars.<env>` and `.env` secrets declared under `secrets.required`",
+        async () => {
+          write({
+            "wrangler.json": {
+              name: "app",
+              compatibility_date: COMPAT_DATE,
+              env: {
+                staging: {
+                  vars: { TIER: "var" },
+                  kv_namespaces: [{ binding: "CACHE" }],
+                },
+                prod: { vars: { TIER: "var" }, secrets: { required: ["API_KEY"] } },
+              },
+            },
+            ".dev.vars": "TIER=dev-vars\n",
+            ".dev.vars.staging": "TIER=dev-vars-staging\nCACHE=oops\nEXTRA=1\n",
+            ".env": "API_KEY=secret\nJUNK=undeclared\nTIER=dotenv\n",
+          });
+          const load = (env: string) =>
+            loadWranglerConfig({ wrangler: join(dir, "wrangler.json"), env, wranglerModule });
+
+          const staging = (await load("staging")).options;
+          expect(staging?.bindings).toEqual({ TIER: "dev-vars-staging", EXTRA: "1" });
+          expect(staging?.kvNamespaces).toHaveProperty("CACHE");
+
+          // `.dev.vars` wins over `.env`; move it away to read `.env` under `secrets`.
+          rmSync(join(dir, ".dev.vars"));
+          rmSync(join(dir, ".dev.vars.staging"));
+          expect((await load("prod")).options?.bindings).toEqual({
+            TIER: "dotenv",
+            API_KEY: "secret",
+          });
+        },
+        WRANGLER_TEST_TIMEOUT,
+      );
+
+      it(
+        "runs a SQLite-backed Durable Object",
+        async () => {
+          write({
+            "worker.mjs": `import { DurableObject } from "cloudflare:workers";
+  export class Sql extends DurableObject {
+    query() { return this.ctx.storage.sql.exec("SELECT 1 AS one").one().one; }
+  }
+  export default {
+    async fetch(request, env) {
+      return Response.json({ one: await env.SQL_DO.get(env.SQL_DO.idFromName("a")).query() });
+    },
+  };`,
+            "wrangler.json": {
+              name: "app",
+              compatibility_date: COMPAT_DATE,
+              durable_objects: { bindings: [{ name: "SQL_DO", class_name: "Sql" }] },
+              migrations: [{ tag: "v1", new_sqlite_classes: ["Sql"] }],
+            },
+          });
+          runner = new MiniflareEnvRunner({
+            name: "sqlite-do",
+            miniflare,
+            data: { entry: join(dir, "worker.mjs") },
+            wrangler: join(dir, "wrangler.json"),
+            wranglerModule,
+            miniflareOptions: { defaultPersistRoot: join(dir, ".state") },
+          });
+          await waitForReady(runner, WRANGLER_TEST_TIMEOUT);
+          const res = await runner.fetch("http://localhost/");
+          expect(await res.json()).toEqual({ one: 1 });
+        },
+        WRANGLER_TEST_TIMEOUT,
+      );
+    });
+  });
+
+  describe("minimal reader warnings", () => {
+    it("warns about bindings it can't map", async () => {
+      write({
+        "wrangler.json": wranglerJson({
+          vars: { A: "1" },
+          hyperdrive: [{ binding: "HD", id: "hd" }],
+          ai: { binding: "AI" },
+          ratelimits: [{ name: "LIMITER", namespace_id: "1001" }],
+          wasm_modules: { WASM: "./mod.wasm" },
+          unsafe: { bindings: [] },
+        }),
+      });
+      const load = () =>
+        loadWranglerConfig({
+          wrangler: { analytics_engine_datasets: [{ binding: "AE" }], ai: { binding: "AI" } },
+          configPath: join(dir, "wrangler.json"),
+          wranglerModule: false,
+        });
+      expect((await load()).options?.bindings).toEqual({ A: "1" });
+      const unsupported = warnings().filter((m) => m.includes("not supported by the built-in"));
+      expect(unsupported).toHaveLength(1);
+      for (const part of [
+        "hyperdrive (HD)",
+        "ai (AI)",
+        "ratelimits (LIMITER)",
+        "wasm_modules (WASM)",
+        "analytics_engine_datasets (AE)",
+        "install 'wrangler'",
+      ]) {
+        expect(unsupported[0]).toContain(part);
+      }
+      expect(unsupported[0]).not.toContain("unsafe");
+      expect(unsupported[0]!.split("AI")).toHaveLength(2);
     });
   });
 
@@ -1439,24 +1637,7 @@ describe("wrangler config loading", () => {
     });
   });
 
-  describe("wranglerEnvFiles (minimal reader)", () => {
-    it("warns once that envFiles are ignored without the wrangler package", async () => {
-      write({ "wrangler.json": { name: "app", vars: { GREETING: "hi" } } });
-      const load = () =>
-        loadWranglerConfig({
-          wrangler: join(dir, "wrangler.json"),
-          envFiles: [".env.custom"],
-          wranglerModule: false,
-        });
-      const count = () =>
-        warnings().filter((m) => m.includes("`wranglerEnvFiles` requires")).length;
-      expect((await load()).options?.bindings).toEqual({ GREETING: "hi" });
-      await load();
-      expect(count()).toBe(1);
-    });
-  });
-
-  describe("wranglerEnvFiles (wrangler package)", () => {
+  describe.each(BACKENDS)("wranglerEnvFiles ($name)", ({ wranglerModule }) => {
     function writeProject() {
       write({
         "config/wrangler.json": {
@@ -1476,7 +1657,7 @@ describe("wrangler config loading", () => {
         loadWranglerConfig({
           wrangler: join(dir, "config/wrangler.json"),
           envFiles,
-          wranglerModule: wrangler,
+          wranglerModule,
         });
 
       // Default: `.dev.vars` is read.
@@ -1519,7 +1700,7 @@ describe("wrangler config loading", () => {
           data: { entry: join(dir, "worker.mjs") },
           wrangler: join(dir, "config/wrangler.json"),
           wranglerEnvFiles: [".env.custom"],
-          wranglerModule: wrangler,
+          wranglerModule,
         });
         await waitForReady(runner, WRANGLER_TEST_TIMEOUT);
         const res = await runner.fetch("http://localhost/");

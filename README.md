@@ -435,7 +435,7 @@ The runner hosts a single fetch-only worker, so config entries it can't run are 
 
 Whenever `wrangler` is enabled (`true`, a path, or an inline config), local state (KV, D1, R2, Durable Objects, ...) persists under `<dir>/.wrangler/state/v3` — the same place `wrangler dev` uses, so both share data. `<dir>` is the directory of the loaded config file, else of the requested config path (`wrangler` string or `wranglerConfigPath`, even if the file is missing), else the current working directory (e.g. inline-only configs, or `wrangler: true` with no file found). Set `miniflareOptions.defaultPersistRoot` (or any `*Persist` option, e.g. `kvPersist: false`) to opt out.
 
-Pass the [`wrangler`](https://www.npmjs.com/package/wrangler) package as `wranglerModule` — the imported module or a specifier — for full fidelity: TOML, `env` inheritance, `.dev.vars`, and every binding type.
+Pass the [`wrangler`](https://www.npmjs.com/package/wrangler) package as `wranglerModule` — the imported module or a specifier — for full fidelity: TOML, config validation, and every binding type.
 
 ```ts
 import * as miniflare from "miniflare";
@@ -465,9 +465,9 @@ await using runner = new MiniflareEnvRunner({
 });
 ```
 
-Paths resolve against the loaded config file's directory (else the current working directory) and later files override earlier ones. When set (non-empty), `.dev.vars` is not read; when unset, wrangler's defaults apply (`.dev.vars[.<env>]`, else `.env*`); an empty array reads `.dev.vars` but no `.env*` files. `wranglerEnvFiles` only applies when the `wrangler` package is used — the built-in minimal reader loads no dev-var files and warns once that the option is ignored.
+Paths resolve against the loaded config file's directory (else the current working directory) and later files override earlier ones. When set (non-empty), `.dev.vars` is not read; when unset, wrangler's defaults apply (`.dev.vars[.<env>]`, else `.env*`); an empty array reads `.dev.vars` but no `.env*` files. Both the `wrangler` package and the built-in minimal reader honor it.
 
-Without `wranglerModule`, `wrangler` is imported optionally; if that fails too, a built-in minimal reader handles plain JSON files and inline objects (common fields only) and JSONC/TOML files are skipped with a warning (they need `wrangler` to parse). Pass `wranglerModule: false` to always use the minimal reader. Values you pass in `miniflareOptions` always take precedence over config-derived ones — binding records (e.g. `bindings`) merge per key, and `compatibilityFlags` are merged.
+Without `wranglerModule`, `wrangler` is imported optionally; if that fails too, a built-in minimal reader handles JSON/JSONC files and inline objects (TOML files are skipped with a warning). It follows wrangler's semantics for `env` selection (bindings and `vars` are not inherited into a named env), local ids (`preview_id` / `preview_bucket_name` / `preview_database_id` first, so state is shared with `wrangler dev`), SQLite-backed Durable Objects (`migrations[].new_sqlite_classes`) and dev vars (`.dev.vars[.<env>]`, `.env*`, `secrets.required`), but only maps common bindings (`vars`, KV, R2, D1, Durable Objects, queue producers); other bindings (e.g. `hyperdrive`, `ai`, `ratelimits`) are ignored with a warning. Pass `wranglerModule: false` to always use the minimal reader. Values you pass in `miniflareOptions` always take precedence over config-derived ones — binding records (e.g. `bindings`) merge per key, and `compatibilityFlags` are merged.
 
 Config options a single dev worker can't run — `services`, `assets`, `queues.consumers`, `workflows`, `tail_consumers`/`streaming_tail_consumers`, and `durable_objects` bindings with a `script_name` naming another worker — are ignored with one warning listing them (e.g. `services (MY_SERVICE)`); pass the equivalent Miniflare options via `miniflareOptions` to opt in.
 

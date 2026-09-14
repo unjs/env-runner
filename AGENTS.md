@@ -23,7 +23,7 @@ src/
 │   ├── bun-process/         # BunProcessEnvRunner + worker
 │   ├── deno-process/        # DenoProcessEnvRunner + worker
 │   ├── self/                # SelfEnvRunner (in-process, no worker)
-│   ├── miniflare/           # MiniflareEnvRunner + wrapper.ts (in-memory workerd wrapper) + wrangler.ts (config → Miniflare options)
+│   ├── miniflare/           # MiniflareEnvRunner + wrapper.ts (in-memory workerd wrapper) + wrangler.ts (config → Miniflare options) + dotenv.ts (minimal-reader dev vars)
 │   ├── vercel/              # VercelEnvRunner (extends node-worker) + worker, oidc.ts, queue-dev.ts
 │   └── netlify/             # NetlifyEnvRunner (extends node-worker) + worker
 ├── types.ts                 # Core interfaces
@@ -91,7 +91,7 @@ Details in [`.agents/MINIFLARE.md`](.agents/MINIFLARE.md). In short: the wrapper
 
 - `crossws`, `httpxy`, `srvx` — WebSocket hooks, HTTP/WS proxy, server framework
 - `cjs-module-lexer` / `es-module-lexer` — devDependencies inlined into `dist` (miniflare module fallback service)
-- **No peer dependencies.** `miniflare`, `wrangler`, `@netlify/runtime`, `@vercel/queue` are installed by the app and passed as runner options (`miniflare`, `wranglerModule`, `netlifyRuntime`, queue `sdk`), resolved via `resolveRuntimeDep()`: imported module | specifier (resolved from cwd) | `false` (opt out) | omitted (optional import). If nothing resolves: miniflare throws; wrangler → minimal JSON reader; netlify → shim; queue → warn-once no-op. `netlifyRuntime` must be a specifier (imported inside the worker, via `resolveRuntimeDepSpecifier()`). These packages must stay listed as external in `build.config.mjs`.
+- **No peer dependencies.** `miniflare`, `wrangler`, `@netlify/runtime`, `@vercel/queue` are installed by the app and passed as runner options (`miniflare`, `wranglerModule`, `netlifyRuntime`, queue `sdk`), resolved via `resolveRuntimeDep()`: imported module | specifier (resolved from cwd) | `false` (opt out) | omitted (optional import). If nothing resolves: miniflare throws; wrangler → minimal JSON/JSONC reader; netlify → shim; queue → warn-once no-op. `netlifyRuntime` must be a specifier (imported inside the worker, via `resolveRuntimeDepSpecifier()`). These packages must stay listed as external in `build.config.mjs`.
 
 ## Key patterns
 

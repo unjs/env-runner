@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { resolveRuntimeDep } from "../../common/runtime-deps.ts";
 import type { RuntimeDep } from "../../common/runtime-deps.ts";
+import { loadDevVars } from "./dotenv.ts";
 
 /** The `wrangler` package namespace, as imported by the app. */
 export interface WranglerModule {
@@ -153,30 +154,34 @@ export async function loadWranglerConfig(
   });
   const dropped: DroppedWranglerOptions = new Map();
   if (!wrangler?.unstable_readConfig || !wrangler.unstable_getMiniflareWorkerOptions) {
-    if (envFiles && !_warnedMinimalEnvFiles) {
-      _warnedMinimalEnvFiles = true;
-      console.warn(
-        "[env-runner] `wranglerEnvFiles` requires the 'wrangler' package and is ignored by the built-in minimal wrangler config reader.",
-      );
+    const unsupported: DroppedWranglerOptions = new Map();
+    const file = configPath ? readWranglerConfigMinimal(configPath, env) : undefined;
+    const inlineConfig = inline ? applyWranglerEnv(inline, env) : undefined;
+    // `{}` (not undefined) marks the file as loaded even without mapped fields.
+    const fileOptions =
+      file && (mapWranglerConfigToMiniflare(file.config, dropped, unsupported) ?? {});
+    const inlineOptions =
+      inlineConfig && mapWranglerConfigToMiniflare(inlineConfig, dropped, unsupported);
+    let options = mergeWranglerMiniflareOptions(fileOptions, inlineOptions);
+    if (file || inlineConfig) {
+      options = applyMinimalDevVars(options, [file?.config, inlineConfig], {
+        // Like the package path: the config file's dir (even if unparsable), else cwd.
+        configDir: configPath ? dirname(configPath) : process.cwd(),
+        env,
+        envFiles,
+      });
     }
-    const fileMeta: { workerName?: string } = {};
-    const fileOptions = configPath
-      ? readWranglerConfigMinimal(configPath, env, dropped, fileMeta)
-      : undefined;
-    const inlineOptions = inline
-      ? mapWranglerConfigToMiniflare(applyWranglerEnv(inline, env), dropped)
-      : undefined;
-    const options = mergeWranglerMiniflareOptions(fileOptions, inlineOptions);
     filterLocalDurableObjects(
       options,
       dropped,
-      (inline && wranglerWorkerName(inline, env)) ?? fileMeta.workerName,
+      (inline && wranglerWorkerName(inline, env)) ?? file?.workerName,
     );
     warnDroppedWranglerOptions(dropped);
+    warnUnsupportedMinimalBindings(unsupported);
     return {
       options,
       // `readWranglerConfigMinimal` returns undefined for skipped/unparsable files.
-      configFile: fileOptions ? configPath : undefined,
+      configFile: file ? configPath : undefined,
     };
   }
 
@@ -260,9 +265,6 @@ export async function loadWranglerConfig(
     configFile: fileLoaded ? configPath : undefined,
   };
 }
-
-// Whether the "`wranglerEnvFiles` ignored by the minimal reader" warning was shown.
-let _warnedMinimalEnvFiles = false;
 
 // Config file versions (path + env + mtime/size) whose wrangler warnings were
 // already shown in this process.
@@ -492,16 +494,118 @@ function filterLocalDurableObjects(
   }
 }
 
-/** Fallback without the `wrangler` package: plain JSON, common fields only. */
+// Fields wrangler does not inherit from the top level into a named env
+// (`notInheritable` in wrangler's `normalizeAndValidateEnvironment`).
+const WRANGLER_NON_INHERITABLE_KEYS = new Set([
+  "vars",
+  "secrets",
+  "define",
+  "durable_objects",
+  "workflows",
+  "kv_namespaces",
+  "cloudchamber",
+  "containers",
+  "send_email",
+  "queues",
+  "connect",
+  "r2_buckets",
+  "d1_databases",
+  "vectorize",
+  "ai_search_namespaces",
+  "ai_search",
+  "websearch",
+  "agent_memory",
+  "hyperdrive",
+  "services",
+  "analytics_engine_datasets",
+  "dispatch_namespaces",
+  "mtls_certificates",
+  "tail_consumers",
+  "streaming_tail_consumers",
+  "unsafe",
+  "browser",
+  "ai",
+  "images",
+  "stream",
+  "media",
+  "pipelines",
+  "secrets_store_secrets",
+  "artifacts",
+  "unsafe_hello_world",
+  "flagship",
+  "worker_loaders",
+  "ratelimits",
+  "vpc_services",
+  "vpc_networks",
+  "version_metadata",
+]);
+
+// Binding config keys the minimal reader doesn't map (warned about).
+const MINIMAL_UNSUPPORTED_BINDING_KEYS = [
+  "hyperdrive",
+  "analytics_engine_datasets",
+  "ai",
+  "ai_search_namespaces",
+  "ai_search",
+  "websearch",
+  "agent_memory",
+  "version_metadata",
+  "ratelimits",
+  "send_email",
+  "secrets_store_secrets",
+  "vectorize",
+  "browser",
+  "images",
+  "stream",
+  "media",
+  "pipelines",
+  "dispatch_namespaces",
+  "mtls_certificates",
+  "worker_loaders",
+  "vpc_services",
+  "vpc_networks",
+  "artifacts",
+  "flagship",
+  "containers",
+  "unsafe",
+  "unsafe_hello_world",
+  "logfwdr",
+  "wasm_modules",
+  "text_blobs",
+  "data_blobs",
+];
+
+// Miniflare options holding non-var bindings mapped by the minimal reader
+// (dev vars never replace them, like wrangler's `getBindings`).
+const MINIMAL_BINDING_OPTIONS = [
+  "kvNamespaces",
+  "r2Buckets",
+  "d1Databases",
+  "queueProducers",
+  "durableObjects",
+];
+
+function warnUnsupportedMinimalBindings(unsupported: DroppedWranglerOptions): void {
+  if (unsupported.size === 0) {
+    return;
+  }
+  const list = [...unsupported]
+    .map(([name, details]) => (details.size > 0 ? `${name} (${[...details].join(", ")})` : name))
+    .join(", ");
+  console.warn(
+    `[env-runner] wrangler config bindings not supported by the built-in minimal wrangler config reader were ignored: ${list}; install 'wrangler' (or pass it as \`wranglerModule\`) to use them.`,
+  );
+}
+
+/** Fallback without the `wrangler` package: JSON/JSONC, common fields only. */
 function readWranglerConfigMinimal(
   configPath: string,
   env: string | undefined,
-  dropped: DroppedWranglerOptions,
-  meta: { workerName?: string } = {},
-): Record<string, unknown> | undefined {
-  if (extname(configPath).toLowerCase() !== ".json") {
+): { config: Record<string, any>; workerName?: string } | undefined {
+  const ext = extname(configPath).toLowerCase();
+  if (ext !== ".json" && ext !== ".jsonc") {
     console.warn(
-      `[env-runner] reading "${basename(configPath)}" requires the 'wrangler' package; the built-in reader supports plain JSON only (install 'wrangler' for JSONC/TOML).`,
+      `[env-runner] reading "${basename(configPath)}" requires the 'wrangler' package; the built-in reader supports JSON/JSONC only (install 'wrangler' for TOML).`,
     );
     return undefined;
   }
@@ -513,21 +617,70 @@ function readWranglerConfigMinimal(
   }
   let config: Record<string, any>;
   try {
-    config = JSON.parse(raw);
+    // Wrangler parses both `.json` and `.jsonc` as JSONC.
+    config = parseJSONC(raw);
   } catch (error) {
     console.warn(
       `[env-runner] failed to parse wrangler config "${configPath}": ${(error as Error).message}`,
     );
     return undefined;
   }
-  meta.workerName = wranglerWorkerName(config, env);
-  // `{}` (not undefined) marks the file as loaded even without mapped fields.
-  return mapWranglerConfigToMiniflare(applyWranglerEnv(config, env), dropped) ?? {};
+  if (!isPlainObject(config)) {
+    warnWranglerLoadError(`"${configPath}"`, new Error("config must be an object"));
+    return undefined;
+  }
+  let envConfig: Record<string, any>;
+  try {
+    envConfig = applyWranglerEnv(config, env, configPath);
+  } catch (error) {
+    warnWranglerLoadError(`"${configPath}"`, error);
+    return undefined;
+  }
+  return { config: envConfig, workerName: wranglerWorkerName(config, env) };
 }
 
-/** Shallow `--env` override (wrangler doesn't inherit bindings into envs). */
-function applyWranglerEnv(config: Record<string, any>, env?: string): Record<string, any> {
-  return env && config.env?.[env] ? { ...config, ...config.env[env] } : config;
+/**
+ * Select `--env` like wrangler: inheritable fields (compatibility, migrations,
+ * ...) fall back to the top level, bindings/vars don't. A file config (with
+ * `configPath`) throws for an env missing from a defined `env` map and warns
+ * (once per file version) about top-level fields the env doesn't inherit; an
+ * inline config lacking the env uses its top level as-is.
+ */
+function applyWranglerEnv(
+  config: Record<string, any>,
+  env?: string,
+  configPath?: string,
+): Record<string, any> {
+  const { env: envs, ...topLevel } = config;
+  if (!env) {
+    return topLevel;
+  }
+  const rawEnv = isPlainObject(envs) ? envs[env] : undefined;
+  const warnings: string[] = [];
+  let out: Record<string, any>;
+  if (isPlainObject(rawEnv)) {
+    out = {};
+    for (const [key, value] of Object.entries(topLevel)) {
+      if (!WRANGLER_NON_INHERITABLE_KEYS.has(key)) {
+        out[key] = value;
+      } else if (rawEnv[key] === undefined) {
+        warnings.push(`"${key}" exists at the top level, but is not inherited by "env.${env}"`);
+      }
+    }
+    Object.assign(out, rawEnv);
+  } else {
+    if (configPath && isPlainObject(envs)) {
+      throw new Error(
+        `No environment found in configuration with name "${env}". The available configured environment names are: ${JSON.stringify(Object.keys(envs))}`,
+      );
+    }
+    warnings.push(`No environment found in configuration with name "${env}"`);
+    out = topLevel;
+  }
+  if (configPath && warnings.length > 0 && claimWranglerWarnings(configPath, env)) {
+    console.warn(`[env-runner] wrangler config "${configPath}": ${warnings.join("; ")}.`);
+  }
+  return out;
 }
 
 /**
@@ -544,6 +697,7 @@ function wranglerWorkerName(config: Record<string, any>, env?: string): string |
 function mapWranglerConfigToMiniflare(
   config: Record<string, any>,
   dropped: DroppedWranglerOptions,
+  unsupported: DroppedWranglerOptions,
 ): Record<string, unknown> | undefined {
   const out: Record<string, unknown> = {};
   for (const [name, value, field] of [
@@ -560,6 +714,13 @@ function mapWranglerConfigToMiniflare(
       addDropped(dropped, name, details);
     }
   }
+  for (const key of MINIMAL_UNSUPPORTED_BINDING_KEYS) {
+    const value = config[key];
+    const bindings = isPlainObject(value) && Array.isArray(value.bindings) ? value.bindings : value;
+    if (!isEmptyOption(bindings)) {
+      addDropped(unsupported, key, describeBindingNames(bindings));
+    }
+  }
   if (typeof config.compatibility_date === "string") {
     out.compatibilityDate = config.compatibility_date;
   }
@@ -569,31 +730,189 @@ function mapWranglerConfigToMiniflare(
   if (config.vars && typeof config.vars === "object") {
     out.bindings = { ...config.vars };
   }
-  const kv = mapBindingArray(config.kv_namespaces, "binding", (n) => n.id ?? n.binding);
+  // Local ids prefer preview ids, like `wrangler dev` (so persisted state is shared).
+  const kv = mapBindingArray(config.kv_namespaces, "binding", (n) =>
+    firstString(n.preview_id, n.id, n.binding),
+  );
   if (kv) out.kvNamespaces = kv;
-  const r2 = mapBindingArray(config.r2_buckets, "binding", (n) => n.bucket_name ?? n.binding);
+  const r2 = mapBindingArray(config.r2_buckets, "binding", (n) =>
+    firstString(n.preview_bucket_name, n.bucket_name, n.binding),
+  );
   if (r2) out.r2Buckets = r2;
-  const d1 = mapBindingArray(
-    config.d1_databases,
-    "binding",
-    (n) => n.database_id ?? n.preview_database_id ?? n.binding,
+  const d1 = mapBindingArray(config.d1_databases, "binding", (n) =>
+    firstString(n.preview_database_id, n.database_id, n.binding),
   );
   if (d1) out.d1Databases = d1;
   const queues = mapBindingArray(config.queues?.producers, "binding", (n) => n.queue);
   if (queues) out.queueProducers = queues;
-  if (Array.isArray(config.durable_objects?.bindings)) {
-    const dos: Record<string, unknown> = {};
-    for (const b of config.durable_objects.bindings) {
-      // Bindings with a `script_name` keep it for `filterLocalDurableObjects()`,
-      // which runs after the file + inline merge.
-      if (!b?.name || !b?.class_name) continue;
-      dos[b.name] = b.script_name
-        ? { className: b.class_name, scriptName: b.script_name }
-        : b.class_name;
-    }
-    if (Object.keys(dos).length > 0) out.durableObjects = dos;
+  const useSQLite = durableObjectClassStorage(config);
+  const doBindings: any[] = Array.isArray(config.durable_objects?.bindings)
+    ? config.durable_objects.bindings
+    : [];
+  const dos: Record<string, unknown> = {};
+  for (const b of doBindings) {
+    // Bindings with a `script_name` keep it for `filterLocalDurableObjects()`,
+    // which runs after the file + inline merge.
+    if (!b?.name || !b?.class_name) continue;
+    dos[b.name] = {
+      className: b.class_name,
+      ...(b.script_name ? { scriptName: b.script_name } : {}),
+      ...(useSQLite.has(b.class_name) ? { useSQLite: useSQLite.get(b.class_name) } : {}),
+    };
   }
+  if (Object.keys(dos).length > 0) out.durableObjects = dos;
+  // Migrated classes without a binding still need their storage backend.
+  const unbound = [...useSQLite]
+    .filter(([className]) => !doBindings.some((b) => b?.class_name === className))
+    .map(([className, sqlite]) => ({ className, useSQLite: sqlite }));
+  if (unbound.length > 0) out.additionalUnboundDurableObjects = unbound;
   return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/**
+ * Durable Object class → `useSQLite`, from `migrations` and `exports` (like
+ * wrangler's `getDurableObjectClassNameToUseSQLiteMap`, minus its errors).
+ */
+function durableObjectClassStorage(config: Record<string, any>): Map<string, boolean> {
+  const classes = new Map<string, boolean>();
+  for (const migration of Array.isArray(config.migrations) ? config.migrations : []) {
+    for (const name of migration?.deleted_classes ?? []) {
+      classes.delete(name);
+    }
+    for (const { from, to } of migration?.renamed_classes ?? []) {
+      const sqlite = classes.get(from);
+      if (sqlite !== undefined) {
+        classes.delete(from);
+        classes.set(to, sqlite);
+      }
+    }
+    for (const name of migration?.new_classes ?? []) {
+      classes.set(name, false);
+    }
+    for (const name of migration?.new_sqlite_classes ?? []) {
+      classes.set(name, true);
+    }
+  }
+  if (isPlainObject(config.exports)) {
+    for (const [name, entry] of Object.entries<any>(config.exports)) {
+      const state = entry?.state;
+      if (
+        entry?.type === "durable-object" &&
+        (state === undefined || state === "created" || state === "expecting-transfer")
+      ) {
+        classes.set(name, entry.storage === "sqlite");
+      }
+    }
+  }
+  return classes;
+}
+
+/** Binding names of a wrangler binding config (list, single object, or record). */
+function describeBindingNames(value: unknown): string[] {
+  if (isPlainObject(value) && typeof value.binding !== "string") {
+    return Object.keys(value);
+  }
+  const entries: any[] = Array.isArray(value) ? value : [value];
+  return entries
+    .map((e) => e?.binding ?? e?.name ?? e?.class_name)
+    .filter((name) => typeof name === "string");
+}
+
+/**
+ * Overlay local dev vars (`.dev.vars` / `.env*`) on `vars`, like wrangler's
+ * `getVarsForDev`. With `secrets` declared (by either config) only declared
+ * vars/secrets are taken; names of other bindings are never replaced.
+ */
+function applyMinimalDevVars(
+  options: Record<string, unknown> | undefined,
+  configs: (Record<string, any> | undefined)[],
+  opts: { configDir: string; env?: string; envFiles?: string[] },
+): Record<string, unknown> | undefined {
+  const secrets = configs.map((c) => c?.secrets).filter(isPlainObject);
+  const loaded = loadDevVars({ ...opts, hasSecrets: secrets.length > 0 });
+  if (!loaded) {
+    return options;
+  }
+  const out = { ...options };
+  const bindings: Record<string, unknown> = isPlainObject(out.bindings) ? { ...out.bindings } : {};
+  const taken = new Set(
+    MINIMAL_BINDING_OPTIONS.flatMap((key) =>
+      isPlainObject(out[key]) ? Object.keys(out[key]) : [],
+    ),
+  );
+  const required = new Set(
+    secrets.flatMap((s) => (Array.isArray(s.required) ? (s.required as string[]) : [])),
+  );
+  let changed = false;
+  for (const [key, value] of Object.entries(loaded)) {
+    if (
+      taken.has(key) ||
+      (secrets.length > 0 && !Object.hasOwn(bindings, key) && !required.has(key))
+    ) {
+      continue;
+    }
+    bindings[key] = value;
+    changed = true;
+  }
+  const missing = [...required].filter((key) => !Object.hasOwn(loaded, key));
+  if (missing.length > 0) {
+    console.warn(
+      `[env-runner] missing required wrangler secrets: ${missing.join(", ")}. Add them to .dev.vars, .env, or set as environment variables.`,
+    );
+  }
+  if (!changed) {
+    return options;
+  }
+  out.bindings = bindings;
+  return out;
+}
+
+function firstString(...values: unknown[]): string | undefined {
+  return values.find((value): value is string => typeof value === "string");
+}
+
+/**
+ * Parse JSON with comments and trailing commas (what wrangler accepts for
+ * `wrangler.json`/`wrangler.jsonc`). Stripped characters become spaces so
+ * error positions stay accurate.
+ */
+export function parseJSONC(text: string): any {
+  let out = "";
+  let comma = -1;
+  const src = text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
+  for (let i = 0; i < src.length; i++) {
+    const ch = src[i]!;
+    if (ch === "/" && (src[i + 1] === "/" || src[i + 1] === "*")) {
+      const line = src[i + 1] === "/";
+      let end = line ? src.indexOf("\n", i) : src.indexOf("*/", i + 2);
+      end = end === -1 ? src.length : line ? end : end + 2;
+      out += src.slice(i, end).replace(/[^\n]/g, " ");
+      i = end - 1;
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      out += ch;
+      continue;
+    }
+    if ((ch === "}" || ch === "]") && comma !== -1) {
+      out = `${out.slice(0, comma)} ${out.slice(comma + 1)}`;
+    }
+    comma = -1;
+    if (ch === '"') {
+      let end = i + 1;
+      while (end < src.length && src[end] !== '"') {
+        end += src[end] === "\\" ? 2 : 1;
+      }
+      out += src.slice(i, end + 1);
+      i = end;
+      continue;
+    }
+    if (ch === ",") {
+      comma = out.length;
+    }
+    out += ch;
+  }
+  return JSON.parse(out);
 }
 
 /** Turn a wrangler binding array (`[{ binding, ... }]`) into a Miniflare record. */
