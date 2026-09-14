@@ -53,10 +53,7 @@ export class SelfEnvRunner extends BaseEnvRunner {
       }
       this.#entry.upgrade?.(context);
     } catch {
-      // The entry may refuse the upgrade by throwing. Unlike the proxied
-      // runners there is no upstream to settle the in-process socket, so
-      // destroy it here — and swallow the rejection to avoid an unhandled
-      // promise rejection in fire-and-forget callers.
+      // No upstream settles the socket when the entry throws, so destroy it here.
       if (!context.node.socket.destroyed) {
         context.node.socket.destroy();
       }
@@ -75,9 +72,8 @@ export class SelfEnvRunner extends BaseEnvRunner {
     this.#entry?.ipc?.onMessage?.(message);
   }
 
-  // Without this override the inherited implementation would leak the internal
-  // `invalidate-module` message into the entry's `ipc.onMessage` and hang until
-  // the ack timeout (there is no worker to respond).
+  // The inherited version would leak `invalidate-module` into `ipc.onMessage`
+  // and wait for an ack no worker sends.
   override async invalidateModule(specifier: string): Promise<void> {
     throw new Error(
       `Cannot invalidate "${specifier}": the self runner does not support virtual modules`,

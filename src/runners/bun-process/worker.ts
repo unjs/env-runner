@@ -10,10 +10,7 @@ import {
 } from "../../common/worker-utils.ts";
 import { registerVirtualModules, handleInvalidateModule } from "../../common/virtual-modules.ts";
 
-// Exit when the supervisor disappears (graceful or crash) to avoid orphan workers.
-// Relies on Bun's Node-compat layer when the host is Bun; verified empirically.
-// Registered before resolving the entry so a supervisor death during a slow
-// entry import (e.g. opening DB pools) cannot leave an orphan behind.
+// Exit with the supervisor to avoid orphans; registered before a possibly slow entry import.
 process.on("disconnect", () => process.exit(0));
 
 const data = JSON.parse(process.env.ENV_RUNNER_DATA || "{}");

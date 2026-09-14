@@ -12,9 +12,6 @@ export interface VercelOidcCheckResult {
 
 let _warned = false;
 
-/**
- * Log a one-time warning if the OIDC token is missing, expired, or malformed.
- */
 export function warnIfVercelOidcTokenInvalid(token?: string | undefined): VercelOidcCheckResult {
   const result = _checkVercelOidcToken(token);
   if (_warned) return result;
@@ -39,9 +36,6 @@ export function warnIfVercelOidcTokenInvalid(token?: string | undefined): Vercel
   return result;
 }
 
-/**
- * Inspect a Vercel OIDC token (defaults to `process.env.VERCEL_OIDC_TOKEN`). Decodes the JWT `exp` claim.
- */
 function _checkVercelOidcToken(
   token: string | undefined = process.env.VERCEL_OIDC_TOKEN,
 ): VercelOidcCheckResult {

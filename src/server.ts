@@ -22,13 +22,7 @@ export interface EnvServerOptions {
   watch?: boolean;
   /** Additional paths to watch (directories or files). */
   watchPaths?: string[];
-  /**
-   * Extra runner-specific constructor options, spread into the runner.
-   *
-   * Runners that build on external packages take them as explicit options —
-   * e.g. `{ miniflare }` for the `miniflare` runner (env-runner never imports
-   * those packages itself).
-   */
+  /** Runner-specific constructor options (e.g. `{ miniflare }`). */
   runnerOptions?: Record<string, unknown>;
 }
 
@@ -57,11 +51,8 @@ export class EnvServer extends RunnerManager {
   }
 
   /**
-   * Start the server by loading and attaching the runner.
-   *
-   * Idempotent — concurrent and repeated calls share one startup. Calling
-   * `start()` explicitly is optional: the first `fetch()` auto-starts the
-   * server. A failed start resets so a later call can retry.
+   * Load and attach the runner. Idempotent and optional (the first `fetch()`
+   * auto-starts); a failed start can be retried.
    */
   start(): Promise<this> {
     this._startPromise ??= this._start().catch((error) => {
@@ -71,10 +62,7 @@ export class EnvServer extends RunnerManager {
     return this._startPromise;
   }
 
-  /**
-   * Replace the active runner. When called without an argument, a fresh
-   * runner is created from the server options.
-   */
+  /** Replace the active runner; without an argument, create one from the server options. */
   override async reload(runner?: EnvRunner) {
     this.runner = runner ?? (await this._createRunner());
     await super.reload(this.runner);

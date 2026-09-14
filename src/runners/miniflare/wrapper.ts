@@ -7,28 +7,10 @@ export const IPC_BINDING = "__ENV_RUNNER_IPC";
 export const UNSAFE_EVAL_BINDING = "__ENV_RUNNER_UNSAFE_EVAL__";
 
 /**
- * Generates a wrapper module that imports the user entry and adds IPC glue.
- *
- * The user module is expected to export `fetch` and optionally `ipc`.
- *
- * Requests are handled like srvx's Cloudflare adapter (`srvx/cloudflare`):
- * `plugins` run against a server-like object, `error` and `middleware` wrap
- * `fetch`, and the request is augmented with `runtime` (`{ name: "cloudflare",
- * cloudflare: { env, context } }`), `ip` (`cf-connecting-ip`) and `waitUntil`.
- * `fetch` still receives `(request, env, ctx)` for Workers-style entries. The
- * `env` the entry sees never contains env-runner's internal bindings.
- *
- * The wrapper uses a persistent WebSocket pair for bidirectional IPC:
- * - Init: `fetch` with `upgrade: websocket` creates a WebSocketPair
- * - Messages: JSON over the WebSocket (no per-message `dispatchFetch`)
- * - Reload: `{ type: "reload" }` triggers cache-busted re-import
- * - Shutdown: `{ type: "shutdown" }` calls `ipc.onClose()`
- *
- * For outgoing messages during fetch request handling, uses a service binding
- * (`__ENV_RUNNER_IPC`) to avoid workerd's cross-request I/O restriction on
- * the WebSocket object.
- *
- * Passed as an in-memory `script` to Miniflare (no temp files needed).
+ * Wrapper module around the user entry. Requests are handled like
+ * `srvx/cloudflare`; `fetch` also receives `(request, env, ctx)`. IPC uses a
+ * persistent WebSocket pair, plus `__ENV_RUNNER_IPC` during fetch (workerd
+ * forbids cross-request I/O on the socket).
  */
 export function generateWrapper(
   entryPath: string,
@@ -47,9 +29,7 @@ export function generateWrapper(
       ? ""
       : `import __process from "node:process";
 if (!globalThis.process) { globalThis.process = __process; }`;
-  // When dynamicOnly is set, skip static `export *` to avoid miniflare's
-  // ModuleLocator walking the entry's import tree at startup. All module
-  // loading goes through dynamic import() via unsafeEvalBinding instead.
+  // Static `export *` would make ModuleLocator walk the entry's imports at startup.
   const staticReExport = opts?.dynamicOnly ? "" : `export * from ${JSON.stringify(entryPath)};`;
 
   // In dynamicOnly mode, we still need explicit re-exports for DO/Entrypoint

@@ -13,12 +13,7 @@ export interface ViteTransport {
   send: (payload: any) => void;
 }
 
-/**
- * Create a Vite `HotChannel` from an env-runner's RPC hooks.
- *
- * Use on the **host side** to bridge env-runner IPC → Vite's DevEnvironment transport.
- * Messages are namespaced by `envName` so multiple Vite environments can share one runner.
- */
+/** Host-side Vite `HotChannel`, namespaced by `envName` so environments can share a runner. */
 export function createViteHotChannel(hooks: RunnerRPCHooks, envName: string): ViteHotChannel {
   const listeners = new WeakMap<(...args: any[]) => void, (data: unknown) => void>();
   return {
@@ -46,12 +41,7 @@ export function createViteHotChannel(hooks: RunnerRPCHooks, envName: string): Vi
   };
 }
 
-/**
- * Create a Vite `ModuleRunner` transport from worker-side IPC primitives.
- *
- * Use on the **worker side** to bridge worker IPC → Vite's `ModuleRunner` transport.
- * Filters messages by `envName` so multiple Vite environments can share one IPC channel.
- */
+/** Worker-side Vite `ModuleRunner` transport, filtered by `envName` to share one IPC channel. */
 export function createViteTransport(
   sendMessage: (data: any) => void,
   onMessage: (listener: (value: any) => void) => void,

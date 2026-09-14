@@ -16,27 +16,9 @@ export interface NetlifyEnvRunnerOptions {
   hooks?: WorkerHooks;
   data?: EnvRunnerData;
   /**
-   * Module specifier for the `@netlify/runtime` package, used inside the
-   * worker to call `startRuntime()` (full `globalThis.Netlify` + `caches`
-   * setup). `env-runner` does not depend on `@netlify/runtime`.
-   *
-   * Unlike the other runtime-dependency options, this one takes a **specifier
-   * only**: the runtime has to be instantiated inside the worker thread, and a
-   * live module instance cannot cross that boundary.
-   *
-   * ```ts
-   * new NetlifyEnvRunner({
-   *   name: "app",
-   *   netlifyRuntime: import.meta.resolve("@netlify/runtime"),
-   *   data: { entry },
-   * });
-   * ```
-   *
-   * A bare specifier (e.g. `"@netlify/runtime"`) is resolved from the current
-   * working directory. When omitted, the worker tries
-   * `import("@netlify/runtime")` and falls back to a lightweight
-   * `globalThis.Netlify` shim (env access only) if it isn't installed. Pass
-   * `false` to always use the shim.
+   * `@netlify/runtime` specifier (resolved from cwd), imported inside the worker
+   * since a module instance can't cross into it. Omitted: imported optionally,
+   * else an env-only `globalThis.Netlify` shim. `false` forces the shim.
    */
   netlifyRuntime?: string | URL | false;
 }
@@ -122,18 +104,9 @@ export class NetlifyEnvRunner extends NodeWorkerEnvRunner {
   }
 }
 
-/**
- * Normalize the `netlifyRuntime` option into an absolute specifier the worker
- * thread can import (its own resolution base is inside `env-runner`, not the
- * user's project). Unresolvable specifiers are passed through as-is so the
- * worker's own import error surfaces the real reason.
- */
+/** Resolve from the app: the worker's own resolution base is inside `env-runner`. */
 function resolveNetlifyRuntime(
   runtime: string | URL | false | undefined,
 ): string | false | undefined {
-  // `false` reaches the worker as-is (force the shim); `undefined` lets the
-  // worker try its own optional `@netlify/runtime` import. Anything else is
-  // resolved to an absolute specifier the worker can import, since a bare one
-  // would otherwise resolve against env-runner rather than the app.
   return resolveRuntimeDepSpecifier(runtime, "netlifyRuntime");
 }

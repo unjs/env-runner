@@ -17,12 +17,8 @@ export interface AppEntryIPC {
 }
 
 /**
- * User entry module shape. Besides `fetch` and the env-runner specific hooks
- * (`upgrade`, `websocket`, `ipc`), any srvx `ServerOptions` (e.g. `error`,
- * `maxRequestBodySize`, `trustProxy`, `node`/`bun`/`deno`) is forwarded to
- * `serve()` by the built-in workers. The listener-related keys in
- * {@link RESERVED_SERVER_OPTIONS} are owned by the worker (it sits behind the
- * runner's proxy) and are ignored if set.
+ * User entry module. Other srvx `ServerOptions` are forwarded to `serve()`,
+ * except {@link RESERVED_SERVER_OPTIONS}.
  */
 export interface AppEntry extends Omit<ServerOptions, "fetch"> {
   fetch: ServerOptions["fetch"];
@@ -31,11 +27,7 @@ export interface AppEntry extends Omit<ServerOptions, "fetch"> {
   ipc?: AppEntryIPC;
 }
 
-/**
- * srvx options the built-in workers always control themselves: the worker
- * listens on a random loopback port behind the runner's proxy, so the entry
- * must not be able to relocate or TLS-terminate it.
- */
+/** Worker-owned srvx options: the worker listens on a random loopback port behind the proxy. */
 export const RESERVED_SERVER_OPTIONS = [
   "port",
   "hostname",
@@ -47,10 +39,8 @@ export const RESERVED_SERVER_OPTIONS = [
 ] as const satisfies (keyof ServerOptions)[];
 
 /**
- * Listener/TLS keys inside the runtime-specific option objects. srvx spreads
- * `node`/`bun`/`deno` *after* its resolved port/host/tls, so these would
- * otherwise bypass {@link RESERVED_SERVER_OPTIONS}. `node.http2` is dropped
- * too: srvx requires a TLS certificate for it, which the worker never has.
+ * srvx spreads `node`/`bun`/`deno` after its resolved listener options, so
+ * these would bypass {@link RESERVED_SERVER_OPTIONS}. `node.http2` needs TLS.
  */
 export const RESERVED_RUNTIME_OPTIONS = {
   node: ["port", "host", "path", "http2", "cert", "key", "passphrase"],
@@ -58,13 +48,7 @@ export const RESERVED_RUNTIME_OPTIONS = {
   deno: ["port", "hostname", "path", "cert", "key"],
 } as const satisfies Record<"node" | "bun" | "deno", readonly string[]>;
 
-/**
- * Build the srvx `serve()` options for a user entry: forwards every srvx
- * option exported by the entry, drops env-runner specific keys (`fetch`,
- * `upgrade`, `websocket`, `ipc`) and pins the worker-owned listener options
- * (top-level and nested in `node`/`bun`/`deno`). Callers add `fetch` (bound
- * lazily so module reloads swap the handler) and the crossws plugin themselves.
- */
+/** Callers add `fetch` (bound lazily so reloads swap it) and the crossws plugin. */
 export function toServerOptions(entry: AppEntry): Omit<ServerOptions, "fetch"> {
   const { fetch: _fetch, upgrade: _upgrade, websocket: _websocket, ipc: _ipc, ...options } = entry;
   for (const key of RESERVED_SERVER_OPTIONS) {
@@ -90,11 +74,7 @@ export function toServerOptions(entry: AppEntry): Omit<ServerOptions, "fetch"> {
   };
 }
 
-/**
- * `true` when the specifier is served from the `data.virtual` map, so entry
- * loading can skip filesystem path handling even if a real file with the same
- * name exists (the virtual module overrides it).
- */
+/** Virtual modules override real files with the same name. */
 export function isVirtualSpecifier(
   specifier: string | undefined,
   virtual?: Record<string, string>,
@@ -121,10 +101,7 @@ export function parseServerAddress(server: Server): { host: string; port: number
   return { host: url.hostname, port: Number(url.port) };
 }
 
-/**
- * Re-import the user entry module with cache busting.
- * Tears down old IPC hooks and re-initializes new ones.
- */
+/** Re-import the user entry (cache-busted) and re-init its IPC hooks. */
 export async function reloadEntryModule(
   entryPath: string,
   currentEntry: AppEntry,
@@ -166,9 +143,7 @@ async function _importFresh(entryPath: string, virtual?: boolean): Promise<AppEn
     const dataUrl = "data:text/javascript;base64," + Buffer.from(code).toString("base64");
     mod = await import(dataUrl);
   } else if (virtual && refreshVirtualModule(filePath)) {
-    // Bun-registered virtual module: `build.module` matches specifiers verbatim
-    // (a `?query` suffix would not resolve), so the re-registration above busts
-    // the cache and a plain re-import evaluates fresh.
+    // Bun matches specifiers verbatim (no `?query`); re-registering busted the cache.
     mod = await import(filePath);
   } else {
     // Virtual or bare specifier (e.g. served by registered ESM hooks): re-import

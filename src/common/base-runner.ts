@@ -13,18 +13,9 @@ export interface EnvRunnerData {
   name?: string;
 
   /**
-   * Virtual modules as a `specifier => source` map.
-   *
-   * Registered as Node.js ESM customization hooks in the worker so the entry
-   * (and its dependencies) can `import` them, e.g.
-   * `{ "#virtual-import": "export const foo = 1" }`.
-   *
-   * Each source may be a string or a factory `() => string | Promise<string>`.
-   * Factories are evaluated once on the host before the worker is spawned (so the
-   * worker always receives plain strings).
-   *
-   * Supported by the `node-worker`, `node-process`, `bun-process`,
-   * `deno-process`, `vercel`, `netlify`, and `miniflare` runners.
+   * Virtual modules importable from the entry, e.g.
+   * `{ "#virtual-import": "export const foo = 1" }`. Factory sources run once
+   * on the host before spawn. Not supported by the `self` runner.
    */
   virtual?: VirtualModules;
 
@@ -87,20 +78,15 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
       await this.waitForReady().catch(() => {});
     }
     if (!this.ready || !this._address) {
-      // The worker never came up (crash during init, timeout, closed). Nothing
-      // downstream owns this raw socket, so destroy it instead of leaking the
-      // fd and leaving the client hanging until its own timeout.
+      // Worker never came up: nothing else owns the socket, destroy to avoid a leak.
       context.node.socket.destroy();
       return;
     }
     try {
       await proxyUpgrade(this._address, context.node.req, context.node.socket, context.node.head);
     } catch {
-      // The worker may refuse the upgrade (e.g. the `upgrade` hook returned a
-      // non-101 response to reject the connection). `proxyUpgrade` has already
-      // settled the client socket (forwarding the upstream response or
-      // destroying it), so swallow the rejection to avoid an unhandled promise
-      // rejection in fire-and-forget callers.
+      // The worker may reject the upgrade; `proxyUpgrade` already settled the
+      // client socket, so swallow (callers are fire-and-forget).
     }
   }
 
@@ -162,9 +148,7 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
 
   /**
    * Invalidate a virtual module so the next `reloadModule()` re-evaluates it.
-   * A factory-valued `data.virtual` source is re-run on the host and the fresh
-   * source is shipped to the worker along with the invalidation. Rejects when
-   * the specifier is not a registered virtual module.
+   * Factory sources are re-run on the host. Rejects for unknown specifiers.
    */
   async invalidateModule(specifier: string, timeout = 5000): Promise<void> {
     const source = await this._refreshVirtualSource(specifier);
@@ -209,11 +193,7 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
 
   // #region Protected methods
 
-  /**
-   * Resolve a relative fetch input (e.g. `"/path"`) against a placeholder
-   * `http://localhost` origin so it parses as a full URL. The origin is a
-   * placeholder — requests are dispatched to the worker address regardless.
-   */
+  /** Placeholder origin for relative inputs; requests go to the worker address regardless. */
   protected _resolveFetchInput(input: string | URL | Request): string | URL | Request {
     if (typeof input === "string" && !URL.canParse(input)) {
       return new URL(input, "http://localhost");
@@ -226,9 +206,7 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
       this._address = message.address;
       this._hooks.onReady?.(this, this._address);
     }
-    // Workers report a failed init (virtual module registration, entry import)
-    // with `init-error` before exiting, so the runner closes with a meaningful
-    // cause instead of a bare "process exited with code 1".
+    // `init-error` gives the close a meaningful cause instead of a bare exit code.
     if (message?.event === "init-error" && !this.ready && !this.closed) {
       this.close(new Error(String(message.error || "Worker initialization failed")));
     }
@@ -238,10 +216,8 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
   }
 
   /**
-   * Send a message and await a matching response message. Shared by `rpc()`,
-   * `reloadModule()`, and `invalidateModule()`. Rejects on timeout, on a
-   * response carrying an `error`, and promptly when the runner closes mid-wait
-   * (instead of letting callers wait out the timeout on a dead worker).
+   * Send a message and await the matching response. Rejects on timeout, on an
+   * `error` response, and as soon as the runner closes.
    */
   protected _request<T = unknown>(
     message: unknown,
@@ -291,11 +267,9 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
   }
 
   /**
-   * Resolve any factory-valued `data.virtual` sources to strings before the
-   * worker is spawned. Returns a pending promise only when there is async work
-   * to do (a factory is present); otherwise returns `undefined` so subclasses can
-   * keep their synchronous spawn path. Factories must be resolved here because
-   * functions can't cross the worker boundary and the load hook can't await.
+   * Resolve factory `data.virtual` sources before spawn (functions can't cross
+   * the worker boundary; the load hook can't await). `undefined` when there is
+   * no factory, so subclasses can spawn synchronously.
    */
   protected _resolveVirtualData(): Promise<void> | undefined {
     const virtual = this._data?.virtual;
@@ -311,16 +285,10 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
     return this._virtualResolved;
   }
 
-  /**
-   * Re-run a factory-valued virtual source on the host and sync the resolved
-   * `data.virtual` map. Returns the fresh source, or `undefined` when the
-   * source is a plain string or unknown (nothing to re-evaluate).
-   */
+  /** Re-run a factory virtual source and sync `data.virtual`; `undefined` if not a factory. */
   protected async _refreshVirtualSource(specifier: string): Promise<string | undefined> {
-    // Wait for the initial factory resolution first: until it settles,
-    // `_data.virtual` still aliases the original (factory-valued) map, and
-    // writing a resolved string into it would permanently replace the factory.
-    // (A rejected resolution closes the runner via `_initWithVirtualData`.)
+    // Until the initial resolution settles, `_data.virtual` aliases the factory
+    // map; writing a string into it would replace the factory for good.
     await this._virtualResolved?.catch(() => {});
     const original = this._virtualSources?.[specifier];
     if (typeof original !== "function") {
@@ -335,10 +303,8 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
   }
 
   /**
-   * Run a subclass spawn callback after `data.virtual` is resolved.
-   * Synchronous when no factory-valued source is present; otherwise defers
-   * `init` until factories resolve. A throwing/rejecting factory closes the
-   * runner with the error as cause instead of leaving an unhandled rejection.
+   * Run `init` once `data.virtual` is resolved (synchronously without factories).
+   * A failing factory closes the runner with the error as cause.
    */
   protected _initWithVirtualData(init: () => void): void {
     const pending = this._resolveVirtualData();

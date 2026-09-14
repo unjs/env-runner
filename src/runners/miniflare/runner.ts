@@ -38,20 +38,10 @@ export interface MiniflareExportInfo {
   type?: "DurableObject" | "WorkerEntrypoint" | "class";
 }
 
-/**
- * The `miniflare` package, as imported by the consumer.
- *
- * `miniflare` is not a dependency of `env-runner` — pass the module namespace
- * (`import * as miniflare from "miniflare"`) so the dependency stays owned by
- * the application. The runner only falls back to importing it itself when this
- * is omitted.
- */
+/** The `miniflare` package namespace, as imported by the app. */
 export interface MiniflareModule {
   Miniflare: new (options: any) => any;
-  /**
-   * Newest compatibility date supported by the installed `workerd` binary,
-   * clamped to today. Used as the default `compatibilityDate`.
-   */
+  /** Newest date the installed `workerd` supports, clamped to today. */
   supportedCompatibilityDate?: string;
   [key: string]: unknown;
 }
@@ -61,171 +51,68 @@ export interface MiniflareEnvRunnerOptions {
   hooks?: WorkerHooks;
   data?: EnvRunnerData;
   /**
-   * The `miniflare` package: the imported module, or a specifier for it.
-   *
-   * ```ts
-   * import * as miniflare from "miniflare";
-   * new MiniflareEnvRunner({ name: "app", miniflare, data: { entry } });
-   *
-   * // or, equivalently
-   * new MiniflareEnvRunner({ name: "app", miniflare: "miniflare", data: { entry } });
-   * ```
-   *
-   * Passing it explicitly is preferred (`miniflare` is not a dependency of
-   * `env-runner`, so the version you install is the version that runs). Bare
-   * specifiers resolve from the current working directory. When omitted, the
-   * runner falls back to importing `miniflare` itself and only fails if that
-   * is unavailable too.
+   * The `miniflare` package (`import * as miniflare from "miniflare"`) or a
+   * specifier resolved from cwd. Omitted: imported optionally.
    */
   miniflare?: RuntimeDep<MiniflareModule>;
   /** Options passed directly to the Miniflare constructor. */
   miniflareOptions?: Record<string, unknown>;
   /**
-   * Compatibility date for the worker. The special value `"latest"` uses the
-   * newest date supported by the installed `workerd` (miniflare's
-   * `supportedCompatibilityDate`), so callers don't need to import miniflare
-   * themselves.
-   *
-   * Overrides the {@link MiniflareEnvRunnerOptions.wrangler} config's
-   * `compatibility_date`; `miniflareOptions.compatibilityDate` still wins.
-   * When unset, the wrangler date is used if present, else the supported
-   * date. Whatever the source, a date newer than the installed `workerd`
-   * supports falls back to the supported date with a warning (like
-   * `wrangler dev`), since workerd refuses to start with it.
+   * `"latest"` uses the installed workerd's newest date. Precedence:
+   * `miniflareOptions` > this > wrangler config > newest supported. Dates newer
+   * than workerd supports fall back with a warning (workerd refuses them).
    */
   compatibilityDate?: "latest" | (string & {});
   /**
-   * Optional module transform callback. When provided, the module fallback
-   * service calls this instead of reading raw files from disk.
-   *
-   * This enables integration with Vite's transform pipeline — pass
-   * `environment.transformRequest` to get TS/JSX/etc. compiled on the fly.
-   *
-   * @param id - Absolute file path of the module to transform
-   * @returns Transformed code, or null/undefined to fall back to raw disk read
+   * Transform modules served by the fallback service (e.g. Vite's
+   * `environment.transformRequest`). `id` is an absolute path; return nullish to
+   * read from disk.
    */
   transformRequest?: (id: string) => Promise<TransformResult | null | undefined>;
   /**
-   * Declare named exports (Durable Objects, WorkerEntrypoints) to auto-wire
-   * bindings and generate re-exports in the wrapper module.
-   *
-   * When set to `true`, `export class` declarations are auto-detected from
-   * the entry file. When set to a record, the listed exports are used
-   * (merged with auto-detected ones). Disabled by default.
+   * Named exports (Durable Objects, WorkerEntrypoints) to bind and re-export.
+   * `true` detects `export class`; a record merges with detected ones.
    */
   exports?: Record<string, MiniflareExportInfo> | boolean;
-  /**
-   * When `true`, the Miniflare instance is cached and reused across runner
-   * swaps (e.g. via `RunnerManager.reload()`). `close()` tears down IPC but
-   * keeps Miniflare alive. Call `dispose()` to fully destroy it.
-   */
+  /** Reuse the Miniflare instance across runner swaps; only `dispose()` destroys it. */
   persistent?: boolean;
   /** Wrap the user's `fetch` in a try/catch that returns structured JSON error responses. Default: `true`. */
   captureErrors?: boolean;
-  /**
-   * Export conditions for bare-specifier module resolution in the module
-   * fallback service. Ensures packages with conditional exports (e.g.
-   * `"workerd"`) resolve to the correct entry instead of the Node.js one.
-   *
-   * Defaults to `["workerd", "worker"]`.
-   */
+  /** Export conditions for the fallback service (default `["workerd", "worker"]`). */
   exportConditions?: string[];
   /**
-   * Load a Cloudflare `wrangler` config to populate Miniflare options
-   * (compatibility date/flags and bindings: `vars`, KV, R2, D1, Durable
-   * Objects, queues).
+   * Load a wrangler config into Miniflare options (compat date/flags, bindings).
    *
-   * - `true` — auto-discover `wrangler.{json,jsonc,toml}`: when the entry
-   *   file is inside the current working directory, walk up from the entry's
-   *   directory to the filesystem root; otherwise (e.g. an entry hoisted
-   *   under `node_modules/.pnpm`) check only the entry's own directory, then
-   *   walk up from the cwd. The nearest directory wins, and within a
-   *   directory `wrangler.json` > `wrangler.jsonc` > `wrangler.toml` (wrangler
-   *   itself tries each filename all the way up before the next). A config
-   *   found above the entry dir/cwd is logged once.
-   * - `string` — explicit path to a wrangler config file.
-   * - `object` — an inline raw (snake_case) wrangler config, as you would
-   *   write in `wrangler.json` (no file needed). A config file is still
-   *   loaded ({@link MiniflareEnvRunnerOptions.wranglerConfigPath}, else
-   *   auto-discovered as for `true`) and the inline config is
-   *   merged on top of it (inline wins per key, binding records merge,
-   *   `compatibilityFlags` are unioned). When the inline config doesn't
-   *   define the selected {@link MiniflareEnvRunnerOptions.wranglerEnv}, its
-   *   top level is used as-is. The file and inline configs load
-   *   independently: one failing warns without discarding the other.
+   * - `true` — auto-discover `wrangler.{json,jsonc,toml}` near the entry or cwd
+   * - `string` — config file path
+   * - `object` — inline raw config merged over the file config (inline wins per
+   *   key, binding records merge, flags union); its top level is used when it
+   *   lacks the selected env
    *
-   * Options a single fetch-only dev worker can't run are dropped from the
-   * config with a single warning naming them: `assets`, service bindings,
-   * queue consumers, workflows, tail consumers, and Durable Object bindings
-   * to another script (`script_name`). Pass them via `miniflareOptions` to
-   * opt in. A Durable Object binding whose `script_name` equals the effective
-   * worker `name` — the inline config's `name` when set, else the file's,
-   * suffixed `-<env>` when a {@link MiniflareEnvRunnerOptions.wranglerEnv} is
-   * selected and its env section sets no `name` (e.g. `app-staging`) — is
-   * local, as in `wrangler dev`, and kept.
-   *
-   * With the `wrangler` package, wrangler's own config warnings (unexpected
-   * keys, an `--env` the config doesn't define, ...) are shown for a config
-   * file once per file version and env per process, not on every reload.
-   * Warnings for inline configs stay hidden. Like `wrangler dev`, wrangler
-   * then also runs its npm update check for unexpected keys (cached for a
-   * day; may print a "newer version of Wrangler" hint).
-   *
-   * Local state is shared with `wrangler dev`: `defaultPersistRoot` defaults
-   * to `<dir>/.wrangler/state/v3`, where `<dir>` is the directory of the
-   * loaded config file, else of the requested config path (`wrangler` string
-   * or `wranglerConfigPath`, even if missing), else the current working
-   * directory (e.g. inline-only configs). Skipped when `miniflareOptions` sets
-   * `defaultPersistRoot` or any `*Persist` option.
-   *
-   * The `wrangler` package is used for full fidelity when available (TOML,
-   * `env` inheritance, `.dev.vars`, every binding type; an inline config is
-   * normalized through a short-lived temp file) — passed explicitly as
-   * `wranglerModule`, or imported optionally. Otherwise a built-in minimal
-   * reader handles plain JSON files and inline objects (common fields only);
-   * JSONC and TOML files are skipped with a warning. Values from
-   * `miniflareOptions` always win over config-derived ones; binding records
-   * (e.g. `bindings`) merge per key and `compatibilityFlags` are unioned.
+   * Options a single dev worker can't run (`assets`, services, queue consumers,
+   * workflows, tails, other-script Durable Objects) are dropped with a warning.
+   * `defaultPersistRoot` defaults to `.wrangler/state/v3` next to the config
+   * (else cwd), shared with `wrangler dev`. The `wrangler` package gives full
+   * fidelity (and may run its npm update check); without it only plain JSON is
+   * read. `miniflareOptions` always win.
    */
   wrangler?: boolean | string | WranglerInlineConfig;
   /**
-   * Explicit wrangler config file to load instead of auto-discovery when
-   * {@link MiniflareEnvRunnerOptions.wrangler} is `true` or an inline object
-   * (the inline config still merges on top). Relative paths resolve from the
-   * current working directory. A missing file warns; with an inline config
-   * the runner continues with the inline config only. Ignored when `wrangler`
-   * is a string path (that path wins) or disabled.
+   * Config file instead of auto-discovery when `wrangler` is `true` or inline
+   * (resolved from cwd). Ignored when `wrangler` is a path.
    */
   wranglerConfigPath?: string;
-  /**
-   * Wrangler environment (`--env`) to select when loading the config.
-   * Defaults to the `CLOUDFLARE_ENV` environment variable.
-   */
+  /** Wrangler `--env` to select (default: `CLOUDFLARE_ENV`). */
   wranglerEnv?: string;
   /**
-   * Custom `.env` files to load local dev vars/secrets from, like
-   * `getPlatformProxy({ envFiles })` — forwarded to wrangler's
-   * `unstable_getMiniflareWorkerOptions(config, env, { envFiles })`. Paths
-   * resolve against the loaded config file's directory (else the current
-   * working directory); later files override earlier ones. When non-empty,
-   * `.dev.vars` is not read. When unset, wrangler's defaults apply
-   * (`.dev.vars[.<env>]`, else `.env`, `.env.local`, `.env.<env>`,
-   * `.env.<env>.local`). An empty array still reads `.dev.vars[.<env>]` but
-   * no `.env*` files.
-   *
-   * Only applies when the `wrangler` package is used (see
-   * {@link MiniflareEnvRunnerOptions.wranglerModule}); the built-in minimal
-   * reader loads no dev-var files and warns once that the option is ignored.
+   * `.env` files for dev vars (like `getPlatformProxy({ envFiles })`), resolved
+   * from the config dir; later files win. Non-empty skips `.dev.vars`; `[]`
+   * reads only `.dev.vars`. Requires the `wrangler` package.
    */
   wranglerEnvFiles?: string[];
   /**
-   * The imported `wrangler` package (`import * as wrangler from "wrangler"`),
-   * used to parse the {@link MiniflareEnvRunnerOptions.wrangler} config with
-   * full fidelity. When omitted, `import("wrangler")` is tried, and a built-in
-   * minimal reader (plain JSON configs and inline objects) handles the rest.
-   *
-   * Pass `false` to skip the `wrangler` package entirely and always use the
-   * built-in minimal reader.
+   * The `wrangler` package for full-fidelity config parsing. Omitted: imported
+   * optionally. `false`: always use the minimal JSON reader.
    */
   wranglerModule?: RuntimeDep<WranglerModule>;
 }
@@ -235,9 +122,7 @@ const IPC_PATH = "/__env_runner_ipc";
 interface MiniflareCacheEntry {
   mf: InstanceType<any>;
   refCount: number;
-  // The instance's fallback-service closure serves these live maps; runners
-  // attaching to the cached instance adopt them so `invalidateModule()`
-  // mutates what the instance actually serves (see #initAsync).
+  // Served live by the instance's fallback service; adopted by attaching runners.
   virtual?: Record<string, string>;
   versions: Map<string, number>;
 }
@@ -359,13 +244,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
     this.#ws.send(JSON.stringify({ type: "message", data: message }));
   }
 
-  /**
-   * Hot-reload the user entry module without recreating the Miniflare instance.
-   *
-   * Sends `reload-module` event over the WebSocket. The worker wrapper uses
-   * `unsafeEvalBinding` to re-import the entry with a cache-busting query string
-   * and responds with `module-reloaded` when done.
-   */
+  /** Hot-reload the entry without recreating the Miniflare instance. */
   override async reloadModule(timeout = 5000): Promise<void> {
     if (!this.#ws) {
       throw new Error("Miniflare env runner should be initialized before reloading.");
@@ -387,15 +266,8 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
   }
 
   /**
-   * Invalidate a virtual module so the next `reloadModule()` re-evaluates it.
-   *
-   * Host-side only (no worker round-trip): the module fallback service serves
-   * virtual sources from a live map, so re-running a factory source and
-   * bumping the per-specifier versions — the module plus its transitive
-   * virtual importers — is enough. Import specifiers in re-served module code
-   * are rewritten to the versioned form, giving workerd fresh module
-   * identities (it caches by name). A `persistent` instance is evicted from
-   * the cache, since its served sources no longer match the cache key.
+   * Host-side only: the fallback service serves a live map, so bumping versions
+   * (see {@link rewriteVirtualImports}) is enough.
    */
   override async invalidateModule(specifier: string, _timeout?: number): Promise<void> {
     const virtual = this.#virtual;
@@ -412,9 +284,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
     for (const key of expandVirtualInvalidation(virtual, specifier)) {
       this.#virtualVersions.set(key, (this.#virtualVersions.get(key) ?? 0) + 1);
     }
-    // The mutated sources no longer match the cache key — evict so future
-    // runners constructed with the original sources get a fresh instance.
-    // Current handles keep ref-counting through #cacheEntry.
+    // Sources no longer match the cache key; current handles stay ref-counted.
     if (this.#cacheKey && _miniflareCache.get(this.#cacheKey) === this.#cacheEntry) {
       _miniflareCache.delete(this.#cacheKey);
     }
@@ -460,11 +330,6 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
 
   // #region Private methods
 
-  /**
-   * The `miniflare` package to run with: the explicitly passed module when
-   * given, otherwise `import("miniflare")`. Throws only when neither is
-   * available (or the passed module isn't miniflare).
-   */
   async #resolveMiniflare(): Promise<MiniflareModule> {
     this.#miniflareModule = (await resolveRuntimeDep<MiniflareModule>({
       name: "miniflare",
@@ -502,21 +367,12 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
         context.node.head,
       );
     } catch {
-      // The worker may refuse the upgrade (e.g. the `upgrade` hook returned a
-      // non-101 response to reject the connection). `proxyUpgrade` has already
-      // settled the client socket (forwarding the upstream response or
-      // destroying it), so swallow the rejection to avoid an unhandled promise
-      // rejection in fire-and-forget callers.
+      // The worker may reject the upgrade; `proxyUpgrade` already settled the
+      // client socket, so swallow (callers are fire-and-forget).
     }
   }
 
-  /**
-   * Resolved `data.virtual` map, prepared for workerd. Sources arrive as plain
-   * strings (factories are resolved on the host by `_initWithVirtualData()`).
-   * workerd parses every `esModule` as plain JS, so `.ts`/`.mts` sources are
-   * type-stripped here with `module.stripTypeScriptTypes`; `.json` sources stay
-   * raw and are served as native `json` modules by the fallback service.
-   */
+  /** workerd parses every `esModule` as JS, so TS is stripped here (JSON is served natively). */
   async #prepareVirtualModules(): Promise<Record<string, string> | undefined> {
     const virtual = this._data?.virtual as Record<string, string> | undefined;
     if (!virtual || Object.keys(virtual).length === 0) {
@@ -562,9 +418,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
     const userDirectSockets = (this.#miniflareOptions.unsafeDirectSockets as unknown[]) || [];
     const options: Record<string, unknown> = {
       modules: true,
-      // Share local state with `wrangler dev` (it persists under
-      // `.wrangler/state/v3`) whenever wrangler config loading is enabled,
-      // unless the user configured persistence themselves.
+      // Share local state with `wrangler dev` unless persistence is configured.
       ...(this.#wrangler && !hasUserPersistOptions(this.#miniflareOptions)
         ? {
             defaultPersistRoot: wranglerPersistRoot(
@@ -575,12 +429,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
         : undefined),
       ...wranglerOptions,
       ...this.#miniflareOptions,
-      // Default to the date supported by the installed workerd binary, not
-      // today: the binary always lags the calendar by a few days, and a
-      // future date makes workerd refuse to start ("requires compatibility
-      // date X, but the newest date supported ... is Y"). `miniflare` exports
-      // this already clamped to `min(today, binary date)`; newer dates from
-      // any source are clamped to it too.
+      // Not today: the workerd binary lags the calendar and refuses newer dates.
       compatibilityDate: resolveCompatibilityDate(
         [
           this.#miniflareOptions.compatibilityDate as string | undefined,
@@ -596,9 +445,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
       unsafeDirectSockets: [{ host: "127.0.0.1", port: 0 }, ...userDirectSockets],
     };
 
-    // Deep-merge nested record options (e.g. `bindings`) so user-supplied
-    // `miniflareOptions` extend wrangler-derived ones per key instead of
-    // replacing the whole object (user keys still win on conflict).
+    // Deep-merge records (e.g. `bindings`) so user keys extend wrangler's.
     if (wranglerOptions) {
       for (const [key, wValue] of Object.entries(wranglerOptions)) {
         const uValue = this.#miniflareOptions[key];
@@ -631,18 +478,14 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
               typeof this.#exports === "object" ? this.#exports : {},
             );
 
-      // The wrapper wires DO/Entrypoint exports as static re-exports from the
-      // entry, which miniflare's ModuleLocator resolves on disk at startup —
-      // impossible for a fallback-served virtual entry.
+      // Static re-exports are resolved on disk at startup, impossible for a virtual entry.
       if (entryIsVirtual && detectedExports.length > 0) {
         throw new Error(
           `[env-runner] named exports (${detectedExports.join(", ")}) are not supported with a virtual entry on the miniflare runner; pass \`exports: false\` or use a real entry file.`,
         );
       }
 
-      // Auto-wire durableObjects bindings for detected/declared exports,
-      // merged with wrangler-derived and user bindings: exports whose class
-      // is already bound (or whose binding name is taken) are skipped.
+      // Skip exports whose class is already bound or whose binding name is taken.
       if (detectedExports.length > 0) {
         const existingDOs = isPlainObject(options.durableObjects) ? options.durableObjects : {};
         const boundClasses = new Set(
@@ -675,10 +518,8 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
       // Enable unsafeEval for hot-reload support (re-import entry without restart)
       options.unsafeEvalBinding = UNSAFE_EVAL_BINDING;
 
-      // Service binding for cross-request IPC (worker → runner).
-      // In workerd, the WebSocket created during IPC handshake cannot be used
-      // from a different request context. This binding provides an alternative
-      // channel for sending messages back to the runner during fetch handling.
+      // workerd forbids using the IPC WebSocket from another request context,
+      // so messages sent during fetch go through this binding.
       const userBindings = (options.serviceBindings as Record<string, unknown>) || {};
       options.serviceBindings = {
         ...userBindings,
@@ -728,10 +569,8 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
           const cleanSpecifier = specifier.split("?")[0] || specifier;
           const cleanRaw = rawSpecifier?.split("?")[0];
 
-          // Virtual modules (data.virtual) win over any other resolution — a
-          // virtual key overrides a real file with the same path. The query is
-          // kept in the returned name so reload cache-busting (`?t=<n>`) gives
-          // workerd a fresh module identity while matching the same key.
+          // Virtual modules override real files. Keep the `?t=` query in the name
+          // so reloads get a fresh workerd module identity.
           if (_virtual) {
             const bareSpecifier = cleanSpecifier.startsWith("/")
               ? cleanSpecifier.slice(1)
@@ -743,9 +582,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
               const query = specifier.includes("?") ? specifier.slice(specifier.indexOf("?")) : "";
               const name = bareSpecifier + query;
               const source = _virtual[virtualKey]!;
-              // workerd parses `json` modules natively (the parsed value is the
-              // default export); `.ts`/`.mts` sources were already type-stripped
-              // on the host (see #prepareVirtualModules).
+              // workerd parses `json` natively; TS was already stripped on the host.
               return virtualModuleFormat(virtualKey) === "json"
                 ? Response.json({ name, json: source })
                 : Response.json({ name, esModule: _applyVirtualVersions(source) });
@@ -853,10 +690,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
             if (isESM) {
               return Response.json({ name, esModule: _applyVirtualVersions(contents) });
             }
-            // Serve CJS modules with an ESM shim wrapper.
-            // workerd's `commonJsModule` handles CJS execution (module/exports/require),
-            // but callers expect ESM. We serve the raw CJS under a suffixed name and
-            // return an ESM shim that re-imports and re-exports from it.
+            // Importers expect ESM: serve raw CJS under a suffixed name behind an ESM shim.
             const cjsSuffix = "?__cjs";
             if (specifier.endsWith(cjsSuffix)) {
               return Response.json({ name, commonJsModule: contents });
@@ -885,9 +719,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
         this.#miniflare = cached.mf;
         cached.refCount++;
         this.#cacheEntry = cached;
-        // The live fallback service closes over the creating runner's maps —
-        // adopt them so invalidateModule() mutates what the instance actually
-        // serves (the sources are identical by cache-key construction).
+        // Adopt the maps the live fallback service closes over.
         this.#virtual = cached.virtual;
         this.#virtualVersions = cached.versions;
       }
@@ -938,10 +770,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
 
 // #region Helpers
 
-/**
- * Detect `export class` declarations in the entry source.
- * Merges with explicitly declared exports from options.
- */
+/** Detect `export class` names in the entry, merged with declared exports. */
 function detectExportedClasses(
   entrySource: string | undefined,
   explicit: Record<string, MiniflareExportInfo>,
@@ -957,12 +786,7 @@ function detectExportedClasses(
   return [...names];
 }
 
-/**
- * Pick the first defined compatibility date from `candidates` (highest
- * precedence first), defaulting to `supported`. A date newer than `supported`
- * (the installed workerd's newest date) falls back to it with a warning —
- * workerd refuses to start otherwise. Dates compare as `YYYY-MM-DD` strings.
- */
+/** First defined date (highest precedence first), capped at `supported` with a warning. */
 function resolveCompatibilityDate(
   candidates: (string | undefined)[],
   supported: string | undefined,
@@ -978,10 +802,8 @@ function resolveCompatibilityDate(
 }
 
 /**
- * Union wrangler-derived and user compatibility flags, defaulting
- * `nodejs_compat` on unless either opts out with `no_nodejs_compat` (workerd
- * refuses to start with both: "mutually contradictory"). User flags win the
- * pair: a user `no_nodejs_compat` drops a wrangler `nodejs_compat` and vice versa.
+ * Union compat flags with `nodejs_compat` on by default. workerd refuses both
+ * `nodejs_compat` and `no_nodejs_compat`, so the user's side of the pair wins.
  */
 function resolveCompatibilityFlags(wranglerFlags: string[], userFlags: string[]): string[] {
   const opposite = (flag: string) =>
@@ -1009,12 +831,7 @@ function hasUserPersistOptions(options: Record<string, unknown>): boolean {
   );
 }
 
-/**
- * Default `defaultPersistRoot` for wrangler configs (`<dir>/.wrangler/state/v3`,
- * where `wrangler dev` persists). Anchored to the loaded config file's dir,
- * else the explicitly requested config path's dir (even if missing), else cwd
- * (where `wrangler dev` runs).
- */
+/** Where `wrangler dev` persists: next to the loaded or requested config, else cwd. */
 function wranglerPersistRoot(configFile?: string, explicitPath?: string): string {
   const file = configFile ?? (explicitPath ? resolve(explicitPath) : undefined);
   return join(file ? dirname(file) : process.cwd(), ".wrangler/state/v3");
@@ -1046,12 +863,8 @@ function computeCacheKey(entryPath: string, opts: Record<string, unknown>): stri
 }
 
 /**
- * Rewrite import specifiers of invalidated virtual modules in re-served module
- * code to their current version (`#config.json` → `#config.json?v=2`). workerd
- * caches modules by name, so the versioned specifier misses its registry, hits
- * the fallback again, and the fresh source is served under a new identity.
- * Only parsed import/re-export specifiers are rewritten (es-module-lexer) —
- * never arbitrary string literals in the code.
+ * Rewrite imports of invalidated virtual modules (`#config.json?v=2`): workerd
+ * caches by name, so the new name misses and the fallback serves fresh source.
  */
 function applyVirtualVersions(code: string, versions: ReadonlyMap<string, number>): string {
   if (versions.size === 0) {

@@ -17,11 +17,7 @@ export interface LoadRunnerOptions {
   hooks?: WorkerHooks;
   data?: EnvRunnerData;
   execArgv?: string[];
-  /**
-   * Additional runner-specific options (passed through to the runner
-   * constructor) — e.g. `miniflare` (the imported `miniflare` package) for the
-   * `miniflare` runner, which this package never imports itself.
-   */
+  /** Runner-specific constructor options (e.g. `miniflare` for the `miniflare` runner). */
   [key: string]: unknown;
 }
 

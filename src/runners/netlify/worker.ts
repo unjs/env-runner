@@ -13,11 +13,6 @@ const netlifyEnv = {
   toObject: () => ({ ...process.env }) as Record<string, string>,
 };
 
-// `@netlify/runtime` is not a dependency of env-runner. The runner forwards the
-// specifier the app resolved (see `NetlifyEnvRunner`'s `netlifyRuntime`
-// option); without one, fall back to importing the package optionally, and to
-// a lightweight `globalThis.Netlify` shim when neither is available. `false`
-// forces the shim.
 const runtimeSpecifier = (workerData || {}).netlifyRuntime as string | false | undefined;
 
 let started = false;

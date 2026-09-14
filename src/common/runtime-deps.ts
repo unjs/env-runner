@@ -2,20 +2,9 @@ import { resolveModulePath } from "exsolve";
 import { pathToFileURL } from "node:url";
 
 /**
- * A runtime dependency the application owns, not `env-runner`.
- *
- * Every runner option that names an external package accepts the same three
- * shapes, so the choice is about ergonomics rather than per-runner API:
- *
- * - the **imported module** (`import * as miniflare from "miniflare"`) — the
- *   version installed by the app is the version that runs
- * - a **module specifier** (`"miniflare"`, `import.meta.resolve("miniflare")`,
- *   or a `URL`) — resolved from {@link ResolveRuntimeDepOptions.from} (cwd by
- *   default), so a bare specifier resolves against the app rather than against
- *   `env-runner`'s own `node_modules`
- * - `false` — opt out of the package entirely
- *
- * Omitting the option falls back to an optional `import()` of the package.
+ * An app-owned package: the imported module, a specifier (resolved from the
+ * app, not `env-runner`), or `false` to opt out. Omitted falls back to an
+ * optional `import()`.
  */
 export type RuntimeDep<T> = T | string | URL | false;
 
@@ -26,18 +15,11 @@ export interface ResolveRuntimeDepOptions<T> {
   option: string;
   /** Value as passed by the caller. */
   value?: RuntimeDep<T>;
-  /**
-   * Named export the resolved module must expose. A module that lacks it is
-   * treated as the wrong package (throws for an explicit value).
-   */
+  /** Named export identifying the package (a mismatch throws for an explicit value). */
   expect?: string;
   /** Directory bare specifiers resolve from. @default process.cwd() */
   from?: string;
-  /**
-   * Throw when the package cannot be resolved at all. Otherwise an
-   * unavailable optional package resolves to `undefined` and the caller
-   * degrades (minimal reader, shim, no-op).
-   */
+  /** Throw when unresolvable instead of resolving `undefined` (callers degrade). */
   required?: boolean;
   /** Extra sentence appended to the "not installed" error when `required`. */
   hint?: string;
@@ -49,10 +31,8 @@ function isSpecifier(value: unknown): value is string | URL {
 }
 
 /**
- * Turn a specifier into something `import()` can load from the app's
- * `node_modules` rather than from `env-runner`'s own location. Absolute paths
- * and URLs pass through; a bare specifier that cannot be resolved is handed to
- * `import()` as-is so the error comes from the runtime.
+ * Resolve a bare specifier from the app rather than `env-runner`. Unresolvable
+ * specifiers pass through so `import()` reports the error.
  */
 export function resolveSpecifier(value: string | URL, from: string = process.cwd()): string {
   if (value instanceof URL) {
@@ -69,13 +49,8 @@ export function resolveSpecifier(value: string | URL, from: string = process.cwd
 }
 
 /**
- * Resolve a {@link RuntimeDep} to an imported module.
- *
- * Resolution order: `false` → `undefined`; an imported module → validated and
- * returned as-is; a specifier → imported (errors propagate, since an explicit
- * specifier that cannot load is a mistake worth surfacing); omitted → optional
- * `import(name)`, which yields `undefined` when the package isn't installed
- * unless {@link ResolveRuntimeDepOptions.required} is set.
+ * Resolve a {@link RuntimeDep} to a module. An explicit specifier that fails to
+ * import throws; an omitted one resolves `undefined` unless `required`.
  */
 export async function resolveRuntimeDep<T>(
   opts: ResolveRuntimeDepOptions<T>,
@@ -129,11 +104,7 @@ function validate<T>(mod: T, expect: string | undefined, name: string, option: s
   return mod;
 }
 
-/**
- * Narrow a {@link RuntimeDep} to a specifier that can cross a worker/process
- * boundary. Used by options whose package must be imported *inside* the
- * worker, where a live module instance cannot be handed over.
- */
+/** Narrow a {@link RuntimeDep} to a specifier, for packages imported inside the worker. */
 export function resolveRuntimeDepSpecifier<T>(
   value: RuntimeDep<T> | undefined,
   option: string,

@@ -9,10 +9,7 @@ import type {
 
 import { createRunnerWSProxyPlugin } from "./common/ws-proxy.ts";
 
-/**
- * Manages an active `EnvRunner` instance, proxying all calls to it.
- * Supports hot-reload, auto-restart on unexpected exit, and message queueing.
- */
+/** Proxies an active `EnvRunner` with hot-reload, auto-restart and message queueing. */
 export class RunnerManager implements EnvRunner, AsyncDisposable {
   private _runner: EnvRunner | undefined;
   private _messageQueue: unknown[] = [];
@@ -44,10 +41,8 @@ export class RunnerManager implements EnvRunner, AsyncDisposable {
   }
 
   /**
-   * Replace the active runner with a new one. Closes the previous runner.
-   *
-   * When called without a runner, a fresh one is created via `_createRunner()`
-   * (only available on subclasses with a runner factory, e.g. `EnvServer`).
+   * Replace (and close) the active runner. Without an argument, subclasses with
+   * `_createRunner()` (e.g. `EnvServer`) create a fresh one.
    */
   async reload(runner?: EnvRunner) {
     this._reloading = true;
@@ -86,11 +81,7 @@ export class RunnerManager implements EnvRunner, AsyncDisposable {
     return runner.fetch(input, init);
   }
 
-  /**
-   * Lazily satisfy a pending `invalidateModule()` with a single entry reload
-   * before serving — concurrent fetches share the same reload. A failed reload
-   * keeps the invalidation pending, so the next fetch retries.
-   */
+  /** Apply a pending invalidation with one shared reload; a failure retries on the next fetch. */
   private _flushInvalidation(runner: EnvRunner): Promise<void> {
     this._pendingModuleReload ??= Promise.resolve(runner.reloadModule?.())
       .then(() => {
@@ -105,22 +96,14 @@ export class RunnerManager implements EnvRunner, AsyncDisposable {
   upgrade: UpgradeHandler = async (context) => {
     const runner = await this._waitForRunner();
     if (!runner?.upgrade) {
-      // No active runner (e.g. a crash/reload gap) owns this raw upgrade socket,
-      // so destroy it instead of leaking the fd and hanging the client until its
-      // own timeout. The runner's own `upgrade()` handles the ready-but-late case.
+      // No runner owns the socket (crash/reload gap): destroy to avoid a leak.
       context.node.socket.destroy();
       return;
     }
     await runner.upgrade(context);
   };
 
-  /**
-   * Create a runtime-native WebSocket reverse-proxy plugin for the public srvx
-   * server. Attach it via `serve({ plugins: [await manager.wsSrvxPlugin()] })`:
-   * on Node it proxies the raw upgrade socket to the worker, and on Bun/Deno it
-   * bridges the WebSocket with crossws. The plugin reads the active runner
-   * lazily, so it keeps working across hot-reloads.
-   */
+  /** WebSocket proxy plugin: `serve({ plugins: [await manager.wsSrvxPlugin()] })`. */
   wsSrvxPlugin(): Promise<ServerPlugin> {
     return createRunnerWSProxyPlugin(() => this);
   }
@@ -168,9 +151,7 @@ export class RunnerManager implements EnvRunner, AsyncDisposable {
         cleanup();
         reject(new Error("Runner closed before becoming ready"));
       };
-      // Register via `onMessage` so the listener is forwarded to the active
-      // runner (and re-forwarded to a fresh one across reloads); a direct
-      // `_messageListeners` add would never receive the worker's ready message.
+      // Via `onMessage` so the listener follows the active runner across reloads.
       this.onMessage(listener);
       this._readyRejectors.add(onClose);
     });
@@ -212,11 +193,7 @@ export class RunnerManager implements EnvRunner, AsyncDisposable {
     this._moduleInvalidated = false;
   }
 
-  /**
-   * Invalidate a virtual module on the active runner and mark the manager
-   * dirty: the next `fetch()` reloads the entry automatically, so callers
-   * don't need to pair the call with an explicit `reloadModule()`.
-   */
+  /** Invalidate a virtual module; the next `fetch()` reloads the entry automatically. */
   async invalidateModule(specifier: string, timeout?: number): Promise<void> {
     if (!this._runner?.invalidateModule) {
       throw new Error("Active runner does not support invalidateModule()");

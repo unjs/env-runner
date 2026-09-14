@@ -1,25 +1,13 @@
 import type { ResolveHookSync, LoadHookSync } from "node:module";
 import { pathToFileURL } from "node:url";
 
-/**
- * Source for a virtual module: either a literal ES module string or a factory
- * that returns one (sync or async).
- *
- * Factories are evaluated **once on the host side** before the worker is spawned
- * (functions can't cross the `workerData`/`JSON` boundary, and Node's synchronous
- * load hook can't await), so the worker always receives plain strings. See
- * {@link resolveVirtualModules}.
- */
+/** Factories run once on the host, before the worker spawns. */
 export type VirtualModuleSource = string | (() => string | Promise<string>);
 
 /** Virtual modules as a `specifier => source` map. */
 export type VirtualModules = Record<string, VirtualModuleSource>;
 
-/**
- * Resolve every {@link VirtualModuleSource} in a {@link VirtualModules} map to a
- * plain string, invoking and awaiting factory functions. Returns a map safe to
- * pass across the worker boundary and to {@link createVirtualHooks}.
- */
+/** Resolve factory sources to strings (safe to pass to workers and {@link createVirtualHooks}). */
 export async function resolveVirtualModules(
   virtual: VirtualModules,
 ): Promise<Record<string, string>> {
@@ -32,40 +20,18 @@ export async function resolveVirtualModules(
 }
 
 /**
- * Build Node.js ESM customization hooks that serve virtual modules from an
- * in-memory `specifier => source` map.
- *
- * Any import whose specifier matches a map key (e.g. `#virtual-import`) is
- * resolved to a `virtual:` URL and loaded from the stored source,
- * short-circuiting default resolution. Intended for use with
- * {@link https://nodejs.org/api/module.html#moduleregisterhooksoptions | module.registerHooks()},
- * which runs the hooks synchronously in the current thread.
- *
- * The load format is derived from the specifier extension (see
- * {@link virtualModuleFormat}): `.ts`/`.mts` sources are served as
- * `module-typescript` (Node's native type stripping) and `.json` as JSON
- * modules (import them `with { type: "json" }`). Deno ignores the `format`
- * returned by custom load hooks, so on Deno the map must be pre-transformed to
- * plain ESM sources first — see `registerVirtualModules()`.
- *
- * Sources must already be resolved to strings (see {@link resolveVirtualModules})
- * because the load hook runs synchronously and cannot await a factory.
+ * `module.registerHooks()` hooks serving virtual modules from resolved string
+ * sources (the sync load hook can't await a factory).
  */
 const VIRTUAL_SCHEME = "virtual:";
 
 export function createVirtualHooks(
   virtual: Record<string, string>,
   versions?: ReadonlyMap<string, number>,
-  // Real directory URL used as the resolution base for a virtual module's own
-  // (non-virtual) imports — see the re-base in `resolve` below. Defaults to the
-  // working directory so bare/relative specifiers resolve against the project.
+  // Resolution base for a virtual module's own non-virtual imports.
   parentURL: string = _defaultParentURL(),
-  // Always report the `module` (plain ESM) load format, ignoring the specifier
-  // extension. Used by backends that pre-transform every source to plain JS
-  // before registration (Deno — see `registerVirtualModules()`): there a `.json`
-  // source is already a JS wrapper and a `.ts` source already type-stripped, so
-  // honoring the extension-derived `json`/`module-typescript` format makes the
-  // runtime re-parse JS as JSON/TS and fail (Deno >= 2.9 honors the format).
+  // For backends that pre-transform sources to JS (Deno >= 2.9 honors the
+  // format and would re-parse them as JSON/TS).
   forcePlainModule = false,
 ): {
   resolve: ResolveHookSync;
@@ -76,20 +42,15 @@ export function createVirtualHooks(
     // keep it in the URL so each reload yields a distinct module identity.
     const key = _stripQuery(specifier);
     if (Object.hasOwn(virtual, key)) {
-      // The invalidation version (see `invalidateVirtualModule()`) is appended
-      // outside the encoded specifier, so the same plain import resolves to a
-      // fresh module identity after each invalidation.
+      // Version is appended outside the encoded specifier for a fresh identity.
       const version = versions?.get(key);
       return {
         url: VIRTUAL_SCHEME + encodeURIComponent(specifier) + (version ? `?v=${version}` : ""),
         shortCircuit: true,
       };
     }
-    // A bare/relative import inside a virtual module arrives with a `virtual:`
-    // parentURL. That scheme is opaque (non-hierarchical), so default resolution
-    // throws when it builds a base from it (`new URL("./package.json",
-    // "virtual:...")` in `getPackageScopeConfig`). Re-base such imports on a real
-    // directory URL so they resolve against the project instead of crashing.
+    // `virtual:` is opaque, so default resolution throws building a base from it
+    // (`getPackageScopeConfig`); re-base on a real directory.
     if (context.parentURL?.startsWith(VIRTUAL_SCHEME)) {
       return nextResolve(specifier, { ...context, parentURL });
     }
@@ -113,12 +74,7 @@ export function createVirtualHooks(
   return { resolve, load };
 }
 
-/**
- * Module format for a virtual specifier, derived from its extension: `.json`
- * loads as a JSON module, `.ts`/`.mts` as type-stripped TypeScript (served
- * natively by Node.js >= 22.18 / 23.6; other backends transform up front),
- * anything else as a plain ES module.
- */
+/** Format by extension (`module-typescript` is native on Node >= 22.18 / 23.6). */
 export function virtualModuleFormat(specifier: string): "module" | "module-typescript" | "json" {
   if (specifier.endsWith(".json")) {
     return "json";
@@ -129,13 +85,7 @@ export function virtualModuleFormat(specifier: string): "module" | "module-types
   return "module";
 }
 
-/**
- * Strip types from a virtual `.ts`/`.mts` source for a backend that can't
- * parse TypeScript itself (Deno load hooks, workerd). Throws a clear
- * `TypeError` when `module.stripTypeScriptTypes` is unavailable, with a
- * backend-specific `requirement` (why it's needed) and `remedy` (what to
- * upgrade) woven into the message.
- */
+/** For backends that can't parse TypeScript (Deno load hooks, workerd). */
 export function stripVirtualTypeScript(
   specifier: string,
   source: string,
@@ -151,16 +101,8 @@ export function stripVirtualTypeScript(
 }
 
 /**
- * Expand an invalidated specifier to the set of virtual modules that must get
- * a fresh identity: the specifier itself plus every virtual module that
- * (transitively) imports it. Without this, a reloaded entry would resolve an
- * intermediate importer to its cached instance, which still links the old
- * module.
- *
- * Importers are detected with a quoted-occurrence scan of the virtual sources
- * (the only modules whose identity invalidation can refresh — disk modules
- * follow the entry-reload semantics). Over-matching is harmless: a bumped
- * version only forces a re-evaluation of a module we already own the source of.
+ * Include transitive virtual importers, else a cached importer still links the
+ * old module. Over-matching the quoted scan only forces a re-evaluation.
  */
 export function expandVirtualInvalidation(
   virtual: Record<string, string>,

@@ -6,48 +6,16 @@ import {
 } from "../virtual-loader.ts";
 
 /**
- * Register runtime hooks that serve virtual modules from an in-memory
- * `specifier => source` map.
+ * Serve virtual modules; await before importing the entry. Format follows the
+ * extension ({@link virtualModuleFormat}); Deno sources are pre-transformed.
  *
- * Must be awaited before the user entry is imported so the hooks are active
- * when its (virtual) imports are resolved.
+ * Backends: `module.registerHooks` (Node >= 22.15 / 23.5, Deno), imported
+ * dynamically since a static named import fails to link where it's missing;
+ * or `Bun.plugin` (Bun's `module.register` is a silent no-op). Warns once and
+ * skips when neither exists.
  *
- * The module format is derived from the specifier extension on every backend
- * (see {@link virtualModuleFormat}): `.ts`/`.mts` sources are served as
- * TypeScript and `.json` as JSON modules (import them `with { type: "json" }`);
- * everything else is plain ESM. Node serves TS through its native type
- * stripping (`module-typescript` load format) and Bun through its `ts` plugin
- * loader. Deno ignores the `format` returned by custom load hooks (sources
- * would be parsed as plain JS), so there the map is transformed up front:
- * `.json` sources are wrapped into a default-exporting ES module, and
- * `.ts`/`.mts` sources are stripped with `module.stripTypeScriptTypes` when
- * available (Deno >= 2.8.2) and **throw** on older Deno (native type stripping
- * is unreachable from hooks; pass pre-transpiled JavaScript instead).
- *
- * Two registration backends, picked by feature detection:
- *
- * - **`module.registerHooks`** (Node.js >= 22.15 / 23.5, Deno >= 2.x) — wired
- *   with hooks from `createVirtualHooks()`. Detected via a dynamic import
- *   (never a static named import, which would throw at link time on runtimes
- *   without it). The dynamic import only runs when a non-empty `virtual` map
- *   is present, so workers without virtual modules never touch it.
- * - **`Bun.plugin` + `build.module()`** (Bun) — Bun's `node:module` lacks
- *   `registerHooks` (`module.register` exists but is a silent no-op), so each
- *   map entry is registered as a Bun virtual module instead. Registration
- *   mid-program affects subsequent dynamic imports, which is all the workers
- *   need. Bun matches `build.module` specifiers verbatim (no `?query`
- *   stripping), so reload cache-busting re-registers the specifier via
- *   {@link refreshVirtualModule} instead of appending a query.
- *
- * When neither backend is available a one-time warning is logged and
- * registration is skipped instead of crashing the worker.
- *
- * Resolves to an **unregister function** (idempotent) so the registration can
- * be released when the runner shuts down. On the `registerHooks` backend it
- * calls the returned `deregister()`, restoring default resolution for the
- * specifiers. Bun has no plugin-removal API, so there it detaches the live
- * source map instead: already-evaluated modules stay cached, but fresh loads
- * of the specifiers fail and {@link refreshVirtualModule} stops matching.
+ * Resolves to an idempotent unregister function. Bun can't remove plugins, so
+ * there it detaches the source map (cached modules survive, fresh loads fail).
  */
 export async function registerVirtualModules(
   virtual?: Record<string, string>,
@@ -73,11 +41,8 @@ export async function registerVirtualModules(
       versions: new Map(),
       transformSource,
     };
-    // Track only after registerHooks succeeds — a throw here must not leave an
-    // orphaned registration (no unregister function is returned to remove it).
-    // Deno sources are pre-transformed to plain JS, so the hooks must report the
-    // `module` format (Deno >= 2.9 honors the load format and would otherwise
-    // re-parse a JS source as JSON/TS).
+    // Track only after registerHooks succeeds (a throw returns no unregister).
+    // Deno sources are already plain JS, so force the `module` format.
     const hooks = registerHooks(
       createVirtualHooks(virtual, registration.versions, undefined, isDeno),
     );
@@ -107,15 +72,9 @@ export async function registerVirtualModules(
 }
 
 /**
- * Force a fresh evaluation of a Bun-registered virtual module by re-registering
- * its specifier (Bun busts the module cache on override). Returns `false` when
- * the specifier wasn't registered through the Bun backend — `registerHooks`
- * runtimes cache-bust with a `?query` suffix instead.
- *
- * Only the given specifier is refreshed; virtual modules it imports keep their
- * cached instances, matching the `registerHooks` reload semantics (a query
- * suffix gives the entry a new identity while its imports resolve to the same
- * `virtual:` URLs).
+ * Re-register a Bun virtual module to bust its cache (Bun matches specifiers
+ * verbatim, so `?query` busting doesn't work). Its imports stay cached, like
+ * on `registerHooks`. `false` when not Bun-registered.
  */
 export function refreshVirtualModule(specifier: string): boolean {
   if (_bunVirtual?.[specifier] === undefined) {
@@ -126,24 +85,9 @@ export function refreshVirtualModule(specifier: string): boolean {
 }
 
 /**
- * Invalidate a registered virtual module so its **next import evaluates
- * fresh**, optionally replacing the stored source. Already-linked importers
- * keep their instances — pair with an entry reload (`reloadModule()`) so the
- * re-imported graph picks up the new module.
- *
- * The invalidation is expanded to every virtual module that (transitively)
- * imports the specifier ({@link expandVirtualInvalidation}), so the fresh
- * module is picked up even through intermediate virtual importers — not only
- * when the entry imports it directly.
- *
- * - `registerHooks` backend: the per-specifier versions consulted by the
- *   resolve hook are bumped, so the same plain imports resolve to new
- *   `virtual:` URLs (fresh module identities). An updated source goes through
- *   the same Deno transform as registration (JSON wrap / type stripping).
- * - `Bun.plugin` backend: the live source map is updated and the specifiers
- *   re-registered (Bun busts its module cache on override).
- *
- * Returns `false` when the specifier is not part of an active registration.
+ * Make the next import of a virtual module (and its virtual importers, see
+ * {@link expandVirtualInvalidation}) evaluate fresh, optionally replacing its
+ * source. Linked importers keep their instances; pair with `reloadModule()`.
  */
 export function invalidateVirtualModule(specifier: string, source?: string): boolean {
   for (const registration of _hooksRegistrations) {
@@ -169,12 +113,7 @@ export function invalidateVirtualModule(specifier: string, source?: string): boo
   return false;
 }
 
-/**
- * Handle an `invalidate-module` IPC message in a built-in worker: invalidate
- * the virtual module (see {@link invalidateVirtualModule}) and ack with a
- * `module-invalidated` event, carrying an `error` when the specifier is not
- * part of an active registration.
- */
+/** Handle an `invalidate-module` IPC message and ack with `module-invalidated`. */
 export function handleInvalidateModule(
   message: { specifier: string; source?: string },
   sendMessage: (message: unknown) => void,
@@ -195,18 +134,14 @@ interface HooksRegistration {
   transformSource?: (specifier: string, source: string) => string;
 }
 
-// Active registerHooks-backend registrations, latest first. `registerHooks`
-// stacks registrations (all stay active until deregistered), so invalidation
-// searches every live registration instead of only the most recent one. The
-// hooks close over each registration's `virtual` and `versions`, so
-// invalidation mutates them in place.
+// Live registerHooks registrations, latest first. Registrations stack, so
+// invalidation searches all of them (mutating the maps the hooks close over).
 const _hooksRegistrations: HooksRegistration[] = [];
 
 let _bunVirtual: Record<string, string> | undefined;
 
-// Load callbacks read from the live `_bunVirtual` map (not a captured source)
-// so unregistering — detaching the map — disables fresh loads even though
-// Bun's plugin API offers no way to remove a `build.module` registration.
+// Read the live map so unregistering (detaching it) disables fresh loads;
+// Bun can't remove a `build.module` registration.
 function _registerBunModules(specifiers: string[]): void {
   (globalThis as any).Bun.plugin({
     name: "env-runner-virtual",
@@ -219,9 +154,7 @@ function _registerBunModules(specifiers: string[]): void {
           }
           const format = virtualModuleFormat(specifier);
           if (format === "json") {
-            // Bun's runtime `json` loader doesn't parse contents — serve the
-            // parsed value through the `object` loader instead (default-only
-            // export, matching Node/Deno JSON module semantics).
+            // Bun's runtime `json` loader doesn't parse contents.
             return { exports: { default: JSON.parse(source) }, loader: "object" };
           }
           return { contents: source, loader: format === "module-typescript" ? "ts" : "js" };
@@ -231,14 +164,9 @@ function _registerBunModules(specifiers: string[]): void {
   });
 }
 
-// Deno ignores the `format` returned by custom load hooks (every source is
-// parsed as plain JS), so non-JS sources are converted to ES modules before
-// registration (and again when invalidation replaces a source): `.json` via a
-// default-exporting wrapper (Deno doesn't validate import attributes on
-// hook-loaded modules, so `with { type: "json" }` stays portable), `.ts`/`.mts`
-// via `module.stripTypeScriptTypes` (in Deno's node:module compat since 2.8.2).
-// On older Deno without it a `.ts`/`.mts` specifier throws instead of failing
-// later with an opaque SyntaxError.
+// Deno parses every hook-loaded source as JS regardless of `format`. It skips
+// import attribute checks there, so `with { type: "json" }` still works.
+// `stripTypeScriptTypes` needs Deno >= 2.8.2.
 function _transformSourceForDeno(
   specifier: string,
   source: string,
