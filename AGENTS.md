@@ -12,38 +12,20 @@ Generic environment runner for Node.js. Ported from the nitro env runner concept
 src/
 ├── common/
 │   ├── base-runner.ts       # BaseEnvRunner abstract class
-│   ├── worker-utils.ts      # AppEntry interface, resolveEntry(), parseServerAddress()
-│   ├── runtime-deps.ts     # resolveRuntimeDep()/resolveRuntimeDepSpecifier() — shared "module | specifier | false" resolver for runtime deps
+│   ├── worker-utils.ts      # AppEntry interface, resolveEntry(), parseServerAddress(), toServerOptions()
+│   ├── runtime-deps.ts      # resolveRuntimeDep()/resolveRuntimeDepSpecifier() — "module | specifier | false" resolver
 │   ├── host-env.ts          # hostEnv() — worker/child env: host env + FORCE_COLOR/COLUMNS from the host TTY
-│   ├── ws-proxy.ts          # createRunnerWSProxyPlugin() — runtime-native WS upgrade proxy (Node raw socket / Bun+Deno crossws bridge)
-│   └── virtual-modules.ts   # registerVirtualModules() — registerHooks()/Bun.plugin wiring shared by node/bun/deno workers
+│   ├── ws-proxy.ts          # createRunnerWSProxyPlugin() — runtime-native WS upgrade proxy
+│   └── virtual-modules.ts   # registerVirtualModules() — registerHooks()/Bun.plugin wiring for node/bun/deno workers
 ├── runners/
-│   ├── node-worker/
-│   │   ├── runner.ts        # NodeWorkerEnvRunner
-│   │   └── worker.ts        # Built-in srvx worker (parentPort)
-│   ├── node-process/
-│   │   ├── runner.ts        # NodeProcessEnvRunner
-│   │   └── worker.ts        # Built-in srvx worker (process.send)
-│   ├── bun-process/
-│   │   ├── runner.ts        # BunProcessEnvRunner
-│   │   └── worker.ts        # Built-in srvx worker (Bun/Node.js)
-│   ├── deno-process/
-│   │   ├── runner.ts        # DenoProcessEnvRunner
-│   │   └── worker.ts        # Built-in srvx worker (Deno)
-│   ├── self/
-│   │   └── runner.ts        # SelfEnvRunner (in-process, no worker)
-│   ├── miniflare/
-│   │   ├── runner.ts          # MiniflareEnvRunner (Cloudflare Workers via miniflare)
-│   │   ├── wrapper.ts         # generateWrapper() — in-memory workerd wrapper (IPC glue + srvx/cloudflare-style request handling)
-│   │   └── wrangler.ts        # loadWranglerConfig() — wrangler.{json,jsonc,toml} → Miniflare options
-│   ├── vercel/
-│   │   ├── runner.ts        # VercelEnvRunner (extends NodeWorkerEnvRunner)
-│   │   ├── worker.ts        # Sets Vercel request context symbol, delegates to node-worker
-│   │   ├── oidc.ts          # VERCEL_OIDC_TOKEN check + dev-time warning
-│   │   └── queue-dev.ts     # Local Vercel Queues delivery bridge (registerDevConsumer)
-│   └── netlify/
-│       ├── runner.ts        # NetlifyEnvRunner (extends NodeWorkerEnvRunner)
-│       └── worker.ts        # Sets global Netlify context, delegates to node-worker
+│   ├── node-worker/         # NodeWorkerEnvRunner + worker (parentPort)
+│   ├── node-process/        # NodeProcessEnvRunner + worker (process.send)
+│   ├── bun-process/         # BunProcessEnvRunner + worker
+│   ├── deno-process/        # DenoProcessEnvRunner + worker
+│   ├── self/                # SelfEnvRunner (in-process, no worker)
+│   ├── miniflare/           # MiniflareEnvRunner + wrapper.ts (in-memory workerd wrapper) + wrangler.ts (config → Miniflare options)
+│   ├── vercel/              # VercelEnvRunner (extends node-worker) + worker, oidc.ts, queue-dev.ts
+│   └── netlify/             # NetlifyEnvRunner (extends node-worker) + worker
 ├── types.ts                 # Core interfaces
 ├── virtual-loader.ts        # createVirtualHooks() — ESM resolve/load hooks for virtual modules
 ├── index.ts                 # Public API exports
@@ -53,176 +35,72 @@ src/
 └── cli.ts                   # CLI entry point
 ```
 
-Detailed per-file notes, the shared `BaseEnvRunner` lifecycle, and `RunnerManager`/`EnvServer` behavior live in [`.agents/ARCHITECTURE.md`](.agents/ARCHITECTURE.md). Per-runner internals and virtual modules:
-
-- **node-worker, node-process, bun-process, deno-process, self** — [`.agents/NODE-RUNNERS.md`](.agents/NODE-RUNNERS.md)
-- **miniflare** (+ wrangler config) — [`.agents/MINIFLARE.md`](.agents/MINIFLARE.md)
-- **vercel** — [`.agents/VERCEL.md`](.agents/VERCEL.md)
-- **netlify** — [`.agents/NETLIFY.md`](.agents/NETLIFY.md)
-- **Virtual modules** (Node + Bun + Deno + Miniflare) — [`.agents/VIRTUAL-MODULES.md`](.agents/VIRTUAL-MODULES.md)
+Exports: see `package.json` `exports` (`.`, `./runners/<name>`, `./runners/<name>/worker`, `./vite`).
 
 ## Built-in Workers
 
-Pre-built worker scripts co-located with their runners (`src/runners/<name>/worker.ts`) that let users provide a simple `export default { fetch }` entry module instead of manually implementing the IPC/server boilerplate. Each worker uses [srvx](https://srvx.h3.dev) to start a standard HTTP server.
+Each IPC-based runner defaults to its co-located `src/runners/<name>/worker.ts` (so `entry` is optional; `data.entry` points to the user module). Workers let users write a plain `export default { fetch }` module and start it with [srvx](https://srvx.h3.dev).
 
 ### User entry format (`AppEntry`)
 
 ```ts
 export default {
-  fetch(request: Request): Response | Promise<Response> {
-    return new Response("Hello!");
-  },
-  websocket?: Partial<Hooks>,  // Optional crossws WebSocket hooks (recommended)
-  upgrade?: (context: { node: { req: IncomingMessage, socket: Socket, head: Buffer } }) => void,  // Optional raw WebSocket upgrade handler (Node.js only)
-  middleware?: [],  // Optional srvx middleware
-  plugins?: [],     // Optional srvx plugins
-  ...ServerOptions, // Any other srvx option (error, maxRequestBodySize, trustProxy, node/bun/deno, ...) is forwarded to serve()
-  ipc?: {
-    onOpen?: (ctx: { sendMessage: (message: unknown) => void }) => void,
-    onMessage?: (message: unknown) => void,
-    onClose?: () => void,
-  },
+  fetch(request: Request): Response | Promise<Response>,
+  websocket?: Partial<Hooks>,  // crossws hooks (recommended)
+  upgrade?: (ctx: { node: { req, socket, head } }) => void,  // raw upgrade (Node-only)
+  middleware?: [], plugins?: [],
+  ...ServerOptions, // other srvx options are forwarded to serve()
+  ipc?: { onOpen?({ sendMessage }), onMessage?(message), onClose?() },
 };
 ```
 
-`AppEntry` extends `Omit<ServerOptions, "fetch">` (#49): the built-in workers spread the entry into srvx `serve()` via `toServerOptions()` (`src/common/worker-utils.ts`), which strips the env-runner keys (`fetch`, `upgrade`, `websocket`, `ipc`) and pins the worker-owned listener options listed in `RESERVED_SERVER_OPTIONS` — `port` (0), `hostname` (`127.0.0.1`), `silent`, `gracefulShutdown` (false), plus `protocol`, `tls` and `manual`, which are dropped — since the worker sits behind the runner's proxy. srvx spreads the runtime objects `node`/`bun`/`deno` _after_ its resolved port/host/tls, so the listener/TLS keys inside them (`RESERVED_RUNTIME_OPTIONS`: `node.port/host/path/cert/key/passphrase` and `node.http2`, which srvx rejects without TLS; `bun.port/hostname/unix/tls`; `deno.port/hostname/path/cert/key`) are removed from a shallow copy too. Everything else (`error`, `maxRequestBodySize`, `trustProxy`, `reusePort`, remaining `node`/`bun`/`deno` keys, ...) reaches srvx unchanged. `serve()` + `server.ready()` run inside the worker's init-error try block, so a bad forwarded option reports `init-error` instead of a readiness timeout. Like `middleware`/`plugins`, these options are read once at server start; `reloadModule()` only swaps the `fetch` handler. `toServerOptions`, `RESERVED_SERVER_OPTIONS` and `RESERVED_RUNTIME_OPTIONS` are exported from `env-runner` for custom workers.
+- `toServerOptions()` strips env-runner keys and pins/drops listener options (`RESERVED_SERVER_OPTIONS`, `RESERVED_RUNTIME_OPTIONS` for nested `node`/`bun`/`deno`) since the worker listens on `127.0.0.1:0` behind the runner proxy. Server options are read once at start; `reloadModule()` only swaps `fetch`.
+- `websocket` uses `crossws/server`, which picks the adapter matching the host runtime (so node-worker/node-process use native Bun/Deno adapters when the host is Bun/Deno).
+- `ipc.onMessage` receives only user messages (ping/pong/shutdown are filtered); `onOpen` runs before the ready signal.
+- Worker flow: import entry → `serve()` + `ready()` → wire `upgrade` → `ipc.onOpen` → post `{ address }`. Any init failure posts `{ event: "init-error", error }`, logs one `[env-runner] worker init failed: ...` line and exits 1.
 
-The `websocket` property uses [crossws](https://crossws.h3.dev) hooks for cross-platform WebSocket support. Each built-in worker adds the crossws srvx plugin when `websocket` is defined. All built-in workers import `crossws/server`, which auto-selects the runtime adapter (node/bun/deno) via export conditions — matching srvx's own native runtime detection. This keeps the WebSocket adapter in sync with the underlying server: the node-worker/node-process workers inherit the host runtime (worker thread / `fork()`), so they use the native Bun.serve/Deno.serve adapter when env-runner runs on Bun or Deno instead of forcing Node compat. The `upgrade` property is a lower-level alternative for raw Node.js socket access (Node-only).
+## Miniflare
 
-The `ipc` property enables bidirectional messaging between the entry and the runner:
-
-- `onOpen` — Called when the IPC channel is established (before ready signal), receives a `{ sendMessage }` context for sending messages back to the runner
-- `onMessage` — Called when the runner sends a user message (internal messages like ping/pong and shutdown are filtered out)
-- `onClose` — Called when the runner is shutting down
-
-### Usage
-
-Each IPC-based runner defaults to its co-located built-in worker, so `entry` is optional:
-
-```ts
-import { NodeProcessEnvRunner } from "env-runner";
-
-// Uses default built-in worker automatically
-const runner = new NodeProcessEnvRunner({
-  name: "my-app",
-  data: { entry: "./my-server.ts" },
-});
-
-// Or explicitly pass a custom entry
-const runner2 = new NodeProcessEnvRunner({
-  name: "my-app",
-  entry: "/path/to/custom-worker.ts",
-  data: { entry: "./my-server.ts" },
-});
-```
-
-### How workers work
-
-1. Worker receives `data.entry` path (via `workerData` or `ENV_RUNNER_DATA`)
-2. Dynamically imports the user's entry module (`resolveEntry()`); if this (or `registerVirtualModules()`, or the `serve()`/`ready()` in step 3) throws, the worker sends `{ event: "init-error", error }`, logs one concise `[env-runner] worker init failed: ...` line, and exits 1 — no uncaught-rejection stack dump on forwarded stderr
-3. Starts a srvx server with `port: 0` on `127.0.0.1` (`toServerOptions(entry)` — forwards the entry's other srvx options), adding crossws srvx plugin if `entry.websocket` is defined
-4. Wires `entry.upgrade()` to the underlying Node.js HTTP server's `upgrade` event (if defined)
-5. Calls `entry.ipc.onOpen()` with `{ sendMessage }` if IPC hooks are defined
-6. Reports `{ address: { host, port } }` via IPC
-7. Forwards user messages to `entry.ipc.onMessage()` (filters out internal ping/pong and shutdown)
-8. Calls `entry.ipc.onClose()` on shutdown before closing the server
-
-### Worker ↔ Runner mapping
-
-| Worker (`entry`)                                   | Runner                 |
-| -------------------------------------------------- | ---------------------- |
-| `env-runner/runners/node-worker/worker` (default)  | `NodeWorkerEnvRunner`  |
-| `env-runner/runners/node-process/worker` (default) | `NodeProcessEnvRunner` |
-| `env-runner/runners/bun-process/worker` (default)  | `BunProcessEnvRunner`  |
-| `env-runner/runners/deno-process/worker` (default) | `DenoProcessEnvRunner` |
-| _(no worker)_                                      | `SelfEnvRunner`        |
-| _(in-memory wrapper module)_                       | `MiniflareEnvRunner`   |
-| `env-runner/runners/vercel/worker` (default)       | `VercelEnvRunner`      |
-| `env-runner/runners/netlify/worker` (default)      | `NetlifyEnvRunner`     |
-
-## Exports
-
-- `env-runner` (`.`) — Types + all runners + `RunnerManager` + `AppEntry` + `toServerOptions`/`RESERVED_SERVER_OPTIONS`/`RESERVED_RUNTIME_OPTIONS` + `resolveRuntimeDep`/`RuntimeDep`
-- `env-runner/runners/node-worker` (`./runners/node-worker`) — Direct import of `NodeWorkerEnvRunner`
-- `env-runner/runners/node-worker/worker` (`./runners/node-worker/worker`) — Built-in srvx worker for Worker threads
-- `env-runner/runners/node-process` (`./runners/node-process`) — Direct import of `NodeProcessEnvRunner`
-- `env-runner/runners/node-process/worker` (`./runners/node-process/worker`) — Built-in srvx worker for Node.js child process
-- `env-runner/runners/bun-process` (`./runners/bun-process`) — Direct import of `BunProcessEnvRunner`
-- `env-runner/runners/bun-process/worker` (`./runners/bun-process/worker`) — Built-in srvx worker for Bun/Node.js process
-- `env-runner/runners/deno-process` (`./runners/deno-process`) — Direct import of `DenoProcessEnvRunner`
-- `env-runner/runners/deno-process/worker` (`./runners/deno-process/worker`) — Built-in srvx worker for Deno process
-- `env-runner/runners/self` (`./runners/self`) — Direct import of `SelfEnvRunner`
-- `env-runner/runners/miniflare` (`./runners/miniflare`) — Direct import of `MiniflareEnvRunner`
-- `env-runner/runners/vercel` (`./runners/vercel`) — Direct import of `VercelEnvRunner`
-- `env-runner/runners/vercel/worker` (`./runners/vercel/worker`) — Vercel worker (sets request context, delegates to node-worker)
-- `env-runner/runners/netlify` (`./runners/netlify`) — Direct import of `NetlifyEnvRunner`
-- `env-runner/runners/netlify/worker` (`./runners/netlify/worker`) — Netlify worker (sets global Netlify context, delegates to node-worker)
-- `env-runner/vite` (`./vite`) — Vite Environment API helpers (`createViteHotChannel`, `createViteTransport`)
-
-Miniflare Request dispatch preserves method, headers, streaming bodies and cancellation, including explicit RequestInit overrides. Regression coverage lives in `test/miniflare-request.test.ts`.
-
-Wrangler configs on miniflare (#52): `wranglerConfigPath` loads a specific file alongside `wrangler: true`/an inline config; the runner's `compatibilityDate` option (`"latest"` = installed workerd date) overrides the wrangler date, and any date newer than workerd supports is clamped with a warning; `assets`/services/queue consumers/workflows/tails and external-script DO bindings are dropped from wrangler-derived options with one deduped `console.warn` per load naming them (config key + binding names, non-empty values only — both backends); file and inline configs load in separate try blocks (one failing warns without discarding the other), and an inline config whose `env` map lacks the selected env is read without `env` (top level as-is, like the minimal reader); enabling `wrangler` (`true`/path/inline) defaults `defaultPersistRoot` to `<dir>/.wrangler/state/v3`, anchored to the loaded config file's dir, else the requested config path's dir (even if missing), else cwd — skipped when `miniflareOptions` configures persistence. Since #55: auto-discovery walks up from the entry's dir when it is inside cwd, else checks only the entry's dir and then walks up from cwd (nearest dir wins; json > jsonc > toml; a parent-dir hit is `console.info`'d once); DO bindings are filtered after the file + inline merge, and those whose `script_name` equals the effective worker name (inline `name` ?? file `name`; `<name>-<env>` whenever an env is selected and its section sets no `name`) are kept with `scriptName` stripped (both backends); wrangler's config warnings are shown for config files once per resolved path + env + mtime/size per process (inline temp-file reads stay `hideWarnings: true`; unexpected keys also fire wrangler's npm update check); `wranglerEnvFiles` forwards `envFiles` to `unstable_getMiniflareWorkerOptions` (wrangler package path only — the minimal reader warns once; relative to the config dir; non-empty skips `.dev.vars`, `[]` reads `.dev.vars` but no `.env*`). See [`.agents/MINIFLARE.md`](.agents/MINIFLARE.md).
-
-The miniflare wrapper handles requests like `srvx/cloudflare` (#50): it applies the entry's `plugins`/`middleware`/`error`, augments the request with `runtime` (`{ name: "cloudflare", cloudflare: { env, context } }`), `ip` and `waitUntil`, and strips the internal `__ENV_RUNNER_IPC`/`__ENV_RUNNER_UNSAFE_EVAL__` bindings from the `env` the entry sees. See [`.agents/MINIFLARE.md`](.agents/MINIFLARE.md).
-
-## Testing
-
-Generic test infrastructure, cross-runner suites (`runners.test.ts`, `manager.test.ts`, `server.test.ts`, `vite.test.ts`), and shared fixtures: [`.agents/TESTS.md`](.agents/TESTS.md). Runner-specific test notes live with each runner doc:
-
-- orphan tests → [`.agents/NODE-RUNNERS.md`](.agents/NODE-RUNNERS.md)
-- miniflare + wrangler tests → [`.agents/MINIFLARE.md`](.agents/MINIFLARE.md)
-- vercel tests → [`.agents/VERCEL.md`](.agents/VERCEL.md)
-- netlify tests → [`.agents/NETLIFY.md`](.agents/NETLIFY.md)
-- virtual-module tests → [`.agents/VIRTUAL-MODULES.md`](.agents/VIRTUAL-MODULES.md)
-
-## Scripts
-
-- `pnpm build` — Build with obuild
-- `pnpm dev` — Vitest watch mode
-- `pnpm test` — Lint + typecheck + vitest with coverage
-- `pnpm typecheck` — tsgo type checking
-- `pnpm fmt` — Format (automd + oxlint fix + oxfmt)
-- `pnpm lint` — Lint check (oxlint + oxfmt check)
-- `pnpm release` — Test + build + changelog + publish + git push
-
-## Dependencies
-
-- `crossws` — Cross-platform WebSocket hooks (used by built-in workers for `websocket` entry key)
-- `httpxy` — HTTP/WebSocket proxy
-- `srvx` — Universal server framework (used by built-in workers)
-- `miniflare` — Cloudflare Workers simulator (**not a dependency**; the app installs it and passes the imported module _or a specifier_ as `MiniflareEnvRunner`'s `miniflare` option — omitting it falls back to an optional import, and only failing both throws)
-- `cjs-module-lexer` / `es-module-lexer` — CJS named-export detection and ESM import-specifier parsing in the miniflare module fallback service (devDependencies inlined into `dist` by obuild)
-- `@netlify/runtime` — Netlify compute runtime (**not a dependency**; the app installs it and passes a _specifier_ via `NetlifyEnvRunner`'s `netlifyRuntime` option — an imported module cannot cross the worker boundary — which the worker imports for full `globalThis.Netlify` + `globalThis.caches` setup; with no specifier the worker imports `@netlify/runtime` optionally and falls back to a shim)
-- `@vercel/queue` — Vercel Queues SDK (**not a dependency**; the caller passes the imported module _or a specifier_ as `registerVercelQueueConsumer`'s `sdk` option — omitting it falls back to a memoized optional import, and registration no-ops with a one-time warning if that fails)
-- `wrangler` — Cloudflare Wrangler (**not a dependency**; passed as the imported module _or a specifier_ via `MiniflareEnvRunner`'s optional `wranglerModule` option to load a `wrangler.{json,jsonc,toml}` config via `unstable_readConfig` + `unstable_getMiniflareWorkerOptions`, else imported optionally; a built-in minimal plain-JSON reader is used when it's absent, and `wranglerModule: false` forces it)
-
-> **No peer dependencies.** `package.json` declares none. Every runner takes the packages it needs as an explicit constructor option, resolved through the shared `resolveRuntimeDep()` helper in `src/common/runtime-deps.ts`: each option accepts the **imported module**, a **specifier** (string/`URL`, resolved from cwd via `exsolve` so bare names hit the app's `node_modules`), or `false` to opt out, and falls back to an optional import of the package name — throwing (`miniflare`, via `required: true`) or degrading (wrangler → minimal reader, netlify → shim, queue → warn-once no-op) only when nothing works. `netlifyRuntime` is the exception: its package must be imported _inside_ the worker, so `resolveRuntimeDepSpecifier()` narrows it to a specifier (or `false`) and rejects a module instance with an actionable error. `build.config.mjs` marks `miniflare`, `wrangler`, `@netlify/runtime`, and `@vercel/queue` external (obuild externalizes `dependencies` + `peerDependencies`, so without peer deps this list is required).
+Details in [`.agents/MINIFLARE.md`](.agents/MINIFLARE.md). In short: the wrapper handles requests like `srvx/cloudflare` (plugins/middleware/error, `request.runtime`/`ip`/`waitUntil`, internal `__ENV_RUNNER_*` bindings hidden from `env`); `wrangler` (`true` | path | inline config) + `wranglerConfigPath`/`wranglerEnv`/`wranglerEnvFiles` load wrangler configs into Miniflare options, with unsupported bindings dropped (warned) and user `miniflareOptions` winning.
 
 ## Reference docs (`.agents/`)
 
-Runner-specific and deep-dive notes, split out of this file:
+- [`ARCHITECTURE.md`](.agents/ARCHITECTURE.md) — core source-file notes, `BaseEnvRunner` lifecycle, `RunnerManager`/`EnvServer`
+- [`NODE-RUNNERS.md`](.agents/NODE-RUNNERS.md) — node-worker, node-process, bun-process, deno-process, self (+ orphan tests)
+- [`MINIFLARE.md`](.agents/MINIFLARE.md) — Miniflare internals, `MiniflareEnvRunner`, wrangler config + tests
+- [`VERCEL.md`](.agents/VERCEL.md) — `VercelEnvRunner` (env vars, headers, OIDC, Queues) + tests
+- [`NETLIFY.md`](.agents/NETLIFY.md) — `NetlifyEnvRunner` + tests
+- [`VIRTUAL-MODULES.md`](.agents/VIRTUAL-MODULES.md) — virtual modules across Node/Bun/Deno/Miniflare + tests
 
-- [`.agents/ARCHITECTURE.md`](.agents/ARCHITECTURE.md) — detailed core source-file notes, the shared `BaseEnvRunner` lifecycle, `RunnerManager`/`EnvServer`
-- [`.agents/NODE-RUNNERS.md`](.agents/NODE-RUNNERS.md) — node-worker, node-process, bun-process, deno-process, and self runners (+ orphan tests)
-- [`.agents/MINIFLARE.md`](.agents/MINIFLARE.md) — Miniflare internals (`unsafeEvalBinding`, `unsafeModuleFallbackService`, service bindings) **and** the `MiniflareEnvRunner` + wrangler config + tests
-- [`.agents/VERCEL.md`](.agents/VERCEL.md) — `VercelEnvRunner` (env vars, header injection, OIDC, Vercel Queues) + tests
-- [`.agents/NETLIFY.md`](.agents/NETLIFY.md) — `NetlifyEnvRunner` (header injection) + tests
-- [`.agents/VIRTUAL-MODULES.md`](.agents/VIRTUAL-MODULES.md) — virtual modules across Node/Bun/Deno/Miniflare + tests
-- [`.agents/TESTS.md`](.agents/TESTS.md) — generic test infrastructure, cross-runner suites, shared fixtures
-- [`.agents/SRVX.md`](.agents/SRVX.md) — srvx server framework notes (used by the built-in workers)
-- [`.agents/PLAN.vite-compat.md`](.agents/PLAN.vite-compat.md) — Planned improvements for Vite Environment API compatibility (`waitForReady`, RPC, transport helpers)
+## Testing
+
+- Runner tests spawn workers from `dist/` (resolved via the self-linked `env-runner` package), so run `pnpm build` after worker-side changes before `pnpm vitest run`
+- `test/runners.test.ts` is the cross-runner suite; bun/deno cases auto-skip when the runtime is missing. Runner-specific test notes live in each runner doc
+
+## Scripts
+
+- `pnpm build` — obuild
+- `pnpm dev` — Vitest watch
+- `pnpm test` — lint + typecheck + vitest with coverage
+- `pnpm typecheck` — tsgo
+- `pnpm fmt` — automd + oxlint fix + oxfmt
+- `pnpm lint` — oxlint + oxfmt check
+- `pnpm release` — test + build + changelog + publish + push
+
+## Dependencies
+
+- `crossws`, `httpxy`, `srvx` — WebSocket hooks, HTTP/WS proxy, server framework
+- `cjs-module-lexer` / `es-module-lexer` — devDependencies inlined into `dist` (miniflare module fallback service)
+- **No peer dependencies.** `miniflare`, `wrangler`, `@netlify/runtime`, `@vercel/queue` are installed by the app and passed as runner options (`miniflare`, `wranglerModule`, `netlifyRuntime`, queue `sdk`), resolved via `resolveRuntimeDep()`: imported module | specifier (resolved from cwd) | `false` (opt out) | omitted (optional import). If nothing resolves: miniflare throws; wrangler → minimal JSON reader; netlify → shim; queue → warn-once no-op. `netlifyRuntime` must be a specifier (imported inside the worker, via `resolveRuntimeDepSpecifier()`). These packages must stay listed as external in `build.config.mjs`.
 
 ## Key patterns
 
-- **Co-located runner + worker** — Each runner directory contains both `runner.ts` and `worker.ts` (except `self/` which has no worker). Runners default to their co-located worker via `import.meta.resolve("env-runner/runners/<name>/worker")` when `entry` is omitted
-- **Message-driven readiness** — Workers/processes post `{ address }` to signal ready state
-- **Runtime-native WebSocket proxying** — The public-facing server attaches `RunnerManager.wsSrvxPlugin()` (a srvx plugin from `src/common/ws-proxy.ts`). On a **Node** host it proxies the raw upgrade socket to the worker (httpxy passthrough via `runner.upgrade()`, transparent end-to-end); on a **Bun/Deno** host (no Node upgrade socket exists) it terminates the client with crossws and bridges to the worker over a `WebSocket` client. The plugin reads the active runner lazily so it survives hot-reloads. `runner.upgrade()` and the bridge both await readiness internally, so consumers don't poll. Replaced the old Node-only `server.node.server.on("upgrade")` wiring in `cli.ts`
-- **Immediate shutdown** — `close()` immediately terminates the worker/process (no graceful shutdown handshake)
-- **Orphan protection** — node-process/bun-process workers register `process.on("disconnect", () => process.exit(0))` at the top of the worker (before the entry import) so a non-graceful supervisor death (SIGKILL, crash) never leaves an orphan, even mid-import (#23)
-- **Data passing:** Worker threads use `workerData`, processes use `ENV_RUNNER_DATA` env var (JSON), self runner uses in-memory channel, miniflare runner uses in-memory `script` with `unsafeModuleFallbackService` for module resolution
-- **Terminal capabilities** — Worker threads and child processes get a pipe for stdout, so `isTTY`/`columns` are `undefined` inside them and standard color detection strips ANSI even though the output lands on the host terminal (#37). All four spawning runners build their env with `hostEnv()` (`src/common/host-env.ts`), which inherits `process.env` and adds `FORCE_COLOR=1` (when the host is a TTY and neither `FORCE_COLOR` nor `NO_COLOR` is already set) plus `COLUMNS` (a spawn-time snapshot; resizes are not propagated)
-- **Stdio forwarding** — All runners forward entry stdout/stderr to the host process: node-process and bun-process pipe child streams to `process.stdout`/`process.stderr`, deno-process forwards non-IPC stdout lines (stdout doubles as NDJSON IPC) and pipes stderr, worker threads use Node.js's built-in forwarding, miniflare uses its default runtime stdio handler
-- **Socket cleanup** — `_closeSocket()` avoids deleting Windows named pipes and abstract sockets
-- **Custom inspect** — `[Symbol.for('nodejs.util.inspect.custom')]()` shows pending/ready/closed status
-- **Explicit external dependencies with an optional-import fallback** — All runtime-dep options go through `resolveRuntimeDep()` (`src/common/runtime-deps.ts`) and share one contract: imported module | specifier | `false` | omitted. Host-side deps (`miniflare`, `wranglerModule`, `registerVercelQueueConsumer`'s `sdk`) resolve to a module; worker-side deps that cannot receive a live instance across the boundary (`netlifyRuntime`) go through `resolveRuntimeDepSpecifier()` on the host and `resolveRuntimeDep()` again inside the worker. When an option is omitted, an optional import of the package name is tried and only errors (miniflare) or degrades (wrangler → minimal reader, netlify → shim, queue → warn-once no-op) if that fails too. `false` explicitly opts out. `EnvServer`'s `runnerOptions` and `loadRunner`'s untyped passthrough carry these options to the runner constructor
-- **Adding a new runner** — Create `src/runners/<name>/runner.ts` extending `BaseEnvRunner`, optionally add `worker.ts`, add export path in `package.json`, add to `loaders` map in `src/loader.ts`, re-export from `src/index.ts`
+- **Message-driven readiness** — workers post `{ address }` when ready
+- **WebSocket proxying** — `RunnerManager.wsSrvxPlugin()`: Node host proxies the raw upgrade socket (httpxy); Bun/Deno host terminates with crossws and bridges via a `WebSocket` client. Reads the active runner lazily (survives hot-reload) and awaits readiness
+- **Immediate shutdown** — `close()` terminates the worker/process, no graceful handshake
+- **Orphan protection** — node-process/bun-process workers call `process.on("disconnect", () => process.exit(0))` before importing the entry
+- **Data passing** — `workerData` (threads), `ENV_RUNNER_DATA` JSON env (processes), direct in-process import (self), in-memory `script` + `unsafeModuleFallbackService` (miniflare)
+- **Terminal capabilities** — spawned workers get piped stdout, so `hostEnv()` forwards `FORCE_COLOR`/`COLUMNS` from the host TTY
+- **Stdio forwarding** — all runners forward entry stdout/stderr to the host (deno-process stdout doubles as NDJSON IPC, so only non-IPC lines are forwarded)
+- **Socket cleanup** — `_closeSocket()` skips Windows named pipes and abstract sockets
+- **Adding a new runner** — `src/runners/<name>/runner.ts` extending `BaseEnvRunner` (+ optional `worker.ts`), add `package.json` export, add to `loaders` in `src/loader.ts`, re-export from `src/index.ts`

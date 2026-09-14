@@ -1,49 +1,39 @@
 # VercelEnvRunner
 
-Extends `NodeWorkerEnvRunner` to simulate a Vercel deployment environment.
+Extends `NodeWorkerEnvRunner`; the worker sets up Vercel globals/env, then imports the node-worker worker.
 
-## Source files
+## Worker environment
 
-- **`src/runners/vercel/runner.ts`** — `VercelEnvRunner` extends `NodeWorkerEnvRunner`: simulates Vercel deployment environment with header injection
-- **`src/runners/vercel/worker.ts`** — Sets Vercel env vars and `Symbol.for("@vercel/request-context")` on globalThis, delegates to node-worker worker
-- **`src/runners/vercel/oidc.ts`** — `_checkVercelOidcToken()` decodes `VERCEL_OIDC_TOKEN` (JWT `exp` claim, no signature check) and returns `{ status: "missing" | "valid" | "expired" | "invalid", expiresAt? }`. `warnIfVercelOidcTokenInvalid()` logs a one-time dev warning hinting the user to run `vercel env pull`. Called from the `VercelEnvRunner` constructor
-- **`src/runners/vercel/queue-dev.ts`** — Bridge for local Vercel Queues delivery. `await registerVercelQueueConsumer({ sdk, topic, handler, consumerGroup?, visibilityTimeoutSeconds?, retry?, retryAfterSeconds? })` lets framework plugins bind a topic to a dispatcher. `sdk` is the caller's `@vercel/queue` module (**not a dependency** of env-runner) typed structurally as `RuntimeDep<VercelQueueSdk>` — the imported module, a specifier, or `false` — resolved through the shared `resolveRuntimeDep()` (`src/common/runtime-deps.ts`) by the module-level `resolveSdk()` helper, which memoizes the omitted-option fallback import in `_importedSdk` so it runs once per process. One `QueueClient` is constructed per SDK instance and cached in a `WeakMap`. The file also declares local `VercelQueueMessageMetadata`/`VercelQueueMessageHandler`/`VercelQueueRetryHandler`/`VercelQueueRetryDirective` types mirroring the SDK's, so no `import type` from `@vercel/queue` remains. Resolves to an unregister function. Re-registering the same `consumerGroup` on a topic replaces the handler via the SDK's own `consumerGroup` keying (HMR-safe; the unregister for a replaced registration becomes a no-op). `retryAfterSeconds` is a shorthand for `retry: () => ({ afterSeconds })`; pass `retry` for richer directives like `{ acknowledge: true }`
+- Defaults (only when unset): `VERCEL=1`, `VERCEL_ENV=development`, `NODE_ENV=development` (gates `@vercel/queue` dev mode). Scoped to the worker thread's own env copy
+- `VERCEL_REGION`/`NOW_REGION` are intentionally **not** defaulted: Vercel SDKs expect valid region identifiers when set
+- `globalThis[Symbol.for("@vercel/request-context")]` for `@vercel/functions`: in-memory `cache` (TTL + tags, lives as long as the worker), `purge` no-ops, `addCacheTag`, `waitUntil` (tracked, never awaited)
 
-## How it works
+## OIDC
 
-Extends `NodeWorkerEnvRunner` to simulate a Vercel deployment environment. The worker sets `Symbol.for("@vercel/request-context")` on `globalThis` (with `waitUntil`, `cache`, `purge`, `addCacheTag`) for `@vercel/functions` compatibility, sets Vercel environment variables, then delegates to the node-worker worker.
+- Constructor checks `VERCEL_OIDC_TOKEN` by decoding the JWT `exp` claim only (no signature check) and warns once per process if missing/expired/malformed, suggesting `vercel env pull`
 
-**Environment variables** (set in worker thread, won't override if already set):
+## Header injection
 
-- `VERCEL` — `"1"`
-- `VERCEL_ENV` — `"development"`
-- `NODE_ENV` — `"development"` (gates `@vercel/queue`'s dev mode and other framework dev paths)
+All headers are set only when absent, so caller-provided values win.
 
-`VERCEL_REGION` and `NOW_REGION` are intentionally not defaulted — Vercel SDKs rely on them being valid region identifiers when set, so they must be explicitly provided if required.
+- Request:
+  - `x-vercel-deployment-url` — `http://<host>:<port>` of the worker, only once the address is known (a fetch before ready lacks it)
+  - `x-vercel-id` — `dev1::<podId>-<ts36>-<hex>`, podId stable per host process (matches `vercel dev`)
+  - Client IP = first `x-forwarded-for` entry, else `x-real-ip`, else `127.0.0.1`; fills `x-vercel-forwarded-for`, `x-forwarded-for`, `x-real-ip`
+  - `x-forwarded-proto` from the URL, `x-forwarded-host` from `host` header or URL
+- Response: `server: Vercel`, `x-vercel-id` (same id as the request), `x-vercel-cache: MISS`
 
-**Request header injection:** Overrides `fetch()` to inject Vercel-specific headers before delegating to the parent:
+## Local Vercel Queues (`env-runner/runners/vercel/queue-dev`)
 
-- `x-vercel-deployment-url` — constructed from the worker's address (`http://<host>:<port>`)
-- `x-vercel-id` — unique request ID in format `dev1::<podId>-<timestamp>-<hex>` (stable podId per process, matches vercel dev behavior)
-- `x-vercel-forwarded-for` — derived from `x-forwarded-for` (first IP) or `x-real-ip`, defaults to `127.0.0.1`
-- `x-forwarded-for`, `x-real-ip` — set to client IP if not already present
-- `x-forwarded-proto` — protocol from request URL
-- `x-forwarded-host` — from `host` header or request URL
-
-**Response header injection:** After proxying, injects response headers:
-
-- `server` — `"Vercel"`
-- `x-vercel-id` — same request ID as the request header
-- `x-vercel-cache` — `"MISS"`
-
-All headers are only injected when not already present in the request/response.
-
-**Local Vercel Queues delivery:** Frameworks running inside the worker `await registerVercelQueueConsumer({ sdk, topic, handler, consumerGroup?, visibilityTimeoutSeconds?, retry?, retryAfterSeconds? })` from `env-runner/runners/vercel/queue-dev` (e.g. Nitro forwards delivered messages to its `vercel:queue` runtime hook), preferably passing the `@vercel/queue` package **they** imported (otherwise it is imported optionally). The first call for a given `sdk` constructs a `QueueClient` (cached per SDK in a `WeakMap`) and registers a dev consumer via `sdk.registerDevConsumer`. Subsequent calls reuse the client; re-registering the same `consumerGroup` on a topic replaces the handler in place (HMR-safe). `retryAfterSeconds` is shorthand for a constant-delay retry; pass `retry: (error, metadata) => RetryDirective` for richer directives (`{ afterSeconds }`, `{ acknowledge: true }`, or `undefined` to propagate). If no SDK is available at all (`_warnedMissing`) or the one in use is too old to expose `registerDevConsumer` (warned once per SDK instance via a `WeakSet`), registrations resolve to a no-op unregister — dev startup is never blocked.
+- Frameworks inside the worker `await registerVercelQueueConsumer({ sdk, topic, handler, ... })` (e.g. Nitro forwards to its `vercel:queue` hook); resolves to an unregister fn
+- `sdk` follows the runtime-dep contract; the omitted-option optional import is memoized once per process
+- One `QueueClient` per SDK instance; the SDK's `registerDevConsumer` does delivery
+- Re-registering the same `consumerGroup` (default `env-runner-vercel-dev`) on a topic replaces the handler (HMR-safe; the replaced registration's unregister becomes a no-op). Use distinct groups to fan out
+- `retryAfterSeconds` is shorthand for `retry: () => ({ afterSeconds })`; an explicit `retry` wins
+- No SDK, or one without `registerDevConsumer` (< 0.2.0) → one-time warning and no-op unregister; dev startup is never blocked
+- Local metadata/handler/retry types mirror the SDK's, so there is no type import from `@vercel/queue`
 
 ## Testing
 
-- Vercel suites (`test/vercel.test.ts` and the Vercel entry in `test/runners.test.ts`) stub a fake far-future `VERCEL_OIDC_TOKEN` via `vi.stubEnv` so the OIDC check doesn't log warnings (real env token takes precedence)
-- **`test/vercel.test.ts`** — Tests for `VercelEnvRunner`: request header injection (`x-vercel-deployment-url`, `x-vercel-id`, `x-vercel-forwarded-for`, `x-forwarded-for`, `x-real-ip`, `x-forwarded-proto`, `x-forwarded-host`), response header injection (`server`, `x-vercel-id`, `x-vercel-cache`), environment variables (`VERCEL`, `VERCEL_ENV`, `VERCEL_REGION`, `NOW_REGION`), header preservation, pre-existing header respect
-- Test fixture in `test/fixtures/app-headers.mjs` — Entry that echoes all request headers as JSON for vercel header injection tests
-- Test fixture in `test/fixtures/app-env.mjs` — Entry that echoes request headers and selected environment variables as JSON
-- **`test/vercel-queue.test.ts`** — Tests `registerVercelQueueConsumer` against a fake `sdk` (no `@vercel/queue` at runtime): registration options forwarded, one `QueueClient` per SDK instance (and a separate one per distinct SDK), `consumerGroup`/`visibilityTimeoutSeconds` passthrough, `retryAfterSeconds` → constant-delay retry, explicit `retry` winning over it, and the warn-once no-op path for an SDK without `registerDevConsumer`. Also covers the omitted-`sdk` path resolving through the optional import, and an `sdk` passed as a **module specifier** pointing at `test/fixtures/queue-sdk-stub.mjs`. A typecheck-only conditional-type assertion keeps the real `typeof import("@vercel/queue")` assignable to `VercelQueueSdk`
+- `test/vercel.test.ts` — header injection/preservation and worker env. Suites (and the Vercel case in `runners.test.ts`) stub a far-future `VERCEL_OIDC_TOKEN` via `vi.stubEnv` to silence the warning; vitest's `NODE_ENV=test` is inherited, so the default isn't observable
+- `test/vercel-queue.test.ts` — fake `sdk` objects plus a specifier stub (`test/fixtures/queue-sdk-stub.mjs`); a typecheck-only assertion keeps the real `@vercel/queue` module assignable to `VercelQueueSdk`
