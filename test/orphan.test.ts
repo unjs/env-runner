@@ -19,6 +19,7 @@ function hasRuntime(cmd: string): boolean {
 }
 
 const hasBun = hasRuntime("bun");
+const hasDeno = hasRuntime("deno");
 
 const _dir = dirname(fileURLToPath(import.meta.url));
 const supervisorEntry = resolve(_dir, "./fixtures/orphan-supervisor.mjs");
@@ -40,6 +41,7 @@ const cases: { name: string; runner: string; skip?: boolean; bunHost?: boolean }
   { name: "NodeProcessEnvRunner", runner: "node-process" },
   { name: "BunProcessEnvRunner (node host)", runner: "bun-process", skip: !hasBun },
   { name: "BunProcessEnvRunner (bun host)", runner: "bun-process", bunHost: true, skip: !hasBun },
+  { name: "DenoProcessEnvRunner", runner: "deno-process", skip: !hasDeno },
 ];
 
 describe("orphan workers on supervisor death", () => {

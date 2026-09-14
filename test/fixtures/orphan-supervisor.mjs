@@ -13,6 +13,7 @@ const entry = resolve(_dir, entryName);
 
 const { NodeProcessEnvRunner } = await import("../../src/runners/node-process/runner.ts");
 const { BunProcessEnvRunner } = await import("../../src/runners/bun-process/runner.ts");
+const { DenoProcessEnvRunner } = await import("../../src/runners/deno-process/runner.ts");
 
 let address;
 const opts = {
@@ -28,6 +29,7 @@ const opts = {
 const runners = {
   "node-process": () => new NodeProcessEnvRunner(opts),
   "bun-process": () => new BunProcessEnvRunner(opts),
+  "deno-process": () => new DenoProcessEnvRunner(opts),
 };
 
 const runner = runners[runnerName]();

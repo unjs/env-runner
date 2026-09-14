@@ -184,6 +184,10 @@ for (const runnerDef of runners) {
         expect(await res.text()).toBe("logged");
 
         await waitFor(() => stdoutChunks.join("").includes(`stdout:${marker}`), 5000);
+        await waitFor(
+          () => stdoutChunks.join("").includes(JSON.stringify({ stdout: marker })),
+          5000,
+        );
         await waitFor(() => stderrChunks.join("").includes(`stderr:${marker}`), 5000);
       } finally {
         stdoutWrite.mockRestore();

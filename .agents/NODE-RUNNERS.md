@@ -19,9 +19,8 @@ Built-in srvx-worker runners (node-worker, node-process, bun-process, deno-proce
 
 ## deno-process
 
-- `deno run -A --node-modules-dir=auto --no-lock <execArgv> <worker>` via Node `spawn()` with plain pipes — **no Node IPC channel** (Deno lacks `process.send`)
-- IPC is newline-delimited JSON: host → worker over stdin, worker → host over **stdout**. The host treats any stdout line starting with `{` that parses as JSON as a message and forwards the rest, so an entry logging a JSON object on its own line is swallowed as IPC. Messages must be JSON-serializable
-- No `disconnect`-based orphan protection (not covered by the orphan tests)
+- `deno run -A --node-modules-dir=auto --no-lock <execArgv> <worker>` via Node `spawn()` with an `"ipc"` stdio slot and `serialization: "json"` — Deno implements Node's IPC channel (`NODE_CHANNEL_FD`, JSON only; verified on Deno 2.9), so messages must be JSON-serializable
+- Same worker shape and orphan protection (`disconnect`) as node-process/bun-process; stdout/stderr are plain logs piped to the host
 
 ## self
 
@@ -34,4 +33,4 @@ Built-in srvx-worker runners (node-worker, node-process, bun-process, deno-proce
 
 - `test/runners.test.ts` covers all of these (see `AGENTS.md` Testing)
 - `test/host-env.test.ts` — `hostEnv()` precedence plus `FORCE_COLOR`/`COLUMNS` reaching node-worker/node-process workers
-- `test/orphan.test.ts` — SIGKILLs a supervisor subprocess (node-process, bun-process on Node and Bun hosts), including mid-import via a slow-import entry with marker files. Probes the worker's **port**, not its pid: a killed-but-unreaped zombie still passes `kill(pid, 0)`
+- `test/orphan.test.ts` — SIGKILLs a supervisor subprocess (node-process, bun-process on Node and Bun hosts, deno-process on a Node host), including mid-import via a slow-import entry with marker files. Probes the worker's **port**, not its pid: a killed-but-unreaped zombie still passes `kill(pid, 0)`

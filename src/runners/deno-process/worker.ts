@@ -10,16 +10,12 @@ import {
 } from "../../common/worker-utils.ts";
 import { registerVirtualModules, handleInvalidateModule } from "../../common/virtual-modules.ts";
 
+// Deno implements Node's IPC channel when spawned with an "ipc" stdio slot.
+// Exit with the supervisor to avoid orphans; registered before a possibly slow entry import.
+process.on("disconnect", () => process.exit(0));
+
 const data = JSON.parse(process.env.ENV_RUNNER_DATA || "{}");
-
-// Deno doesn't support Node.js IPC (process.send), so use stdin/stdout JSON lines
-const _stdout = (globalThis as any).Deno?.stdout
-  ? { write: (s: string) => (globalThis as any).Deno.stdout.writeSync(new TextEncoder().encode(s)) }
-  : process.stdout;
-const sendMessage = (message: unknown) => _stdout.write(JSON.stringify(message) + "\n");
-
-const _stdin = (globalThis as any).Deno?.stdin?.readable || process.stdin;
-
+const sendMessage = (message: unknown) => process.send!(message);
 const virtualEntry = isVirtualSpecifier(data.entry, data.virtual);
 
 let unregisterVirtualModules: () => void;
@@ -55,39 +51,17 @@ if (entry.ipc) {
   await entry.ipc.onOpen?.({ sendMessage });
 }
 
-sendMessage({
+process.send!({
   address: parseServerAddress(server),
 });
 
-// Read newline-delimited JSON from stdin
-async function readMessages() {
-  const decoder = new TextDecoder();
-  let buffer = "";
-  for await (const chunk of _stdin as AsyncIterable<Uint8Array>) {
-    buffer += decoder.decode(chunk, { stream: true });
-    let newlineIdx;
-    while ((newlineIdx = buffer.indexOf("\n")) !== -1) {
-      const line = buffer.slice(0, newlineIdx);
-      buffer = buffer.slice(newlineIdx + 1);
-      if (!line) continue;
-      let message: any;
-      try {
-        message = JSON.parse(line);
-      } catch {
-        continue;
-      }
-      await handleMessage(message);
-    }
-  }
-}
-
-async function handleMessage(message: any) {
+process.on("message", async (message: any) => {
   if (message?.event === "shutdown") {
     Promise.resolve(entry.ipc?.onClose?.())
       .then(() => server.close())
       .then(() => {
         unregisterVirtualModules();
-        sendMessage({ event: "exit" });
+        process.send!({ event: "exit" });
       });
     return;
   }
@@ -95,9 +69,9 @@ async function handleMessage(message: any) {
   if (message?.event === "reload-module") {
     try {
       entry = await reloadEntryModule(data.entry, entry, sendMessage, virtualEntry);
-      sendMessage({ event: "module-reloaded" });
+      process.send!({ event: "module-reloaded" });
     } catch (error: any) {
-      sendMessage({ event: "module-reloaded", error: error?.message || String(error) });
+      process.send!({ event: "module-reloaded", error: error?.message || String(error) });
     }
     return;
   }
@@ -108,11 +82,9 @@ async function handleMessage(message: any) {
   }
 
   if (message?.type === "ping") {
-    sendMessage({ type: "pong", data: message.data });
+    process.send!({ type: "pong", data: message.data });
     return;
   }
 
   entry.ipc?.onMessage?.(message);
-}
-
-readMessages().catch(() => {});
+});

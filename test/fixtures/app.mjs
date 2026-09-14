@@ -20,6 +20,8 @@ export default {
     if (url.pathname === "/log") {
       const marker = url.searchParams.get("marker");
       console.log(`stdout:${marker}`);
+      // A JSON line must not be mistaken for IPC (deno-process uses stdout for IPC)
+      console.log(JSON.stringify({ stdout: marker }));
       console.error(`stderr:${marker}`);
       return new Response("logged");
     }

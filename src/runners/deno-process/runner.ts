@@ -1,5 +1,6 @@
 import type { WorkerHooks } from "../../types.ts";
 
+import type { ChildProcess } from "node:child_process";
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -12,17 +13,8 @@ export type { EnvRunnerData as DenoProcessEnvRunnerData } from "../../common/bas
 
 let _defaultEntry: string;
 
-interface ProcessHandle {
-  pid: number;
-  kill: () => void;
-  send: (message: unknown) => void;
-  exited: Promise<number>;
-  _exitCode?: number | null;
-  removeAllListeners?: () => void;
-}
-
 export class DenoProcessEnvRunner extends BaseEnvRunner {
-  #process?: ProcessHandle;
+  #process?: ChildProcess & { _exitCode?: number | null };
 
   constructor(opts: {
     name: string;
@@ -42,7 +34,7 @@ export class DenoProcessEnvRunner extends BaseEnvRunner {
     if (!this.#process) {
       throw new Error("Deno env process should be initialized before sending messages.");
     }
-    this.#process.send(message);
+    this.#process.send(message as any);
   }
 
   // #region Protected methods
@@ -59,7 +51,7 @@ export class DenoProcessEnvRunner extends BaseEnvRunner {
     if (!this.#process) {
       return;
     }
-    this.#process.removeAllListeners?.();
+    this.#process.removeAllListeners();
     try {
       this.#process.kill();
     } catch {}
@@ -76,37 +68,22 @@ export class DenoProcessEnvRunner extends BaseEnvRunner {
       return;
     }
 
-    const env = hostEnv({
-      ENV_RUNNER_NAME: this._name,
-      ENV_RUNNER_DATA: JSON.stringify(this._data || {}),
-    });
-
+    // Deno implements Node's IPC channel (`NODE_CHANNEL_FD`), JSON serialization only
     const child = spawn(
       "deno",
       ["run", "-A", "--node-modules-dir=auto", "--no-lock", ...(execArgv || []), this._workerEntry],
       {
-        env,
-        stdio: ["pipe", "pipe", "pipe"],
+        env: hostEnv({
+          ENV_RUNNER_NAME: this._name,
+          ENV_RUNNER_DATA: JSON.stringify(this._data || {}),
+        }),
+        stdio: ["pipe", "pipe", "pipe", "ipc"],
+        serialization: "json",
       },
-    );
-
-    const exited = new Promise<number>((resolve) => {
-      child.once("exit", (code) => resolve(code ?? 1));
-    });
-
-    const handle: ProcessHandle = {
-      pid: child.pid!,
-      kill: () => child.kill(),
-      send: (message: unknown) => {
-        child.stdin!.write(JSON.stringify(message) + "\n");
-      },
-      exited,
-      _exitCode: undefined,
-      removeAllListeners: () => child.removeAllListeners(),
-    };
+    ) as ChildProcess & { _exitCode?: number | null };
 
     child.once("exit", (code) => {
-      handle._exitCode = code;
+      child._exitCode = code;
       this.close(`process exited with code ${code}`);
     });
 
@@ -117,29 +94,14 @@ export class DenoProcessEnvRunner extends BaseEnvRunner {
       }
     });
 
-    // Parse newline-delimited JSON from stdout for IPC, forward other output
-    let buffer = "";
-    child.stdout!.on("data", (chunk: Buffer) => {
-      buffer += chunk.toString();
-      let newlineIdx;
-      while ((newlineIdx = buffer.indexOf("\n")) !== -1) {
-        const line = buffer.slice(0, newlineIdx);
-        buffer = buffer.slice(newlineIdx + 1);
-        if (line.startsWith("{")) {
-          try {
-            this._handleMessage(JSON.parse(line));
-            continue;
-          } catch {
-            // Not JSON, forward as regular output
-          }
-        }
-        process.stdout.write(line + "\n");
-      }
+    child.on("message", (message: any) => {
+      this._handleMessage(message);
     });
 
+    child.stdout?.pipe(process.stdout);
     child.stderr?.pipe(process.stderr);
 
-    this.#process = handle;
+    this.#process = child;
   }
 
   // #endregion

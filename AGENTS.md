@@ -98,9 +98,9 @@ Details in [`.agents/MINIFLARE.md`](.agents/MINIFLARE.md). In short: the wrapper
 - **Message-driven readiness** — workers post `{ address }` when ready
 - **WebSocket proxying** — `RunnerManager.wsSrvxPlugin()`: Node host proxies the raw upgrade socket (httpxy); Bun/Deno host terminates with crossws and bridges via a `WebSocket` client. Reads the active runner lazily (survives hot-reload) and awaits readiness
 - **Immediate shutdown** — `close()` terminates the worker/process, no graceful handshake
-- **Orphan protection** — node-process/bun-process workers call `process.on("disconnect", () => process.exit(0))` before importing the entry
+- **Orphan protection** — node-process/bun-process/deno-process workers call `process.on("disconnect", () => process.exit(0))` before importing the entry
 - **Data passing** — `workerData` (threads), `ENV_RUNNER_DATA` JSON env (processes), direct in-process import (self), in-memory `script` + `unsafeModuleFallbackService` (miniflare)
 - **Terminal capabilities** — spawned workers get piped stdout, so `hostEnv()` forwards `FORCE_COLOR`/`COLUMNS` from the host TTY
-- **Stdio forwarding** — all runners forward entry stdout/stderr to the host (deno-process stdout doubles as NDJSON IPC, so only non-IPC lines are forwarded)
+- **Stdio forwarding** — all runners forward entry stdout/stderr to the host
 - **Socket cleanup** — `_closeSocket()` skips Windows named pipes and abstract sockets
 - **Adding a new runner** — `src/runners/<name>/runner.ts` extending `BaseEnvRunner` (+ optional `worker.ts`), add `package.json` export, add to `loaders` in `src/loader.ts`, re-export from `src/index.ts`
