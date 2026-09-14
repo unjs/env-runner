@@ -411,7 +411,7 @@ await using runner = new MiniflareEnvRunner({
 });
 ```
 
-When an inline config is passed, a `wrangler.{json,jsonc,toml}` file is still auto-discovered (next to the entry, then cwd) and loaded, and the inline config is **merged on top of it** — inline values win per key, binding records (e.g. `vars`) merge, and `compatibilityFlags` are unioned. This lets you keep a committed `wrangler` file and override a few fields programmatically.
+When an inline config is passed, a `wrangler.{json,jsonc,toml}` file is still auto-discovered (next to the entry, then cwd) and loaded, and the inline config is **merged on top of it** — inline values win per key, binding records (e.g. `vars`) merge, and `compatibilityFlags` are unioned. This lets you keep a committed `wrangler` file and override a few fields programmatically. If the inline config doesn't define the selected `wranglerEnv`, its top level is used as-is (the file's env still applies), and a config that fails to load only warns without discarding the other one.
 
 Set `wranglerConfigPath` to load a specific config file instead of auto-discovering one — with `wrangler: true` or an inline config (which still merges on top), and without changing the working directory:
 
@@ -447,6 +447,8 @@ await using runner = new MiniflareEnvRunner({
 ```
 
 Without `wranglerModule`, `wrangler` is imported optionally; if that fails too, a built-in minimal reader handles plain JSON files and inline objects (common fields only) and JSONC/TOML files are skipped with a warning (they need `wrangler` to parse). Pass `wranglerModule: false` to always use the minimal reader. Values you pass in `miniflareOptions` always take precedence over config-derived ones — binding records (e.g. `bindings`) merge per key, and `compatibilityFlags` are merged.
+
+Config options a single dev worker can't run — `services`, `assets`, `queues.consumers`, `workflows`, `tail_consumers`/`streaming_tail_consumers`, and `durable_objects` bindings with a `script_name` — are ignored with one warning listing them (e.g. `services (MY_SERVICE)`); pass the equivalent Miniflare options via `miniflareOptions` to opt in.
 
 #### Module Transform Pipeline
 

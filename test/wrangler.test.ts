@@ -83,6 +83,15 @@ interface WranglerCase {
   assert: (json: any, ctx: WranglerCaseContext) => void;
   /** Substrings expected among `console.warn` messages. */
   warns?: string[];
+  /** Custom assertion on all `console.warn` messages. */
+  assertWarnings?: (warnings: string[]) => void;
+}
+
+const DROPPED_WARNING = "wrangler config options not supported by the miniflare dev runner";
+
+// The "ignored options" warnings among the captured `console.warn` messages.
+function droppedWarnings(warnings: string[]): string[] {
+  return warnings.filter((m) => m.includes(DROPPED_WARNING));
 }
 
 // Loading the real `wrangler` package (+ spinning up miniflare/workerd) on the
@@ -160,12 +169,11 @@ function defineWranglerCases(cases: WranglerCase[], withWrangler: boolean): void
       async () => {
         const { json, ctx } = await runWranglerCase({ withWrangler, ...c });
         c.assert(json, ctx);
-        if (c.warns) {
-          const warnings = warn.mock.calls.map((call: unknown[]) => String(call[0]));
-          for (const expected of c.warns) {
-            expect(warnings.some((m: string) => m.includes(expected))).toBe(true);
-          }
+        const warnings = warn.mock.calls.map((call: unknown[]) => String(call[0]));
+        for (const expected of c.warns ?? []) {
+          expect(warnings.some((m: string) => m.includes(expected))).toBe(true);
         }
+        c.assertWarnings?.(warnings);
       },
       WRANGLER_TEST_TIMEOUT,
     );
@@ -189,7 +197,11 @@ const SHARED_CASES: WranglerCase[] = [
       wrangler: { vars: { GREETING: "from-inline" } },
       wranglerConfigPath: join(tmpDir, "config/wrangler.json"),
     }),
-    assert: (json) => expect(json).toEqual({ greeting: "from-inline", tier: "from-file" }),
+    assert: (json, ctx) => {
+      expect(json).toEqual({ greeting: "from-inline", tier: "from-file" });
+      // The inline config's temp normalization dir must not leak as `rootPath`.
+      expect(String(ctx.mfOptions.rootPath ?? "")).not.toContain("env-runner-wrangler-");
+    },
   },
   {
     name: "uses wranglerConfigPath with `wrangler: true`",
@@ -205,6 +217,31 @@ const SHARED_CASES: WranglerCase[] = [
       wranglerConfigPath: join(tmpDir, "config/wrangler.json"),
     }),
     assert: (json) => expect(json.greeting).toBe("from-config-path"),
+    // wrangler returns `{}`/`[]` for unused binding types — no drop warning.
+    assertWarnings: (warnings) => expect(droppedWarnings(warnings)).toEqual([]),
+  },
+  {
+    name: "keeps file env bindings when an inline env map lacks the selected env",
+    files: {
+      "wrangler.json": JSON.stringify({
+        name: "test",
+        compatibility_date: "2024-09-01",
+        vars: { TIER: "file-top" },
+        env: { test: { vars: { TIER: "file-env" } } },
+      }),
+    },
+    options: () => ({
+      wrangler: {
+        vars: { GREETING: "inline-top" },
+        env: { prod: { vars: { GREETING: "inline-prod" } } },
+      },
+      wranglerEnv: "test",
+    }),
+    // File `env.test` applies; the inline config has no `test` env, so its
+    // top level is used as-is.
+    assert: (json) => expect(json).toEqual({ greeting: "inline-top", tier: "file-env" }),
+    assertWarnings: (warnings) =>
+      expect(warnings.filter((m) => m.includes("failed to load"))).toEqual([]),
   },
   {
     name: "warns about a missing wranglerConfigPath and continues with the inline config",
@@ -272,6 +309,12 @@ const SHARED_CASES: WranglerCase[] = [
         counter: "undefined",
         external: "undefined",
       }),
+    assertWarnings: (warnings) => {
+      const dropped = droppedWarnings(warnings);
+      expect(dropped).toHaveLength(1);
+      expect(dropped[0]).toContain('durable_objects (EXTERNAL → script "other-worker")');
+      expect(dropped[0]).not.toContain("LOCAL");
+    },
   },
   {
     name: "drops services, assets, queue consumers, workflows and tails from the config",
@@ -305,6 +348,41 @@ const SHARED_CASES: WranglerCase[] = [
       }
       // Only the runner's own IPC service binding remains.
       expect(Object.keys(mfOptions.serviceBindings)).toEqual(["__ENV_RUNNER_IPC"]);
+    },
+    assertWarnings: (warnings) => {
+      const dropped = droppedWarnings(warnings);
+      expect(dropped).toHaveLength(1);
+      for (const part of [
+        "services (OTHER_SERVICE)",
+        "assets (ASSETS)",
+        "queues.consumers (my-queue)",
+        "workflows (MY_WORKFLOW)",
+        "tail_consumers (tail-worker)",
+        "pass them via miniflareOptions",
+      ]) {
+        expect(dropped[0]).toContain(part);
+      }
+    },
+  },
+  {
+    name: "dedupes dropped options reported by both the file and inline configs",
+    entry: DO_ENTRY,
+    files: {
+      "wrangler.json": JSON.stringify({
+        name: "test",
+        compatibility_date: "2024-09-01",
+        services: [{ binding: "OTHER_SERVICE", service: "other-worker" }],
+      }),
+    },
+    options: () => ({
+      wrangler: { services: [{ binding: "OTHER_SERVICE", service: "other-worker" }] },
+      exports: false,
+    }),
+    assert: (json) => expect(json.service).toBe("undefined"),
+    assertWarnings: (warnings) => {
+      const dropped = droppedWarnings(warnings);
+      expect(dropped).toHaveLength(1);
+      expect(dropped.join("\n").split("OTHER_SERVICE")).toHaveLength(2);
     },
   },
   {
@@ -465,6 +543,26 @@ const INSTALLED_CASES: WranglerCase[] = [
     options: () => ({ wrangler: { vars: { GREETING: "from-inline" } } }),
     // GREETING from inline (wins), TIER preserved from the discovered file.
     assert: (json) => expect(json).toEqual({ greeting: "from-inline", tier: "from-file" }),
+  },
+  {
+    name: "keeps file bindings when the inline config fails to load",
+    files: {
+      "wrangler.json": JSON.stringify({
+        name: "test",
+        compatibility_date: "2024-09-01",
+        vars: { GREETING: "from-file", TIER: "from-file" },
+      }),
+    },
+    // `readConfig` rejects a non-object `vars`.
+    options: () => ({ wrangler: { vars: "not-an-object" } }),
+    assert: (json, { tmpDir, mfOptions }) => {
+      expect(json).toEqual({ greeting: "from-file", tier: "from-file" });
+      // The file still counts as loaded (persist root anchored next to it).
+      expect(mfOptions.defaultPersistRoot).toBe(join(tmpDir, ".wrangler/state/v3"));
+    },
+    warns: ["failed to load wrangler config (inline)"],
+    assertWarnings: (warnings) =>
+      expect(warnings.filter((m) => m.includes("failed to load"))).toHaveLength(1),
   },
   {
     // `transformRequest` (Vite-style TS compilation) and a `wrangler` config are

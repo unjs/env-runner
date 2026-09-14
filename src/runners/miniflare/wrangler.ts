@@ -56,6 +56,47 @@ const WRANGLER_OPTION_DROPLIST = new Set([
   "streamingTails",
 ]);
 
+// Wrangler config key names for dropped Miniflare options (used in the
+// "ignored options" warning, so users recognize their own config keys).
+const WRANGLER_DROPPED_OPTION_NAMES: Record<string, string> = {
+  assets: "assets",
+  serviceBindings: "services",
+  workflows: "workflows",
+  queueConsumers: "queues.consumers",
+  tails: "tail_consumers",
+  streamingTails: "streaming_tail_consumers",
+  durableObjects: "durable_objects",
+};
+
+/**
+ * Collects wrangler-derived options that were dropped (config key → binding
+ * names/details), deduped across the file and inline configs so a single
+ * warning can be emitted per load.
+ */
+type DroppedWranglerOptions = Map<string, Set<string>>;
+
+function addDropped(dropped: DroppedWranglerOptions, name: string, details: string[]): void {
+  let set = dropped.get(name);
+  if (!set) {
+    set = new Set();
+    dropped.set(name, set);
+  }
+  for (const detail of details) set.add(detail);
+}
+
+/** Emit one warning listing every dropped option (no-op when nothing was dropped). */
+function warnDroppedWranglerOptions(dropped: DroppedWranglerOptions): void {
+  if (dropped.size === 0) {
+    return;
+  }
+  const list = [...dropped]
+    .map(([name, details]) => (details.size > 0 ? `${name} (${[...details].join(", ")})` : name))
+    .join(", ");
+  console.warn(
+    `[env-runner] wrangler config options not supported by the miniflare dev runner were ignored: ${list}; pass them via miniflareOptions to opt in.`,
+  );
+}
+
 /** Whether a value is a plain (non-array, non-null) object. */
 export function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -148,11 +189,15 @@ export async function loadWranglerConfig(
     option: "wranglerModule",
     value: wranglerModule,
   });
+  const dropped: DroppedWranglerOptions = new Map();
   if (!wrangler?.unstable_readConfig || !wrangler.unstable_getMiniflareWorkerOptions) {
-    const fileOptions = configPath ? readWranglerConfigMinimal(configPath, env) : undefined;
-    const inlineOptions = inline
-      ? mapWranglerConfigToMiniflare(applyWranglerEnv(inline, env))
+    const fileOptions = configPath
+      ? readWranglerConfigMinimal(configPath, env, dropped)
       : undefined;
+    const inlineOptions = inline
+      ? mapWranglerConfigToMiniflare(applyWranglerEnv(inline, env), dropped)
+      : undefined;
+    warnDroppedWranglerOptions(dropped);
     return {
       options: mergeWranglerMiniflareOptions(fileOptions, inlineOptions),
       // `readWranglerConfigMinimal` returns undefined for skipped/unparsable files.
@@ -160,36 +205,57 @@ export async function loadWranglerConfig(
     };
   }
 
-  try {
-    const fileOptions = configPath
-      ? pickWranglerMiniflareOptions(
-          wrangler.unstable_getMiniflareWorkerOptions(
-            wrangler.unstable_readConfig({ config: configPath, env }, { hideWarnings: true }),
-            env,
-          ).workerOptions,
-        )
-      : undefined;
-    const inlineOptions = inline
-      ? pickWranglerMiniflareOptions(
-          wrangler.unstable_getMiniflareWorkerOptions(
-            readInlineWranglerConfig(wrangler, inline, env),
-            env,
-          ).workerOptions,
-        )
-      : undefined;
-    return {
-      options: mergeWranglerMiniflareOptions(fileOptions, inlineOptions),
-      configFile: configPath,
-    };
-  } catch (error) {
-    const desc = [configPath && `"${configPath}"`, inline && "(inline)"]
-      .filter(Boolean)
-      .join(" + ");
-    console.warn(
-      `[env-runner] failed to load wrangler config ${desc}: ${(error as Error).message}`,
-    );
-    return {};
+  // File and inline configs are read independently: a failure in one warns
+  // (naming its source) without discarding the other's options.
+  let fileLoaded = false;
+  let fileOptions: Record<string, unknown> | undefined;
+  if (configPath) {
+    try {
+      fileOptions = pickWranglerMiniflareOptions(
+        wrangler.unstable_getMiniflareWorkerOptions(
+          wrangler.unstable_readConfig({ config: configPath, env }, { hideWarnings: true }),
+          env,
+        ).workerOptions,
+        dropped,
+      );
+      fileLoaded = true;
+    } catch (error) {
+      warnWranglerLoadError(`"${configPath}"`, error);
+    }
   }
+  let inlineOptions: Record<string, unknown> | undefined;
+  if (inline) {
+    try {
+      // `readConfig` throws for an `--env` missing from the config's `env`
+      // map, while the file may define it. Like `applyWranglerEnv()`, use the
+      // inline top level as-is when it doesn't define the selected env.
+      const inlineEnv = env && isPlainObject(inline.env) && inline.env[env] ? env : undefined;
+      const { env: _env, ...inlineTopLevel } = inline;
+      inlineOptions = pickWranglerMiniflareOptions(
+        wrangler.unstable_getMiniflareWorkerOptions(
+          readInlineWranglerConfig(wrangler, inlineEnv ? inline : inlineTopLevel, inlineEnv),
+          inlineEnv,
+        ).workerOptions,
+        dropped,
+      );
+      // `rootPath` points at the deleted temp dir the inline config was
+      // normalized in — never let it override the file's `rootPath`.
+      if (inlineOptions) {
+        delete inlineOptions.rootPath;
+      }
+    } catch (error) {
+      warnWranglerLoadError("(inline)", error);
+    }
+  }
+  warnDroppedWranglerOptions(dropped);
+  return {
+    options: mergeWranglerMiniflareOptions(fileOptions, inlineOptions),
+    configFile: fileLoaded ? configPath : undefined,
+  };
+}
+
+function warnWranglerLoadError(desc: string, error: unknown): void {
+  console.warn(`[env-runner] failed to load wrangler config ${desc}: ${(error as Error).message}`);
 }
 
 /**
@@ -259,22 +325,27 @@ function findWranglerConfig(entryPath?: string): string | undefined {
  * output, dropping keys the runner manages (entry script, module fallback,
  * direct sockets, etc.), options a single dev worker can't run (service
  * bindings, assets, queue consumers, workflows, tails), Durable Object
- * bindings that target another script, and empty records/arrays. The
+ * bindings that target another script, and empty records/arrays. Non-empty
+ * dropped options are recorded in `dropped` for the load warning. The
  * returned object is spread under `miniflareOptions`.
  */
 function pickWranglerMiniflareOptions(
   workerOptions: Record<string, unknown>,
+  dropped: DroppedWranglerOptions,
 ): Record<string, unknown> | undefined {
   const out: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(workerOptions)) {
-    if (
-      value === undefined ||
-      WRANGLER_OPTION_DENYLIST.has(key) ||
-      WRANGLER_OPTION_DROPLIST.has(key)
-    ) {
+    if (value === undefined || WRANGLER_OPTION_DENYLIST.has(key)) {
       continue;
     }
-    const picked = key === "durableObjects" ? filterLocalDurableObjects(value) : value;
+    if (WRANGLER_OPTION_DROPLIST.has(key)) {
+      // wrangler returns `{}`/`[]` for unused types — only report real values.
+      if (!isEmptyOption(value)) {
+        addDropped(dropped, WRANGLER_DROPPED_OPTION_NAMES[key]!, describeDroppedOption(value));
+      }
+      continue;
+    }
+    const picked = key === "durableObjects" ? filterLocalDurableObjects(value, dropped) : value;
     if (
       (Array.isArray(picked) && picked.length === 0) ||
       (isPlainObject(picked) && Object.keys(picked).length === 0)
@@ -286,20 +357,51 @@ function pickWranglerMiniflareOptions(
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
+/** Whether a wrangler-derived option value is empty (`{}`/`[]`/falsy). */
+function isEmptyOption(value: unknown): boolean {
+  return (
+    !value ||
+    (Array.isArray(value) && value.length === 0) ||
+    (isPlainObject(value) && Object.keys(value).length === 0)
+  );
+}
+
+/**
+ * Binding names for a dropped option: record keys (`serviceBindings`,
+ * `workflows`, `queueConsumers`), `name`s of array entries (`tails`), or the
+ * `binding` of a single object (`assets`).
+ */
+function describeDroppedOption(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value.map((entry) => entry?.name).filter((name) => typeof name === "string");
+  }
+  if (isPlainObject(value)) {
+    if ("directory" in value) {
+      return typeof value.binding === "string" ? [value.binding] : [];
+    }
+    return Object.keys(value);
+  }
+  return [];
+}
+
 /**
  * Keep Durable Object bindings served by this worker (a class name string, or
  * an object without `scriptName`); bindings to another script's class can't
  * resolve in a single-worker Miniflare and would stop workerd from starting.
  */
-function filterLocalDurableObjects(value: unknown): unknown {
+function filterLocalDurableObjects(value: unknown, dropped: DroppedWranglerOptions): unknown {
   if (!isPlainObject(value)) {
     return value;
   }
   return Object.fromEntries(
-    Object.entries(value).filter(
-      ([, binding]) =>
-        typeof binding === "string" || (isPlainObject(binding) && !binding.scriptName),
-    ),
+    Object.entries(value).filter(([name, binding]) => {
+      if (typeof binding === "string" || (isPlainObject(binding) && !binding.scriptName)) {
+        return true;
+      }
+      const scriptName = isPlainObject(binding) ? binding.scriptName : undefined;
+      addDropped(dropped, "durable_objects", [`${name} → script "${String(scriptName)}"`]);
+      return false;
+    }),
   );
 }
 
@@ -311,7 +413,8 @@ function filterLocalDurableObjects(value: unknown): unknown {
  */
 function readWranglerConfigMinimal(
   configPath: string,
-  env?: string,
+  env: string | undefined,
+  dropped: DroppedWranglerOptions,
 ): Record<string, unknown> | undefined {
   if (extname(configPath).toLowerCase() !== ".json") {
     console.warn(
@@ -335,7 +438,7 @@ function readWranglerConfigMinimal(
     return undefined;
   }
   // `{}` (not undefined) marks the file as loaded even without mapped fields.
-  return mapWranglerConfigToMiniflare(applyWranglerEnv(config, env)) ?? {};
+  return mapWranglerConfigToMiniflare(applyWranglerEnv(config, env), dropped) ?? {};
 }
 
 /**
@@ -347,11 +450,30 @@ function applyWranglerEnv(config: Record<string, any>, env?: string): Record<str
   return env && config.env?.[env] ? { ...config, ...config.env[env] } : config;
 }
 
-/** Map raw (snake_case) wrangler config fields to Miniflare option shapes. */
+/**
+ * Map raw (snake_case) wrangler config fields to Miniflare option shapes.
+ * Unsupported fields the real-package path drops (services, assets, queue
+ * consumers, workflows, tails, external-script DOs) are recorded in `dropped`.
+ */
 function mapWranglerConfigToMiniflare(
   config: Record<string, any>,
+  dropped: DroppedWranglerOptions,
 ): Record<string, unknown> | undefined {
   const out: Record<string, unknown> = {};
+  for (const [name, value, field] of [
+    ["services", config.services, "binding"],
+    ["assets", config.assets, "binding"],
+    ["queues.consumers", config.queues?.consumers, "queue"],
+    ["workflows", config.workflows, "binding"],
+    ["tail_consumers", config.tail_consumers, "service"],
+    ["streaming_tail_consumers", config.streaming_tail_consumers, "service"],
+  ] as const) {
+    if (!isEmptyOption(value)) {
+      const entries: any[] = Array.isArray(value) ? value : [value];
+      const details = entries.map((e) => e?.[field]).filter((d) => typeof d === "string");
+      addDropped(dropped, name, details);
+    }
+  }
   if (typeof config.compatibility_date === "string") {
     out.compatibilityDate = config.compatibility_date;
   }
@@ -378,7 +500,11 @@ function mapWranglerConfigToMiniflare(
     for (const b of config.durable_objects.bindings) {
       // Bindings to another script's class can't run in a single-worker dev
       // Miniflare (see `filterLocalDurableObjects`).
-      if (!b?.name || !b?.class_name || b.script_name) continue;
+      if (!b?.name || !b?.class_name) continue;
+      if (b.script_name) {
+        addDropped(dropped, "durable_objects", [`${b.name} → script "${b.script_name}"`]);
+        continue;
+      }
       dos[b.name] = b.class_name;
     }
     if (Object.keys(dos).length > 0) out.durableObjects = dos;

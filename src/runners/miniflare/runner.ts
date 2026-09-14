@@ -143,12 +143,16 @@ export interface MiniflareEnvRunnerOptions {
    *   loaded ({@link MiniflareEnvRunnerOptions.wranglerConfigPath}, else
    *   auto-discovered next to the entry, then cwd) and the inline config is
    *   merged on top of it (inline wins per key, binding records merge,
-   *   `compatibilityFlags` are unioned).
+   *   `compatibilityFlags` are unioned). When the inline config doesn't
+   *   define the selected {@link MiniflareEnvRunnerOptions.wranglerEnv}, its
+   *   top level is used as-is. The file and inline configs load
+   *   independently: one failing warns without discarding the other.
    *
    * Options a single fetch-only dev worker can't run are dropped from the
-   * config: `assets`, service bindings, queue consumers, workflows, tail
-   * consumers, and Durable Object bindings to another script (`script_name`).
-   * Pass them via `miniflareOptions` to opt in.
+   * config with a single warning naming them: `assets`, service bindings,
+   * queue consumers, workflows, tail consumers, and Durable Object bindings
+   * to another script (`script_name`). Pass them via `miniflareOptions` to
+   * opt in.
    *
    * Local state is shared with `wrangler dev`: `defaultPersistRoot` defaults
    * to `<dir>/.wrangler/state/v3`, where `<dir>` is the directory of the
