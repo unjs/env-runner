@@ -42,6 +42,20 @@ const WRANGLER_OPTION_DENYLIST = new Set([
   "unsafeUseModuleFallbackService",
 ]);
 
+// Wrangler-derived options a single fetch-only dev worker can't run: they
+// reference other workers (`serviceBindings`, `tails`, `streamingTails`),
+// need an asset router / queue / workflow engine wired around the entry
+// (`assets`, `queueConsumers`, `workflows`), and make workerd refuse to start
+// when the target is missing. Pass them via `miniflareOptions` to opt in.
+const WRANGLER_OPTION_DROPLIST = new Set([
+  "assets",
+  "serviceBindings",
+  "workflows",
+  "queueConsumers",
+  "tails",
+  "streamingTails",
+]);
+
 /** Whether a value is a plain (non-array, non-null) object. */
 export function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -52,52 +66,77 @@ function isInlineWranglerConfig(opt: unknown): opt is WranglerInlineConfig {
   return isPlainObject(opt);
 }
 
+/** Options for {@link loadWranglerConfig}. */
+export interface LoadWranglerConfigOptions {
+  /** The runner's `wrangler` option: `true`, a config path, or an inline raw config. */
+  wrangler: boolean | string | WranglerInlineConfig;
+  /** Wrangler environment (`--env`) to select. */
+  env?: string;
+  /** Entry file path — anchors config auto-discovery. */
+  entryPath?: string;
+  /**
+   * Explicit config file used instead of auto-discovery when `wrangler` is
+   * `true` or an inline object. Ignored when `wrangler` is a string path.
+   */
+  configPath?: string;
+  /** The `wrangler` package (module or specifier), or `false` for the minimal reader. */
+  wranglerModule?: RuntimeDep<WranglerModule>;
+}
+
+/** Result of {@link loadWranglerConfig}. */
+export interface LoadedWranglerConfig {
+  /** Partial Miniflare options derived from the config(s). */
+  options?: Record<string, unknown>;
+  /** Absolute path of the config file that was actually loaded (not set for inline-only configs). */
+  configFile?: string;
+}
+
 /**
  * Resolve the optional wrangler config into a partial Miniflare options
  * object (compat date/flags + bindings). Accepts a file path, auto-discovery
- * (`true`), or an inline raw config object. When an inline config is passed,
- * a config file is still auto-discovered (next to the entry, then cwd) and
- * loaded — the inline config is merged on top of it (inline wins per key,
- * binding records merge, `compatibilityFlags` are unioned).
+ * (`true`), or an inline raw config object. When `true` or an inline config
+ * is passed, the explicit `configPath` is used as the config file when given,
+ * otherwise a file is auto-discovered (next to the entry, then cwd). An inline
+ * config is merged on top of the file (inline wins per key, binding records
+ * merge, `compatibilityFlags` are unioned).
  *
  * When `wranglerModule` (the imported `wrangler` package or a specifier for
  * it) is supplied it is used for full fidelity; otherwise `wrangler` is
  * imported optionally, and a built-in minimal JSON reader handles plain JSON
  * files and inline objects if that fails. Pass `false` to force the minimal
- * reader. Returns `undefined` when `wrangler` is disabled or no config could
- * be loaded.
+ * reader. Returns an empty result when `wrangler` is disabled or no config
+ * could be loaded.
  */
 export async function loadWranglerConfig(
-  opt: boolean | string | WranglerInlineConfig,
-  env: string | undefined,
-  entryPath?: string,
-  wranglerModule?: RuntimeDep<WranglerModule>,
-): Promise<Record<string, unknown> | undefined> {
+  opts: LoadWranglerConfigOptions,
+): Promise<LoadedWranglerConfig> {
+  const { wrangler: opt, env, entryPath, wranglerModule } = opts;
   if (!opt) {
-    return undefined;
+    return {};
   }
   const inline = isInlineWranglerConfig(opt) ? opt : undefined;
 
-  // Resolve a config file: an explicit string path, or auto-discovery for
-  // both `true` and inline objects (an inline config is merged on top of any
-  // discovered file). A missing explicit/auto-discovered file warns, but a
-  // missing file is fine for an inline config (the inline config is enough).
+  // Resolve a config file: an explicit string path wins; `true` and inline
+  // objects use `configPath` when given, else auto-discovery. A missing
+  // explicit/auto-discovered file warns and aborts, except for an inline
+  // config (the inline config is enough on its own).
   let configPath: string | undefined;
-  if (typeof opt === "string") {
-    configPath = resolve(opt);
+  const explicitPath = typeof opt === "string" ? opt : opts.configPath;
+  if (explicitPath) {
+    configPath = resolve(explicitPath);
     if (!existsSync(configPath)) {
       console.warn(`[env-runner] wrangler config requested but not found at "${configPath}"`);
-      return undefined;
-    }
-  } else if (opt === true) {
-    configPath = findWranglerConfig(entryPath);
-    if (!configPath) {
-      console.warn("[env-runner] wrangler config requested but none found near the entry or cwd");
-      return undefined;
+      if (!inline) {
+        return {};
+      }
+      configPath = undefined;
     }
   } else {
-    // Inline object — augment with an auto-discovered file when present.
     configPath = findWranglerConfig(entryPath);
+    if (!configPath && !inline) {
+      console.warn("[env-runner] wrangler config requested but none found near the entry or cwd");
+      return {};
+    }
   }
 
   // Use the `wrangler` package for full fidelity (TOML, env inheritance,
@@ -114,7 +153,11 @@ export async function loadWranglerConfig(
     const inlineOptions = inline
       ? mapWranglerConfigToMiniflare(applyWranglerEnv(inline, env))
       : undefined;
-    return mergeWranglerMiniflareOptions(fileOptions, inlineOptions);
+    return {
+      options: mergeWranglerMiniflareOptions(fileOptions, inlineOptions),
+      // `readWranglerConfigMinimal` returns undefined for skipped/unparsable files.
+      configFile: fileOptions ? configPath : undefined,
+    };
   }
 
   try {
@@ -134,7 +177,10 @@ export async function loadWranglerConfig(
           ).workerOptions,
         )
       : undefined;
-    return mergeWranglerMiniflareOptions(fileOptions, inlineOptions);
+    return {
+      options: mergeWranglerMiniflareOptions(fileOptions, inlineOptions),
+      configFile: configPath,
+    };
   } catch (error) {
     const desc = [configPath && `"${configPath}"`, inline && "(inline)"]
       .filter(Boolean)
@@ -142,7 +188,7 @@ export async function loadWranglerConfig(
     console.warn(
       `[env-runner] failed to load wrangler config ${desc}: ${(error as Error).message}`,
     );
-    return undefined;
+    return {};
   }
 }
 
@@ -211,19 +257,50 @@ function findWranglerConfig(entryPath?: string): string | undefined {
 /**
  * Keep the binding/compat fields from wrangler's `unstable_getMiniflareWorkerOptions`
  * output, dropping keys the runner manages (entry script, module fallback,
- * direct sockets, etc.). The returned object is spread under `miniflareOptions`.
+ * direct sockets, etc.), options a single dev worker can't run (service
+ * bindings, assets, queue consumers, workflows, tails), Durable Object
+ * bindings that target another script, and empty records/arrays. The
+ * returned object is spread under `miniflareOptions`.
  */
 function pickWranglerMiniflareOptions(
   workerOptions: Record<string, unknown>,
 ): Record<string, unknown> | undefined {
   const out: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(workerOptions)) {
-    if (value === undefined || WRANGLER_OPTION_DENYLIST.has(key)) {
+    if (
+      value === undefined ||
+      WRANGLER_OPTION_DENYLIST.has(key) ||
+      WRANGLER_OPTION_DROPLIST.has(key)
+    ) {
       continue;
     }
-    out[key] = value;
+    const picked = key === "durableObjects" ? filterLocalDurableObjects(value) : value;
+    if (
+      (Array.isArray(picked) && picked.length === 0) ||
+      (isPlainObject(picked) && Object.keys(picked).length === 0)
+    ) {
+      continue;
+    }
+    out[key] = picked;
   }
   return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/**
+ * Keep Durable Object bindings served by this worker (a class name string, or
+ * an object without `scriptName`); bindings to another script's class can't
+ * resolve in a single-worker Miniflare and would stop workerd from starting.
+ */
+function filterLocalDurableObjects(value: unknown): unknown {
+  if (!isPlainObject(value)) {
+    return value;
+  }
+  return Object.fromEntries(
+    Object.entries(value).filter(
+      ([, binding]) =>
+        typeof binding === "string" || (isPlainObject(binding) && !binding.scriptName),
+    ),
+  );
 }
 
 /**
@@ -257,7 +334,8 @@ function readWranglerConfigMinimal(
     );
     return undefined;
   }
-  return mapWranglerConfigToMiniflare(applyWranglerEnv(config, env));
+  // `{}` (not undefined) marks the file as loaded even without mapped fields.
+  return mapWranglerConfigToMiniflare(applyWranglerEnv(config, env)) ?? {};
 }
 
 /**
@@ -298,10 +376,10 @@ function mapWranglerConfigToMiniflare(
   if (Array.isArray(config.durable_objects?.bindings)) {
     const dos: Record<string, unknown> = {};
     for (const b of config.durable_objects.bindings) {
-      if (!b?.name || !b?.class_name) continue;
-      dos[b.name] = b.script_name
-        ? { className: b.class_name, scriptName: b.script_name }
-        : b.class_name;
+      // Bindings to another script's class can't run in a single-worker dev
+      // Miniflare (see `filterLocalDurableObjects`).
+      if (!b?.name || !b?.class_name || b.script_name) continue;
+      dos[b.name] = b.class_name;
     }
     if (Object.keys(dos).length > 0) out.durableObjects = dos;
   }

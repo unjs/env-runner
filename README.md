@@ -373,7 +373,7 @@ Passing `miniflare` explicitly is preferred — the version you install is then 
 
 The entry uses the same `AppEntry` format as the other runners. Requests are handled like srvx's Cloudflare adapter (`srvx/cloudflare`): the entry's `plugins`, `middleware` and `error` handler are applied, and the request carries `request.runtime` (`{ name: "cloudflare", cloudflare: { env, context } }`), `request.ip` (from `cf-connecting-ip`) and `request.waitUntil()`. For Workers-style entries, `fetch` still receives `(request, env, ctx)`. env-runner's internal bindings are never exposed on `env`. Listener-level srvx options (`maxRequestBodySize`, `trustProxy`, `node`/`bun`/`deno`, ...) do not apply to miniflare.
 
-When you don't set a `compatibilityDate` (via `miniflareOptions` or a wrangler config), it defaults to the date supported by the installed `workerd` binary rather than today's date — the binary always lags the calendar slightly, and pinning a future date makes `workerd` refuse to start.
+When you don't set a compatibility date, it defaults to the date supported by the installed `workerd` binary rather than today's date — the binary always lags the calendar slightly, and pinning a future date makes `workerd` refuse to start. Set the runner's `compatibilityDate` option to pin one, or to `"latest"` to use the installed `workerd`'s supported date explicitly (no need to import `miniflare` for `supportedCompatibilityDate`). Precedence: `miniflareOptions.compatibilityDate` > `compatibilityDate` > the wrangler config's `compatibility_date` > the supported date. Whatever the source, a date newer than the installed `workerd` supports falls back to the supported date with a warning (like `wrangler dev`).
 
 #### Wrangler Config
 
@@ -389,6 +389,7 @@ await using runner = new MiniflareEnvRunner({
   wrangler: true, // auto-discover wrangler.{json,jsonc,toml} next to the entry, then cwd
   // wrangler: "./config/wrangler.toml", // or an explicit path
   // wranglerEnv: "production",          // select a `[env.production]` block
+  // compatibilityDate: "latest",        // override the config's compatibility_date
 });
 ```
 
@@ -411,6 +412,24 @@ await using runner = new MiniflareEnvRunner({
 ```
 
 When an inline config is passed, a `wrangler.{json,jsonc,toml}` file is still auto-discovered (next to the entry, then cwd) and loaded, and the inline config is **merged on top of it** — inline values win per key, binding records (e.g. `vars`) merge, and `compatibilityFlags` are unioned. This lets you keep a committed `wrangler` file and override a few fields programmatically.
+
+Set `wranglerConfigPath` to load a specific config file instead of auto-discovering one — with `wrangler: true` or an inline config (which still merges on top), and without changing the working directory:
+
+```ts
+await using runner = new MiniflareEnvRunner({
+  miniflare,
+  name: "my-worker",
+  data: { entry: "./.nitro/dev/index.mjs" },
+  wrangler: { vars: { GREETING: "hello" } },
+  wranglerConfigPath: "./wrangler.jsonc", // relative to cwd
+});
+```
+
+A missing `wranglerConfigPath` file warns (an inline config is still applied). When `wrangler` is itself a string path, that path wins and `wranglerConfigPath` is ignored.
+
+The runner hosts a single fetch-only worker, so config entries it can't run are **dropped**: `assets`, `services`, `queues.consumers`, `workflows`, `tail_consumers`/`streaming_tail_consumers`, and Durable Object bindings to another script (`script_name`). Durable Object bindings to classes exported by your entry are kept, and merged with [auto-detected exports](#auto-detected-exports). Pass any of the dropped options via `miniflareOptions` to opt back in.
+
+When a config **file** was loaded, local state (KV, D1, R2, Durable Objects, ...) persists under `<config dir>/.wrangler/state/v3` — the same place `wrangler dev` uses, so both share data. Set `miniflareOptions.defaultPersistRoot` (or any `*Persist` option, e.g. `kvPersist: false`) to opt out. Inline-only configs keep Miniflare's in-memory default.
 
 Pass the [`wrangler`](https://www.npmjs.com/package/wrangler) package as `wranglerModule` — the imported module or a specifier — for full fidelity: TOML, `env` inheritance, `.dev.vars`, and every binding type.
 
@@ -465,9 +484,9 @@ export class Counter {
 
 export default {
   async fetch(request, env) {
-    // env.Counter is auto-wired — no manual config needed
-    const id = env.Counter.idFromName("test");
-    const stub = env.Counter.get(id);
+    // env.COUNTER is auto-wired — no manual config needed
+    const id = env.COUNTER.idFromName("test");
+    const stub = env.COUNTER.get(id);
     return stub.fetch(request);
   },
 };
@@ -485,7 +504,7 @@ await using runner = new MiniflareEnvRunner({
 });
 ```
 
-Set `exports: false` to disable auto-detection entirely.
+Auto-wired bindings are merged with Durable Object bindings from `miniflareOptions` and a wrangler config: exports whose class is already bound (or whose binding name is taken) are skipped. Set `exports: false` to disable auto-detection entirely.
 
 #### Error Capture
 

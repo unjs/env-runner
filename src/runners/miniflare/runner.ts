@@ -2,7 +2,7 @@ import type { WorkerHooks } from "../../types.ts";
 
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
-import { basename, dirname, isAbsolute, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { resolveModulePath } from "exsolve";
 import { init as initCjsLexer, parse as parseCjs } from "cjs-module-lexer";
@@ -81,6 +81,20 @@ export interface MiniflareEnvRunnerOptions {
   /** Options passed directly to the Miniflare constructor. */
   miniflareOptions?: Record<string, unknown>;
   /**
+   * Compatibility date for the worker. The special value `"latest"` uses the
+   * newest date supported by the installed `workerd` (miniflare's
+   * `supportedCompatibilityDate`), so callers don't need to import miniflare
+   * themselves.
+   *
+   * Overrides the {@link MiniflareEnvRunnerOptions.wrangler} config's
+   * `compatibility_date`; `miniflareOptions.compatibilityDate` still wins.
+   * When unset, the wrangler date is used if present, else the supported
+   * date. Whatever the source, a date newer than the installed `workerd`
+   * supports falls back to the supported date with a warning (like
+   * `wrangler dev`), since workerd refuses to start with it.
+   */
+  compatibilityDate?: "latest" | (string & {});
+  /**
    * Optional module transform callback. When provided, the module fallback
    * service calls this instead of reading raw files from disk.
    *
@@ -126,9 +140,18 @@ export interface MiniflareEnvRunnerOptions {
    * - `string` — explicit path to a wrangler config file.
    * - `object` — an inline raw (snake_case) wrangler config, as you would
    *   write in `wrangler.json` (no file needed). A config file is still
-   *   auto-discovered (next to the entry, then cwd) and the inline config is
+   *   loaded ({@link MiniflareEnvRunnerOptions.wranglerConfigPath}, else
+   *   auto-discovered next to the entry, then cwd) and the inline config is
    *   merged on top of it (inline wins per key, binding records merge,
    *   `compatibilityFlags` are unioned).
+   *
+   * Options a single fetch-only dev worker can't run are dropped from the
+   * config: `assets`, service bindings, queue consumers, workflows, tail
+   * consumers, and Durable Object bindings to another script (`script_name`).
+   * Pass them via `miniflareOptions` to opt in. When a config _file_ was
+   * loaded, `defaultPersistRoot` defaults to `<config dir>/.wrangler/state/v3`
+   * (sharing local state with `wrangler dev`) unless `miniflareOptions` sets
+   * `defaultPersistRoot` or any `*Persist` option.
    *
    * The `wrangler` package is used for full fidelity when available (TOML,
    * `env` inheritance, `.dev.vars`, every binding type; an inline config is
@@ -140,6 +163,15 @@ export interface MiniflareEnvRunnerOptions {
    * (e.g. `bindings`) merge per key and `compatibilityFlags` are unioned.
    */
   wrangler?: boolean | string | WranglerInlineConfig;
+  /**
+   * Explicit wrangler config file to load instead of auto-discovery when
+   * {@link MiniflareEnvRunnerOptions.wrangler} is `true` or an inline object
+   * (the inline config still merges on top). Relative paths resolve from the
+   * current working directory. A missing file warns; with an inline config
+   * the runner continues with the inline config only. Ignored when `wrangler`
+   * is a string path (that path wins) or disabled.
+   */
+  wranglerConfigPath?: string;
   /**
    * Wrangler environment (`--env`) to select when loading the config.
    * Defaults to the `CLOUDFLARE_ENV` environment variable.
@@ -188,6 +220,8 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
   #exportConditions: string[];
   #wrangler: boolean | string | WranglerInlineConfig;
   #wranglerEnv?: string;
+  #wranglerConfigPath?: string;
+  #compatibilityDate?: string;
   #wranglerModule?: RuntimeDep<WranglerModule>;
   #miniflareModule?: RuntimeDep<MiniflareModule>;
 
@@ -204,6 +238,8 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
     // Default the wrangler `--env` to the `CLOUDFLARE_ENV` variable.
     this.#wranglerEnv = opts.wranglerEnv ?? process.env.CLOUDFLARE_ENV;
     this.#wranglerModule = opts.wranglerModule;
+    this.#wranglerConfigPath = opts.wranglerConfigPath;
+    this.#compatibilityDate = opts.compatibilityDate;
     this._initWithVirtualData(() => this.#init());
   }
 
@@ -469,26 +505,43 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
 
     // Optional wrangler config → Miniflare options (compat date/flags +
     // bindings). User-provided `miniflareOptions` win; flags are merged.
-    const wranglerOptions = await loadWranglerConfig(
-      this.#wrangler,
-      this.#wranglerEnv,
+    const { options: wranglerOptions, configFile: wranglerConfigFile } = await loadWranglerConfig({
+      wrangler: this.#wrangler,
+      env: this.#wranglerEnv,
       entryPath,
-      this.#wranglerModule,
-    );
+      configPath: this.#wranglerConfigPath,
+      wranglerModule: this.#wranglerModule,
+    });
 
     const userFlags = (this.#miniflareOptions.compatibilityFlags as string[]) || [];
     const wranglerFlags = (wranglerOptions?.compatibilityFlags as string[]) || [];
     const userDirectSockets = (this.#miniflareOptions.unsafeDirectSockets as unknown[]) || [];
     const options: Record<string, unknown> = {
-      // Default to the date supported by the installed workerd binary, not
-      // today: the binary always lags the calendar by a few days, and pinning
-      // a future date makes workerd refuse to start ("requires compatibility
-      // date X, but the newest date supported ... is Y"). `miniflare` exports
-      // this already clamped to `min(today, binary date)`.
-      compatibilityDate: supportedCompatibilityDate,
       modules: true,
+      // Share local state with `wrangler dev` when a config file was loaded
+      // (it persists under `<config dir>/.wrangler/state/v3`), unless the
+      // user configured persistence themselves.
+      ...(wranglerConfigFile && !hasUserPersistOptions(this.#miniflareOptions)
+        ? { defaultPersistRoot: join(dirname(wranglerConfigFile), ".wrangler/state/v3") }
+        : undefined),
       ...wranglerOptions,
       ...this.#miniflareOptions,
+      // Default to the date supported by the installed workerd binary, not
+      // today: the binary always lags the calendar by a few days, and a
+      // future date makes workerd refuse to start ("requires compatibility
+      // date X, but the newest date supported ... is Y"). `miniflare` exports
+      // this already clamped to `min(today, binary date)`; newer dates from
+      // any source are clamped to it too.
+      compatibilityDate: resolveCompatibilityDate(
+        [
+          this.#miniflareOptions.compatibilityDate as string | undefined,
+          this.#compatibilityDate === "latest"
+            ? supportedCompatibilityDate
+            : this.#compatibilityDate,
+          wranglerOptions?.compatibilityDate as string | undefined,
+        ],
+        supportedCompatibilityDate,
+      ),
       compatibilityFlags: [...new Set(["nodejs_compat", ...wranglerFlags, ...userFlags])],
       // Expose a direct socket so we can proxy WebSocket upgrades via workerd
       unsafeDirectSockets: [{ host: "127.0.0.1", port: 0 }, ...userDirectSockets],
@@ -538,13 +591,20 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
         );
       }
 
-      // Auto-wire durableObjects bindings for detected/declared exports
-      if (detectedExports.length > 0 && !options.durableObjects) {
-        const userDOs = (this.#miniflareOptions.durableObjects as Record<string, string>) || {};
-        const autoDOs: Record<string, string> = { ...userDOs };
+      // Auto-wire durableObjects bindings for detected/declared exports,
+      // merged with wrangler-derived and user bindings: exports whose class
+      // is already bound (or whose binding name is taken) are skipped.
+      if (detectedExports.length > 0) {
+        const existingDOs = isPlainObject(options.durableObjects) ? options.durableObjects : {};
+        const boundClasses = new Set(
+          Object.values(existingDOs).map((b) =>
+            typeof b === "string" ? b : isPlainObject(b) && !b.scriptName ? b.className : undefined,
+          ),
+        );
+        const autoDOs: Record<string, unknown> = { ...existingDOs };
         for (const name of detectedExports) {
           const bindingName = toScreamingSnakeCase(name);
-          if (!autoDOs[bindingName]) {
+          if (!autoDOs[bindingName] && !boundClasses.has(name)) {
             autoDOs[bindingName] = name;
           }
         }
@@ -845,6 +905,37 @@ function detectExportedClasses(
     }
   }
   return [...names];
+}
+
+/**
+ * Pick the first defined compatibility date from `candidates` (highest
+ * precedence first), defaulting to `supported`. A date newer than `supported`
+ * (the installed workerd's newest date) falls back to it with a warning —
+ * workerd refuses to start otherwise. Dates compare as `YYYY-MM-DD` strings.
+ */
+function resolveCompatibilityDate(
+  candidates: (string | undefined)[],
+  supported: string | undefined,
+): string | undefined {
+  const date = candidates.find((d) => typeof d === "string" && d) ?? supported;
+  if (date && supported && _isDateString(date) && _isDateString(supported) && date > supported) {
+    console.warn(
+      `[env-runner] compatibility date "${date}" is newer than the installed workerd supports; falling back to "${supported}".`,
+    );
+    return supported;
+  }
+  return date;
+}
+
+function _isDateString(value: string): boolean {
+  return /^\d{4}-\d{2}-\d{2}$/.test(value);
+}
+
+/** Whether user `miniflareOptions` configure persistence (`defaultPersistRoot` or any `*Persist`). */
+function hasUserPersistOptions(options: Record<string, unknown>): boolean {
+  return Object.keys(options).some(
+    (key) => key === "defaultPersistRoot" || key.endsWith("Persist"),
+  );
 }
 
 /** Entry might not exist yet (e.g. generated at build time). */

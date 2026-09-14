@@ -1,6 +1,6 @@
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { writeFileSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync, mkdtempSync, rmSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as miniflare from "miniflare";
 import * as wrangler from "wrangler";
@@ -33,11 +33,45 @@ const KV_ENTRY = `export default {
   },
 };`;
 
+// Entry that writes to KV (to observe on-disk persistence).
+const KV_PUT_ENTRY = `export default {
+  async fetch(request, env) {
+    await env.MY_KV.put("key", "value");
+    return Response.json({ value: await env.MY_KV.get("key") });
+  },
+};`;
+
+// Entry exporting two Durable Object classes and reporting which bindings exist.
+const DO_ENTRY = `import { DurableObject } from "cloudflare:workers";
+export class Counter extends DurableObject {}
+export class Greeter extends DurableObject {}
+export default {
+  fetch(request, env) {
+    return Response.json({
+      greeting: env.GREETING ?? null,
+      local: typeof env.LOCAL?.idFromName,
+      greeter: typeof env.GREETER?.idFromName,
+      counter: typeof env.COUNTER,
+      external: typeof env.EXTERNAL,
+      service: typeof env.OTHER_SERVICE,
+      workflow: typeof env.MY_WORKFLOW,
+      assets: typeof env.ASSETS,
+    });
+  },
+};`;
+
+interface WranglerCaseContext {
+  tmpDir: string;
+  entryPath: string;
+  /** Options the runner passed to the `Miniflare` constructor. */
+  mfOptions: Record<string, any>;
+}
+
 interface WranglerCase {
   name: string;
   /** Entry source (defaults to `ENV_ENTRY`). */
   entry?: string;
-  /** Files to write into the temp dir (filename → contents). */
+  /** Files to write into the temp dir (relative path → contents; parent dirs are created). */
   files?: Record<string, string>;
   /** Extra runner options (e.g. `wrangler`, `wranglerEnv`, `miniflareOptions`). */
   options: (ctx: { tmpDir: string; entryPath: string }) => Partial<MiniflareEnvRunnerOptions>;
@@ -45,9 +79,9 @@ interface WranglerCase {
   withWrangler?: boolean;
   /** Pass `wrangler` as a module specifier instead of an imported module. */
   wranglerSpecifier?: string;
-  /** Assert on the JSON the worker returned. */
-  assert: (json: any) => void;
-  /** Substrings expected among `console.warn` messages (fallback path only). */
+  /** Assert on the JSON the worker returned (and the resolved Miniflare options). */
+  assert: (json: any, ctx: WranglerCaseContext) => void;
+  /** Substrings expected among `console.warn` messages. */
   warns?: string[];
 }
 
@@ -70,18 +104,29 @@ afterEach(async () => {
 });
 
 // Set up a temp dir + entry (+ optional config files), construct the runner,
-// wait for readiness, and return the worker's JSON response.
-async function runWranglerCase(c: WranglerCase): Promise<any> {
+// wait for readiness, and return the worker's JSON response along with the
+// options the runner passed to Miniflare (captured via a subclass).
+async function runWranglerCase(c: WranglerCase): Promise<{ json: any; ctx: WranglerCaseContext }> {
   tmpDir = mkdtempSync(join(_dir, ".tmp-wrangler-"));
   const entryPath = join(tmpDir, "worker.mjs");
   writeFileSync(entryPath, c.entry ?? ENV_ENTRY);
   for (const [filename, contents] of Object.entries(c.files ?? {})) {
-    writeFileSync(join(tmpDir, filename), contents);
+    const file = join(tmpDir, filename);
+    mkdirSync(dirname(file), { recursive: true });
+    writeFileSync(file, contents);
+  }
+
+  const ctx = { tmpDir, entryPath, mfOptions: {} } as WranglerCaseContext;
+  class CapturingMiniflare extends miniflare.Miniflare {
+    constructor(options: any) {
+      ctx.mfOptions = options;
+      super(options);
+    }
   }
 
   runner = new MiniflareEnvRunner({
     name: c.name,
-    miniflare,
+    miniflare: { ...miniflare, Miniflare: CapturingMiniflare },
     data: { entry: entryPath },
     wranglerModule: c.wranglerSpecifier ?? (c.withWrangler ? wrangler : false),
     ...c.options({ tmpDir, entryPath }),
@@ -89,8 +134,215 @@ async function runWranglerCase(c: WranglerCase): Promise<any> {
   await waitForReady(runner, WRANGLER_TEST_TIMEOUT);
 
   const res = await runner.fetch("http://localhost/");
-  return res.json();
+  return { json: await res.json(), ctx };
 }
+
+// Register one `it` per case, asserting on the response and expected warnings.
+function defineWranglerCases(cases: WranglerCase[], withWrangler: boolean): void {
+  let warn: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    warn.mockRestore();
+  });
+
+  for (const c of cases) {
+    it(
+      c.name,
+      async () => {
+        const { json, ctx } = await runWranglerCase({ withWrangler, ...c });
+        c.assert(json, ctx);
+        if (c.warns) {
+          const warnings = warn.mock.calls.map((call: unknown[]) => String(call[0]));
+          for (const expected of c.warns) {
+            expect(warnings.some((m: string) => m.includes(expected))).toBe(true);
+          }
+        }
+      },
+      WRANGLER_TEST_TIMEOUT,
+    );
+  }
+}
+
+// Cases shared by both backends (the minimal reader and the real package).
+const SHARED_CASES: WranglerCase[] = [
+  {
+    name: "merges an inline config on top of an explicit wranglerConfigPath",
+    // The config lives outside the entry dir (and cwd), so auto-discovery
+    // alone would not find it.
+    files: {
+      "config/wrangler.json": JSON.stringify({
+        name: "test",
+        compatibility_date: "2024-09-01",
+        vars: { GREETING: "from-file", TIER: "from-file" },
+      }),
+    },
+    options: ({ tmpDir }) => ({
+      wrangler: { vars: { GREETING: "from-inline" } },
+      wranglerConfigPath: join(tmpDir, "config/wrangler.json"),
+    }),
+    assert: (json) => expect(json).toEqual({ greeting: "from-inline", tier: "from-file" }),
+  },
+  {
+    name: "uses wranglerConfigPath with `wrangler: true`",
+    files: {
+      "config/wrangler.json": JSON.stringify({
+        name: "test",
+        compatibility_date: "2024-09-01",
+        vars: { GREETING: "from-config-path" },
+      }),
+    },
+    options: ({ tmpDir }) => ({
+      wrangler: true,
+      wranglerConfigPath: join(tmpDir, "config/wrangler.json"),
+    }),
+    assert: (json) => expect(json.greeting).toBe("from-config-path"),
+  },
+  {
+    name: "warns about a missing wranglerConfigPath and continues with the inline config",
+    options: ({ tmpDir }) => ({
+      wrangler: { compatibility_date: "2024-09-01", vars: { GREETING: "inline-only" } },
+      wranglerConfigPath: join(tmpDir, "missing/wrangler.json"),
+    }),
+    assert: (json) => expect(json.greeting).toBe("inline-only"),
+    warns: ["wrangler config requested but not found"],
+  },
+  {
+    name: 'compatibilityDate: "latest" overrides the wrangler date',
+    options: () => ({
+      wrangler: { compatibility_date: "2024-09-01", vars: { GREETING: "latest" } },
+      compatibilityDate: "latest",
+    }),
+    assert: (json, { mfOptions }) => {
+      expect(json.greeting).toBe("latest");
+      expect(mfOptions.compatibilityDate).toBe(miniflare.supportedCompatibilityDate);
+    },
+  },
+  {
+    name: "miniflareOptions.compatibilityDate wins over compatibilityDate",
+    options: () => ({
+      wrangler: { compatibility_date: "2024-09-01" },
+      compatibilityDate: "latest",
+      miniflareOptions: { compatibilityDate: "2024-10-01" },
+    }),
+    assert: (_json, { mfOptions }) => expect(mfOptions.compatibilityDate).toBe("2024-10-01"),
+  },
+  {
+    name: "clamps a future wrangler compatibility_date to the supported date",
+    options: () => ({
+      wrangler: { compatibility_date: "2999-01-01", vars: { GREETING: "clamped" } },
+    }),
+    assert: (json, { mfOptions }) => {
+      expect(json.greeting).toBe("clamped");
+      expect(mfOptions.compatibilityDate).toBe(miniflare.supportedCompatibilityDate);
+    },
+    warns: ['compatibility date "2999-01-01" is newer than the installed workerd supports'],
+  },
+  {
+    name: "drops Durable Object bindings to another script and merges auto-wired exports",
+    entry: DO_ENTRY,
+    options: () => ({
+      wrangler: {
+        compatibility_date: "2024-09-01",
+        vars: { GREETING: "do" },
+        durable_objects: {
+          bindings: [
+            { name: "LOCAL", class_name: "Counter" },
+            { name: "EXTERNAL", class_name: "Remote", script_name: "other-worker" },
+          ],
+        },
+        migrations: [{ tag: "v1", new_classes: ["Counter", "Greeter"] }],
+      },
+    }),
+    // LOCAL (wrangler) + GREETER (auto-wired); Counter is already bound, so no
+    // COUNTER binding; the external-script binding is dropped.
+    assert: (json) =>
+      expect(json).toMatchObject({
+        greeting: "do",
+        local: "function",
+        greeter: "function",
+        counter: "undefined",
+        external: "undefined",
+      }),
+  },
+  {
+    name: "drops services, assets, queue consumers, workflows and tails from the config",
+    entry: DO_ENTRY,
+    files: {
+      "public/index.html": "<h1>hi</h1>",
+      "wrangler.json": JSON.stringify({
+        name: "test",
+        compatibility_date: "2024-09-01",
+        vars: { GREETING: "still-serves" },
+        services: [{ binding: "OTHER_SERVICE", service: "other-worker" }],
+        assets: { directory: "./public", binding: "ASSETS" },
+        queues: {
+          producers: [{ binding: "MY_QUEUE", queue: "my-queue" }],
+          consumers: [{ queue: "my-queue" }],
+        },
+        workflows: [{ binding: "MY_WORKFLOW", name: "my-workflow", class_name: "Greeter" }],
+        tail_consumers: [{ service: "tail-worker" }],
+      }),
+    },
+    options: () => ({ wrangler: true, exports: false }),
+    assert: (json, { mfOptions }) => {
+      expect(json).toMatchObject({
+        greeting: "still-serves",
+        service: "undefined",
+        workflow: "undefined",
+        assets: "undefined",
+      });
+      for (const key of ["assets", "workflows", "queueConsumers", "tails", "streamingTails"]) {
+        expect(mfOptions[key]).toBeUndefined();
+      }
+      // Only the runner's own IPC service binding remains.
+      expect(Object.keys(mfOptions.serviceBindings)).toEqual(["__ENV_RUNNER_IPC"]);
+    },
+  },
+  {
+    name: "defaults defaultPersistRoot next to a loaded config file",
+    entry: KV_PUT_ENTRY,
+    files: {
+      "wrangler.json": JSON.stringify({
+        name: "test",
+        compatibility_date: "2024-09-01",
+        kv_namespaces: [{ binding: "MY_KV", id: "kv-id" }],
+      }),
+    },
+    options: () => ({ wrangler: true }),
+    assert: (json, { tmpDir, mfOptions }) => {
+      expect(json.value).toBe("value");
+      const root = join(tmpDir, ".wrangler/state/v3");
+      expect(mfOptions.defaultPersistRoot).toBe(root);
+      expect(existsSync(join(root, "kv"))).toBe(true);
+    },
+  },
+  {
+    name: "does not default defaultPersistRoot when the user configures persistence",
+    entry: KV_PUT_ENTRY,
+    files: {
+      "wrangler.json": JSON.stringify({
+        name: "test",
+        compatibility_date: "2024-09-01",
+        kv_namespaces: [{ binding: "MY_KV", id: "kv-id" }],
+      }),
+    },
+    options: () => ({ wrangler: true, miniflareOptions: { kvPersist: false } }),
+    assert: (json, { tmpDir, mfOptions }) => {
+      expect(json.value).toBe("value");
+      expect(mfOptions.defaultPersistRoot).toBeUndefined();
+      expect(existsSync(join(tmpDir, ".wrangler"))).toBe(false);
+    },
+  },
+  {
+    name: "does not default defaultPersistRoot for an inline-only config",
+    options: () => ({ wrangler: { compatibility_date: "2024-09-01" } }),
+    assert: (_json, { mfOptions }) => expect(mfOptions.defaultPersistRoot).toBeUndefined(),
+  },
+];
 
 // --- Installed `wrangler` package (full fidelity) ---
 
@@ -237,23 +489,14 @@ export default {
 ];
 
 describe("MiniflareEnvRunner (wrangler config)", () => {
-  for (const c of INSTALLED_CASES) {
-    it(
-      c.name,
-      async () => {
-        const json = await runWranglerCase({ ...c, withWrangler: true });
-        c.assert(json);
-      },
-      WRANGLER_TEST_TIMEOUT,
-    );
-  }
+  defineWranglerCases([...SHARED_CASES, ...INSTALLED_CASES], true);
 
   it(
     "defaults wranglerEnv to the CLOUDFLARE_ENV variable",
     async () => {
       vi.stubEnv("CLOUDFLARE_ENV", "production");
       try {
-        const json = await runWranglerCase({
+        const { json } = await runWranglerCase({
           name: "cloudflare-env",
           files: {
             "wrangler.json": JSON.stringify({
@@ -347,28 +590,7 @@ const FALLBACK_CASES: WranglerCase[] = [
 ];
 
 describe("MiniflareEnvRunner (wrangler config, fallback reader)", () => {
-  let warn: ReturnType<typeof vi.spyOn>;
-
-  beforeEach(() => {
-    warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-  });
-
-  afterEach(() => {
-    warn.mockRestore();
-  });
-
-  for (const c of FALLBACK_CASES) {
-    it(c.name, async () => {
-      const json = await runWranglerCase(c);
-      c.assert(json);
-      if (c.warns) {
-        const warnings = warn.mock.calls.map((call: unknown[]) => String(call[0]));
-        for (const expected of c.warns) {
-          expect(warnings.some((m: string) => m.includes(expected))).toBe(true);
-        }
-      }
-    });
-  }
+  defineWranglerCases([...SHARED_CASES, ...FALLBACK_CASES], false);
 });
 
 // --- Helpers ---
