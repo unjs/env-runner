@@ -148,9 +148,13 @@ export interface MiniflareEnvRunnerOptions {
    * Options a single fetch-only dev worker can't run are dropped from the
    * config: `assets`, service bindings, queue consumers, workflows, tail
    * consumers, and Durable Object bindings to another script (`script_name`).
-   * Pass them via `miniflareOptions` to opt in. When a config _file_ was
-   * loaded, `defaultPersistRoot` defaults to `<config dir>/.wrangler/state/v3`
-   * (sharing local state with `wrangler dev`) unless `miniflareOptions` sets
+   * Pass them via `miniflareOptions` to opt in.
+   *
+   * Local state is shared with `wrangler dev`: `defaultPersistRoot` defaults
+   * to `<dir>/.wrangler/state/v3`, where `<dir>` is the directory of the
+   * loaded config file, else of the requested config path (`wrangler` string
+   * or `wranglerConfigPath`, even if missing), else the current working
+   * directory (e.g. inline-only configs). Skipped when `miniflareOptions` sets
    * `defaultPersistRoot` or any `*Persist` option.
    *
    * The `wrangler` package is used for full fidelity when available (TOML,
@@ -518,11 +522,16 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
     const userDirectSockets = (this.#miniflareOptions.unsafeDirectSockets as unknown[]) || [];
     const options: Record<string, unknown> = {
       modules: true,
-      // Share local state with `wrangler dev` when a config file was loaded
-      // (it persists under `<config dir>/.wrangler/state/v3`), unless the
-      // user configured persistence themselves.
-      ...(wranglerConfigFile && !hasUserPersistOptions(this.#miniflareOptions)
-        ? { defaultPersistRoot: join(dirname(wranglerConfigFile), ".wrangler/state/v3") }
+      // Share local state with `wrangler dev` (it persists under
+      // `.wrangler/state/v3`) whenever wrangler config loading is enabled,
+      // unless the user configured persistence themselves.
+      ...(this.#wrangler && !hasUserPersistOptions(this.#miniflareOptions)
+        ? {
+            defaultPersistRoot: wranglerPersistRoot(
+              wranglerConfigFile,
+              typeof this.#wrangler === "string" ? this.#wrangler : this.#wranglerConfigPath,
+            ),
+          }
         : undefined),
       ...wranglerOptions,
       ...this.#miniflareOptions,
@@ -936,6 +945,17 @@ function hasUserPersistOptions(options: Record<string, unknown>): boolean {
   return Object.keys(options).some(
     (key) => key === "defaultPersistRoot" || key.endsWith("Persist"),
   );
+}
+
+/**
+ * Default `defaultPersistRoot` for wrangler configs (`<dir>/.wrangler/state/v3`,
+ * where `wrangler dev` persists). Anchored to the loaded config file's dir,
+ * else the explicitly requested config path's dir (even if missing), else cwd
+ * (where `wrangler dev` runs).
+ */
+function wranglerPersistRoot(configFile?: string, explicitPath?: string): string {
+  const file = configFile ?? (explicitPath ? resolve(explicitPath) : undefined);
+  return join(file ? dirname(file) : process.cwd(), ".wrangler/state/v3");
 }
 
 /** Entry might not exist yet (e.g. generated at build time). */

@@ -1,5 +1,5 @@
 import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
+import { dirname, join, sep } from "node:path";
 import { existsSync, mkdirSync, writeFileSync, mkdtempSync, rmSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as miniflare from "miniflare";
@@ -120,7 +120,12 @@ async function runWranglerCase(c: WranglerCase): Promise<{ json: any; ctx: Wrang
   class CapturingMiniflare extends miniflare.Miniflare {
     constructor(options: any) {
       ctx.mfOptions = options;
-      super(options);
+      // Miniflare creates persist dirs eagerly (e.g. `cache/`). Keep tests
+      // from writing state outside the temp dir (cwd-anchored defaults would
+      // land in the repo root): assert on the captured options instead.
+      const root = options.defaultPersistRoot;
+      const inTmp = typeof root !== "string" || root.startsWith(ctx.tmpDir + sep);
+      super(inTmp ? options : { ...options, defaultPersistRoot: undefined });
     }
   }
 
@@ -338,9 +343,31 @@ const SHARED_CASES: WranglerCase[] = [
     },
   },
   {
-    name: "does not default defaultPersistRoot for an inline-only config",
+    name: "defaults defaultPersistRoot to cwd for an inline-only config",
     options: () => ({ wrangler: { compatibility_date: "2024-09-01" } }),
-    assert: (_json, { mfOptions }) => expect(mfOptions.defaultPersistRoot).toBeUndefined(),
+    assert: (_json, { mfOptions }) =>
+      expect(mfOptions.defaultPersistRoot).toBe(join(process.cwd(), ".wrangler/state/v3")),
+  },
+  {
+    name: "defaults defaultPersistRoot to cwd when wrangler: true finds no config",
+    options: () => ({ wrangler: true }),
+    assert: (json, { mfOptions }) => {
+      expect(json).toEqual({ greeting: null, tier: null });
+      expect(mfOptions.defaultPersistRoot).toBe(join(process.cwd(), ".wrangler/state/v3"));
+    },
+    warns: ["wrangler config requested but none found"],
+  },
+  {
+    name: "anchors defaultPersistRoot to a missing wranglerConfigPath's dir",
+    options: ({ tmpDir }) => ({
+      wrangler: { compatibility_date: "2024-09-01", vars: { GREETING: "inline" } },
+      wranglerConfigPath: join(tmpDir, "config/wrangler.json"),
+    }),
+    assert: (json, { tmpDir, mfOptions }) => {
+      expect(json.greeting).toBe("inline");
+      expect(mfOptions.defaultPersistRoot).toBe(join(tmpDir, "config/.wrangler/state/v3"));
+    },
+    warns: ["wrangler config requested but not found"],
   },
 ];
 
