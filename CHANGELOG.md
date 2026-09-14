@@ -1,6 +1,30 @@
 # Changelog
 
 
+## v0.2.2
+
+[compare changes](https://github.com/unjs/env-runner/compare/v0.2.1...v0.2.2)
+
+### 🚀 Enhancements
+
+- Forward srvx server options from `AppEntry` ([#49](https://github.com/unjs/env-runner/pull/49))
+- **miniflare:** Add cloudflare runtime context to requests ([b2da5b9](https://github.com/unjs/env-runner/commit/b2da5b9))
+
+### 🩹 Fixes
+
+- **miniflare:** Preserve Request inputs when dispatching fetch ([#47](https://github.com/unjs/env-runner/pull/47))
+
+### 🏡 Chore
+
+- Update release script ([9fd44a8](https://github.com/unjs/env-runner/commit/9fd44a8))
+- Update deps ([69f17c2](https://github.com/unjs/env-runner/commit/69f17c2))
+- Update es-module-lexer ([809c29c](https://github.com/unjs/env-runner/commit/809c29c))
+
+### ❤️ Contributors
+
+- Pooya Parsa ([@pi0](https://github.com/pi0))
+- Ben Snyder <ben@snyder.tech>
+
 ## v0.2.1
 
 [compare changes](https://github.com/unjs/env-runner/compare/v0.2.0...v0.2.1)
