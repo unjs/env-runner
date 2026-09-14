@@ -46,7 +46,7 @@
     "crossws": "^0.4.12",
     "exsolve": "^1.1.1",
     "httpxy": "^0.5.5",
-    "srvx": "^1.0.4"
+    "srvx": "^1.0.5"
   },
   "devDependencies": {
     "@netlify/runtime": "^5.0.3",
