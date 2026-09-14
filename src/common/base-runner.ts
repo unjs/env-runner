@@ -60,9 +60,7 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
   // #region Public methods
 
   async fetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
-    for (let i = 0; i < 5 && !this._address && !this.closed; i++) {
-      await new Promise((r) => setTimeout(r, 100 * Math.pow(2, i)));
-    }
+    await this._waitForAddress();
     if (!this._address) {
       return new Response(`${this._runtimeType()} env runner is unavailable`, {
         status: 503,
@@ -192,6 +190,13 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
   // #endregion
 
   // #region Protected methods
+
+  /** Briefly back off (~3s total) while the worker is still starting. */
+  protected async _waitForAddress() {
+    for (let i = 0; i < 5 && !this._address && !this.closed; i++) {
+      await new Promise((r) => setTimeout(r, 100 * Math.pow(2, i)));
+    }
+  }
 
   /** Placeholder origin for relative inputs; requests go to the worker address regardless. */
   protected _resolveFetchInput(input: string | URL | Request): string | URL | Request {

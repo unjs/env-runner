@@ -49,6 +49,14 @@ describe("VercelEnvRunner", () => {
     expect(headers["x-vercel-deployment-url"]).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
   });
 
+  it("injects x-vercel-deployment-url header before runner is ready", async () => {
+    runner = new VercelEnvRunner({ name: "test-deploy-url-early", data: { entry: headersEntry } });
+    expect(runner.ready).toBe(false);
+    const res = await runner.fetch("http://localhost/");
+    const headers = await res.json();
+    expect(headers["x-vercel-deployment-url"]).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
+  });
+
   it("injects x-vercel-forwarded-for header", async () => {
     runner = new VercelEnvRunner({ name: "test-vff", data: { entry: headersEntry } });
     await runner.waitForReady();

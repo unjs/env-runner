@@ -38,6 +38,8 @@ export class VercelEnvRunner extends NodeWorkerEnvRunner {
 
     const requestId = generateVercelId();
 
+    // The deployment URL needs the worker address; wait for it like `super.fetch()` does.
+    await this._waitForAddress();
     if (this._address && this._address.port != null && !headers.has("x-vercel-deployment-url")) {
       const host = this._address.host || "127.0.0.1";
       headers.set("x-vercel-deployment-url", `http://${host}:${this._address.port}`);
