@@ -588,12 +588,15 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
         options.durableObjects = autoDOs;
       }
 
-      const script = generateWrapper(resolvedEntry, {
-        dynamicOnly: true,
-        captureErrors: this.#captureErrors,
-        exports: typeof this.#exports === "string" ? this.#exports : detectedExports,
-        nodeCompat: !(options.compatibilityFlags as string[]).includes("no_nodejs_compat"),
-      });
+      const script = generateWrapper(
+        entryIsVirtual ? toWorkerdPath(resolvedEntry) : resolvedEntry,
+        {
+          dynamicOnly: true,
+          captureErrors: this.#captureErrors,
+          exports: typeof this.#exports === "string" ? this.#exports : detectedExports,
+          nodeCompat: !(options.compatibilityFlags as string[]).includes("no_nodejs_compat"),
+        },
+      );
       const scriptPath = entryDir + "/__env_runner_wrapper.mjs";
       // Static re-exports (an `exports` module, or a virtual entry's classes) must
       // reach the fallback service. v4's ModuleLocator would read them from disk
@@ -735,7 +738,9 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
               cleanSpecifier !== keyPath &&
               cleanSpecifier.includes("file:")
             ) {
-              const location = Buffer.from(keyPath + query, "utf8").toString("latin1");
+              const location = Buffer.from(toWorkerdPath(keyPath) + query, "utf8").toString(
+                "latin1",
+              );
               return new Response(null, { status: 301, headers: { location } });
             }
             const name = bareSpecifier + query;
@@ -1085,11 +1090,17 @@ function computeCacheKey(entryPath: string, opts: Record<string, unknown>): stri
   return `${resolve(entryPath)}::${JSON.stringify(serializableOpts)}`;
 }
 
+const _isWin = process.platform === "win32";
+
 /**
  * Absolute path of a path key (absolute path or `file:` URL, which workerd has
  * no scheme for), else `undefined`: other keys only match verbatim.
  */
 function virtualKeyPath(key: string): string | undefined {
+  if (_isWin && /^\/[A-Za-z]:\//.test(key)) {
+    // `/D:/app/x.mjs` (see `toWorkerdPath()`)
+    key = key.slice(1);
+  }
   if (key.startsWith("file:")) {
     try {
       return fileURLToPath(key);
@@ -1098,6 +1109,15 @@ function virtualKeyPath(key: string): string | undefined {
     }
   }
   return isAbsolute(key) ? resolve(key) : undefined;
+}
+
+/**
+ * workerd resolves relative specifiers against `/`-separated module names, so
+ * on Windows spell `D:\app\x.mjs` as `/D:/app/x.mjs` (else `../y.mjs` fails
+ * as an invalid specifier). Other paths are returned as is.
+ */
+function toWorkerdPath(path: string): string {
+  return _isWin && /^[A-Za-z]:[\\/]/.test(path) ? "/" + path.replaceAll("\\", "/") : path;
 }
 
 type VirtualKeyResolver = (specifier: string, importerPath?: string) => string | undefined;
