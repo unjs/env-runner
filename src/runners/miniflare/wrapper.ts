@@ -9,8 +9,8 @@ export const UNSAFE_EVAL_BINDING = "__ENV_RUNNER_UNSAFE_EVAL__";
 /**
  * Wrapper module around the user entry. Requests are handled like
  * `srvx/cloudflare`; `fetch` also receives `(request, env, ctx)`. IPC uses a
- * persistent WebSocket pair, plus `__ENV_RUNNER_IPC` during fetch (workerd
- * forbids cross-request I/O on the socket).
+ * persistent WebSocket pair, plus `__ENV_RUNNER_IPC` for worker → host messages
+ * once a user request was seen (workerd forbids cross-request I/O on the socket).
  */
 export function generateWrapper(
   entryPath: string,
@@ -72,7 +72,10 @@ let __userEntry;
 let __server;
 let __ipcInitialized = false;
 let __serverWs;
-let __currentEnv;
+// Raw env of the latest user request. Kept after the request ends: requests
+// overlap and streamed bodies outlive fetch(), and unlike \`__serverWs\` the
+// IPC binding works from any request context.
+let __ipcEnv;
 
 const __userEnvs = new WeakMap();
 
@@ -160,7 +163,7 @@ async function __loadEntry(env, path) {
 
 function __sendMessage(message) {
   const payload = JSON.stringify(message);
-  const env = __currentEnv;
+  const env = __ipcEnv;
   if (env && env[__IPC_BINDING]) {
     env[__IPC_BINDING].fetch("http://localhost/__ipc", {
       method: "POST",
@@ -269,18 +272,15 @@ export default {
       return new Response("Worker not initialized", { status: 503 });
     }
 
+    __ipcEnv = env;
+
     // Handle WebSocket upgrade via crossws cloudflare adapter
     if (__userEntry.websocket && request.headers.get("upgrade") === "websocket") {
       const adapter = await __initCrossws(env, __userEntry.websocket);
       return adapter.handleUpgrade(request, __userEnv(env), ctx);
     }
 
-    __currentEnv = env;
-    try {
-      ${fetchBody}
-    } finally {
-      __currentEnv = undefined;
-    }
+    ${fetchBody}
   }
 };
 `;

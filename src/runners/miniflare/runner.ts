@@ -125,6 +125,9 @@ interface MiniflareCacheEntry {
   // Served live by the instance's fallback service; adopted by attaching runners.
   virtual?: Record<string, string>;
   versions: Map<string, number>;
+  // Receiver of the instance's `__ENV_RUNNER_IPC` binding; retargeted to the
+  // runner that attaches last (like the IPC WebSocket).
+  ipc: { runner: MiniflareEnvRunner };
 }
 
 // Module-level cache for persistent Miniflare instances
@@ -458,6 +461,8 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
       }
     }
 
+    const ipc: MiniflareCacheEntry["ipc"] = { runner: this };
+
     // Generate in-memory wrapper module with IPC support
     if (entryPath && !options.script && !options.scriptPath) {
       // A virtual entry is matched verbatim by the module fallback service —
@@ -522,14 +527,14 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
       options.unsafeEvalBinding = UNSAFE_EVAL_BINDING;
 
       // workerd forbids using the IPC WebSocket from another request context,
-      // so messages sent during fetch go through this binding.
+      // so worker messages go through this binding once a request was seen.
       const userBindings = (options.serviceBindings as Record<string, unknown>) || {};
       options.serviceBindings = {
         ...userBindings,
         [IPC_BINDING]: async (request: Request) => {
           try {
             const message = await request.json();
-            this._handleMessage(message);
+            ipc.runner._handleMessage(message);
           } catch {
             // Ignore malformed messages
           }
@@ -722,6 +727,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
         this.#miniflare = cached.mf;
         cached.refCount++;
         this.#cacheEntry = cached;
+        cached.ipc.runner = this;
         // Adopt the maps the live fallback service closes over.
         this.#virtual = cached.virtual;
         this.#virtualVersions = cached.versions;
@@ -737,6 +743,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
           refCount: 1,
           virtual,
           versions: this.#virtualVersions,
+          ipc,
         };
         _miniflareCache.set(this.#cacheKey, this.#cacheEntry);
       }

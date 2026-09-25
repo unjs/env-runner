@@ -9,6 +9,7 @@ import type { EnvRunner } from "../src/index.ts";
 const _dir = dirname(fileURLToPath(import.meta.url));
 const workerDoEntry = resolve(_dir, "./fixtures/worker-do.mjs");
 const workerSrvxEntry = resolve(_dir, "./fixtures/worker-srvx.mjs");
+const workerIpcRequestsEntry = resolve(_dir, "./fixtures/worker-ipc-requests.mjs");
 
 describe("MiniflareEnvRunner (custom exports)", () => {
   let runner: EnvRunner | undefined;
@@ -143,6 +144,41 @@ describe("MiniflareEnvRunner (srvx cloudflare context)", () => {
     const errRes = await runner.fetch("http://localhost/throw");
     expect(errRes.status).toBe(599);
     expect(await errRes.text()).toBe("handled: boom");
+  });
+});
+
+describe("MiniflareEnvRunner (IPC across requests)", () => {
+  let runner: EnvRunner | undefined;
+
+  afterEach(async () => {
+    await runner?.close();
+    runner = undefined;
+  });
+
+  // https://github.com/unjs/env-runner/issues/58
+  it("sends messages from overlapping requests and streamed bodies", async () => {
+    runner = new MiniflareEnvRunner({
+      miniflare,
+      name: "test-ipc-requests",
+      data: { entry: workerIpcRequestsEntry },
+    });
+    await waitForReady(runner);
+    const received: string[] = [];
+    runner.onMessage((msg: any) => {
+      if (msg?.type === "sent") received.push(msg.tag);
+    });
+    const text = async (path: string) => (await runner!.fetch(`http://localhost${path}`)).text();
+
+    // `/fast` finishes while `/slow` is still in flight
+    const slow = text("/slow");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(await text("/fast")).toBe("ok");
+    expect(await slow).toBe("ok");
+
+    // Body is produced after the wrapper's fetch() has returned
+    expect(await text("/stream")).toBe("ok");
+
+    await vi.waitFor(() => expect(received.sort()).toEqual(["fast", "slow", "stream"]));
   });
 });
 
@@ -503,6 +539,38 @@ describe("MiniflareEnvRunner (persistent)", () => {
     // New WebSocket IPC is established, entry is reloaded
     const res2 = await runner2.fetch("http://localhost/");
     expect(await res2.text()).toBe("v2");
+
+    await runner2.close();
+  });
+
+  it("routes IPC messages to the runner that reuses the instance", async () => {
+    tmpDir = mkdtempSync(join(_dir, ".tmp-persistent-"));
+    const entryPath = join(tmpDir, "worker.mjs");
+
+    writeFileSync(entryPath, `export default { fetch() { return new Response("ok"); } };`);
+
+    const runner1 = new MiniflareEnvRunner({
+      miniflare,
+      name: "test-persistent-ipc-1",
+      data: { entry: entryPath },
+      persistent: true,
+    });
+    await waitForReady(runner1);
+    // A user request makes the worker send over the IPC binding from now on
+    await (await runner1.fetch("http://localhost/")).text();
+
+    // Hot-swap: runner2 attaches to the shared instance before runner1 closes
+    const runner2 = new MiniflareEnvRunner({
+      miniflare,
+      name: "test-persistent-ipc-2",
+      data: { entry: entryPath },
+      persistent: true,
+    });
+    await waitForReady(runner2);
+    await runner1.close();
+
+    // `module-reloaded` must reach runner2, not the closed runner1
+    await runner2.reloadModule(2000);
 
     await runner2.close();
   });
