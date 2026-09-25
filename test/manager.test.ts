@@ -115,6 +115,31 @@ describe("RunnerManager", () => {
     expect(manager.ready).toBe(false);
   });
 
+  it("keeps the close cause when an attached runner closes itself", async () => {
+    let hookCause: unknown;
+    const runner = new NodeWorkerEnvRunner({
+      name: "close-cause",
+      workerEntry,
+      data: { entry: resolve(_dir, "./fixtures/does-not-exist.mjs") },
+      hooks: {
+        onClose: (_runner, cause) => {
+          hookCause = cause;
+        },
+      },
+    });
+    runners.push(runner);
+    manager = new RunnerManager(runner);
+    const managerCause = new Promise((resolve) => {
+      manager!.onClose((_runner, cause) => resolve(cause));
+    });
+
+    // The worker's `init-error` closes the runner through the manager's close() wrapper.
+    const error = await runner.waitForReady().catch((error) => error);
+    expect(String(error?.cause?.message)).toContain("does-not-exist");
+    expect(hookCause).toBe(error.cause);
+    expect(await managerCause).toBe(error.cause);
+  });
+
   it("fires onReady hook", async () => {
     const runner = createRunner("on-ready");
     runners.push(runner);

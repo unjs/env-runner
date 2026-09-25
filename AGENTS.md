@@ -12,9 +12,10 @@ Generic environment runner for Node.js. Ported from the nitro env runner concept
 src/
 ├── common/
 │   ├── base-runner.ts       # BaseEnvRunner abstract class
-│   ├── worker-utils.ts      # AppEntry interface, resolveEntry(), parseServerAddress(), toServerOptions()
+│   ├── worker-utils.ts      # AppEntry interface, resolveEntry(), parseServerAddress(), toServerOptions(), formatInitError()
 │   ├── runtime-deps.ts      # resolveRuntimeDep()/resolveRuntimeDepSpecifier() — "module | specifier | false" resolver
 │   ├── host-env.ts          # hostEnv() — worker/child env: host env + FORCE_COLOR/COLUMNS from the host TTY
+│   ├── process-data.ts      # receiveProcessData() — runner data over IPC for process workers
 │   ├── ws-proxy.ts          # createRunnerWSProxyPlugin() — runtime-native WS upgrade proxy
 │   └── virtual-modules.ts   # registerVirtualModules() — registerHooks()/Bun.plugin wiring for node/bun/deno workers
 ├── runners/
@@ -57,7 +58,7 @@ export default {
 - `toServerOptions()` strips env-runner keys and pins/drops listener options (`RESERVED_SERVER_OPTIONS`, `RESERVED_RUNTIME_OPTIONS` for nested `node`/`bun`/`deno`) since the worker listens on `127.0.0.1:0` behind the runner proxy. Server options are read once at start; `reloadModule()` only swaps `fetch`.
 - `websocket` uses `crossws/server`, which picks the adapter matching the host runtime (so node-worker/node-process use native Bun/Deno adapters when the host is Bun/Deno).
 - `ipc.onMessage` receives only user messages (ping/pong/shutdown are filtered); `onOpen` runs before the ready signal.
-- Worker flow: import entry → `serve()` + `ready()` → wire `upgrade` → `ipc.onOpen` → post `{ address }`. Any init failure posts `{ event: "init-error", error }`, logs one `[env-runner] worker init failed: ...` line and exits 1.
+- Worker flow: (process workers: receive data over IPC) → import entry → `serve()` + `ready()` → wire `upgrade` → `ipc.onOpen` → post `{ address }`. Any init failure posts `{ event: "init-error", error }` (`formatInitError()`: the message, plus where it was thrown if it doesn't say), logs one `[env-runner] worker init failed: ...` line and exits 1.
 
 ## Miniflare
 
@@ -98,8 +99,8 @@ Details in [`.agents/MINIFLARE.md`](.agents/MINIFLARE.md). In short: the wrapper
 - **Message-driven readiness** — workers post `{ address }` when ready
 - **WebSocket proxying** — `RunnerManager.wsSrvxPlugin()`: Node host proxies the raw upgrade socket (httpxy); Bun/Deno host terminates with crossws and bridges via a `WebSocket` client. Reads the active runner lazily (survives hot-reload) and awaits readiness
 - **Immediate shutdown** — `close()` terminates the worker/process, no graceful handshake
-- **Orphan protection** — node-process/bun-process/deno-process workers call `process.on("disconnect", () => process.exit(0))` before importing the entry
-- **Data passing** — `workerData` (threads), `ENV_RUNNER_DATA` JSON env (processes), direct in-process import (self), in-memory `script` + `unsafeModuleFallbackService` (miniflare)
+- **Orphan protection** — node-process/bun-process/deno-process workers call `process.on("disconnect", () => process.exit(0))` before the data handshake and entry import
+- **Data passing** — `workerData` (threads), IPC handshake (processes: worker listens, sends `request-init-data`, host replies `{ event: "init-data", data: "<JSON>" }`; env vars are size-limited, see [`NODE-RUNNERS.md`](.agents/NODE-RUNNERS.md)), direct in-process import (self), in-memory `script` + `unsafeModuleFallbackService` (miniflare)
 - **Terminal capabilities** — spawned workers get piped stdout, so `hostEnv()` forwards `FORCE_COLOR`/`COLUMNS` from the host TTY
 - **Stdio forwarding** — all runners forward entry stdout/stderr to the host
 - **Socket cleanup** — `_closeSocket()` skips Windows named pipes and abstract sockets

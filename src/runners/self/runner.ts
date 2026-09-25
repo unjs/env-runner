@@ -132,9 +132,21 @@ export class SelfEnvRunner extends BaseEnvRunner {
       this.close("self runner requires data.entry");
       return;
     }
+    // Nothing registers virtual modules in the host process; fail fast instead
+    // of a confusing import error for a virtual key.
+    if (Object.keys(this._data?.virtual ?? {}).length > 0) {
+      this.close(
+        new Error("Cannot use data.virtual: the self runner does not support virtual modules"),
+      );
+      return;
+    }
     this.#active = true;
     resolveEntry(entryPath)
       .then(async (entry) => {
+        // Closed mid-import: don't open IPC that `_closeRuntime()` will never close.
+        if (this.closed) {
+          return;
+        }
         this.#entry = entry;
         await entry.ipc?.onOpen?.({
           sendMessage: (message) => {

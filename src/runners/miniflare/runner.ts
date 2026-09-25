@@ -10,7 +10,6 @@ import { init as initEsmLexer, parse as parseEsm } from "es-module-lexer";
 import { proxyUpgrade } from "httpxy";
 import { BaseEnvRunner } from "../../common/base-runner.ts";
 import type { EnvRunnerData } from "../../common/base-runner.ts";
-import { isVirtualSpecifier } from "../../common/worker-utils.ts";
 import { resolveRuntimeDep } from "../../common/runtime-deps.ts";
 import type { RuntimeDep } from "../../common/runtime-deps.ts";
 import {
@@ -296,7 +295,10 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
     if (source !== undefined) {
       virtual[specifier] = await this.#prepareVirtualSource(specifier, source);
     }
-    for (const key of expandVirtualInvalidation(virtual, specifier)) {
+    // Import edges catch importers the quoted key scan misses (`./dep.mjs`).
+    await initEsmLexer;
+    const importers = virtualImporters(virtual, createVirtualKeyResolver(virtual));
+    for (const key of expandVirtualInvalidation(virtual, specifier, importers)) {
       this.#virtualVersions.set(key, (this.#virtualVersions.get(key) ?? 0) + 1);
     }
     // Sources no longer match the cache key; current handles stay ref-counted.
@@ -475,10 +477,15 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
 
     // Generate in-memory wrapper module with IPC support
     if (entryPath && !options.script && !options.scriptPath) {
-      // A virtual entry is matched verbatim by the module fallback service —
-      // don't resolve non-path specifiers (e.g. "#entry") against cwd.
-      const entryIsVirtual = isVirtualSpecifier(entryPath, virtual);
-      const resolvedEntry = entryIsVirtual ? entryPath : resolve(entryPath);
+      // A virtual entry is matched like the fallback service matches imports:
+      // verbatim (don't resolve "#entry" against cwd), or by path for path keys.
+      const virtualKeyOf = virtual && createVirtualKeyResolver(virtual);
+      const entryKey = virtualKeyOf?.(entryPath) ?? virtualKeyOf?.(resolve(entryPath));
+      const entryIsVirtual = entryKey !== undefined;
+      // Path keys load by path (workerd has no `file:` scheme).
+      const resolvedEntry = entryIsVirtual
+        ? (virtualKeyPath(entryKey) ?? entryKey)
+        : resolve(entryPath);
       // Anchor for scriptPath and bare-specifier resolution; a non-path
       // virtual key has no directory, so fall back to cwd.
       const entryBase = isAbsolute(resolvedEntry)
@@ -487,7 +494,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
       const entryDir = dirname(entryBase);
 
       // Auto-detect exported classes from entry source (skipped for a module specifier)
-      const entrySource = entryIsVirtual ? virtual![entryPath] : _tryReadFile(resolvedEntry);
+      const entrySource = entryIsVirtual ? virtual![entryKey] : _tryReadFile(resolvedEntry);
       const detectedExports =
         this.#exports === false || typeof this.#exports === "string"
           ? []
@@ -514,25 +521,27 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
         options.durableObjects = autoDOs;
       }
 
-      options.script = generateWrapper(resolvedEntry, {
+      const script = generateWrapper(resolvedEntry, {
         dynamicOnly: true,
         captureErrors: this.#captureErrors,
         exports: typeof this.#exports === "string" ? this.#exports : detectedExports,
         nodeCompat: !(options.compatibilityFlags as string[]).includes("no_nodejs_compat"),
       });
-      options.scriptPath = entryDir + "/__env_runner_wrapper.mjs";
+      const scriptPath = entryDir + "/__env_runner_wrapper.mjs";
+      // Static re-exports (an `exports` module, or a virtual entry's classes) must
+      // reach the fallback service. v4's ModuleLocator would read them from disk
+      // instead, but it only walks `script`; a module list skips it.
+      const skipLocator =
+        typeof this.#exports === "string" || (entryIsVirtual && detectedExports.length > 0);
+      if (skipLocator) {
+        options.modules = [{ type: "ESModule", path: scriptPath, contents: script }];
+      } else {
+        options.script = script;
+        options.scriptPath = scriptPath;
+      }
       // Use "/" as modulesRoot so absolute paths don't produce ".." relative paths
       if (!options.modulesRoot) {
         options.modulesRoot = "/";
-      }
-      if (typeof this.#exports === "string" || (entryIsVirtual && detectedExports.length > 0)) {
-        options.modules = [
-          {
-            type: "ESModule",
-            path: options.scriptPath,
-            contents: options.script,
-          },
-        ];
       }
 
       // Enable unsafeEval for hot-reload support (re-import entry without restart)
@@ -558,7 +567,12 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
       // ModuleLocator doesn't reject non-JS extensions (e.g. .ts, .tsx, .jsx).
       // v5 has no ModuleLocator (and rejects `modulesRules`): imports all go
       // through the fallback service.
-      if (this.#transformRequest && !options.modulesRules && !miniflare.convertV4MiniflareOptions) {
+      if (
+        this.#transformRequest &&
+        !options.modulesRules &&
+        !miniflare.convertV4MiniflareOptions &&
+        !skipLocator
+      ) {
         options.modulesRules = [
           { type: "ESModule", include: ["**/*.ts", "**/*.tsx", "**/*.jsx", "**/*.mts"] },
         ];
@@ -569,11 +583,17 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
       if (!options.unsafeModuleFallbackService) {
         const _require = createRequire(entryBase);
         const _virtual = virtual;
+        const _virtualKeyOf = virtualKeyOf;
         const _virtualVersions = this.#virtualVersions;
         const _transformRequest = this.#transformRequest;
         const _exportConditions = this.#exportConditions;
-        const _applyVirtualVersions = (code: string) =>
-          applyVirtualVersions(code, _virtualVersions);
+        // `modulePath`: the served module's path, which its relative imports join onto.
+        const _applyVirtualVersions = (code: string, modulePath: string | undefined) =>
+          _virtualKeyOf
+            ? applyVirtualVersions(code, _virtualVersions, (specifier) =>
+                _virtualKeyOf(specifier, modulePath),
+              )
+            : code;
         options.unsafeUseModuleFallbackService = true;
         // Map workerd module names to real filesystem paths for correct
         // relative import resolution from bare-specifier modules.
@@ -593,21 +613,40 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
 
           // Virtual modules override real files. Keep the `?t=` query in the name
           // so reloads get a fresh workerd module identity.
-          if (_virtual) {
+          if (_virtual && _virtualKeyOf) {
             const bareSpecifier = cleanSpecifier.startsWith("/")
               ? cleanSpecifier.slice(1)
               : cleanSpecifier;
-            const virtualKey = [cleanRaw, cleanSpecifier, bareSpecifier].find(
-              (key) => key !== undefined && Object.hasOwn(_virtual, key),
-            );
+            // workerd joins a `file:` specifier onto the referrer's directory
+            // like a relative path, so only the raw one maps to a path key.
+            const virtualKey =
+              [cleanRaw, cleanSpecifier, bareSpecifier].find(
+                (key) => key !== undefined && Object.hasOwn(_virtual, key),
+              ) ??
+              _virtualKeyOf(cleanSpecifier) ??
+              (cleanRaw?.startsWith("file:") ? _virtualKeyOf(cleanRaw) : undefined);
             if (virtualKey !== undefined) {
               const query = specifier.includes("?") ? specifier.slice(specifier.indexOf("?")) : "";
+              const keyPath = virtualKeyPath(virtualKey);
+              // Redirect a `file:` import to the key's path: one module identity
+              // for both spellings, and its relative imports resolve. workerd
+              // requests the location verbatim (no `file:` left, so no loop) and
+              // reads header bytes as UTF-8.
+              if (
+                keyPath &&
+                cleanRaw?.startsWith("file:") &&
+                cleanSpecifier !== keyPath &&
+                cleanSpecifier.includes("file:")
+              ) {
+                const location = Buffer.from(keyPath + query, "utf8").toString("latin1");
+                return new Response(null, { status: 301, headers: { location } });
+              }
               const name = bareSpecifier + query;
               const source = _virtual[virtualKey]!;
               // workerd parses `json` natively; TS was already stripped on the host.
               return virtualModuleFormat(virtualKey) === "json"
                 ? Response.json({ name, json: source })
-                : Response.json({ name, esModule: _applyVirtualVersions(source) });
+                : Response.json({ name, esModule: _applyVirtualVersions(source, keyPath) });
             }
           }
 
@@ -692,7 +731,10 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
               const result = await _transformRequest(resolvedPath);
               if (result?.code) {
                 modulePathMap.set(name, resolvedPath);
-                return Response.json({ name, esModule: _applyVirtualVersions(result.code) });
+                return Response.json({
+                  name,
+                  esModule: _applyVirtualVersions(result.code, resolvedPath),
+                });
               }
             } catch {
               // Fall through to raw disk read
@@ -710,7 +752,10 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
               (!resolvedPath.endsWith(".cjs") &&
                 /\b(import\s|import\(|export\s|export\{|import\.meta\b)/.test(contents));
             if (isESM) {
-              return Response.json({ name, esModule: _applyVirtualVersions(contents) });
+              return Response.json({
+                name,
+                esModule: _applyVirtualVersions(contents, resolvedPath),
+              });
             }
             // Importers expect ESM: serve raw CJS under a suffixed name behind an ESM shim.
             const cjsSuffix = "?__cjs";
@@ -937,42 +982,127 @@ function computeCacheKey(entryPath: string, opts: Record<string, unknown>): stri
 }
 
 /**
- * Rewrite imports of invalidated virtual modules (`#config.json?v=2`): workerd
- * caches by name, so the new name misses and the fallback serves fresh source.
+ * Absolute path of a path key (absolute path or `file:` URL, which workerd has
+ * no scheme for), else `undefined`: other keys only match verbatim.
  */
-function applyVirtualVersions(code: string, versions: ReadonlyMap<string, number>): string {
-  if (versions.size === 0) {
-    return code;
+function virtualKeyPath(key: string): string | undefined {
+  if (key.startsWith("file:")) {
+    try {
+      return fileURLToPath(key);
+    } catch {
+      return undefined;
+    }
   }
+  return isAbsolute(key) ? resolve(key) : undefined;
+}
+
+/**
+ * Virtual key an import specifier refers to, resolved like workerd: verbatim
+ * (query stripped), else by path for path keys. Relative specifiers join onto
+ * the importer's path as plain text (workerd doesn't percent-decode them).
+ */
+function createVirtualKeyResolver(
+  virtual: Record<string, string>,
+): (specifier: string, importerPath?: string) => string | undefined {
+  const pathKeys = new Map<string, string>();
+  for (const key of Object.keys(virtual)) {
+    const path = virtualKeyPath(key);
+    if (path !== undefined) {
+      pathKeys.set(path, key);
+    }
+  }
+  return (specifier, importerPath) => {
+    const clean = specifier.split("?")[0]!;
+    if (Object.hasOwn(virtual, clean)) {
+      return clean;
+    }
+    if (pathKeys.size === 0) {
+      return undefined;
+    }
+    const path = /^\.\.?\//.test(clean)
+      ? importerPath && resolve(dirname(importerPath), clean)
+      : virtualKeyPath(clean);
+    return path ? pathKeys.get(path) : undefined;
+  };
+}
+
+/** `key => importer keys` from the import specifiers of virtual sources. */
+function virtualImporters(
+  virtual: Record<string, string>,
+  keyOf: ReturnType<typeof createVirtualKeyResolver>,
+): Map<string, Set<string>> {
+  const importers = new Map<string, Set<string>>();
+  for (const [importer, source] of Object.entries(virtual)) {
+    if (virtualModuleFormat(importer) === "json") {
+      continue;
+    }
+    const importerPath = virtualKeyPath(importer);
+    for (const { specifier } of versionableImports(source) ?? []) {
+      const key = keyOf(specifier, importerPath);
+      if (key !== undefined && key !== importer) {
+        let set = importers.get(key);
+        if (!set) {
+          importers.set(key, (set = new Set()));
+        }
+        set.add(importer);
+      }
+    }
+  }
+  return importers;
+}
+
+/**
+ * Static imports/re-exports and literal dynamic imports, with the offset to
+ * append a query at; `undefined` for unparsable code.
+ */
+function versionableImports(code: string): { specifier: string; end: number }[] | undefined {
   let imports: ReturnType<typeof parseEsm>[0];
   try {
     [imports] = parseEsm(code);
   } catch {
-    // Unparsable code is served untouched — workerd reports its own error.
+    return undefined;
+  }
+  const result: { specifier: string; end: number }[] = [];
+  for (const imp of imports) {
+    // A template-literal dynamic import with substitutions is reported as a
+    // glob specifier (each `${...}` collapsed to `*`), never a real key.
+    if (typeof imp.specifier !== "string" || (imp.type === "dynamic" && imp.glob)) {
+      continue;
+    }
+    // Static import/re-export offsets exclude the quotes; dynamic import
+    // offsets span the full specifier expression including them.
+    result.push({ specifier: imp.specifier, end: imp.type === "dynamic" ? imp.end - 1 : imp.end });
+  }
+  return result;
+}
+
+/**
+ * Rewrite imports of invalidated virtual modules (`#config.json?v=2`): workerd
+ * caches by name, so the new name misses and the fallback serves fresh source.
+ */
+function applyVirtualVersions(
+  code: string,
+  versions: ReadonlyMap<string, number>,
+  keyOf: (specifier: string) => string | undefined,
+): string {
+  if (versions.size === 0) {
+    return code;
+  }
+  // Unparsable code is served untouched — workerd reports its own error.
+  const imports = versionableImports(code);
+  if (!imports) {
     return code;
   }
   let out = "";
   let last = 0;
-  for (const imp of imports) {
-    if (imp.type === "import-meta") {
-      continue;
-    }
-    const dynamic = imp.type === "dynamic";
-    // A template-literal dynamic import with substitutions is reported as a
-    // glob specifier (each `${...}` collapsed to `*`), never a real key.
-    if (dynamic && imp.glob) {
-      continue;
-    }
-    const specifier = imp.specifier;
-    const version = specifier === undefined ? undefined : versions.get(specifier);
+  for (const { specifier, end } of imports) {
+    const key = keyOf(specifier);
+    const version = key === undefined ? undefined : versions.get(key);
     if (!version) {
       continue;
     }
-    const versioned = `${specifier}?v=${version}`;
-    // Static import/re-export offsets exclude the quotes; dynamic import
-    // offsets span the full specifier expression including them.
-    out += code.slice(last, imp.start) + (dynamic ? JSON.stringify(versioned) : versioned);
-    last = imp.end;
+    out += code.slice(last, end) + (specifier.includes("?") ? "&" : "?") + `v=${version}`;
+    last = end;
   }
   return out + code.slice(last);
 }

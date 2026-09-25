@@ -262,13 +262,15 @@ export class RunnerManager implements EnvRunner, AsyncDisposable {
       runner.onMessage(listener);
     }
 
-    // Wrap close() to detect when runner exits (works with BaseEnvRunner)
-    const originalClose = runner.close.bind(runner);
-    runner.close = async () => {
-      await originalClose();
+    // Wrap close() to detect when runner exits (works with BaseEnvRunner). Runners
+    // close themselves via this wrapper, so forward the cause (`hooks.onClose`,
+    // `waitForReady()` rejections).
+    const originalClose = runner.close.bind(runner) as (cause?: unknown) => Promise<void>;
+    runner.close = async (cause?: unknown) => {
+      await originalClose(cause);
       if (this._runner === runner) {
         this._runner = undefined;
-        for (const fn of this._closeListeners) fn(this);
+        for (const fn of this._closeListeners) fn(this, cause);
       }
     };
 

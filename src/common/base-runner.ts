@@ -4,8 +4,9 @@ import type { RunnerMessageListener, EnvRunner, WorkerAddress, WorkerHooks } fro
 
 import { rm } from "node:fs/promises";
 import { proxyFetch, proxyUpgrade } from "httpxy";
-import { resolveVirtualModules } from "../virtual-loader.ts";
+import { resolveVirtualModules, warnVirtualPathCollisions } from "../virtual-loader.ts";
 import type { VirtualModules } from "../virtual-loader.ts";
+import { hostEnv } from "./host-env.ts";
 
 export type { VirtualModules, VirtualModuleSource } from "../virtual-loader.ts";
 
@@ -15,7 +16,8 @@ export interface EnvRunnerData {
   /**
    * Virtual modules importable from the entry, e.g.
    * `{ "#virtual-import": "export const foo = 1" }`. Factory sources run once
-   * on the host before spawn. Not supported by the `self` runner.
+   * on the host before spawn. Not supported by the `self` runner (it closes
+   * with an error).
    */
   virtual?: VirtualModules;
 
@@ -32,8 +34,12 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
   protected _hooks: Partial<WorkerHooks>;
   protected _address?: WorkerAddress;
   protected _messageListeners: Set<(data: unknown) => void>;
+  // Rejectors run by `close()`: in-flight `_request()` and `waitForReady()` calls.
   protected _pendingRequests: Set<(cause?: unknown) => void>;
+  protected _closeCause?: unknown;
   protected _virtualResolved?: Promise<void>;
+  // Runner data JSON for process workers, snapshotted at spawn (`_processEnv()`).
+  protected _processData?: string;
 
   constructor(opts: {
     name: string;
@@ -98,26 +104,34 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
     this._messageListeners.delete(listener);
   }
 
+  /** Rejects on timeout, and as soon as the runner closes (with the close cause). */
   waitForReady(timeout = 15_000): Promise<void> {
     if (this.ready) return Promise.resolve();
-    if (this.closed) return Promise.reject(new Error("Runner closed before becoming ready"));
+    if (this.closed) return Promise.reject(closedBeforeReadyError(this._closeCause));
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
-        this._messageListeners.delete(listener);
+        cleanup();
         reject(new Error("Runner did not become ready in time"));
       }, timeout);
       const listener = () => {
         if (this.ready) {
-          clearTimeout(timer);
-          this._messageListeners.delete(listener);
+          cleanup();
           resolve();
-        } else if (this.closed) {
-          clearTimeout(timer);
-          this._messageListeners.delete(listener);
-          reject(new Error("Runner closed before becoming ready"));
         }
       };
+      // Via `close()`, not a message: a runner can close without the worker
+      // sending anything (exit, spawn error, failed `self` entry import).
+      const onClose = (cause?: unknown) => {
+        cleanup();
+        reject(closedBeforeReadyError(cause));
+      };
+      const cleanup = () => {
+        clearTimeout(timer);
+        this._messageListeners.delete(listener);
+        this._pendingRequests.delete(onClose);
+      };
       this._messageListeners.add(listener);
+      this._pendingRequests.add(onClose);
     });
   }
 
@@ -165,6 +179,7 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
       return;
     }
     this.closed = true;
+    this._closeCause = cause;
     // Safe to iterate directly: each rejector only deletes itself from the set.
     for (const rejectPending of this._pendingRequests) {
       rejectPending(cause);
@@ -217,6 +232,45 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
     }
     for (const listener of this._messageListeners) {
       listener(message);
+    }
+  }
+
+  /**
+   * Env for a process worker. Also snapshots the runner data, which goes over
+   * IPC on request (see `common/process-data.ts`); throws if not JSON-serializable.
+   */
+  protected _processEnv(): NodeJS.ProcessEnv {
+    try {
+      this._processData = JSON.stringify(this._data || {});
+    } catch (error: any) {
+      throw new TypeError(`Runner data must be JSON-serializable: ${error?.message || error}`, {
+        cause: error,
+      });
+    }
+    return hostEnv({ ENV_RUNNER_NAME: this._name });
+  }
+
+  /**
+   * Process worker messages: answer the `request-init-data` handshake with the
+   * runner data (internal, not forwarded to listeners), handle everything else.
+   */
+  protected _handleProcessMessage(message: any) {
+    if (message?.event !== "request-init-data") {
+      this._handleMessage(message);
+      return;
+    }
+    if (this.closed) {
+      return;
+    }
+    try {
+      this.sendMessage({ event: "init-data", data: this._processData ?? "{}" });
+    } catch (error: any) {
+      const cause = new Error(
+        `Failed to send runner data to the worker over IPC: ${error?.message || error}`,
+        { cause: error },
+      );
+      console.error(`[env-runner] ${cause.message}`);
+      this.close(cause);
     }
   }
 
@@ -281,6 +335,7 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
     // Keep the original sources (including factories) so `invalidateModule()`
     // can re-run a factory for fresh contents.
     this._virtualSources = virtual;
+    warnVirtualPathCollisions(Object.keys(virtual ?? {}));
     if (!virtual || !Object.values(virtual).some((v) => typeof v === "function")) {
       return undefined;
     }
@@ -309,17 +364,17 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
 
   /**
    * Run `init` once `data.virtual` is resolved (synchronously without factories).
-   * A failing factory closes the runner with the error as cause.
+   * A failing factory (or deferred `init`, e.g. a spawn error) closes the runner
+   * with the error as cause.
    */
   protected _initWithVirtualData(init: () => void): void {
     const pending = this._resolveVirtualData();
     if (pending) {
-      pending.then(
-        () => {
+      pending
+        .then(() => {
           if (!this.closed) init();
-        },
-        (error) => this.close(error),
-      );
+        })
+        .catch((error) => this.close(error));
     } else {
       init();
     }
@@ -343,4 +398,8 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
   protected abstract _runtimeType(): string;
 
   // #endregion
+}
+
+function closedBeforeReadyError(cause: unknown): Error {
+  return new Error("Runner closed before becoming ready", cause ? { cause } : undefined);
 }

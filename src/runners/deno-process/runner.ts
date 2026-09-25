@@ -6,7 +6,6 @@ import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import { BaseEnvRunner } from "../../common/base-runner.ts";
-import { hostEnv } from "../../common/host-env.ts";
 import type { EnvRunnerData } from "../../common/base-runner.ts";
 
 export type { EnvRunnerData as DenoProcessEnvRunnerData } from "../../common/base-runner.ts";
@@ -73,10 +72,7 @@ export class DenoProcessEnvRunner extends BaseEnvRunner {
       "deno",
       ["run", "-A", "--node-modules-dir=auto", "--no-lock", ...(execArgv || []), this._workerEntry],
       {
-        env: hostEnv({
-          ENV_RUNNER_NAME: this._name,
-          ENV_RUNNER_DATA: JSON.stringify(this._data || {}),
-        }),
+        env: this._processEnv(),
         stdio: ["pipe", "pipe", "pipe", "ipc"],
         serialization: "json",
       },
@@ -95,7 +91,7 @@ export class DenoProcessEnvRunner extends BaseEnvRunner {
     });
 
     child.on("message", (message: any) => {
-      this._handleMessage(message);
+      this._handleProcessMessage(message);
     });
 
     child.stdout?.pipe(process.stdout);

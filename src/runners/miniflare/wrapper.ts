@@ -165,6 +165,13 @@ async function __loadEntry(env, path) {
   return mod.default || mod;
 }
 
+// Where an entry load error was thrown (first stack frame), so one thrown by a
+// virtual module names its key (\`#config:2:7\`). workerd's messages don't.
+function __errorLocation(e) {
+  const location = /\\n\\s+at (?:async )?(?:.* \\()?([^\\n()]+:\\d+:\\d+)\\)?/.exec(String(e?.stack))?.[1];
+  return location ? " (at " + location + ")" : "";
+}
+
 function __sendMessage(message) {
   const payload = JSON.stringify(message);
   const env = __ipcEnv;
@@ -248,7 +255,8 @@ export default {
           __userEntry = entry;
         }
       } catch (e) {
-        return new Response("Failed to load entry: " + String(e), { status: 500 });
+        const message = "Failed to load entry: " + String(e) + __errorLocation(e);
+        return new Response(message, { status: 500 });
       }
 
       const pair = new WebSocketPair();

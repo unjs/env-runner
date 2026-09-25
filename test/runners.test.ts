@@ -339,6 +339,37 @@ for (const runnerDef of runners) {
       expect(runner.ready).toBe(true);
     });
 
+    // The waits below outlast the test timeout, so only a prompt rejection passes.
+    // Miniflare is skipped: its async init doesn't stop when closed mid-start.
+    it.skipIf(name === "MiniflareEnvRunner")(
+      "waitForReady rejects promptly with the close cause when closed before ready",
+      async () => {
+        const r = create(opts("test-wait-ready-closed"));
+        runner = r;
+        const cause = new Error("closed early");
+        const rejected = expect(r.waitForReady(60_000)).rejects.toMatchObject({
+          message: "Runner closed before becoming ready",
+          cause,
+        });
+        await r.close(cause);
+        await rejected;
+        // Later calls on the closed runner report the cause too.
+        await expect(r.waitForReady()).rejects.toMatchObject({ cause });
+      },
+    );
+
+    // `self` closes without any worker message here (it used to time out).
+    it("waitForReady rejects promptly with the entry error when the entry fails to load", async () => {
+      runner = create(
+        opts("test-wait-ready-bad-entry", {
+          data: { entry: resolve(_dir, "./fixtures/does-not-exist.mjs") },
+        }),
+      );
+      const error = await runner.waitForReady(60_000).catch((error) => error);
+      expect(error?.message).toBe("Runner closed before becoming ready");
+      expect(String(error?.cause?.message)).toContain("does-not-exist");
+    });
+
     it("inspect returns formatted string", async () => {
       runner = create(opts("test-inspect"));
       const pending = inspect(runner);
@@ -366,7 +397,13 @@ const reloadRunners = [
     create: (opts: any) => new BunProcessEnvRunner(opts),
     skip: !hasBun,
   },
-  // SelfEnvRunner reloadModule works in real Node.js but not under vitest's module transform
+  {
+    name: "DenoProcessEnvRunner",
+    create: (opts: any) => new DenoProcessEnvRunner(opts),
+    skip: !hasDeno,
+  },
+  // In-process: under vitest, the entry goes through vitest's module runner.
+  { name: "SelfEnvRunner", create: (opts: any) => new SelfEnvRunner(opts) },
 ];
 
 for (const { name, create, skip } of reloadRunners) {
@@ -400,6 +437,30 @@ for (const { name, create, skip } of reloadRunners) {
 
       const res2 = await runner.fetch("http://localhost/");
       expect(await res2.text()).toBe("v2");
+    });
+
+    // The entry is re-imported under its own file URL (plus a cache-busting
+    // query), not as a `data:` URL, so its relative imports keep resolving.
+    it("reloads an entry with relative imports, keeping its dependencies cached", async () => {
+      tmpDir = mkdtempSync(join(_dir, ".tmp-reload-"));
+      const entryPath = join(tmpDir, "app.mjs");
+      const depPath = join(tmpDir, "dep.mjs");
+      const makeEntry = (v: number) => `import { dep } from "./dep.mjs";
+export default { fetch() { return new Response("v${v}:" + dep + ":" + (import.meta.dirname === ${JSON.stringify(tmpDir)})); } };`;
+
+      writeFileSync(depPath, `export const dep = "dep1";`);
+      writeFileSync(entryPath, makeEntry(1));
+      runner = create({ name: "test-reload-relative", data: { entry: entryPath } });
+      await runner.waitForReady();
+      expect(await (await runner.fetch("http://localhost/")).text()).toBe("v1:dep1:true");
+
+      for (const v of [2, 3]) {
+        writeFileSync(entryPath, makeEntry(v));
+        writeFileSync(depPath, `export const dep = "dep${v}";`);
+        await runner.reloadModule!();
+        // Fresh entry; its own (disk) dependency stays cached.
+        expect(await (await runner.fetch("http://localhost/")).text()).toBe(`v${v}:dep1:true`);
+      }
     });
 
     it("re-initializes IPC hooks after reload", async () => {
@@ -667,6 +728,88 @@ for (const { name, create, skip } of serverOptionsRunners) {
       expect(runner.address).toMatchObject({ host: "127.0.0.1" });
       expect(runner.address?.port).not.toBe(1);
       expect(runner.address?.port).toBeGreaterThan(0);
+    });
+  });
+}
+
+// --- process runner data (IPC handshake instead of the size-limited env) ---
+
+const appIpcLogEntry = resolve(_dir, "./fixtures/app-ipc-log.mjs");
+
+const processRunners = [
+  { name: "NodeProcessEnvRunner", create: (opts: any) => new NodeProcessEnvRunner(opts) },
+  {
+    name: "BunProcessEnvRunner",
+    create: (opts: any) => new BunProcessEnvRunner(opts),
+    skip: !hasBun,
+  },
+  {
+    name: "DenoProcessEnvRunner",
+    create: (opts: any) => new DenoProcessEnvRunner(opts),
+    skip: !hasDeno,
+  },
+];
+
+for (const { name, create, skip } of processRunners) {
+  describe.skipIf(skip ?? false)(`${name} runner data`, () => {
+    let runner: EnvRunner | undefined;
+
+    afterEach(async () => {
+      await runner?.close();
+      runner = undefined;
+    });
+
+    it("keeps the init-data handshake out of ipc.onMessage and host listeners", async () => {
+      runner = create({ name: "test-data-handshake", data: { entry: appIpcLogEntry } });
+      const hostMessages: unknown[] = [];
+      runner.onMessage((msg) => hostMessages.push(msg));
+      await runner.waitForReady();
+
+      const reply = new Promise<any>((resolve) => {
+        runner!.onMessage((msg: any) => {
+          if (msg?.type === "ipc-log-reply") resolve(msg);
+        });
+      });
+      runner.sendMessage({ type: "ipc-log" });
+      expect((await reply).received).toEqual([{ type: "ipc-log" }]);
+      expect(hostMessages).not.toContainEqual({ event: "request-init-data" });
+    });
+
+    it("delivers data too large for an env var to the built-in worker", async () => {
+      // A single env string is capped at 128 KiB on Linux (`spawn E2BIG`).
+      runner = create({
+        name: "test-data-large",
+        data: { entry: appEntry, blob: "x".repeat(256 * 1024) },
+      });
+      await runner.waitForReady();
+      expect(await (await runner.fetch("/")).text()).toBe("ok");
+    });
+
+    it("throws a clear error for data that isn't JSON-serializable", () => {
+      expect(() =>
+        create({ name: "test-data-bigint", data: { entry: appEntry, big: 1n } }),
+      ).toThrow("Runner data must be JSON-serializable");
+    });
+
+    it("closes with that error (no unhandled rejection) after async virtual factories", async () => {
+      let closeCause: unknown;
+      runner = create({
+        name: "test-data-bigint-factory",
+        hooks: {
+          onClose: (_runner: EnvRunner, cause: unknown) => {
+            closeCause = cause;
+          },
+        },
+        data: {
+          entry: "#entry",
+          big: 1n,
+          virtual: { "#entry": async () => `export default { fetch: () => new Response("") };` },
+        },
+      });
+      await waitFor(() => runner!.closed);
+      expect(String((closeCause as Error)?.message)).toContain(
+        "Runner data must be JSON-serializable",
+      );
     });
   });
 }
