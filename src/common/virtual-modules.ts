@@ -86,6 +86,11 @@ export async function registerVirtualModules(
       if (index !== -1) {
         _bunRegistrations.splice(index, 1);
       }
+      // Its `onLoad` filters stay installed, so its paths resolve to the real
+      // files from now on (like a removed key).
+      for (const path of [...registration.paths.keys(), ...registration.removed.keys()]) {
+        _bunReleasedPaths.add(path);
+      }
     });
   }
   console.warn(
@@ -316,6 +321,8 @@ let _bunDynamicCallbacks = false;
 // updates, the catch-all's cheap pre-check. Never shrinks: removed path keys
 // still resolve.
 const _bunDynamicNames = new Set<string>();
+// Paths of unregistered registrations, resolved to the real files.
+const _bunReleasedPaths = new Set<string>();
 
 function _createBunRegistration(
   virtual: Record<string, string>,
@@ -506,6 +513,9 @@ function _resolveBunModule(args: { path: string; importer: string }) {
     );
     _addToSetMap(registration.served, key, served);
     return { path: served };
+  }
+  if (path && _bunReleasedPaths.has(path)) {
+    return { path: path + _withBunMarker(query, BUN_DISK_MARKER) };
   }
   return undefined;
 }
