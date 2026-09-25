@@ -61,7 +61,7 @@ export default {
 
 ## Miniflare
 
-Details in [`.agents/MINIFLARE.md`](.agents/MINIFLARE.md). In short: the wrapper handles requests like `srvx/cloudflare` (plugins/middleware/error, `request.runtime`/`ip`/`waitUntil`, internal `__ENV_RUNNER_*` bindings hidden from `env`); `wrangler` (`true` | path | inline config) + `wranglerConfigPath`/`wranglerEnv`/`wranglerEnvFiles` load wrangler configs into Miniflare options, with unsupported bindings dropped (warned) and user `miniflareOptions` winning.
+Details in [`.agents/MINIFLARE.md`](.agents/MINIFLARE.md). In short: the wrapper handles requests like `srvx/cloudflare` (plugins/middleware/error, `request.runtime`/`ip`/`waitUntil`, internal `__ENV_RUNNER_*` bindings hidden from `env`); `wrangler` (`true` | path | inline config) + `wranglerConfigPath`/`wranglerEnv`/`wranglerEnvFiles` load wrangler configs into Miniflare options, with unsupported bindings dropped (warned) and user `miniflareOptions` winning. Supports miniflare v4 and v5: options are built in the v4 format and converted with v5's `convertV4MiniflareOptions`.
 
 ## Reference docs (`.agents/`)
 

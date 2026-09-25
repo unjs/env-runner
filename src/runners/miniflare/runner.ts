@@ -3,7 +3,7 @@ import type { WorkerHooks } from "../../types.ts";
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { resolveModulePath } from "exsolve";
 import { init as initCjsLexer, parse as parseCjs } from "cjs-module-lexer";
 import { init as initEsmLexer, parse as parseEsm } from "es-module-lexer";
@@ -38,11 +38,13 @@ export interface MiniflareExportInfo {
   type?: "DurableObject" | "WorkerEntrypoint" | "class";
 }
 
-/** The `miniflare` package namespace, as imported by the app. */
+/** The `miniflare` package namespace (v4 or v5), as imported by the app. */
 export interface MiniflareModule {
   Miniflare: new (options: any) => any;
-  /** Newest date the installed `workerd` supports, clamped to today. */
+  /** Newest date the installed `workerd` supports, clamped to today (v4 only). */
   supportedCompatibilityDate?: string;
+  /** Converts v4 options, which the runner builds, to the v5 format (v5 only). */
+  convertV4MiniflareOptions?: (options: any) => any;
   [key: string]: unknown;
 }
 
@@ -91,10 +93,11 @@ export interface MiniflareEnvRunnerOptions {
    *
    * Options a single dev worker can't run (`assets`, services, queue consumers,
    * workflows, tails, other-script Durable Objects) are dropped with a warning.
-   * `defaultPersistRoot` defaults to `.wrangler/state/v3` next to the config
-   * (else cwd), shared with `wrangler dev`. The `wrangler` package gives full
-   * fidelity (and may run its npm update check); without it only plain JSON is
-   * read. `miniflareOptions` always win.
+   * `defaultPersistRoot` (v5: `resourcePersistencePath`) defaults to
+   * `.wrangler/state/v3` next to the config (else cwd), shared with
+   * `wrangler dev`. The `wrangler` package gives full fidelity (and may run its
+   * npm update check); without it only plain JSON is read. `miniflareOptions`
+   * always win.
    */
   wrangler?: boolean | string | WranglerInlineConfig;
   /**
@@ -402,7 +405,8 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
   }
 
   async #initAsync() {
-    const { Miniflare, supportedCompatibilityDate } = await this.#resolveMiniflare();
+    const miniflare = await this.#resolveMiniflare();
+    const supportedCompatibilityDate = await resolveSupportedCompatibilityDate(miniflare);
 
     const entryPath = this._data?.entry as string | undefined;
     const virtual = await this.#prepareVirtualModules();
@@ -543,8 +547,10 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
       };
 
       // When transformRequest is provided, add module rules so miniflare's
-      // ModuleLocator doesn't reject non-JS extensions (e.g. .ts, .tsx, .jsx)
-      if (this.#transformRequest && !options.modulesRules) {
+      // ModuleLocator doesn't reject non-JS extensions (e.g. .ts, .tsx, .jsx).
+      // v5 has no ModuleLocator (and rejects `modulesRules`): imports all go
+      // through the fallback service.
+      if (this.#transformRequest && !options.modulesRules && !miniflare.convertV4MiniflareOptions) {
         options.modulesRules = [
           { type: "ESModule", include: ["**/*.ts", "**/*.tsx", "**/*.jsx", "**/*.mts"] },
         ];
@@ -735,7 +741,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
     }
 
     if (!this.#miniflare) {
-      this.#miniflare = new Miniflare(options);
+      this.#miniflare = new miniflare.Miniflare(toMiniflareOptions(miniflare, options));
       await this.#miniflare.ready;
       if (this.#persistent && this.#cacheKey) {
         this.#cacheEntry = {
@@ -796,6 +802,51 @@ function detectExportedClasses(
   return [...names];
 }
 
+/**
+ * Options are built in the v4 format (as wrangler's
+ * `unstable_getMiniflareWorkerOptions` returns them); v5 converts them.
+ */
+function toMiniflareOptions(
+  miniflare: MiniflareModule,
+  options: Record<string, unknown>,
+): Record<string, unknown> {
+  if (!miniflare.convertV4MiniflareOptions) {
+    return options;
+  }
+  // v5 replaced `defaultPersistRoot` with `resourcePersistencePath`; the
+  // converter drops it.
+  const { defaultPersistRoot, ...rest } = options;
+  return miniflare.convertV4MiniflareOptions({
+    resourcePersistencePath: defaultPersistRoot,
+    ...rest,
+  });
+}
+
+/**
+ * Newest date the installed `workerd` supports, clamped to today. miniflare v4
+ * exports it; for v5, read `workerd` (a miniflare dependency) the same way.
+ */
+async function resolveSupportedCompatibilityDate(
+  miniflare: MiniflareModule,
+): Promise<string | undefined> {
+  if (typeof miniflare.supportedCompatibilityDate === "string") {
+    return miniflare.supportedCompatibilityDate;
+  }
+  try {
+    const from = [process.cwd() + "/", import.meta.url];
+    const miniflarePath = resolveModulePath("miniflare", { from, try: true });
+    const workerdPath = resolveModulePath("workerd", { from: miniflarePath || from });
+    const { compatibilityDate } = await import(pathToFileURL(workerdPath).href);
+    if (!_isDateString(compatibilityDate)) {
+      return undefined;
+    }
+    const today = new Date().toISOString().slice(0, 10);
+    return compatibilityDate > today ? today : compatibilityDate;
+  } catch {
+    return undefined;
+  }
+}
+
 /** First defined date (highest precedence first), capped at `supported` with a warning. */
 function resolveCompatibilityDate(
   candidates: (string | undefined)[],
@@ -834,10 +885,14 @@ function _isDateString(value: string): boolean {
   return /^\d{4}-\d{2}-\d{2}$/.test(value);
 }
 
-/** Whether user `miniflareOptions` configure persistence (`defaultPersistRoot` or any `*Persist`). */
+/**
+ * Whether user `miniflareOptions` configure persistence (`defaultPersistRoot`,
+ * any `*Persist`, or v5's `resourcePersistencePath`).
+ */
 function hasUserPersistOptions(options: Record<string, unknown>): boolean {
   return Object.keys(options).some(
-    (key) => key === "defaultPersistRoot" || key.endsWith("Persist"),
+    (key) =>
+      key === "defaultPersistRoot" || key === "resourcePersistencePath" || key.endsWith("Persist"),
   );
 }
 

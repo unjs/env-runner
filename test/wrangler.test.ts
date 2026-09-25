@@ -1,3 +1,4 @@
+import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { dirname, join, sep } from "node:path";
 import { existsSync, mkdirSync, writeFileSync, mkdtempSync, rmSync } from "node:fs";
@@ -16,6 +17,45 @@ import type { EnvRunner } from "../src/index.ts";
 // built-in minimal reader.
 
 const _dir = dirname(fileURLToPath(import.meta.url));
+
+// Newest date the installed workerd supports, clamped to today (miniflare v4
+// exports it as `supportedCompatibilityDate`, v5 doesn't).
+const supportedCompatibilityDate: string = (() => {
+  const exported = (miniflare as { supportedCompatibilityDate?: string })
+    .supportedCompatibilityDate;
+  if (exported) {
+    return exported;
+  }
+  const _require = createRequire(import.meta.url);
+  const { compatibilityDate } = createRequire(_require.resolve("miniflare"))("workerd");
+  const today = new Date().toISOString().slice(0, 10);
+  return compatibilityDate > today ? today : compatibilityDate;
+})();
+
+// Persist root in the options the runner built (v5 names it `resourcePersistencePath`).
+function persistRoot(options: Record<string, any>): string | undefined {
+  return options.defaultPersistRoot ?? options.resourcePersistencePath;
+}
+
+// `miniflare` module that passes the options the runner built (v4 format) to
+// `capture` before v5 converts them or v4 constructs from them.
+function capturingMiniflare(capture: (options: any) => any): typeof miniflare {
+  const mf = miniflare as any;
+  if (mf.convertV4MiniflareOptions) {
+    return {
+      ...mf,
+      convertV4MiniflareOptions: (options: any) => mf.convertV4MiniflareOptions(capture(options)),
+    };
+  }
+  return {
+    ...mf,
+    Miniflare: class extends mf.Miniflare {
+      constructor(options: any) {
+        super(capture(options));
+      }
+    },
+  };
+}
 
 // Entry that echoes selected bindings from `env` as JSON.
 const ENV_ENTRY = `export default {
@@ -134,21 +174,21 @@ async function runWranglerCase(c: WranglerCase): Promise<{ json: any; ctx: Wrang
   }
 
   const ctx = { tmpDir, entryPath, mfOptions: {} } as WranglerCaseContext;
-  class CapturingMiniflare extends miniflare.Miniflare {
-    constructor(options: any) {
-      ctx.mfOptions = options;
-      // Miniflare creates persist dirs eagerly (e.g. `cache/`). Keep tests
-      // from writing state outside the temp dir (cwd-anchored defaults would
-      // land in the repo root): assert on the captured options instead.
-      const root = options.defaultPersistRoot;
-      const inTmp = typeof root !== "string" || root.startsWith(ctx.tmpDir + sep);
-      super(inTmp ? options : { ...options, defaultPersistRoot: undefined });
-    }
-  }
+  const capturing = capturingMiniflare((options) => {
+    ctx.mfOptions = options;
+    // Miniflare creates persist dirs eagerly (e.g. `cache/`). Keep tests
+    // from writing state outside the temp dir (cwd-anchored defaults would
+    // land in the repo root): assert on the captured options instead.
+    const root = persistRoot(options);
+    const inTmp = typeof root !== "string" || root.startsWith(ctx.tmpDir + sep);
+    return inTmp
+      ? options
+      : { ...options, defaultPersistRoot: undefined, resourcePersistencePath: undefined };
+  });
 
   runner = new MiniflareEnvRunner({
     name: c.name,
-    miniflare: { ...miniflare, Miniflare: CapturingMiniflare },
+    miniflare: capturing,
     data: { entry: entryPath },
     wranglerModule: c.wranglerSpecifier ?? (c.withWrangler ? wrangler : false),
     ...c.options({ tmpDir, entryPath }),
@@ -268,7 +308,7 @@ const SHARED_CASES: WranglerCase[] = [
     }),
     assert: (json, { mfOptions }) => {
       expect(json.greeting).toBe("latest");
-      expect(mfOptions.compatibilityDate).toBe(miniflare.supportedCompatibilityDate);
+      expect(mfOptions.compatibilityDate).toBe(supportedCompatibilityDate);
     },
   },
   {
@@ -287,7 +327,7 @@ const SHARED_CASES: WranglerCase[] = [
     }),
     assert: (json, { mfOptions }) => {
       expect(json.greeting).toBe("clamped");
-      expect(mfOptions.compatibilityDate).toBe(miniflare.supportedCompatibilityDate);
+      expect(mfOptions.compatibilityDate).toBe(supportedCompatibilityDate);
     },
     warns: ['compatibility date "2999-01-01" is newer than the installed workerd supports'],
   },
@@ -407,7 +447,7 @@ const SHARED_CASES: WranglerCase[] = [
     assert: (json, { tmpDir, mfOptions }) => {
       expect(json.value).toBe("value");
       const root = join(tmpDir, ".wrangler/state/v3");
-      expect(mfOptions.defaultPersistRoot).toBe(root);
+      expect(persistRoot(mfOptions)).toBe(root);
       expect(existsSync(join(root, "kv"))).toBe(true);
     },
   },
@@ -424,7 +464,7 @@ const SHARED_CASES: WranglerCase[] = [
     options: () => ({ wrangler: true, miniflareOptions: { kvPersist: false } }),
     assert: (json, { tmpDir, mfOptions }) => {
       expect(json.value).toBe("value");
-      expect(mfOptions.defaultPersistRoot).toBeUndefined();
+      expect(persistRoot(mfOptions)).toBeUndefined();
       expect(existsSync(join(tmpDir, ".wrangler"))).toBe(false);
     },
   },
@@ -432,14 +472,14 @@ const SHARED_CASES: WranglerCase[] = [
     name: "defaults defaultPersistRoot to cwd for an inline-only config",
     options: () => ({ wrangler: { compatibility_date: "2024-09-01" } }),
     assert: (_json, { mfOptions }) =>
-      expect(mfOptions.defaultPersistRoot).toBe(join(process.cwd(), ".wrangler/state/v3")),
+      expect(persistRoot(mfOptions)).toBe(join(process.cwd(), ".wrangler/state/v3")),
   },
   {
     name: "defaults defaultPersistRoot to cwd when wrangler: true finds no config",
     options: () => ({ wrangler: true }),
     assert: (json, { mfOptions }) => {
       expect(json).toEqual({ greeting: null, tier: null });
-      expect(mfOptions.defaultPersistRoot).toBe(join(process.cwd(), ".wrangler/state/v3"));
+      expect(persistRoot(mfOptions)).toBe(join(process.cwd(), ".wrangler/state/v3"));
     },
     warns: ["wrangler config requested but none found"],
   },
@@ -451,7 +491,7 @@ const SHARED_CASES: WranglerCase[] = [
     }),
     assert: (json, { tmpDir, mfOptions }) => {
       expect(json.greeting).toBe("inline");
-      expect(mfOptions.defaultPersistRoot).toBe(join(tmpDir, "config/.wrangler/state/v3"));
+      expect(persistRoot(mfOptions)).toBe(join(tmpDir, "config/.wrangler/state/v3"));
     },
     warns: ["wrangler config requested but not found"],
   },
@@ -566,7 +606,7 @@ const INSTALLED_CASES: WranglerCase[] = [
     assert: (json, { tmpDir, mfOptions }) => {
       expect(json).toEqual({ greeting: "from-file", tier: "from-file" });
       // The file still counts as loaded (persist root anchored next to it).
-      expect(mfOptions.defaultPersistRoot).toBe(join(tmpDir, ".wrangler/state/v3"));
+      expect(persistRoot(mfOptions)).toBe(join(tmpDir, ".wrangler/state/v3"));
     },
     warns: ["failed to load wrangler config (inline)"],
     assertWarnings: (warnings) =>
@@ -780,15 +820,9 @@ describe("wrangler config loading", () => {
     const entryPath = join(dir, "worker.mjs");
     writeFileSync(entryPath, OK_ENTRY);
     let mfOptions: Record<string, any> = {};
-    class CapturingMiniflare extends miniflare.Miniflare {
-      constructor(opts: any) {
-        mfOptions = opts;
-        super(opts);
-      }
-    }
     runner = new MiniflareEnvRunner({
       name: "wrangler-load",
-      miniflare: { ...miniflare, Miniflare: CapturingMiniflare },
+      miniflare: capturingMiniflare((opts) => (mfOptions = opts)),
       data: { entry: entryPath },
       wranglerModule: false,
       miniflareOptions: { kvPersist: false },
