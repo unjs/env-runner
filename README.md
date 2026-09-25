@@ -328,7 +328,7 @@ Two path keys naming the same file (`/app/x.mjs` and `file:///app/x.mjs`) can't 
 
 Keys match **every importer** in the worker, dependencies included, like an import map entry. A bare key such as `react` replaces that package everywhere (useful to alias or stub it), and a `#name` key also replaces a dependency's own `#name` [subpath import](https://nodejs.org/api/packages.html#subpath-imports). There is no warning for this, since overriding a package is often the point, so give your own modules distinctive names (`#app/config` rather than `#utils`).
 
-Each source may also be a **factory** `() => string | Promise<string>` instead of a literal string — useful for lazily computed or asynchronously loaded sources:
+Each source may also be a **factory** returning a source (or a promise of one) — useful for lazily computed or asynchronously loaded sources:
 
 ```ts
 await using runner = new NodeWorkerEnvRunner({
@@ -343,7 +343,7 @@ await using runner = new NodeWorkerEnvRunner({
 });
 ```
 
-Factories are invoked once on the host (before the worker is spawned), so the worker always receives plain strings — functions can't cross the `workerData`/`JSON` boundary, and Node's synchronous load hook can't await. For the same reason, **all** factories are resolved eagerly at startup (in parallel), not lazily on first import — so keep them cheap, or use plain strings for sources that don't need computation. Maps containing only strings skip this step entirely.
+Factories are invoked once on the host (before the worker is spawned), so the worker always receives resolved sources — functions can't cross the `workerData`/`JSON` boundary, and Node's synchronous load hook can't await. For the same reason, **all** factories are resolved eagerly at startup (in parallel), not lazily on first import — so keep them cheap, or use plain sources for modules that don't need computation. Maps without factories skip this step entirely.
 
 To refresh a single virtual module without restarting the worker, call `invalidateModule(specifier)`: a factory-valued source is re-run on the host and the module is invalidated in the worker so its **next import evaluates fresh**. Virtual modules that import the invalidated one (directly or transitively) are invalidated along with it, so the fresh module is picked up even through intermediate virtual importers. On Node.js, Bun and Deno this follows the imports that were actually resolved, and on miniflare the import specifiers of the virtual sources, including relative ones between path keys. On Node.js and Deno it also covers **real files** on the way from the entry, such as a `./lib.mjs` importing `#config`: they are re-evaluated on the next reload too, while files that don't depend on the module stay cached. CommonJS files are never re-evaluated. On Bun and miniflare, a real file other than the entry keeps the old module. Already-imported modules keep their instances, so pair it with `reloadModule()` to re-import the entry graph:
 
@@ -372,9 +372,11 @@ Changed and removed keys are invalidated like `invalidateModule()` does, togethe
 
 Calls are applied one at a time in call order (a later call never loses to a slower factory of an earlier one), and `reloadModule()` waits for pending ones. A call made before the runner is ready waits for it. `invalidateModule(specifier)` is the same as updating the key with its current source. The runner keeps its own copy of the map, never changing your `data.virtual`. `RunnerManager.updateVirtualModules()` marks the manager dirty like `invalidateModule()`, and `EnvServer` also keeps the changes for the runners it creates later (`reload()`, watch mode). Changes made before the server started are only recorded, and the first runner starts with them.
 
-The module format is derived from the specifier extension: `.ts`/`.mts` sources are served as **TypeScript** and `.json` sources as **JSON modules**; everything else is plain JavaScript ESM:
+Each module has a **format**. By default it follows the key's extension, like Node.js does for files: `.cjs` is CommonJS, `.ts`/`.mts` TypeScript, `.cts` CommonJS TypeScript, `.json` JSON, `.jsx`/`.tsx` JSX and `.wasm` WebAssembly. Any other string is an ES module, and any other `Uint8Array` raw bytes. To set the format explicitly, for example on a key without an extension, pass `{ source, format }`:
 
 ```ts
+import { readFileSync } from "node:fs";
+
 await using runner = new NodeWorkerEnvRunner({
   name: "my-app",
   data: {
@@ -382,23 +384,52 @@ await using runner = new NodeWorkerEnvRunner({
     virtual: {
       "#entry.ts": `
         import { getGreeting } from "#util.ts";
-        import config from "#config.json";
-        const handler: () => Response = () => new Response(getGreeting(config.name));
+        import config from "#config";
+        import legacy from "#legacy.cjs";
+        import logo from "#logo";
+        import add from "#add.wasm";
+        const { exports } = await WebAssembly.instantiate(add);
+        const handler: () => Response = () =>
+          new Response(\`\${getGreeting(config.name)} \${legacy.answer} \${logo.length} \${exports.add(1, 2)}\`);
         export default { fetch: handler };
       `,
       "#util.ts": `export function getGreeting(name: string): string {
         return \`Hello, \${name}!\`;
       }`,
-      "#config.json": JSON.stringify({ name: "virtual" }),
+      "#config": { source: JSON.stringify({ name: "virtual" }), format: "json" },
+      "#legacy.cjs": `module.exports = { answer: 42 };`,
+      "#logo": readFileSync("logo.png"), // a Uint8Array: `bytes`
+      "#add.wasm": readFileSync("add.wasm"),
     },
   },
 });
 ```
 
-- **TypeScript** is type-stripped by Node's native [type stripping](https://nodejs.org/api/typescript.html#type-stripping) (Node.js >= 22.18 / 23.6 — erasable syntax only) and by Bun's `ts` loader. On Deno, custom load hooks bypass its native type stripping, so sources are pre-stripped with [`module.stripTypeScriptTypes`](https://docs.deno.com/api/node/module/~/Module.stripTypeScriptTypes) (Deno >= 2.8.2); on older Deno without it, virtual `.ts`/`.mts` sources **throw at registration** — pass pre-transpiled JavaScript instead. On miniflare, sources are likewise pre-stripped with `module.stripTypeScriptTypes` on the host (workerd does not parse TypeScript).
-- **JSON** sources expose the parsed value as the default export on all runtimes. The `with { type: "json" }` import attribute is optional on Node.js and Bun; on Deno and miniflare it must be **omitted** (static imports carrying an import attribute bypass `registerHooks` resolution on Deno, and workerd rejects import attributes outright).
+| Format                | Default for                | Source       | Importing it gives                                |
+| --------------------- | -------------------------- | ------------ | ------------------------------------------------- |
+| `module`              | other string sources       | string       | the ES module                                     |
+| `commonjs`            | `.cjs`                     | string       | `module.exports` as default export, named exports |
+| `module-typescript`   | `.ts`, `.mts`              | string       | the ES module, types stripped                     |
+| `commonjs-typescript` | `.cts`                     | string       | like `commonjs`, types stripped                   |
+| `json`                | `.json`                    | string       | the parsed value as default export                |
+| `jsx`, `tsx`          | `.jsx`, `.tsx`             | string       | the ES module (Bun only)                          |
+| `text`                | —                          | string       | the string as default export                      |
+| `bytes`               | other `Uint8Array` sources | `Uint8Array` | a `Uint8Array` as default export                  |
+| `wasm`                | `.wasm`                    | `Uint8Array` | a compiled `WebAssembly.Module` as default export |
 
-Virtual modules are registered inside the worker, before the entry is imported. On Node.js (>= 22.15 / 23.5) and Deno (>= 2.8) this uses [ESM customization hooks](https://nodejs.org/api/module.html#moduleregisterhooksoptions) (`module.registerHooks`); on Bun (which does not implement `registerHooks`) it uses a [`Bun.plugin()`](https://bun.com/docs/runtime/plugins) runtime plugin instead, also for the Node.js runners when the host runtime is Bun. The source string is treated as an ES module, and virtual specifiers (including a virtual entry) resolve across `reloadModule()`. On runtimes supporting neither mechanism, a warning is logged and registration is skipped. When the worker shuts down gracefully the registration is unregistered again (the `registerHooks` registration is deregistered; on Bun, which has no plugin-removal API, the registration is detached so fresh loads and reloads stop resolving, and an overridden real file loads from disk again).
+The code formats are named like Node's [load formats](https://nodejs.org/api/module.html#loadurl-context-nextload), and `text` and `bytes` like the `with { type }` import attributes proposed for them (import them without attributes, though). An unknown format, or a source that doesn't fit its format (a `Uint8Array` for `json`, a string for `wasm`, bytes that aren't valid WebAssembly), closes the runner at startup with an error naming the key, or rejects `updateVirtualModules()` before anything changes.
+
+- **TypeScript** is type-stripped by Node's native [type stripping](https://nodejs.org/api/typescript.html#type-stripping) (Node.js >= 22.18 / 23.6 — erasable syntax only) and by Bun's `ts` loader. On Deno, custom load hooks bypass its native type stripping, so sources are pre-stripped with [`module.stripTypeScriptTypes`](https://docs.deno.com/api/node/module/~/Module.stripTypeScriptTypes) (Deno >= 2.8.2); on older Deno without it, virtual TypeScript sources **throw at registration** — pass pre-transpiled JavaScript instead. On miniflare, sources are likewise pre-stripped with `module.stripTypeScriptTypes` on the host (workerd does not parse TypeScript).
+- **JSON** sources expose the parsed value as the default export on all runtimes. The `with { type: "json" }` import attribute is optional on Node.js and Bun; on Deno and miniflare it must be **omitted** (static imports carrying an import attribute bypass `registerHooks` resolution on Deno, and workerd rejects import attributes outright).
+- **CommonJS** is loaded natively by Node.js and workerd (miniflare). Bun and Deno only parse in-memory sources as ES modules, so there the source runs inside an ES module wrapper, as strict-mode code. Named exports are detected like Node.js does ([cjs-module-lexer](https://github.com/nodejs/cjs-module-lexer)), but re-exports (`module.exports = require("./other.cjs")`) only add named exports on Node.js. `require()` resolves packages, real files and other virtual modules, with these exceptions:
+  - On Deno, `require()` only reaches real files and packages, not virtual modules (Deno reads required files from disk), and requiring an ES module crashes Deno 2.9 while module hooks are registered (a Deno bug).
+  - On miniflare, a virtual module that is `require()`d keeps its first instance when it changes (`invalidateModule()`, updates): only `import` specifiers are rewritten. Import it instead, or restart the runner.
+  - On Node.js, after a module re-exported by CommonJS (`module.exports = require("./dep.cjs")`) changes, Node reads it as an empty, circular module (this happens with real files too after deleting them from `require.cache`). Assign it first (`const dep = require("./dep.cjs"); module.exports = dep;`).
+- **Text and bytes** can't be imported from memory natively on every runtime, so they are served as ES modules where needed. `bytes` gives each module instance its own `Uint8Array`. Bytes survive every transport, including the process runners' JSON IPC (as base64) and `updateVirtualModules()`.
+- **WebAssembly** default-exports a compiled [`WebAssembly.Module`](https://developer.mozilla.org/docs/WebAssembly/Reference/JavaScript_interface/Module) on every runtime, so instantiate it yourself with `WebAssembly.instantiate(module, imports)`. This follows workerd, which compiles `.wasm` modules ahead of time and disallows compiling Wasm at runtime. Node.js and Deno's own `.wasm` imports instantiate the module instead ([Wasm ESM integration](https://github.com/WebAssembly/esm-integration)), and Bun's give a file path, so those aren't used.
+- **JSX** is only supported on Bun, by its `jsx`/`tsx` loaders (configure the JSX runtime with `tsconfig.json` or pragma comments like `/** @jsxImportSource preact */`). Node.js, Deno and miniflare can't load JSX from memory and fail with an error naming the key: pre-transpile it to JavaScript, and pass `{ source, format: "module" }` to keep a `.jsx`/`.tsx` key.
+
+Virtual modules are registered inside the worker, before the entry is imported. On Node.js (>= 22.15 / 23.5) and Deno (>= 2.8) this uses [ESM customization hooks](https://nodejs.org/api/module.html#moduleregisterhooksoptions) (`module.registerHooks`); on Bun (which does not implement `registerHooks`) it uses a [`Bun.plugin()`](https://bun.com/docs/runtime/plugins) runtime plugin instead, also for the Node.js runners when the host runtime is Bun. Each source is served in its format, and virtual specifiers (including a virtual entry) resolve across `reloadModule()`. On runtimes supporting neither mechanism, a warning is logged and registration is skipped. When the worker shuts down gracefully the registration is unregistered again (the `registerHooks` registration is deregistered; on Bun, which has no plugin-removal API, the registration is detached so fresh loads and reloads stop resolving, and an overridden real file loads from disk again).
 
 On `MiniflareEnvRunner` there is no in-worker registration: the runner's module fallback service serves virtual specifiers to workerd directly (taking precedence over disk files and the `transformRequest` pipeline, so a virtual key overrides a real file with the same path). Named `exports` (Durable Objects / WorkerEntrypoints) also work with virtual entries. One limitation on miniflare v4: a **real** entry with auto-detected named exports can't import virtual modules, because miniflare's module locator reads its imports from disk at startup. Use a virtual entry, a separate `exports` module or miniflare v5 instead.
 

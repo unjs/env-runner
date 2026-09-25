@@ -1160,6 +1160,431 @@ for (const { name, create, skip, bun, deno, miniflare } of runners) {
   });
 }
 
+// --- Module formats ---
+
+// `(module (func (export "answer") (result i32) i32.const <n>))`
+const answerWasm = (n: number) =>
+  new Uint8Array([
+    0,
+    97,
+    115,
+    109,
+    1,
+    0,
+    0,
+    0,
+    1,
+    5,
+    1,
+    96,
+    0,
+    1,
+    127,
+    3,
+    2,
+    1,
+    0,
+    7,
+    10,
+    1,
+    6,
+    97,
+    110,
+    115,
+    119,
+    101,
+    114,
+    0,
+    0,
+    10,
+    6,
+    1,
+    4,
+    0,
+    65,
+    n,
+    11,
+  ]);
+
+// Every byte value, so an encoding that isn't binary-safe shows.
+const allBytes = new Uint8Array(512).map((_, i) => i % 256);
+
+// Classic JSX runtime: no `react` needed.
+const jsxSource = (types: boolean) =>
+  [
+    "/** @jsxRuntime classic */",
+    "/** @jsx h */",
+    types
+      ? "const h = (tag: string, _props: unknown, ...children: string[]): string =>"
+      : "const h = (tag, _props, ...children) =>",
+    "  `<${tag}>${children.join('')}</${tag}>`;",
+    "export default <b>bold</b>;",
+  ].join("\n");
+
+for (const { name, create, skip, bun, deno, miniflare } of runners) {
+  describe.skipIf(skip ?? false)(`${name} virtual module formats`, () => {
+    let runner: EnvRunner;
+
+    afterEach(async () => {
+      await runner?.close();
+    });
+
+    const text = async () => (await runner.fetch("http://localhost/")).text();
+    const start = async (virtual: Record<string, unknown>, entry = "#entry") => {
+      runner = create({ name: "virtual-formats", data: { entry, virtual } });
+      await runner.waitForReady();
+    };
+    // The close cause of a runner whose virtual modules fail to start.
+    const startError = async (virtual: Record<string, unknown>): Promise<string> => {
+      runner = create({ name: "virtual-formats-error", data: { entry: "#entry", virtual } });
+      const error = await runner.waitForReady().catch((error) => error);
+      return String(error?.cause?.message);
+    };
+
+    it.skipIf(deno && !denoTypeStripping)(
+      "serves extensionless keys in an explicit format",
+      async () => {
+        await start({
+          "#entry": `import config from "#config";
+            import greet from "#greet";
+            export default { fetch: () => new Response(greet(config.name)) };`,
+          "#config": { source: JSON.stringify({ name: "json" }), format: "json" },
+          "#greet": {
+            source: `export default (name: string): string => "hello " + name;`,
+            format: "module-typescript",
+          },
+        });
+        expect(await text()).toBe("hello json");
+      },
+    );
+
+    it("imports CommonJS with `module.exports` as default and named exports", async () => {
+      await start({
+        "#entry": `import lib, { value, sep } from "#lib.cjs";
+          import legacy from "#legacy";
+          export default {
+            fetch: () => new Response([lib.value, value, sep, legacy.kind].join(":")),
+          };`,
+        "#lib.cjs": `const path = require("node:path");
+          exports.sep = path.sep;
+          module.exports.value = "cjs";`,
+        "#legacy": { source: `module.exports = { kind: "explicit" };`, format: "commonjs" },
+      });
+      expect(await text()).toBe("cjs:cjs:/:explicit");
+    });
+
+    it.skipIf(deno && !denoTypeStripping)("imports CommonJS TypeScript (.cts)", async () => {
+      await start({
+        "#entry": `import { total } from "#sum.cts";
+          export default { fetch: () => new Response(String(total)) };`,
+        "#sum.cts": `const add = (a: number, b: number): number => a + b;
+          exports.total = add(1, 2);`,
+      });
+      expect(await text()).toBe("3");
+    });
+
+    // Deno's `require()` resolves through the hooks, but reads from disk.
+    it.skipIf(deno)("requires other virtual modules from CommonJS", async () => {
+      const lib = resolve(ghostDir, "lib.cjs");
+      await start(
+        {
+          [resolve(ghostDir, "entry.mjs")]: `import lib from "./lib.cjs";
+            export default { fetch: () => new Response(lib) };`,
+          [lib]: `module.exports = require("./dep.cjs") + ":" + require("#other.cjs").name;`,
+          [resolve(ghostDir, "dep.cjs")]: `module.exports = "dep";`,
+          "#other.cjs": `exports.name = "other";`,
+        },
+        resolve(ghostDir, "entry.mjs"),
+      );
+      expect(await text()).toBe("dep:other");
+    });
+
+    // Node caches CommonJS instances whatever the URL's version, so changed
+    // keys are evicted from `require.cache`. Not `module.exports =
+    // require(...)`: after an eviction, Node 24 reads that re-export target as
+    // an empty circular module (also with real files). Miniflare doesn't
+    // version `require()` specifiers: the required module keeps its first
+    // instance.
+    it.skipIf(deno || miniflare)("updates modules required by CommonJS", async () => {
+      const entry = resolve(ghostDir, "entry.mjs");
+      const dep = resolve(ghostDir, "dep.cjs");
+      await start(
+        {
+          [entry]: `import lib from "./lib.cjs";
+            export default { fetch: () => new Response(lib) };`,
+          [resolve(ghostDir, "lib.cjs")]: `const dep = require("./dep.cjs");
+            module.exports = dep + ":" + require("#other.cjs");`,
+          [dep]: `module.exports = "dep";`,
+          "#other.cjs": `module.exports = "other";`,
+        },
+        entry,
+      );
+      expect(await text()).toBe("dep:other");
+      await runner.updateVirtualModules!({
+        [dep]: `module.exports = "dep2";`,
+        "#other.cjs": `module.exports = "other2";`,
+      });
+      await runner.reloadModule!();
+      expect(await text()).toBe("dep2:other2");
+    });
+
+    // The ES importer is versioned everywhere; Node also evicts the path key.
+    it("updates a path-keyed CommonJS module imported by an ES module", async () => {
+      const entry = resolve(ghostDir, "entry.mjs");
+      const lib = resolve(ghostDir, "lib.cjs");
+      await start(
+        {
+          [entry]: `import lib from "./lib.cjs";
+            export default { fetch: () => new Response(lib.value) };`,
+          [lib]: `exports.value = "v1";`,
+        },
+        entry,
+      );
+      expect(await text()).toBe("v1");
+      await runner.updateVirtualModules!({ [lib]: `exports.value = "v2";` });
+      await runner.reloadModule!();
+      expect(await text()).toBe("v2");
+    });
+
+    // Node: the real file's instance is cached by path. Deno: `.cjs` file URLs
+    // skip the load hook, so the key is served under a `virtual:` URL.
+    it("overrides a real CommonJS file, and uncovers it on removal", async () => {
+      const legacy = resolve(pathsDir, "legacy.cjs");
+      await start({}, resolve(pathsDir, "app-cjs.mjs"));
+      expect(await text()).toBe("disk legacy");
+      await runner.updateVirtualModules!({ [legacy]: `module.exports = "virtual legacy";` });
+      await runner.reloadModule!();
+      expect(await text()).toBe("virtual legacy");
+      await runner.updateVirtualModules!({ [legacy]: null });
+      await runner.reloadModule!();
+      expect(await text()).toBe("disk legacy");
+    });
+
+    it("serves text as a string default export", async () => {
+      await start({
+        "#entry": `import readme from "#readme";
+          export default { fetch: () => new Response(typeof readme + ":" + readme) };`,
+        "#readme": { source: `"quoted" \`text\` \${not} é漢😀\n`, format: "text" },
+      });
+      expect(await text()).toBe(`string:"quoted" \`text\` \${not} é漢😀\n`);
+    });
+
+    // Process runners pass bytes as base64 (JSON), node-worker natively.
+    it("round-trips bytes at startup and through updates", async () => {
+      await start({
+        "#entry": `import logo from "#logo.png";
+          import blob from "#blob";
+          export default {
+            fetch: () => new Response(
+              [logo instanceof Uint8Array, logo.join(","), blob.length, blob.join(",")].join("|"),
+            ),
+          };`,
+        // Unknown extension: a Uint8Array defaults to `bytes`.
+        "#logo.png": new Uint8Array([0, 1, 127, 128, 254, 255]),
+        "#blob": { source: allBytes, format: "bytes" },
+      });
+      expect(await text()).toBe(`true|0,1,127,128,254,255|512|${allBytes.join(",")}`);
+      await runner.updateVirtualModules!({ "#logo.png": new Uint8Array([9, 8, 7]) });
+      await runner.reloadModule!();
+      expect(await text()).toBe(`true|9,8,7|512|${allBytes.join(",")}`);
+    });
+
+    it("serves Wasm as a compiled WebAssembly.Module, also after an update", async () => {
+      await start({
+        "#entry": `import mod from "#answer.wasm";
+          export default {
+            fetch: async () => {
+              const instance = await WebAssembly.instantiate(mod);
+              return new Response(String(mod instanceof WebAssembly.Module) + ":" + instance.exports.answer());
+            },
+          };`,
+        "#answer.wasm": answerWasm(42),
+      });
+      expect(await text()).toBe("true:42");
+      await runner.updateVirtualModules!({ "#answer.wasm": answerWasm(7) });
+      await runner.reloadModule!();
+      expect(await text()).toBe("true:7");
+    });
+
+    it("invalidates a raw module through an intermediate importer", async () => {
+      let counter = 0;
+      await start({
+        "#entry": `import { greeting } from "#mid";
+          export default { fetch: () => new Response(greeting) };`,
+        "#mid": `import text from "#greeting"; export const greeting = text;`,
+        "#greeting": () => ({ source: `hello ${counter++}`, format: "text" as const }),
+      });
+      expect(await text()).toBe("hello 0");
+      await runner.invalidateModule!("#greeting");
+      await runner.reloadModule!();
+      expect(await text()).toBe("hello 1");
+    });
+
+    // Only Bun's loaders parse JSX; elsewhere it fails at registration.
+    it.skipIf(!bun)("serves JSX and TSX with Bun's loaders", async () => {
+      await start({
+        "#entry": `import a from "#a.jsx";
+          import b from "#b";
+          export default { fetch: () => new Response(a + b) };`,
+        "#a.jsx": jsxSource(false),
+        "#b": { source: jsxSource(true), format: "tsx" },
+      });
+      expect(await text()).toBe("<b>bold</b><b>bold</b>");
+    });
+
+    it.skipIf(bun)("fails clearly for JSX, at startup and on update", async () => {
+      const runtime = miniflare ? "workerd" : deno ? "Deno" : "Node.js";
+      const message = await startError({
+        "#entry": `export default { fetch: () => new Response("unreachable") };`,
+        "#app.tsx": jsxSource(true),
+      });
+      expect(message).toContain(`virtual module "#app.tsx" has format "tsx", which ${runtime}`);
+      expect(message).toContain("pre-transpile");
+
+      await start({ "#entry": `export default { fetch: () => new Response("ok") };` });
+      await expect(
+        runner.updateVirtualModules!({ "#view": { source: jsxSource(false), format: "jsx" } }),
+      ).rejects.toThrow(`virtual module "#view" has format "jsx", which ${runtime}`);
+      expect(await text()).toBe("ok");
+    });
+
+    // Validated on the host, before anything reaches the worker.
+    it("fails clearly for an unknown format or a source that doesn't fit", async () => {
+      expect(
+        await startError({
+          "#entry": `export default { fetch: () => new Response("unreachable") };`,
+          "#config": { source: "a: 1", format: "yaml" },
+        }),
+      ).toContain(`virtual module "#config" has an unknown format "yaml"`);
+      expect(
+        await startError({
+          "#entry": `export default { fetch: () => new Response("unreachable") };`,
+          "#data.json": new Uint8Array([123, 125]),
+        }),
+      ).toContain(`virtual module "#data.json" has format "json", which needs a string source`);
+
+      await start({ "#entry": `export default { fetch: () => new Response("ok") };` });
+      await expect(
+        runner.updateVirtualModules!({ "#mod": { source: "export {}", format: "wasm" } }),
+      ).rejects.toThrow(`virtual module "#mod" has format "wasm", which needs a Uint8Array source`);
+      await expect(
+        runner.updateVirtualModules!({ "#bad.wasm": new Uint8Array([1, 2, 3]) }),
+      ).rejects.toThrow(`virtual module "#bad.wasm" is not a valid WebAssembly binary`);
+      expect(await text()).toBe("ok");
+    });
+  });
+}
+
+describe("virtual module sources", async () => {
+  const {
+    normalizeVirtualModule,
+    encodeVirtualModules,
+    decodeVirtualModules,
+    expandVirtualInvalidation,
+    virtualModuleFormat,
+  } = await import("../src/virtual-loader.ts");
+
+  it("defaults the format by extension, then by source type", () => {
+    const formats = Object.fromEntries(
+      [
+        ["#a.mjs", "x"],
+        ["#a.js", "x"],
+        ["#a.cjs", "x"],
+        ["#a.cts", "x"],
+        ["#a.mts", "x"],
+        ["#a.ts", "x"],
+        ["#a.tsx", "x"],
+        ["#a.jsx", "x"],
+        ["#a.json", "x"],
+        ["#a", "x"],
+        ["/app/v1.2/entry", "x"],
+        ["#a.wasm", answerWasm(1)],
+        ["#a.png", new Uint8Array(1)],
+        ["#a", new Uint8Array(1)],
+      ].map(([key, source]) => [
+        `${key} (${typeof source})`,
+        virtualModuleFormat(key as string, normalizeVirtualModule(key as string, source as any)),
+      ]),
+    );
+    expect(formats).toEqual({
+      "#a.mjs (string)": "module",
+      "#a.js (string)": "module",
+      "#a.cjs (string)": "commonjs",
+      "#a.cts (string)": "commonjs-typescript",
+      "#a.mts (string)": "module-typescript",
+      "#a.ts (string)": "module-typescript",
+      "#a.tsx (string)": "tsx",
+      "#a.jsx (string)": "jsx",
+      "#a.json (string)": "json",
+      "#a (string)": "module",
+      "/app/v1.2/entry (string)": "module",
+      "#a.wasm (object)": "wasm",
+      "#a.png (object)": "bytes",
+      "#a (object)": "bytes",
+    });
+    // An explicit format wins over the extension.
+    expect(normalizeVirtualModule("#a.json", { source: "x", format: "text" })).toEqual({
+      source: "x",
+      format: "text",
+    });
+  });
+
+  it("keeps strings as they are and copies bytes", () => {
+    expect(normalizeVirtualModule("#a", "export {}")).toBe("export {}");
+    const bytes = Buffer.from([1, 2]);
+    const module = normalizeVirtualModule("#a", bytes) as { source: Uint8Array };
+    bytes[0] = 9;
+    expect(module.source).toEqual(new Uint8Array([1, 2]));
+    expect(Buffer.isBuffer(module.source)).toBe(false);
+  });
+
+  it("names the key of an invalid module", () => {
+    expect(() => normalizeVirtualModule("#a", 1 as any)).toThrow(
+      `virtual module "#a" must be a string, a Uint8Array or { source, format }`,
+    );
+    expect(() => normalizeVirtualModule("#a", { source: "x", format: "esm" as any })).toThrow(
+      `virtual module "#a" has an unknown format "esm"`,
+    );
+    expect(() => normalizeVirtualModule("#a.wasm", "x")).toThrow(
+      `virtual module "#a.wasm" has format "wasm", which needs a Uint8Array source`,
+    );
+    expect(() =>
+      normalizeVirtualModule("#a", { source: new Uint8Array(1), format: "text" }),
+    ).toThrow(`virtual module "#a" has format "text", which needs a string source`);
+  });
+
+  it("round-trips bytes through JSON", () => {
+    const virtual = {
+      "#code": "export {}",
+      "#text": normalizeVirtualModule("#text", { source: "x", format: "text" }),
+      "#bytes": normalizeVirtualModule("#bytes", allBytes),
+      "#gone": null,
+    };
+    const wire = JSON.parse(JSON.stringify(encodeVirtualModules(virtual)));
+    expect(wire["#bytes"]).toEqual({
+      source: Buffer.from(allBytes).toString("base64"),
+      format: "bytes",
+      encoding: "base64",
+    });
+    const decoded = decodeVirtualModules(wire);
+    expect(decoded).toEqual({ ...virtual, "#bytes": { source: allBytes, format: "bytes" } });
+    // Bytes passed natively (`workerData`) stay as they are.
+    expect(decodeVirtualModules(virtual)["#bytes"]).toBe(virtual["#bytes"]);
+  });
+
+  it("scans only code for quoted importers", () => {
+    const virtual = {
+      "#dep": "export default 1",
+      "#code": `import dep from "#dep";`,
+      "#cjs.cjs": `require("#dep");`,
+      "#text": normalizeVirtualModule("#text", { source: `import "#dep";`, format: "text" }),
+      "#data.json": JSON.stringify({ ref: "#dep" }),
+      "#bytes": normalizeVirtualModule("#bytes", new TextEncoder().encode(`"#dep"`)),
+    };
+    expect(expandVirtualInvalidation(virtual, "#dep")).toEqual(["#dep", "#code", "#cjs.cjs"]);
+  });
+});
+
 describe("MiniflareEnvRunner virtual module updates", () => {
   it("updates the instance shared by persistent runners, and evicts it from the cache", async () => {
     const text = async (runner: EnvRunner) => (await runner.fetch("http://localhost/")).text();
@@ -1199,6 +1624,42 @@ describe("MiniflareEnvRunner virtual module updates", () => {
       await third?.close();
       await second.close();
       await first.close();
+      await MiniflareEnvRunner.disposeAll();
+    }
+  });
+
+  // Bytes are part of the cache key (as base64).
+  it("shares a persistent instance only between runners with the same bytes", async () => {
+    const create = (bytes: number[]) =>
+      new MiniflareEnvRunner({
+        miniflare,
+        name: "virtual-persistent-bytes",
+        persistent: true,
+        data: {
+          entry: "#entry",
+          virtual: {
+            // Counts requests per instance.
+            "#entry": `import bytes from "#bytes"; let requests = 0;
+              export default { fetch: () => new Response(bytes.join(",") + ":" + ++requests) };`,
+            "#bytes": new Uint8Array(bytes),
+          },
+        },
+      });
+    const runners: MiniflareEnvRunner[] = [];
+    try {
+      const texts = [];
+      // One at a time: an instance is cached once it is ready.
+      for (const bytes of [[1, 2], [1, 2], [3]]) {
+        const runner = create(bytes);
+        runners.push(runner);
+        await runner.waitForReady();
+        texts.push(await (await runner.fetch("http://localhost/")).text());
+      }
+      expect(texts).toEqual(["1,2:1", "1,2:2", "3:1"]);
+    } finally {
+      for (const runner of runners) {
+        await runner.close();
+      }
       await MiniflareEnvRunner.disposeAll();
     }
   });

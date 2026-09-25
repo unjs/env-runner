@@ -1,16 +1,23 @@
-import { basename, dirname, isAbsolute, resolve } from "node:path";
+import { basename, dirname, isAbsolute, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   createVirtualHooks,
+  decodeVirtualModules,
   expandVirtualInvalidation,
   stripVirtualTypeScript,
+  unsupportedVirtualJSXError,
   virtualKeyURL,
+  virtualModuleCacheId,
+  virtualModuleCode,
   virtualModuleFormat,
 } from "../virtual-loader.ts";
+import type { ResolvedVirtualModule, VirtualModuleWire } from "../virtual-loader.ts";
 
 /**
- * Serve virtual modules; await before importing the entry. Format follows the
- * extension ({@link virtualModuleFormat}); Deno sources are pre-transformed.
+ * Serve virtual modules; await before importing the entry. Formats follow
+ * {@link virtualModuleFormat}; what a backend can't load natively is
+ * prepared first (Deno: everything to plain JS, Bun: CommonJS), and a format
+ * it can't serve at all (JSX outside Bun) throws, naming the key.
  *
  * Backends: `module.registerHooks` (Node >= 22.15 / 23.5, Deno), imported
  * dynamically since a static named import fails to link where it's missing;
@@ -23,28 +30,23 @@ import {
  * {@link updateVirtualModules} adds a key; its unregister covers that.
  */
 export async function registerVirtualModules(
-  virtual?: Record<string, string>,
+  wire?: Record<string, VirtualModuleWire>,
 ): Promise<() => void> {
-  if (!virtual || Object.keys(virtual).length === 0) {
+  if (!wire || Object.keys(wire).length === 0) {
     return _once(() => {
       for (const unregister of _lazyUnregisters.splice(0)) {
         unregister();
       }
     });
   }
-  const { registerHooks, stripTypeScriptTypes } = await import("node:module");
+  let virtual = decodeVirtualModules(wire);
+  const { registerHooks, stripTypeScriptTypes, createRequire } = await import("node:module");
   if (typeof registerHooks === "function") {
     const isDeno = "Deno" in globalThis;
-    let transformSource: ((specifier: string, source: string) => string) | undefined;
-    if (isDeno) {
-      transformSource = (specifier, source) =>
-        _transformSourceForDeno(specifier, source, stripTypeScriptTypes);
-      const transformed: Record<string, string> = {};
-      for (const [specifier, source] of Object.entries(virtual)) {
-        transformed[specifier] = transformSource(specifier, source);
-      }
-      virtual = transformed;
-    }
+    const prepare: VirtualModulePreparer = isDeno
+      ? (key, module) => _prepareForDeno(key, module, stripTypeScriptTypes)
+      : _prepareForNode;
+    virtual = await _prepareVirtualModules(virtual, prepare);
     const versions = new Map<string, number>();
     const importers = new Map<string, Set<string>>();
     // Track only after registerHooks succeeds (a throw returns no unregister).
@@ -53,6 +55,8 @@ export async function registerVirtualModules(
       versions,
       importers,
       forcePlainModule: isDeno,
+      // Verified on Deno 2.9.6: no other extension skips the load hook.
+      opaquePathURL: isDeno ? (url) => url.endsWith(".cjs") || url.endsWith(".cts") : undefined,
     });
     const hooks = registerHooks({ resolve, load });
     const registration: HooksRegistration = {
@@ -60,8 +64,9 @@ export async function registerVirtualModules(
       versions,
       version: 0,
       importers,
-      transformSource,
+      prepare,
       updateKeys,
+      cache: createRequire(import.meta.url).cache,
     };
     _hooksRegistrations.unshift(registration);
     return _once(() => {
@@ -73,7 +78,7 @@ export async function registerVirtualModules(
     });
   }
   if (typeof (globalThis as any).Bun?.plugin === "function") {
-    const { createRequire } = await import("node:module");
+    virtual = await _prepareVirtualModules(virtual, _prepareForBun);
     const registration = _createBunRegistration(virtual, createRequire(import.meta.url).cache);
     // One plugin per registration: reloads and invalidation never add another.
     (globalThis as any).Bun.plugin({
@@ -123,12 +128,17 @@ export function refreshVirtualModule(specifier: string): boolean {
  * evaluate fresh on their next import. Linked importers keep their instances,
  * so pair with `reloadModule()`. A removed key falls through to normal
  * resolution: the real file it overrode, or not found. If a source can't be
- * prepared (Deno type stripping), nothing changes.
+ * prepared (Deno type stripping, JSX outside Bun), nothing changes.
  */
-export async function updateVirtualModules(changes: Record<string, string | null>): Promise<void> {
+export async function updateVirtualModules(
+  wire: Record<string, VirtualModuleWire | null>,
+): Promise<void> {
+  const changes = decodeVirtualModules(wire);
   if (_hooksRegistrations.length === 0 && _bunRegistrations.length === 0) {
     const added = Object.fromEntries(
-      Object.entries(changes).filter((entry): entry is [string, string] => entry[1] !== null),
+      Object.entries(changes).filter(
+        (entry): entry is [string, ResolvedVirtualModule] => entry[1] !== null,
+      ),
     );
     if (Object.keys(added).length === 0) {
       return;
@@ -143,28 +153,25 @@ export async function updateVirtualModules(changes: Record<string, string | null
   }
   const registrations: VirtualRegistration[] =
     _hooksRegistrations.length > 0 ? _hooksRegistrations : _bunRegistrations;
-  const groups = new Map<VirtualRegistration, Record<string, string | null>>();
-  for (const [key, source] of Object.entries(changes)) {
+  const groups = new Map<VirtualRegistration, Record<string, ResolvedVirtualModule | null>>();
+  for (const [key, module] of Object.entries(changes)) {
     const owner =
       registrations.find((registration) => Object.hasOwn(registration.virtual, key)) ??
-      (source === null ? undefined : registrations[0]!);
+      (module === null ? undefined : registrations[0]!);
     if (owner) {
       let group = groups.get(owner);
       if (!group) {
         groups.set(owner, (group = {}));
       }
-      group[key] = source;
+      group[key] = module;
     }
   }
-  // Prepare every source before changing any registration (Deno can throw).
-  const prepared = [...groups].map(([registration, group]) => {
-    const transform = "transformSource" in registration && registration.transformSource;
-    const sources: Record<string, string | null> = {};
-    for (const [key, source] of Object.entries(group)) {
-      sources[key] = transform && source !== null ? transform(key, source) : source;
-    }
-    return [registration, sources] as const;
-  });
+  // Prepare every source before changing any registration (preparing can throw).
+  const prepared: [VirtualRegistration, Record<string, ResolvedVirtualModule | null>][] = [];
+  for (const [registration, group] of groups) {
+    const prepare = "prepare" in registration ? registration.prepare : _prepareForBun;
+    prepared.push([registration, await _prepareVirtualModules(group, prepare)]);
+  }
   for (const [registration, sources] of prepared) {
     if ("updateKeys" in registration) {
       _updateHooksRegistration(registration, sources);
@@ -179,7 +186,7 @@ export async function updateVirtualModules(changes: Record<string, string | null
  * `virtual-modules-updated` (same `id`). Messages apply in arrival order.
  */
 export function handleUpdateVirtualModules(
-  message: { id?: unknown; changes?: Record<string, string | null> },
+  message: { id?: unknown; changes?: Record<string, VirtualModuleWire | null> },
   sendMessage: (message: unknown) => void,
 ): Promise<void> {
   const update = _pendingUpdate
@@ -197,9 +204,12 @@ export function handleUpdateVirtualModules(
   return _pendingUpdate;
 }
 
-/** The live `key => source` view of all registrations (the latest wins), following updates. */
-export function registeredVirtualModules(): Record<string, string> {
-  const merged: Record<string, string> = {};
+/**
+ * The live `key => module` view of all registrations (the latest wins,
+ * sources as prepared for the backend), following updates.
+ */
+export function registeredVirtualModules(): Record<string, ResolvedVirtualModule> {
+  const merged: Record<string, ResolvedVirtualModule> = {};
   for (const registration of [..._hooksRegistrations, ..._bunRegistrations].reverse()) {
     Object.assign(merged, registration.virtual);
   }
@@ -207,6 +217,10 @@ export function registeredVirtualModules(): Record<string, string> {
 }
 
 type VirtualRegistration = HooksRegistration | BunRegistration;
+
+// Makes a module servable by a backend: returns it as served, or throws
+// naming the key (nothing is registered then).
+type VirtualModulePreparer = (key: string, module: ResolvedVirtualModule) => ResolvedVirtualModule;
 
 // Serializes `handleUpdateVirtualModules()` (registering can await).
 let _pendingUpdate: Promise<void> = Promise.resolve();
@@ -216,7 +230,7 @@ let _pendingUpdate: Promise<void> = Promise.resolve();
 const _lazyUnregisters: (() => void)[] = [];
 
 interface HooksRegistration {
-  virtual: Record<string, string>;
+  virtual: Record<string, ResolvedVirtualModule>;
   versions: Map<string, number>;
   // Last version handed out: unique per registration, so a key and the disk
   // file it overrides (or uncovers) never share a `?v=<n>` URL.
@@ -224,26 +238,29 @@ interface HooksRegistration {
   // Resolved `module => importers` edges (keys and disk files), recorded by
   // the hooks; `versions` also covers the disk files.
   importers: Map<string, Set<string>>;
-  transformSource?: (specifier: string, source: string) => string;
+  // Checks (Node) or transforms (Deno) a source before it is served.
+  prepare: VirtualModulePreparer;
   updateKeys: (keys: Iterable<string>) => void;
+  // `require.cache`: CommonJS is cached by filename, whatever the query.
+  cache: Record<string, unknown>;
 }
 
 function _updateHooksRegistration(
   registration: HooksRegistration,
-  changes: Record<string, string | null>,
+  changes: Record<string, ResolvedVirtualModule | null>,
 ): void {
   const { virtual, versions, importers } = registration;
   const added: string[] = [];
   const removed: string[] = [];
-  for (const [key, source] of Object.entries(changes)) {
-    if (source === null) {
+  for (const [key, module] of Object.entries(changes)) {
+    if (module === null) {
       removed.push(key);
       continue;
     }
     if (!Object.hasOwn(virtual, key)) {
       added.push(key);
     }
-    virtual[key] = source;
+    virtual[key] = module;
   }
   registration.updateKeys(added);
   // Path keys also expand from their file URL, which tracks disk importers of
@@ -255,6 +272,12 @@ function _updateHooksRegistration(
   });
   for (const node of expandVirtualInvalidation(virtual, targets, importers)) {
     versions.set(node, ++registration.version);
+    // Node caches a key's CommonJS instance whatever the version (a path key
+    // by path, any key when `require()`d): evict it, so it re-evaluates (or
+    // the file it uncovers loads).
+    if (Object.hasOwn(virtual, node)) {
+      delete registration.cache[virtualModuleCacheId(node)];
+    }
   }
   for (const key of removed) {
     delete virtual[key];
@@ -274,7 +297,7 @@ const _hooksRegistrations: HooksRegistration[] = [];
  *   matched verbatim by `build.module()`.
  */
 interface BunRegistration {
-  virtual: Record<string, string>;
+  virtual: Record<string, ResolvedVirtualModule>;
   paths: Map<string, string>;
   namespaced: Set<string>;
   modules: Set<string>;
@@ -325,7 +348,7 @@ const _bunDynamicNames = new Set<string>();
 const _bunReleasedPaths = new Set<string>();
 
 function _createBunRegistration(
-  virtual: Record<string, string>,
+  virtual: Record<string, ResolvedVirtualModule>,
   cache: Record<string, unknown>,
 ): BunRegistration {
   const registration: BunRegistration = {
@@ -349,7 +372,7 @@ function _createBunRegistration(
 
 // Classify a key by how Bun can reach it; `true` for a path key.
 function _addBunKey(registration: BunRegistration, key: string): boolean {
-  const path = _bunKeyPath(key);
+  const path = _keyPath(key);
   if (path === undefined) {
     const resolvable = !key.includes(":") && _bunResolvable(key);
     (resolvable ? registration.namespaced : registration.modules).add(key);
@@ -414,7 +437,7 @@ function _installBunDynamicCallbacks(build: any): void {
 
 function _updateBunRegistration(
   registration: BunRegistration,
-  changes: Record<string, string | null>,
+  changes: Record<string, ResolvedVirtualModule | null>,
 ): void {
   const { virtual } = registration;
   const removed: string[] = [];
@@ -425,7 +448,7 @@ function _updateBunRegistration(
       continue;
     }
     if (!Object.hasOwn(virtual, key)) {
-      const path = _bunKeyPath(key);
+      const path = _keyPath(key);
       if (_addBunKey(registration, key)) {
         registration.dynamic.add(path!);
         _bunDynamicNames.add(_bunSpecifierName(path!));
@@ -456,7 +479,7 @@ function _removeBunKey(registration: BunRegistration, key: string): void {
   registration.namespaced.delete(key);
   // A `build.module()` can't be unregistered: fresh loads throw.
   registration.modules.delete(key);
-  const path = _bunKeyPath(key);
+  const path = _keyPath(key);
   if (path === undefined || paths.get(path) !== key) {
     return;
   }
@@ -465,7 +488,7 @@ function _removeBunKey(registration: BunRegistration, key: string): void {
   registration.removed.set(path, key);
   // Another key naming the same file (the latest) takes over.
   for (const other of Object.keys(virtual)) {
-    if (_bunKeyPath(other) === path) {
+    if (_keyPath(other) === path) {
       paths.set(path, other);
       registration.removed.delete(path);
     }
@@ -582,16 +605,34 @@ function _loadBunModule(key: string) {
   return _serveBunModule(key, registration?.virtual[key]);
 }
 
-function _serveBunModule(key: string, source: string | undefined) {
-  if (source === undefined) {
+// Runtime plugins can't use Bun's `text`/`file`/`wasm` loaders, and its `json`
+// loader doesn't parse contents: those formats are served as `object` modules.
+function _serveBunModule(key: string, module: ResolvedVirtualModule | undefined) {
+  if (module === undefined) {
     throw new Error(`Cannot find virtual module "${key}" (unregistered)`);
   }
-  const format = virtualModuleFormat(key);
-  if (format === "json") {
-    // Bun's runtime `json` loader doesn't parse contents.
-    return { exports: { default: _parseBunJSON(key, source) }, loader: "object" };
+  const format = virtualModuleFormat(key, module);
+  const source = typeof module === "string" ? module : module.source;
+  switch (format) {
+    case "json": {
+      return { exports: { default: _parseBunJSON(key, source as string) }, loader: "object" };
+    }
+    case "text": {
+      return { exports: { default: source }, loader: "object" };
+    }
+    case "bytes": {
+      // A copy per instance: importers may write to it.
+      return { exports: { default: (source as Uint8Array).slice() }, loader: "object" };
+    }
+    case "wasm": {
+      return {
+        exports: { default: new WebAssembly.Module(source as Uint8Array<ArrayBuffer>) },
+        loader: "object",
+      };
+    }
   }
-  return { contents: source, loader: format === "module-typescript" ? "ts" : "js" };
+  const loader = format === "module-typescript" ? "ts" : format === "module" ? "js" : format;
+  return { contents: source, loader };
 }
 
 // Names the key, as Node's JSON errors do (Bun's parse error has no location).
@@ -632,7 +673,7 @@ function _bunVersioned(id: string, version: number | undefined): string {
 }
 
 // Path of a path key (absolute path or `file:` URL), else `undefined`.
-function _bunKeyPath(key: string): string | undefined {
+function _keyPath(key: string): string | undefined {
   if (key.startsWith("file:")) {
     try {
       return fileURLToPath(key);
@@ -684,25 +725,145 @@ function _escapeRegExp(value: string): string {
   return value.replace(/[$()*+.?[\\\]^{|}]/g, String.raw`\$&`);
 }
 
-// Deno parses every hook-loaded source as JS regardless of `format`. It skips
-// import attribute checks there, so `with { type: "json" }` still works.
-// `stripTypeScriptTypes` needs Deno >= 2.8.2.
-function _transformSourceForDeno(
-  specifier: string,
-  source: string,
+// Prepare every module (for a registration or an update), loading the
+// CommonJS lexer first if a module needs it. Throws before anything changes.
+async function _prepareVirtualModules(
+  virtual: Record<string, ResolvedVirtualModule>,
+  prepare: VirtualModulePreparer,
+): Promise<Record<string, ResolvedVirtualModule>>;
+async function _prepareVirtualModules(
+  virtual: Record<string, ResolvedVirtualModule | null>,
+  prepare: VirtualModulePreparer,
+): Promise<Record<string, ResolvedVirtualModule | null>>;
+async function _prepareVirtualModules(
+  virtual: Record<string, ResolvedVirtualModule | null>,
+  prepare: VirtualModulePreparer,
+): Promise<Record<string, ResolvedVirtualModule | null>> {
+  if (prepare !== _prepareForNode && !_cjsLexer) {
+    const commonJS = Object.entries(virtual).some(
+      ([key, module]) => module !== null && virtualModuleFormat(key, module).startsWith("commonjs"),
+    );
+    if (commonJS) {
+      const lexer = await import("cjs-module-lexer");
+      await lexer.init();
+      _cjsLexer = lexer;
+    }
+  }
+  const out: Record<string, ResolvedVirtualModule | null> = {};
+  for (const [key, module] of Object.entries(virtual)) {
+    out[key] = module === null ? module : prepare(key, module);
+  }
+  return out;
+}
+
+let _cjsLexer: { parse: (source: string) => { exports: string[] } } | undefined;
+
+// Node loads every format but JSX (the load hook serves raw formats as ES
+// modules), so JSX fails here instead of on import.
+function _prepareForNode(key: string, module: ResolvedVirtualModule): ResolvedVirtualModule {
+  const format = virtualModuleFormat(key, module);
+  if (format === "jsx" || format === "tsx") {
+    throw unsupportedVirtualJSXError(key, format, "Node.js");
+  }
+  return module;
+}
+
+// Plugin sources always parse as ES modules (verified on Bun 1.4.2, also with
+// `.cjs` paths), so CommonJS is wrapped. Everything else loads natively.
+function _prepareForBun(key: string, module: ResolvedVirtualModule): ResolvedVirtualModule {
+  const format = virtualModuleFormat(key, module);
+  if (format !== "commonjs" && format !== "commonjs-typescript") {
+    return module;
+  }
+  const source = typeof module === "string" ? module : (module.source as string);
+  // The `ts` loader strips the types inside the wrapper.
+  return {
+    source: _commonJSToESM(key, source),
+    format: format === "commonjs" ? "module" : "module-typescript",
+  };
+}
+
+// Deno parses every hook-loaded source as JS regardless of `format`, so each
+// module becomes plain JS (served as `module`). It skips import attribute
+// checks there, so `with { type: "json" }` still works. `stripTypeScriptTypes`
+// needs Deno >= 2.8.2.
+function _prepareForDeno(
+  key: string,
+  module: ResolvedVirtualModule,
   stripTypeScriptTypes?: (code: string) => string,
 ): string {
-  const format = virtualModuleFormat(specifier);
-  if (format === "module-typescript") {
-    return stripVirtualTypeScript(specifier, source, stripTypeScriptTypes, {
+  const format = virtualModuleFormat(key, module);
+  const source = typeof module === "string" ? module : module.source;
+  const strip = () =>
+    stripVirtualTypeScript(key, source as string, stripTypeScriptTypes, {
       requirement: "(custom load hooks bypass Deno's native type stripping)",
       remedy: "upgrade Deno",
     });
+  switch (format) {
+    case "module-typescript": {
+      return strip();
+    }
+    case "commonjs": {
+      return _commonJSToESM(key, source as string);
+    }
+    case "commonjs-typescript": {
+      return _commonJSToESM(key, strip());
+    }
+    case "json": {
+      return `export default JSON.parse(${JSON.stringify(source)});`;
+    }
+    case "text":
+    case "bytes":
+    case "wasm": {
+      return virtualModuleCode(format, source);
+    }
+    case "jsx":
+    case "tsx": {
+      throw unsupportedVirtualJSXError(key, format, "Deno");
+    }
   }
-  if (format === "json") {
-    return `export default JSON.parse(${JSON.stringify(source)});`;
+  return source as string;
+}
+
+/**
+ * A CommonJS module as an ES module, for backends that parse in-memory
+ * sources as ES modules only (Bun, Deno). Like Node: `module.exports` is the
+ * default export, named exports are detected by cjs-module-lexer, and the
+ * `"module.exports"` export makes `require()` of it return `module.exports`
+ * (honored by Node and Bun). `require()` is `createRequire()` at the key's
+ * path, else cwd. The body is strict-mode code (inside an ES module); line
+ * numbers are kept.
+ */
+function _commonJSToESM(key: string, source: string): string {
+  const path = _keyPath(key);
+  const filename = JSON.stringify(path ?? key);
+  const dir = JSON.stringify(path ? dirname(path) : process.cwd());
+  // A directory base resolves from cwd itself (non-path keys, like their imports).
+  const base = JSON.stringify(path ?? process.cwd() + sep);
+  let names: string[] = [];
+  try {
+    names = _cjsLexer!.parse(source).exports;
+  } catch {
+    // Evaluating reports the syntax error; default export only until then.
   }
-  return source;
+  const p = "__envRunner";
+  const lines = [
+    `import { createRequire as ${p}CreateRequire } from "node:module"; const ${p}Module = { exports: {} }; (function (exports, require, module, __filename, __dirname) {${source}`,
+    `}).call(${p}Module.exports, ${p}Module.exports, ${p}CreateRequire(${base}), ${p}Module, ${filename}, ${dir});`,
+    `const ${p}Exports = ${p}Module.exports;`,
+    `export { ${p}Exports as default, ${p}Exports as "module.exports" };`,
+  ];
+  let index = 0;
+  for (const name of new Set(names)) {
+    if (name !== "default" && name !== "module.exports") {
+      const local = `${p}Export${index++}`;
+      lines.push(
+        `const ${local} = ${p}Exports?.[${JSON.stringify(name)}];`,
+        `export { ${local} as ${JSON.stringify(name)} };`,
+      );
+    }
+  }
+  return lines.join("\n") + "\n";
 }
 
 const _noop = () => {};

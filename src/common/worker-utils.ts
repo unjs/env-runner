@@ -82,7 +82,7 @@ export function toServerOptions(entry: AppEntry): Omit<ServerOptions, "fetch"> {
  */
 export function isVirtualSpecifier(
   specifier: string | undefined,
-  virtual?: Record<string, string>,
+  virtual?: Record<string, unknown>,
   matchPaths = false,
 ): boolean {
   if (!specifier || !virtual) {
@@ -102,7 +102,7 @@ export function isVirtualSpecifier(
  */
 export function isVirtualEntry(
   entry: string | undefined,
-  virtual: Record<string, string> | undefined = registeredVirtualModules(),
+  virtual: Record<string, unknown> | undefined = registeredVirtualModules(),
 ): boolean {
   const registerHooks = process.getBuiltinModule?.("node:module")?.registerHooks;
   return isVirtualSpecifier(entry, virtual, typeof registerHooks === "function");

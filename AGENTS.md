@@ -28,7 +28,7 @@ src/
 │   ├── vercel/              # VercelEnvRunner (extends node-worker) + worker, oidc.ts, queue-dev.ts
 │   └── netlify/             # NetlifyEnvRunner (extends node-worker) + worker
 ├── types.ts                 # Core interfaces
-├── virtual-loader.ts        # createVirtualHooks() — ESM resolve/load hooks for virtual modules
+├── virtual-loader.ts        # Virtual module formats/validation/JSON transport + createVirtualHooks() — ESM resolve/load hooks
 ├── index.ts                 # Public API exports
 ├── loader.ts                # Dynamic runner loader
 ├── manager.ts               # RunnerManager for hot-reload

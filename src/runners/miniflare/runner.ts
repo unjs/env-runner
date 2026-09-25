@@ -13,10 +13,15 @@ import type { EnvRunnerData } from "../../common/base-runner.ts";
 import { resolveRuntimeDep } from "../../common/runtime-deps.ts";
 import type { RuntimeDep } from "../../common/runtime-deps.ts";
 import {
+  encodeVirtualModules,
   expandVirtualInvalidation,
   stripVirtualTypeScript,
+  unsupportedVirtualJSXError,
+  virtualModuleCode,
+  virtualModuleCodeSource,
   virtualModuleFormat,
 } from "../../virtual-loader.ts";
+import type { ResolvedVirtualModule, VirtualModule } from "../../virtual-loader.ts";
 import { generateWrapper, IPC_BINDING, UNSAFE_EVAL_BINDING } from "./wrapper.ts";
 import { isPlainObject, loadWranglerConfig } from "./wrangler.ts";
 import type { WranglerInlineConfig, WranglerModule } from "./wrangler.ts";
@@ -132,8 +137,8 @@ const IPC_PATH = "/__env_runner_ipc";
  * updates need no restart) and adopted by the runners attaching to it.
  */
 interface MiniflareVirtualModules {
-  /** Served sources (TS already stripped). */
-  sources: Record<string, string>;
+  /** Served modules (see {@link ServedVirtualModule}). */
+  sources: Record<string, ServedVirtualModule>;
   /**
    * Removed keys: their importers keep versioning the import, so a re-served
    * importer misses workerd's cache and the fallback serves the real module.
@@ -147,6 +152,11 @@ interface MiniflareVirtualModules {
   /** Import specifier → served or removed key, for versioning imports. */
   versionedKeyOf: VirtualKeyResolver;
 }
+
+/** A module as the fallback serves it: TypeScript stripped, format explicit. */
+type ServedVirtualModule = Required<VirtualModule> & {
+  format: "module" | "commonjs" | "json" | "text" | "bytes" | "wasm";
+};
 
 interface MiniflareCacheEntry {
   mf: InstanceType<any>;
@@ -303,17 +313,17 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
    * bumping versions (see {@link applyVirtualVersions}) is enough.
    */
   protected override async _applyVirtualUpdates(
-    changes: Record<string, string | null>,
+    changes: Record<string, ResolvedVirtualModule | null>,
   ): Promise<void> {
     const virtual = this.#virtual;
     if (!virtual) {
       throw new Error("Miniflare env runner should be initialized before updating modules.");
     }
-    // Prepared first: a source that fails to strip changes nothing.
-    const prepared: Record<string, string> = {};
-    for (const [key, source] of Object.entries(changes)) {
-      if (source !== null) {
-        prepared[key] = await this.#prepareVirtualSource(key, source);
+    // Prepared first: a source that fails to strip (or is JSX) changes nothing.
+    const prepared: Record<string, ServedVirtualModule> = {};
+    for (const [key, module] of Object.entries(changes)) {
+      if (module !== null) {
+        prepared[key] = await this.#prepareVirtualModule(key, module);
       }
     }
     // Importers over the sources before and after the change: a removed key
@@ -424,24 +434,46 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
     }
   }
 
-  /** workerd parses every `esModule` as JS, so TS is stripped here (JSON is served natively). */
-  async #prepareVirtualModules(): Promise<Record<string, string>> {
-    const virtual = (this._data?.virtual ?? {}) as Record<string, string>;
-    const out: Record<string, string> = {};
-    for (const [specifier, source] of Object.entries(virtual)) {
-      out[specifier] = await this.#prepareVirtualSource(specifier, source);
+  async #prepareVirtualModules(): Promise<Record<string, ServedVirtualModule>> {
+    const virtual = (this._data?.virtual ?? {}) as Record<string, ResolvedVirtualModule>;
+    const out: Record<string, ServedVirtualModule> = {};
+    for (const [key, module] of Object.entries(virtual)) {
+      out[key] = await this.#prepareVirtualModule(key, module);
     }
     return out;
   }
 
-  async #prepareVirtualSource(specifier: string, source: string): Promise<string> {
-    if (virtualModuleFormat(specifier) !== "module-typescript") {
-      return source;
+  /**
+   * workerd parses `esModule`/`commonJsModule` sources as JS, so TypeScript is
+   * stripped here, and it has no JSX. Other formats are served natively (or,
+   * for `bytes`, as an ES module).
+   */
+  async #prepareVirtualModule(
+    key: string,
+    module: ResolvedVirtualModule,
+  ): Promise<ServedVirtualModule> {
+    const format = virtualModuleFormat(key, module);
+    const source = typeof module === "string" ? module : module.source;
+    switch (format) {
+      case "module-typescript":
+      case "commonjs-typescript": {
+        const stripped = stripVirtualTypeScript(
+          key,
+          source as string,
+          await _getStripTypeScriptTypes(),
+          {
+            requirement: "on the host (workerd does not parse TypeScript)",
+            remedy: "upgrade Node.js",
+          },
+        );
+        return { source: stripped, format: format === "module-typescript" ? "module" : "commonjs" };
+      }
+      case "jsx":
+      case "tsx": {
+        throw unsupportedVirtualJSXError(key, format, "workerd");
+      }
     }
-    return stripVirtualTypeScript(specifier, source, await _getStripTypeScriptTypes(), {
-      requirement: "on the host (workerd does not parse TypeScript)",
-      remedy: "upgrade Node.js",
-    });
+    return { source, format };
   }
 
   async #initAsync() {
@@ -527,7 +559,9 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
       const entryDir = dirname(entryBase);
 
       // Auto-detect exported classes from entry source (skipped for a module specifier)
-      const entrySource = entryIsVirtual ? virtual.sources[entryKey] : _tryReadFile(resolvedEntry);
+      const entrySource = entryIsVirtual
+        ? virtualModuleCodeSource(entryKey, virtual.sources[entryKey])
+        : _tryReadFile(resolvedEntry);
       const detectedExports =
         this.#exports === false || typeof this.#exports === "string"
           ? []
@@ -624,6 +658,35 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
           applyVirtualVersions(code, _virtual.versions, (specifier) =>
             _virtual.versionedKeyOf(specifier, modulePath),
           );
+        // workerd module types, except `bytes`: a `data` module is an
+        // ArrayBuffer, not a `Uint8Array`. Only ES modules have their imports
+        // versioned (see `applyVirtualVersions`).
+        const _serveVirtual = (module: ServedVirtualModule, modulePath: string | undefined) => {
+          const { source } = module;
+          switch (module.format) {
+            case "module": {
+              return { esModule: _applyVirtualVersions(source as string, modulePath) };
+            }
+            case "commonjs": {
+              return {
+                commonJsModule: source,
+                namedExports: commonJSExports(source as string).filter((e) => e !== "default"),
+              };
+            }
+            case "json": {
+              return { json: source };
+            }
+            case "text": {
+              return { text: source };
+            }
+            case "bytes": {
+              return { esModule: virtualModuleCode("bytes", source) };
+            }
+            case "wasm": {
+              return { wasm: Array.from(source as Uint8Array) };
+            }
+          }
+        };
         options.unsafeUseModuleFallbackService = true;
         // Map workerd module names to real filesystem paths for correct
         // relative import resolution from bare-specifier modules.
@@ -671,11 +734,10 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
               return new Response(null, { status: 301, headers: { location } });
             }
             const name = bareSpecifier + query;
-            const source = _virtual.sources[virtualKey]!;
-            // workerd parses `json` natively; TS was already stripped on the host.
-            return virtualModuleFormat(virtualKey) === "json"
-              ? Response.json({ name, json: source })
-              : Response.json({ name, esModule: _applyVirtualVersions(source, keyPath) });
+            return Response.json({
+              name,
+              ..._serveVirtual(_virtual.sources[virtualKey]!, keyPath),
+            });
           }
 
           let resolvedPath: string;
@@ -807,8 +869,9 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
         _exportConditions: this.#exportConditions,
         _exports: this.#exports,
         // The fallback service closure captures the virtual map, so instances
-        // are only shareable when the resolved sources are identical.
-        _virtual: initialVirtual,
+        // are only shareable when the resolved sources are identical (bytes
+        // compared as base64, not as JSON objects of indices).
+        _virtual: encodeVirtualModules(initialVirtual),
       });
       const cached = _miniflareCache.get(this.#cacheKey);
       if (cached) {
@@ -1024,7 +1087,9 @@ function virtualKeyPath(key: string): string | undefined {
 
 type VirtualKeyResolver = (specifier: string, importerPath?: string) => string | undefined;
 
-function createMiniflareVirtualModules(sources: Record<string, string>): MiniflareVirtualModules {
+function createMiniflareVirtualModules(
+  sources: Record<string, ServedVirtualModule>,
+): MiniflareVirtualModules {
   const virtual = { sources, removed: new Set<string>(), versions: new Map(), version: 0 };
   return refreshVirtualKeyResolvers(virtual as MiniflareVirtualModules);
 }
@@ -1071,16 +1136,17 @@ function createVirtualKeyResolver(keys: Iterable<string>): VirtualKeyResolver {
 
 /** `key => importer keys` from the import specifiers of virtual sources. */
 function virtualImporters(
-  virtual: Record<string, string>,
+  virtual: Record<string, ServedVirtualModule>,
   keyOf: ReturnType<typeof createVirtualKeyResolver>,
 ): Map<string, Set<string>> {
   const importers = new Map<string, Set<string>>();
-  for (const [importer, source] of Object.entries(virtual)) {
-    if (virtualModuleFormat(importer) === "json") {
+  for (const [importer, { source, format }] of Object.entries(virtual)) {
+    // Only ES modules: CommonJS `require()` specifiers aren't versioned.
+    if (format !== "module") {
       continue;
     }
     const importerPath = virtualKeyPath(importer);
-    for (const { specifier } of versionableImports(source) ?? []) {
+    for (const { specifier } of versionableImports(source as string) ?? []) {
       const key = keyOf(specifier, importerPath);
       if (key !== undefined && key !== importer) {
         let set = importers.get(key);
@@ -1168,14 +1234,19 @@ function ensureCjsLexer() {
   return _cjsLexerReady;
 }
 
-function createCjsEsmShim(cjsSpecifier: string, contents: string): string {
-  let namedExports: string[] = [];
+/** Named exports of CommonJS code (cjs-module-lexer, like Node); none if it can't be lexed. */
+function commonJSExports(contents: string): string[] {
   try {
-    const { exports } = parseCjs(contents);
-    namedExports = exports.filter((e) => e !== "default" && e !== "__esModule");
+    return parseCjs(contents).exports;
   } catch {
-    // If parsing fails, just use default export
+    return [];
   }
+}
+
+function createCjsEsmShim(cjsSpecifier: string, contents: string): string {
+  const namedExports = commonJSExports(contents).filter(
+    (e) => e !== "default" && e !== "__esModule",
+  );
   const quoted = JSON.stringify(cjsSpecifier);
   let shim = `import __cjs_mod__ from ${quoted};\nexport default __cjs_mod__;\n`;
   for (const name of namedExports) {

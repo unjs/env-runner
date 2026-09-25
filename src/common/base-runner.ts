@@ -4,8 +4,15 @@ import type { RunnerMessageListener, EnvRunner, WorkerAddress, WorkerHooks } fro
 
 import { rm } from "node:fs/promises";
 import { proxyFetch, proxyUpgrade } from "httpxy";
-import { resolveVirtualModules, warnVirtualPathCollisions } from "../virtual-loader.ts";
+import {
+  encodeVirtualModules,
+  normalizeVirtualModules,
+  resolveVirtualModules,
+  warnVirtualPathCollisions,
+} from "../virtual-loader.ts";
 import type {
+  ResolvedVirtualModule,
+  VirtualModuleContent,
   VirtualModules,
   VirtualModuleSource,
   VirtualModuleUpdates,
@@ -13,6 +20,9 @@ import type {
 import { hostEnv } from "./host-env.ts";
 
 export type {
+  VirtualModule,
+  VirtualModuleContent,
+  VirtualModuleFormat,
   VirtualModules,
   VirtualModuleSource,
   VirtualModuleUpdates,
@@ -23,10 +33,11 @@ export interface EnvRunnerData {
 
   /**
    * Virtual modules importable from the entry, e.g.
-   * `{ "#virtual-import": "export const foo = 1" }`. Factory sources run once
-   * on the host before spawn. Change them at runtime with
-   * `updateVirtualModules()`. Not supported by the `self` runner (it closes
-   * with an error).
+   * `{ "#virtual-import": "export const foo = 1" }`. A source is a string, a
+   * `Uint8Array` or `{ source, format }` (format by extension by default), or
+   * a factory returning one, which runs on the host before spawn. Change them
+   * at runtime with `updateVirtualModules()`. Not supported by the `self`
+   * runner (it closes with an error).
    */
   virtual?: VirtualModules;
 
@@ -262,11 +273,16 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
 
   /**
    * Env for a process worker. Also snapshots the runner data, which goes over
-   * IPC on request (see `common/process-data.ts`); throws if not JSON-serializable.
+   * IPC on request (see `common/process-data.ts`), virtual module bytes as
+   * base64; throws if not JSON-serializable.
    */
   protected _processEnv(): NodeJS.ProcessEnv {
+    const data = this._data || {};
+    const virtual = data.virtual as Record<string, ResolvedVirtualModule> | undefined;
     try {
-      this._processData = JSON.stringify(this._data || {});
+      this._processData = JSON.stringify(
+        virtual ? { ...data, virtual: encodeVirtualModules(virtual) } : data,
+      );
     } catch (error: any) {
       throw new TypeError(`Runner data must be JSON-serializable: ${error?.message || error}`, {
         cause: error,
@@ -352,8 +368,9 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
 
   /**
    * Resolve factory `data.virtual` sources before spawn (functions can't cross
-   * the worker boundary; the load hook can't await). `undefined` when there is
-   * no factory, so subclasses can spawn synchronously.
+   * the worker boundary; the load hook can't await), and validate every
+   * module. `undefined` when there is no factory and nothing is invalid, so
+   * subclasses can spawn synchronously.
    */
   protected _resolveVirtualData(): Promise<void> | undefined {
     const virtual = this._data?.virtual;
@@ -363,11 +380,20 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
     this._virtualSources = { ...virtual };
     this._data = { ...this._data };
     warnVirtualPathCollisions(Object.keys(virtual ?? {}));
-    if (!virtual || !Object.values(virtual).some((v) => typeof v === "function")) {
-      if (virtual) {
-        this._data.virtual = { ...virtual };
-      }
+    if (!virtual) {
       return undefined;
+    }
+    if (!Object.values(virtual).some((v) => typeof v === "function")) {
+      try {
+        this._data.virtual = normalizeVirtualModules(
+          virtual as Record<string, VirtualModuleContent>,
+        );
+        return undefined;
+      } catch (error) {
+        // Like a throwing factory: the runner closes with it as cause.
+        this._virtualResolved = Promise.reject(error);
+        return this._virtualResolved;
+      }
     }
     this._virtualResolved = resolveVirtualModules(virtual).then((resolved) => {
       this._data = { ...this._data, virtual: resolved };
@@ -394,13 +420,15 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
       if (entries.length === 0) {
         return;
       }
-      // Factories run on the host; one that throws rejects before any change.
+      // Factories run on the host; one that throws, or an invalid module,
+      // rejects before any change.
       const sets: VirtualModules = Object.fromEntries(
         entries.filter((entry): entry is [string, VirtualModuleSource] => entry[1] !== null),
       );
-      const resolved: Record<string, string | null> = await resolveVirtualModules(sets);
+      const resolved: Record<string, ResolvedVirtualModule | null> =
+        await resolveVirtualModules(sets);
       const sources = (this._virtualSources ??= {});
-      const virtual = ((this._data ??= {}).virtual ??= {}) as Record<string, string>;
+      const virtual = ((this._data ??= {}).virtual ??= {}) as Record<string, ResolvedVirtualModule>;
       let added = false;
       for (const [key, source] of entries) {
         if (source === null) {
@@ -410,7 +438,7 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
         } else {
           added ||= !Object.hasOwn(sources, key);
           sources[key] = source;
-          virtual[key] = resolved[key] as string;
+          virtual[key] = resolved[key]!;
         }
       }
       if (added) {
@@ -427,15 +455,16 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
 
   /**
    * Apply resolved changes (`null` removes) to the running worker in one round
-   * trip. Overridden by runners serving virtual modules from the host.
+   * trip, bytes as base64 (the message may be JSON). Overridden by runners
+   * serving virtual modules from the host.
    */
   protected async _applyVirtualUpdates(
-    changes: Record<string, string | null>,
+    changes: Record<string, ResolvedVirtualModule | null>,
     timeout: number,
   ): Promise<void> {
     const id = ++this.#virtualUpdateId;
     await this._request(
-      { event: "update-virtual-modules", id, changes },
+      { event: "update-virtual-modules", id, changes: encodeVirtualModules(changes) },
       {
         match: (msg) => msg?.event === "virtual-modules-updated" && msg.id === id,
         timeout,

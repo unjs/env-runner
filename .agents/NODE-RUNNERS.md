@@ -14,7 +14,7 @@ Built-in srvx-worker runners (node-worker, node-process, bun-process, deno-proce
   2. host (`_handleProcessMessage()`) replies `{ event: "init-data", data: "<JSON>" }`; the request is internal, never forwarded to `onMessage` listeners
   3. worker removes its listener before importing the entry, so `init-data` never reaches `ipc.onMessage`. Readiness is still only the `{ address }` message
 - `data` travels as a **JSON string** so every channel (Node/Deno `json`, Bun `advanced`) keeps the old `JSON.stringify()` semantics (functions dropped, `Date` → string). Raw IPC verified with 16–64 MiB messages to Node/Bun/Deno children from Node and Bun hosts
-- `_processEnv()` snapshots `data` as JSON at spawn; the reply sends that snapshot. There is no `ENV_RUNNER_DATA` env var, so custom `workerEntry` process workers must do the handshake too
+- `_processEnv()` snapshots `data` as JSON at spawn, with `data.virtual` bytes base64-encoded (`encodeVirtualModules()`, decoded by the worker's `registerVirtualModules()`; see [`VIRTUAL-MODULES.md`](VIRTUAL-MODULES.md#transport-bytes)); the reply sends that snapshot. There is no `ENV_RUNNER_DATA` env var, so custom `workerEntry` process workers must do the handshake too
 - **Failures**: non-JSON-serializable data throws `Runner data must be JSON-serializable: ...` at spawn (constructor, or `close(cause)` after async virtual factories — `_initWithVirtualData()` routes deferred spawn errors to `close()`). A failing IPC reply logs `[env-runner] Failed to send runner data ...` and closes the runner with it as cause
 
 ## node-process
