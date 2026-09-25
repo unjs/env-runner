@@ -431,7 +431,7 @@ await using runner = new MiniflareEnvRunner({
 
 A missing `wranglerConfigPath` file warns (an inline config is still applied). When `wrangler` is itself a string path, that path wins and `wranglerConfigPath` is ignored.
 
-The runner hosts a single fetch-only worker, so config entries it can't run are **dropped**: `assets`, `services`, `queues.consumers`, `workflows`, `tail_consumers`/`streaming_tail_consumers`, and Durable Object bindings to another script (`script_name`). Durable Object bindings to classes exported by your entry are kept — including bindings whose `script_name` is the worker's own `name` (the inline config's `name` when set, else the file's; with `wranglerEnv` suffixed `-<env>` unless the env section sets a `name`, e.g. `my-worker-staging`), which are local in `wrangler dev` too — and merged with [auto-detected exports](#auto-detected-exports). Pass any of the dropped options via `miniflareOptions` to opt back in.
+The runner hosts a single fetch-only worker, so config entries it can't run are **dropped**: `assets`, `services`, `queues.consumers`, `workflows`, `tail_consumers`/`streaming_tail_consumers`, and Durable Object bindings to another script (`script_name`). Durable Object bindings to local classes (exported by your entry or an [exports module](#exports-module)) are kept — including bindings whose `script_name` is the worker's own `name` (the inline config's `name` when set, else the file's; with `wranglerEnv` suffixed `-<env>` unless the env section sets a `name`, e.g. `my-worker-staging`), which are local in `wrangler dev` too — and merged with [auto-detected exports](#auto-detected-exports). Pass any of the dropped options via `miniflareOptions` to opt back in.
 
 Whenever `wrangler` is enabled (`true`, a path, or an inline config), local state (KV, D1, R2, Durable Objects, ...) persists under `<dir>/.wrangler/state/v3` — the same place `wrangler dev` uses, so both share data. `<dir>` is the directory of the loaded config file, else of the requested config path (`wrangler` string or `wranglerConfigPath`, even if the file is missing), else the current working directory (e.g. inline-only configs, or `wrangler: true` with no file found). Set `miniflareOptions.defaultPersistRoot` (or any `*Persist` option, e.g. `kvPersist: false`; on miniflare v5, `resourcePersistencePath`) to opt out.
 
@@ -491,7 +491,7 @@ When `transformRequest` is provided:
 
 - The `unsafeModuleFallbackService` calls it with the resolved file path before falling back to raw disk reads
 - Module rules for `.ts`, `.tsx`, `.jsx`, and `.mts` are added automatically
-- Static `export *` re-exports are skipped in the wrapper to avoid miniflare's ModuleLocator pre-walking the import tree
+- The wrapper never statically re-exports the entry (`export *`), to avoid miniflare's ModuleLocator pre-walking its import tree
 
 The callback should return `{ code: string }` for transformed modules, or `null`/`undefined` to fall back to the default raw file read.
 
@@ -529,7 +529,11 @@ await using runner = new MiniflareEnvRunner({
 
 Auto-wired bindings are merged with Durable Object bindings from `miniflareOptions` and a wrangler config: exports whose class is already bound (or whose binding name is taken) are skipped. Set `exports: false` to disable auto-detection entirely.
 
-To load named exports from a separate module, set `exports` to its absolute path or a virtual module specifier. This preserves re-exports and exported aliases. Configure the bindings explicitly with `wrangler` or `miniflareOptions`; this mode does not auto-detect bindings.
+#### Exports Module
+
+To load named exports from a separate module, set `exports` to its absolute path or a `data.virtual` key (a relative path resolves from the entry's directory, not the working directory). The wrapper re-exports it with `export *`, so re-exports and exported aliases work.
+
+In this mode nothing is auto-detected or auto-wired: configure the bindings with `wrangler` or `miniflareOptions`. The entry's own `export class` declarations are **not** re-exported either, so re-export them from the exports module if they are bound.
 
 ```ts
 const runner = new MiniflareEnvRunner({
@@ -546,7 +550,7 @@ const runner = new MiniflareEnvRunner({
 });
 ```
 
-Named exports are registered when the worker starts. Recreate the runner when their implementation or export list changes; `reloadModule()` only reloads the request entry.
+In both modes, named exports are registered when the worker starts. Recreate the runner when their implementation or export list changes; `reloadModule()` only reloads the request entry.
 
 #### Error Capture
 

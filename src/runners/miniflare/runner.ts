@@ -73,9 +73,13 @@ export interface MiniflareEnvRunnerOptions {
   transformRequest?: (id: string) => Promise<TransformResult | null | undefined>;
   /**
    * Named exports (Durable Objects, WorkerEntrypoints) to bind and re-export.
-   * `true` detects `export class`; a record merges with detected ones.
-   * A module specifier re-exports that module (including virtual modules).
-   * Configure its bindings with `wrangler` or `miniflareOptions`.
+   * Default (or `true`): detect `export class` in the entry and auto-bind them;
+   * a record merges with detected ones; `false` disables it.
+   * A module specifier (absolute path or `data.virtual` key; relative paths
+   * resolve from the entry's directory) is re-exported with `export *` instead:
+   * nothing is detected or auto-bound (configure bindings with `wrangler` or
+   * `miniflareOptions`) and the entry's own classes are not re-exported.
+   * Exports load at startup, so changes need a new runner (not `reloadModule()`).
    */
   exports?: Record<string, MiniflareExportInfo> | boolean | string;
   /** Reuse the Miniflare instance across runner swaps; only `dispose()` destroys it. */
@@ -482,7 +486,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
         : resolve("__env_runner_virtual_entry__.mjs");
       const entryDir = dirname(entryBase);
 
-      // Auto-detect exported classes from entry source (opt-in)
+      // Auto-detect exported classes from entry source (skipped for a module specifier)
       const entrySource = entryIsVirtual ? virtual![entryPath] : _tryReadFile(resolvedEntry);
       const detectedExports =
         this.#exports === false || typeof this.#exports === "string"
