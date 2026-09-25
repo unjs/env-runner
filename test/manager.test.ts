@@ -115,6 +115,31 @@ describe("RunnerManager", () => {
     expect(manager.ready).toBe(false);
   });
 
+  it("keeps the close cause when an attached runner closes itself", async () => {
+    let hookCause: unknown;
+    const runner = new NodeWorkerEnvRunner({
+      name: "close-cause",
+      workerEntry,
+      data: { entry: resolve(_dir, "./fixtures/does-not-exist.mjs") },
+      hooks: {
+        onClose: (_runner, cause) => {
+          hookCause = cause;
+        },
+      },
+    });
+    runners.push(runner);
+    manager = new RunnerManager(runner);
+    const managerCause = new Promise((resolve) => {
+      manager!.onClose((_runner, cause) => resolve(cause));
+    });
+
+    // The worker's `init-error` closes the runner through the manager's close() wrapper.
+    const error = await runner.waitForReady().catch((error) => error);
+    expect(String(error?.cause?.message)).toContain("does-not-exist");
+    expect(hookCause).toBe(error.cause);
+    expect(await managerCause).toBe(error.cause);
+  });
+
   it("fires onReady hook", async () => {
     const runner = createRunner("on-ready");
     runners.push(runner);
@@ -320,6 +345,50 @@ describe("RunnerManager", () => {
     // Plain fetches don't reload again
     expect(await (await manager.fetch("http://localhost/")).text()).toBe("1");
     expect(reloads).toBe(1);
+  });
+
+  it("fetch after updateVirtualModules reloads the entry automatically", async () => {
+    const runner = new NodeWorkerEnvRunner({
+      name: "manager-update",
+      workerEntry,
+      data: {
+        entry: "#entry",
+        virtual: {
+          "#entry": `import value from "#value";
+            export default { fetch: () => new Response(value) };`,
+          "#value": `export default "v1";`,
+        },
+      },
+    });
+    runners.push(runner);
+    manager = new RunnerManager(runner);
+    await waitForReady(runner);
+
+    let reloads = 0;
+    manager.onMessage((msg: any) => {
+      if (msg?.event === "module-reloaded") reloads++;
+    });
+
+    expect(await (await manager.fetch("http://localhost/")).text()).toBe("v1");
+
+    // No explicit reloadModule(): the next fetch reloads once, and sees the
+    // batch (a replaced entry importing an added key).
+    await manager.updateVirtualModules({
+      "#entry": `import value from "#added";
+        export default { fetch: () => new Response(value) };`,
+      "#added": `export default "v2";`,
+      "#value": null,
+    });
+    expect(await (await manager.fetch("http://localhost/")).text()).toBe("v2");
+    expect(await (await manager.fetch("http://localhost/")).text()).toBe("v2");
+    expect(reloads).toBe(1);
+  });
+
+  it("rejects updateVirtualModules without an active runner", async () => {
+    manager = new RunnerManager();
+    await expect(manager.updateVirtualModules({ "#x": "" })).rejects.toThrow(
+      "Active runner does not support updateVirtualModules()",
+    );
   });
 
   it("explicit reloadModule satisfies a pending invalidation", async () => {

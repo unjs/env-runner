@@ -5,25 +5,31 @@ import {
   resolveEntry,
   reloadEntryModule,
   parseServerAddress,
-  isVirtualSpecifier,
+  isVirtualEntry,
   toServerOptions,
+  formatInitError,
   type AppEntry,
 } from "../../common/worker-utils.ts";
-import { registerVirtualModules, handleInvalidateModule } from "../../common/virtual-modules.ts";
+import {
+  registerVirtualModules,
+  handleUpdateVirtualModules,
+} from "../../common/virtual-modules.ts";
+import { receiveProcessData } from "../../common/process-data.ts";
 
 // Exit with the supervisor to avoid orphans; registered before a possibly slow entry import.
 process.on("disconnect", () => process.exit(0));
 
-const data = JSON.parse(process.env.ENV_RUNNER_DATA || "{}");
+// Runner data comes over IPC (env vars are size-limited), before any entry import.
+const data = await receiveProcessData();
 const sendMessage = (message: unknown) => process.send!(message);
-const virtualEntry = isVirtualSpecifier(data.entry, data.virtual);
 
 let unregisterVirtualModules: () => void;
 let entry: AppEntry;
 let server: Server;
 try {
   unregisterVirtualModules = await registerVirtualModules(data.virtual);
-  entry = await resolveEntry(data.entry, virtualEntry);
+  // After registering: entry detection follows the live registrations.
+  entry = await resolveEntry(data.entry, isVirtualEntry(data.entry));
   // The entry's own srvx options are forwarded, so `serve()` can throw on a
   // bad option — keep it inside the init-error path for an actionable message.
   server = serve({
@@ -35,7 +41,7 @@ try {
 } catch (error: any) {
   // Report a structured error before exiting so the runner closes with a
   // meaningful cause instead of an uncaught rejection + bare exit code.
-  const message = error?.message || String(error);
+  const message = formatInitError(error);
   sendMessage({ event: "init-error", error: message });
   console.error(`[env-runner] worker init failed: ${message}`);
   process.exit(1);
@@ -68,7 +74,7 @@ process.on("message", async (message: any) => {
 
   if (message?.event === "reload-module") {
     try {
-      entry = await reloadEntryModule(data.entry, entry, sendMessage, virtualEntry);
+      entry = await reloadEntryModule(data.entry, entry, sendMessage, isVirtualEntry(data.entry));
       process.send!({ event: "module-reloaded" });
     } catch (error: any) {
       process.send!({ event: "module-reloaded", error: error?.message || String(error) });
@@ -76,8 +82,8 @@ process.on("message", async (message: any) => {
     return;
   }
 
-  if (message?.event === "invalidate-module") {
-    handleInvalidateModule(message, sendMessage);
+  if (message?.event === "update-virtual-modules") {
+    handleUpdateVirtualModules(message, sendMessage);
     return;
   }
 

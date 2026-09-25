@@ -7,7 +7,6 @@ import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 
 import { BaseEnvRunner } from "../../common/base-runner.ts";
-import { hostEnv } from "../../common/host-env.ts";
 import type { EnvRunnerData } from "../../common/base-runner.ts";
 
 export type { EnvRunnerData as BunProcessEnvRunnerData } from "../../common/base-runner.ts";
@@ -112,10 +111,7 @@ export class BunProcessEnvRunner extends BaseEnvRunner {
       return;
     }
 
-    const env = hostEnv({
-      ENV_RUNNER_NAME: this._name,
-      ENV_RUNNER_DATA: JSON.stringify(this._data || {}),
-    });
+    const env = this._processEnv();
 
     if (_isBun) {
       this.#initBunProcess(execArgv, env);
@@ -131,7 +127,7 @@ export class BunProcessEnvRunner extends BaseEnvRunner {
       env,
       stdio: ["pipe", "pipe", "pipe"],
       ipc: (message: any) => {
-        this._handleMessage(message);
+        this._handleProcessMessage(message);
       },
     });
 
@@ -187,7 +183,7 @@ export class BunProcessEnvRunner extends BaseEnvRunner {
     });
 
     child.on("message", (message: any) => {
-      this._handleMessage(message);
+      this._handleProcessMessage(message);
     });
 
     child.stdout?.pipe(process.stdout);

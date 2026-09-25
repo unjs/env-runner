@@ -1,7 +1,7 @@
 import type { WorkerHooks } from "../../types.ts";
 
 import { BaseEnvRunner } from "../../common/base-runner.ts";
-import type { EnvRunnerData } from "../../common/base-runner.ts";
+import type { EnvRunnerData, VirtualModuleUpdates } from "../../common/base-runner.ts";
 import type { AppEntry } from "../../common/worker-utils.ts";
 import { resolveEntry, reloadEntryModule } from "../../common/worker-utils.ts";
 
@@ -72,8 +72,14 @@ export class SelfEnvRunner extends BaseEnvRunner {
     this.#entry?.ipc?.onMessage?.(message);
   }
 
-  // The inherited version would leak `invalidate-module` into `ipc.onMessage`
-  // and wait for an ack no worker sends.
+  // The inherited versions would leak `update-virtual-modules` into
+  // `ipc.onMessage` and wait for an ack no worker sends.
+  override async updateVirtualModules(_changes: VirtualModuleUpdates): Promise<void> {
+    throw new Error(
+      "Cannot update virtual modules: the self runner does not support virtual modules",
+    );
+  }
+
   override async invalidateModule(specifier: string): Promise<void> {
     throw new Error(
       `Cannot invalidate "${specifier}": the self runner does not support virtual modules`,
@@ -132,9 +138,21 @@ export class SelfEnvRunner extends BaseEnvRunner {
       this.close("self runner requires data.entry");
       return;
     }
+    // Nothing registers virtual modules in the host process; fail fast instead
+    // of a confusing import error for a virtual key.
+    if (Object.keys(this._data?.virtual ?? {}).length > 0) {
+      this.close(
+        new Error("Cannot use data.virtual: the self runner does not support virtual modules"),
+      );
+      return;
+    }
     this.#active = true;
     resolveEntry(entryPath)
       .then(async (entry) => {
+        // Closed mid-import: don't open IPC that `_closeRuntime()` will never close.
+        if (this.closed) {
+          return;
+        }
         this.#entry = entry;
         await entry.ipc?.onOpen?.({
           sendMessage: (message) => {

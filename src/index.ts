@@ -13,8 +13,12 @@ export type {
 
 export {
   type EnvRunnerData,
+  type VirtualModule,
+  type VirtualModuleContent,
+  type VirtualModuleFormat,
   type VirtualModules,
   type VirtualModuleSource,
+  type VirtualModuleUpdates,
   BaseEnvRunner,
 } from "./common/base-runner.ts";
 export { RunnerManager } from "./manager.ts";
