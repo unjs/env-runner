@@ -709,14 +709,19 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
           const bareSpecifier = cleanSpecifier.startsWith("/")
             ? cleanSpecifier.slice(1)
             : cleanSpecifier;
-          // workerd joins a `file:` specifier onto the referrer's directory
-          // like a relative path, so only the raw one maps to a path key.
+          // Real path of the referrer (disk file or path key), if served here.
+          const referrerKey = referrer.startsWith("/") ? referrer.slice(1) : referrer;
+          const referrerPath = modulePathMap.get(referrerKey);
+          // Match the raw specifier against the referrer's real path first:
+          // workerd joins a `file:` specifier onto the referrer's directory like
+          // a relative path, and on Windows module names are native paths
+          // (`D:\app\x.mjs`) it can't join relative specifiers onto at all.
           const virtualKey =
             [cleanRaw, cleanSpecifier, bareSpecifier].find(
               (key) => key !== undefined && Object.hasOwn(_virtual.sources, key),
             ) ??
-            _virtual.keyOf(cleanSpecifier) ??
-            (cleanRaw?.startsWith("file:") ? _virtual.keyOf(cleanRaw) : undefined);
+            (cleanRaw ? _virtual.keyOf(cleanRaw, referrerPath) : undefined) ??
+            _virtual.keyOf(cleanSpecifier);
           if (virtualKey !== undefined) {
             const query = specifier.includes("?") ? specifier.slice(specifier.indexOf("?")) : "";
             const keyPath = virtualKeyPath(virtualKey);
@@ -734,6 +739,10 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
               return new Response(null, { status: 301, headers: { location } });
             }
             const name = bareSpecifier + query;
+            if (keyPath) {
+              // Its relative imports resolve against the key's path.
+              modulePathMap.set(name, keyPath);
+            }
             return Response.json({
               name,
               ..._serveVirtual(_virtual.sources[virtualKey]!, keyPath),
@@ -751,11 +760,16 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
               return new Response(null, { status: 404 });
             }
           }
-          // Bare specifier (npm package) — resolve via Node module resolution
-          else if (cleanRaw && !cleanRaw.startsWith(".") && !cleanRaw.startsWith("/")) {
+          // Bare specifier (npm package) — resolve via Node module resolution.
+          // Not a Windows absolute path (`D:\app\x.mjs`), which isn't `/`-rooted.
+          else if (
+            cleanRaw &&
+            !cleanRaw.startsWith(".") &&
+            !cleanRaw.startsWith("/") &&
+            !isAbsolute(cleanRaw)
+          ) {
             // Resolve relative to the referrer's real path when available
-            const referrerKey = referrer.startsWith("/") ? referrer.slice(1) : referrer;
-            const referrerReal = modulePathMap.get(referrerKey);
+            const referrerReal = referrerPath;
             const contextRequire = referrerReal ? createRequire(referrerReal) : _require;
             // cloudflare:* modules are workerd built-ins
             if (cleanRaw.startsWith("cloudflare:")) {
@@ -789,14 +803,15 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
             }
           } else {
             // Resolve against the referrer's real filesystem path
-            const referrerKey = referrer.startsWith("/") ? referrer.slice(1) : referrer;
             const referrerReal =
-              modulePathMap.get(referrerKey) ||
-              (referrer.startsWith("/") ? referrer : "/" + referrer);
+              referrerPath || (referrer.startsWith("/") ? referrer : "/" + referrer);
             const referrerDir = dirname(referrerReal);
             const raw = cleanRaw || cleanSpecifier;
             if (raw.startsWith(".")) {
               resolvedPath = resolve(referrerDir, raw);
+            } else if (cleanRaw && isAbsolute(cleanRaw) && !cleanRaw.startsWith("/")) {
+              // Windows absolute path, e.g. the wrapper's entry import
+              resolvedPath = cleanRaw;
             } else if (cleanSpecifier.startsWith("/")) {
               // Absolute specifier — use directly
               resolvedPath = cleanSpecifier;

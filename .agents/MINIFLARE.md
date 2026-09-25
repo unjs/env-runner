@@ -25,6 +25,7 @@ Shared (top-level) callback invoked when workerd can't resolve an import; each w
 - `404` → not found (workerd falls back to built-ins like `node:`/`cloudflare:`); `301` + `Location` → redirect.
 - workerd caches modules by name: strip `?t=` when reading from disk but keep it in `name` so a reload is a new module.
 - `specifier` is `rawSpecifier` joined onto the referrer's name as **plain text**: no percent-decoding (`./a%20b.mjs` stays `%20`), and a `file:` URL is joined like a relative path (`/dir/file:/x.mjs`). Only `rawSpecifier` keeps the URL intact.
+- On Windows, module names are native paths (the wrapper imports the entry as `D:\app\entry.mjs`), so `specifier` can't be joined at all (`./a.mjs` arrives as `/a.mjs`). The fallback therefore resolves `rawSpecifier` against the referrer's real path (`modulePathMap`, which also records served path keys), and treats a drive-letter `rawSpecifier` as an absolute path, not a bare specifier. Not verified locally; covered by the Windows CI job.
 - **Redirects** (verified on v4 and v5): workerd re-requests with the `Location` verbatim as `specifier` (`rawSpecifier`/`referrer` unchanged), and the `name` must match it. Header bytes are read as UTF-8, so send a non-ASCII location as latin1-encoded UTF-8 (`Buffer.from(loc, "utf8").toString("latin1")`). A redirect loop crashes workerd (segfault).
 - Static imports of the main module that no worker module provides go through the fallback at startup (v5, or v4 with a `modules` list).
 
