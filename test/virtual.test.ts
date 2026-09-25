@@ -531,31 +531,34 @@ describe("MiniflareEnvRunner virtual module invalidation", () => {
   });
 });
 
-describe("MiniflareEnvRunner virtual module limitations", () => {
-  // The wrapper wires DO/Entrypoint exports as static re-exports, which
-  // miniflare's ModuleLocator resolves on disk — impossible for a virtual entry.
-  it("fails fast for named exports with a virtual entry", async () => {
-    let closeCause: unknown;
+describe("MiniflareEnvRunner virtual exports", () => {
+  it("supports named exports with a virtual entry", async () => {
     const runner = new MiniflareEnvRunner({
       miniflare,
       name: "virtual-do",
       exports: { Counter: {} },
-      hooks: {
-        onClose: (_runner, cause) => {
-          closeCause = cause;
-        },
-      },
       data: {
         entry: "#entry",
         virtual: {
-          "#entry": `export default { fetch: () => new Response("unreachable") };`,
+          "#entry": `
+            export class Counter {
+              fetch() { return new Response("from virtual DO"); }
+            }
+            export default {
+              fetch(request, env) {
+                return env.COUNTER.get(env.COUNTER.idFromName("test")).fetch(request);
+              }
+            };
+          `,
         },
       },
     });
-    await expect(runner.waitForReady(3000)).rejects.toThrow();
-    expect(runner.closed).toBe(true);
-    expect(String((closeCause as Error)?.message)).toContain("virtual entry");
-    await runner.close();
+    try {
+      await runner.waitForReady();
+      expect(await (await runner.fetch("http://localhost/")).text()).toBe("from virtual DO");
+    } finally {
+      await runner.close();
+    }
   });
 });
 

@@ -73,9 +73,15 @@ export interface MiniflareEnvRunnerOptions {
   transformRequest?: (id: string) => Promise<TransformResult | null | undefined>;
   /**
    * Named exports (Durable Objects, WorkerEntrypoints) to bind and re-export.
-   * `true` detects `export class`; a record merges with detected ones.
+   * Default (or `true`): detect `export class` in the entry and auto-bind them;
+   * a record merges with detected ones; `false` disables it.
+   * A module specifier (absolute path or `data.virtual` key; relative paths
+   * resolve from the entry's directory) is re-exported with `export *` instead:
+   * nothing is detected or auto-bound (configure bindings with `wrangler` or
+   * `miniflareOptions`) and the entry's own classes are not re-exported.
+   * Exports load at startup, so changes need a new runner (not `reloadModule()`).
    */
-  exports?: Record<string, MiniflareExportInfo> | boolean;
+  exports?: Record<string, MiniflareExportInfo> | boolean | string;
   /** Reuse the Miniflare instance across runner swaps; only `dispose()` destroys it. */
   persistent?: boolean;
   /** Wrap the user's `fetch` in a try/catch that returns structured JSON error responses. Default: `true`. */
@@ -147,7 +153,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
   #ws?: { send(data: string): void; close(): void };
   #persistent: boolean;
   #cacheKey?: string;
-  #exports: Record<string, MiniflareExportInfo> | boolean;
+  #exports: Record<string, MiniflareExportInfo> | boolean | string;
   #captureErrors: boolean;
   #exportConditions: string[];
   #wrangler: boolean | string | WranglerInlineConfig;
@@ -480,22 +486,15 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
         : resolve("__env_runner_virtual_entry__.mjs");
       const entryDir = dirname(entryBase);
 
-      // Auto-detect exported classes from entry source (opt-in)
+      // Auto-detect exported classes from entry source (skipped for a module specifier)
       const entrySource = entryIsVirtual ? virtual![entryPath] : _tryReadFile(resolvedEntry);
       const detectedExports =
-        this.#exports === false || this.#exports === undefined
+        this.#exports === false || typeof this.#exports === "string"
           ? []
           : detectExportedClasses(
               entrySource,
               typeof this.#exports === "object" ? this.#exports : {},
             );
-
-      // Static re-exports are resolved on disk at startup, impossible for a virtual entry.
-      if (entryIsVirtual && detectedExports.length > 0) {
-        throw new Error(
-          `[env-runner] named exports (${detectedExports.join(", ")}) are not supported with a virtual entry on the miniflare runner; pass \`exports: false\` or use a real entry file.`,
-        );
-      }
 
       // Skip exports whose class is already bound or whose binding name is taken.
       if (detectedExports.length > 0) {
@@ -518,13 +517,22 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
       options.script = generateWrapper(resolvedEntry, {
         dynamicOnly: true,
         captureErrors: this.#captureErrors,
-        exports: detectedExports,
+        exports: typeof this.#exports === "string" ? this.#exports : detectedExports,
         nodeCompat: !(options.compatibilityFlags as string[]).includes("no_nodejs_compat"),
       });
       options.scriptPath = entryDir + "/__env_runner_wrapper.mjs";
       // Use "/" as modulesRoot so absolute paths don't produce ".." relative paths
       if (!options.modulesRoot) {
         options.modulesRoot = "/";
+      }
+      if (typeof this.#exports === "string" || (entryIsVirtual && detectedExports.length > 0)) {
+        options.modules = [
+          {
+            type: "ESModule",
+            path: options.scriptPath,
+            contents: options.script,
+          },
+        ];
       }
 
       // Enable unsafeEval for hot-reload support (re-import entry without restart)
@@ -724,6 +732,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
       this.#cacheKey = computeCacheKey(entryPath, {
         ...this.#miniflareOptions,
         _exportConditions: this.#exportConditions,
+        _exports: this.#exports,
         // The fallback service closure captures the virtual map, so instances
         // are only shareable when the resolved sources are identical.
         _virtual: virtual,

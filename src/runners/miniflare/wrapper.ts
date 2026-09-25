@@ -17,7 +17,8 @@ export function generateWrapper(
   opts?: {
     dynamicOnly?: boolean;
     captureErrors?: boolean;
-    exports?: string[];
+    /** Class names re-exported from the entry, or a module specifier re-exported with `export *`. */
+    exports?: string[] | string;
     /** Import `node:process` as the `process` global (needs `nodejs_compat`). Default: `true`. */
     nodeCompat?: boolean;
   },
@@ -32,14 +33,17 @@ if (!globalThis.process) { globalThis.process = __process; }`;
   // Static `export *` would make ModuleLocator walk the entry's imports at startup.
   const staticReExport = opts?.dynamicOnly ? "" : `export * from ${JSON.stringify(entryPath)};`;
 
-  // In dynamicOnly mode, we still need explicit re-exports for DO/Entrypoint
-  // classes since workerd requires them as static named exports.
+  // workerd requires DO/Entrypoint classes as static named exports: re-export a
+  // separate exports module wholesale, or (in dynamicOnly mode) the named classes
+  // from the entry.
   const explicitExports =
-    opts?.dynamicOnly && opts.exports?.length
-      ? opts.exports
-          .map((name) => `export { ${name} } from ${JSON.stringify(entryPath)};`)
-          .join("\n")
-      : "";
+    typeof opts?.exports === "string"
+      ? `export * from ${JSON.stringify(opts.exports)};`
+      : opts?.dynamicOnly && opts.exports?.length
+        ? opts.exports
+            .map((name) => `export { ${name} } from ${JSON.stringify(entryPath)};`)
+            .join("\n")
+        : "";
 
   const captureErrors = opts?.captureErrors ?? true;
 

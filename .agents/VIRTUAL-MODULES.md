@@ -50,7 +50,7 @@ In-memory ES modules served from a `data.virtual` map (`specifier => source`). S
 - Reload keeps `?t=<n>` in the returned module `name` to get a fresh workerd identity.
 - A virtual entry skips path handling (anchored at cwd for bare resolution) and is eval-imported verbatim by the wrapper.
 - workerd rejects **any** import attribute ("Unrecognized import attributes specified"), so JSON imports must omit `with { type: "json" }`.
-- **`ModuleLocator` statically walks the wrapper**, so literal virtual specifiers must never appear in it (`dynamicOnly` mode). As a result, named `exports` (DO/WorkerEntrypoint re-exports) combined with a virtual entry **throw at init**.
+- **Named exports** use an explicit `modules` array containing the wrapper, bypassing `ModuleLocator` so static re-exports can resolve through the fallback service at startup. Both virtual entries and a separate `exports` module specifier are supported.
 - **Invalidation is host-side only**: it bumps versions for the key plus its transitive virtual importers, and the fallback service rewrites **import specifiers** of invalidated keys in re-served code.
   - Rewritten: static imports/re-exports and literal dynamic imports (including plain template literals).
   - Not rewritten: glob template literals, `import.meta` and arbitrary string literals (code mentioning a key as data is untouched). Unparsable and CJS-shim responses are served as-is.

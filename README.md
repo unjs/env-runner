@@ -338,7 +338,7 @@ await using runner = new NodeWorkerEnvRunner({
 
 Virtual modules are registered inside the worker, before the entry is imported. On Node.js (>= 22.15 / 23.5) and Deno (>= 2.x) this uses [ESM customization hooks](https://nodejs.org/api/module.html#moduleregisterhooksoptions) (`module.registerHooks`); on Bun (which does not implement `registerHooks`) it uses [`Bun.plugin()`](https://bun.com/docs/runtime/plugins) virtual modules instead. The source string is treated as an ES module, and virtual specifiers (including a virtual entry) resolve across `reloadModule()`. On runtimes supporting neither mechanism, a warning is logged and registration is skipped. When the worker shuts down gracefully the registration is unregistered again (the `registerHooks` registration is deregistered; on Bun, which has no plugin-removal API, the in-memory source map is detached so fresh loads and reloads stop resolving).
 
-On `MiniflareEnvRunner` there is no in-worker registration: the runner's module fallback service serves virtual specifiers to workerd directly (taking precedence over disk files and the `transformRequest` pipeline, so a virtual key overrides a real file with the same path). One limitation: named `exports` (Durable Objects / WorkerEntrypoints) cannot be combined with a **virtual entry** — the wrapper would need a static re-export that miniflare cannot resolve at startup — and the runner fails fast with a clear error in that case.
+On `MiniflareEnvRunner` there is no in-worker registration: the runner's module fallback service serves virtual specifiers to workerd directly (taking precedence over disk files and the `transformRequest` pipeline, so a virtual key overrides a real file with the same path). Named `exports` (Durable Objects / WorkerEntrypoints) also work with virtual entries.
 
 #### Miniflare Runner
 
@@ -431,7 +431,7 @@ await using runner = new MiniflareEnvRunner({
 
 A missing `wranglerConfigPath` file warns (an inline config is still applied). When `wrangler` is itself a string path, that path wins and `wranglerConfigPath` is ignored.
 
-The runner hosts a single fetch-only worker, so config entries it can't run are **dropped**: `assets`, `services`, `queues.consumers`, `workflows`, `tail_consumers`/`streaming_tail_consumers`, and Durable Object bindings to another script (`script_name`). Durable Object bindings to classes exported by your entry are kept — including bindings whose `script_name` is the worker's own `name` (the inline config's `name` when set, else the file's; with `wranglerEnv` suffixed `-<env>` unless the env section sets a `name`, e.g. `my-worker-staging`), which are local in `wrangler dev` too — and merged with [auto-detected exports](#auto-detected-exports). Pass any of the dropped options via `miniflareOptions` to opt back in.
+The runner hosts a single fetch-only worker, so config entries it can't run are **dropped**: `assets`, `services`, `queues.consumers`, `workflows`, `tail_consumers`/`streaming_tail_consumers`, and Durable Object bindings to another script (`script_name`). Durable Object bindings to local classes (exported by your entry or an [exports module](#exports-module)) are kept — including bindings whose `script_name` is the worker's own `name` (the inline config's `name` when set, else the file's; with `wranglerEnv` suffixed `-<env>` unless the env section sets a `name`, e.g. `my-worker-staging`), which are local in `wrangler dev` too — and merged with [auto-detected exports](#auto-detected-exports). Pass any of the dropped options via `miniflareOptions` to opt back in.
 
 Whenever `wrangler` is enabled (`true`, a path, or an inline config), local state (KV, D1, R2, Durable Objects, ...) persists under `<dir>/.wrangler/state/v3` — the same place `wrangler dev` uses, so both share data. `<dir>` is the directory of the loaded config file, else of the requested config path (`wrangler` string or `wranglerConfigPath`, even if the file is missing), else the current working directory (e.g. inline-only configs, or `wrangler: true` with no file found). Set `miniflareOptions.defaultPersistRoot` (or any `*Persist` option, e.g. `kvPersist: false`; on miniflare v5, `resourcePersistencePath`) to opt out.
 
@@ -491,7 +491,7 @@ When `transformRequest` is provided:
 
 - The `unsafeModuleFallbackService` calls it with the resolved file path before falling back to raw disk reads
 - Module rules for `.ts`, `.tsx`, `.jsx`, and `.mts` are added automatically
-- Static `export *` re-exports are skipped in the wrapper to avoid miniflare's ModuleLocator pre-walking the import tree
+- The wrapper never statically re-exports the entry (`export *`), to avoid miniflare's ModuleLocator pre-walking its import tree
 
 The callback should return `{ code: string }` for transformed modules, or `null`/`undefined` to fall back to the default raw file read.
 
@@ -528,6 +528,29 @@ await using runner = new MiniflareEnvRunner({
 ```
 
 Auto-wired bindings are merged with Durable Object bindings from `miniflareOptions` and a wrangler config: exports whose class is already bound (or whose binding name is taken) are skipped. Set `exports: false` to disable auto-detection entirely.
+
+#### Exports Module
+
+To load named exports from a separate module, set `exports` to its absolute path or a `data.virtual` key (a relative path resolves from the entry's directory, not the working directory). The wrapper re-exports it with `export *`, so re-exports and exported aliases work.
+
+In this mode nothing is auto-detected or auto-wired: configure the bindings with `wrangler` or `miniflareOptions`. The entry's own `export class` declarations are **not** re-exported either, so re-export them from the exports module if they are bound.
+
+```ts
+const runner = new MiniflareEnvRunner({
+  name: "app",
+  miniflare,
+  data: {
+    entry: "/path/to/server.mjs",
+    virtual: {
+      "#server-exports": 'export { Counter } from "/path/to/counter.mjs";',
+    },
+  },
+  exports: "#server-exports",
+  miniflareOptions: { durableObjects: { COUNTER: "Counter" } },
+});
+```
+
+In both modes, named exports are registered when the worker starts. Recreate the runner when their implementation or export list changes; `reloadModule()` only reloads the request entry.
 
 #### Error Capture
 
