@@ -121,6 +121,12 @@ describe("Miniflare Request inputs", () => {
       await server.close(true);
     }
   });
+  test.each(["string", "Request"])("returns %s redirects without following them", async (kind) => {
+    const target = "http://localhost/redirect";
+    const res = await runner.fetch(kind === "Request" ? new Request(target) : target);
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/echo");
+  });
   test("preserves an aborted Request signal", async () => {
     await expect(
       runner.fetch(new Request(url, { signal: AbortSignal.abort() })),

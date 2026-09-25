@@ -211,11 +211,14 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
     const resolved = this._resolveFetchInput(input);
     // Treat request adapters as RequestInit dictionaries so all public request
     // properties survive without requiring native Request's private state.
+    // `redirect: "manual"` returns worker 3xx responses as-is (like proxyFetch)
+    // instead of letting dispatchFetch's undici fetch follow them.
     const request =
       typeof resolved === "string" || resolved instanceof URL
-        ? new Request(resolved, init)
+        ? new Request(resolved, { ...init, redirect: "manual" })
         : new Request(new Request(resolved.url, resolved), {
             ...init,
+            redirect: "manual",
             referrer: init?.referrer ?? resolved.referrer,
             referrerPolicy: init?.referrerPolicy ?? resolved.referrerPolicy,
           });
