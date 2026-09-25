@@ -8,5 +8,7 @@ export default defineConfig({
     // budget so these first-start costs don't flake.
     testTimeout: 20_000,
     hookTimeout: 20_000,
+    // Installs Deno's npm packages once before suites spawn Deno workers.
+    globalSetup: ["./test/global-setup.ts"],
   },
 });

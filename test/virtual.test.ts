@@ -800,7 +800,7 @@ for (const { name, create, skip, bun, miniflare } of runners) {
           data: {
             entry,
             virtual: {
-              [entry]: `import { count } from ${JSON.stringify(lib)};
+              [entry]: `import { count } from ${JSON.stringify(pathToFileURL(lib).href)};
                 export default { fetch: () => Response.json({ count, evaluations: globalThis.__evaluations }) };`,
               "#count": () => `export default ${counter++};`,
             },
@@ -1143,7 +1143,7 @@ for (const { name, create, skip, bun, deno, miniflare } of runners) {
             entry: "#entry",
             virtual: {
               // `app.mjs` (disk) imports `./config.mjs` (disk).
-              "#entry": `export { default } from ${JSON.stringify(resolve(pathsDir, "app.mjs"))};`,
+              "#entry": `export { default } from ${JSON.stringify(pathToFileURL(resolve(pathsDir, "app.mjs")).href)};`,
             },
           },
         });
@@ -1266,11 +1266,11 @@ for (const { name, create, skip, bun, deno, miniflare } of runners) {
             fetch: () => new Response([lib.value, value, sep, legacy.kind].join(":")),
           };`,
         "#lib.cjs": `const path = require("node:path");
-          exports.sep = path.sep;
+          exports.sep = path.basename("/dir/file.txt");
           module.exports.value = "cjs";`,
         "#legacy": { source: `module.exports = { kind: "explicit" };`, format: "commonjs" },
       });
-      expect(await text()).toBe("cjs:cjs:/:explicit");
+      expect(await text()).toBe("cjs:cjs:file.txt:explicit");
     });
 
     it.skipIf(deno && !denoTypeStripping)("imports CommonJS TypeScript (.cts)", async () => {
