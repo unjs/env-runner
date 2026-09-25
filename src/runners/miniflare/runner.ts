@@ -918,6 +918,16 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
       }
     }
 
+    // Load the entry with a plain request first, so a load error arrives as a
+    // normal response: miniflare leaves the socket of a failed WebSocket upgrade
+    // without an error listener, and disposing workerd then resets it (an
+    // uncaught ECONNRESET on Windows).
+    const loadRes = await this.#miniflare.dispatchFetch("http://localhost" + IPC_PATH);
+    const loadBody = await loadRes.text().catch(() => "");
+    if (!loadRes.ok) {
+      throw new Error(`Failed to establish WebSocket IPC channel (${loadRes.status}: ${loadBody})`);
+    }
+
     // Establish persistent WebSocket connection for IPC
     const initRes = await this.#miniflare.dispatchFetch("http://localhost" + IPC_PATH, {
       headers: { upgrade: "websocket" },
