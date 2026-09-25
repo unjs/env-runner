@@ -1,6 +1,35 @@
 # Changelog
 
 
+## v0.3.0
+
+[compare changes](https://github.com/unjs/env-runner/compare/v0.2.3...v0.3.0)
+
+### 🚀 Enhancements
+
+- **miniflare:** Support a module specifier for `exports` ([#60](https://github.com/unjs/env-runner/pull/60))
+- ⚠️  Virtual modules improvements ([#61](https://github.com/unjs/env-runner/pull/61))
+
+### 🩹 Fixes
+
+- **miniflare:** Return worker redirects instead of following them ([d01fca7](https://github.com/unjs/env-runner/commit/d01fca7))
+- **miniflare:** Keep IPC env across requests ([358bff6](https://github.com/unjs/env-runner/commit/358bff6))
+- **miniflare:** Support miniflare v5 ([0838ef3](https://github.com/unjs/env-runner/commit/0838ef3))
+
+### 🏡 Chore
+
+- Update deps ([6d01008](https://github.com/unjs/env-runner/commit/6d01008))
+
+#### ⚠️ Breaking Changes
+
+- ⚠️  Virtual modules improvements ([#61](https://github.com/unjs/env-runner/pull/61))
+
+### ❤️ Contributors
+
+- Pi0x <x@pi0.io>
+- Rihan Arfan ([@RihanArfan](https://github.com/RihanArfan))
+- Pooya Parsa ([@pi0](https://github.com/pi0))
+
 ## v0.2.3
 
 [compare changes](https://github.com/unjs/env-runner/compare/v0.2.2...v0.2.3)
