@@ -1,7 +1,7 @@
 import type { WorkerHooks } from "../../types.ts";
 
 import { BaseEnvRunner } from "../../common/base-runner.ts";
-import type { EnvRunnerData } from "../../common/base-runner.ts";
+import type { EnvRunnerData, VirtualModuleUpdates } from "../../common/base-runner.ts";
 import type { AppEntry } from "../../common/worker-utils.ts";
 import { resolveEntry, reloadEntryModule } from "../../common/worker-utils.ts";
 
@@ -72,8 +72,14 @@ export class SelfEnvRunner extends BaseEnvRunner {
     this.#entry?.ipc?.onMessage?.(message);
   }
 
-  // The inherited version would leak `invalidate-module` into `ipc.onMessage`
-  // and wait for an ack no worker sends.
+  // The inherited versions would leak `update-virtual-modules` into
+  // `ipc.onMessage` and wait for an ack no worker sends.
+  override async updateVirtualModules(_changes: VirtualModuleUpdates): Promise<void> {
+    throw new Error(
+      "Cannot update virtual modules: the self runner does not support virtual modules",
+    );
+  }
+
   override async invalidateModule(specifier: string): Promise<void> {
     throw new Error(
       `Cannot invalidate "${specifier}": the self runner does not support virtual modules`,

@@ -4,6 +4,7 @@ import {
   createVirtualHooks,
   expandVirtualInvalidation,
   stripVirtualTypeScript,
+  virtualKeyURL,
   virtualModuleFormat,
 } from "../virtual-loader.ts";
 
@@ -18,13 +19,18 @@ import {
  *
  * Resolves to an idempotent unregister function. Bun can't remove plugins, so
  * there it detaches the registration (cached modules survive, fresh loads fail
- * or fall through to disk).
+ * or fall through to disk). An empty map registers nothing until
+ * {@link updateVirtualModules} adds a key; its unregister covers that.
  */
 export async function registerVirtualModules(
   virtual?: Record<string, string>,
 ): Promise<() => void> {
   if (!virtual || Object.keys(virtual).length === 0) {
-    return _noop;
+    return _once(() => {
+      for (const unregister of _lazyUnregisters.splice(0)) {
+        unregister();
+      }
+    });
   }
   const { registerHooks, stripTypeScriptTypes } = await import("node:module");
   if (typeof registerHooks === "function") {
@@ -39,21 +45,24 @@ export async function registerVirtualModules(
       }
       virtual = transformed;
     }
-    const registration: HooksRegistration = {
-      virtual,
-      versions: new Map(),
-      importers: new Map(),
-      transformSource,
-    };
+    const versions = new Map<string, number>();
+    const importers = new Map<string, Set<string>>();
     // Track only after registerHooks succeeds (a throw returns no unregister).
     // Deno sources are already plain JS, so force the `module` format.
-    const hooks = registerHooks(
-      createVirtualHooks(virtual, {
-        versions: registration.versions,
-        importers: registration.importers,
-        forcePlainModule: isDeno,
-      }),
-    );
+    const { resolve, load, updateKeys } = createVirtualHooks(virtual, {
+      versions,
+      importers,
+      forcePlainModule: isDeno,
+    });
+    const hooks = registerHooks({ resolve, load });
+    const registration: HooksRegistration = {
+      virtual,
+      versions,
+      version: 0,
+      importers,
+      transformSource,
+      updateKeys,
+    };
     _hooksRegistrations.unshift(registration);
     return _once(() => {
       const index = _hooksRegistrations.indexOf(registration);
@@ -102,61 +111,150 @@ export function refreshVirtualModule(specifier: string): boolean {
 }
 
 /**
- * Make the next import of a virtual module (and its importers, see
+ * Set (string source) or remove (`null`) virtual modules in one step. A key
+ * changes in the registration serving it and a new key goes to the latest one,
+ * registering one if there is none. Changed keys and their importers (see
  * {@link expandVirtualInvalidation}; with `registerHooks` also disk ES modules)
- * evaluate fresh, optionally replacing its source. Linked importers keep their
- * instances; pair with `reloadModule()`.
+ * evaluate fresh on their next import. Linked importers keep their instances,
+ * so pair with `reloadModule()`. A removed key falls through to normal
+ * resolution: the real file it overrode, or not found. If a source can't be
+ * prepared (Deno type stripping), nothing changes.
  */
-export function invalidateVirtualModule(specifier: string, source?: string): boolean {
-  for (const registration of _hooksRegistrations) {
-    if (!Object.hasOwn(registration.virtual, specifier)) {
-      continue;
+export async function updateVirtualModules(changes: Record<string, string | null>): Promise<void> {
+  if (_hooksRegistrations.length === 0 && _bunRegistrations.length === 0) {
+    const added = Object.fromEntries(
+      Object.entries(changes).filter((entry): entry is [string, string] => entry[1] !== null),
+    );
+    if (Object.keys(added).length === 0) {
+      return;
     }
-    const { virtual, versions, importers, transformSource } = registration;
-    if (source !== undefined) {
-      virtual[specifier] = transformSource ? transformSource(specifier, source) : source;
+    // Registered with the added keys, then updated below like any registration,
+    // which versions them: their paths may be cached from disk.
+    const unregister = await registerVirtualModules(added);
+    if (_hooksRegistrations.length === 0 && _bunRegistrations.length === 0) {
+      throw new Error("Cannot update virtual modules: this runtime can't serve them");
     }
-    for (const key of expandVirtualInvalidation(virtual, specifier, importers)) {
-      versions.set(key, (versions.get(key) ?? 0) + 1);
-    }
-    return true;
+    _lazyUnregisters.push(unregister);
   }
-  for (const registration of _bunRegistrations) {
-    if (!Object.hasOwn(registration.virtual, specifier)) {
-      continue;
+  const registrations: VirtualRegistration[] =
+    _hooksRegistrations.length > 0 ? _hooksRegistrations : _bunRegistrations;
+  const groups = new Map<VirtualRegistration, Record<string, string | null>>();
+  for (const [key, source] of Object.entries(changes)) {
+    const owner =
+      registrations.find((registration) => Object.hasOwn(registration.virtual, key)) ??
+      (source === null ? undefined : registrations[0]!);
+    if (owner) {
+      let group = groups.get(owner);
+      if (!group) {
+        groups.set(owner, (group = {}));
+      }
+      group[key] = source;
     }
-    const { virtual, importers } = registration;
-    if (source !== undefined) {
-      virtual[specifier] = source;
-    }
-    _bustBunModules(registration, expandVirtualInvalidation(virtual, specifier, importers));
-    return true;
   }
-  return false;
+  // Prepare every source before changing any registration (Deno can throw).
+  const prepared = [...groups].map(([registration, group]) => {
+    const transform = "transformSource" in registration && registration.transformSource;
+    const sources: Record<string, string | null> = {};
+    for (const [key, source] of Object.entries(group)) {
+      sources[key] = transform && source !== null ? transform(key, source) : source;
+    }
+    return [registration, sources] as const;
+  });
+  for (const [registration, sources] of prepared) {
+    if ("updateKeys" in registration) {
+      _updateHooksRegistration(registration, sources);
+    } else {
+      _updateBunRegistration(registration, sources);
+    }
+  }
 }
 
-/** Handle an `invalidate-module` IPC message and ack with `module-invalidated`. */
-export function handleInvalidateModule(
-  message: { specifier: string; source?: string },
+/**
+ * Handle an `update-virtual-modules` IPC message and ack with
+ * `virtual-modules-updated` (same `id`). Messages apply in arrival order.
+ */
+export function handleUpdateVirtualModules(
+  message: { id?: unknown; changes?: Record<string, string | null> },
   sendMessage: (message: unknown) => void,
-): void {
-  const ok = invalidateVirtualModule(message.specifier, message.source);
-  sendMessage({
-    event: "module-invalidated",
-    specifier: message.specifier,
-    error: ok
-      ? undefined
-      : `Cannot invalidate "${message.specifier}" (not a registered virtual module)`,
-  });
+): Promise<void> {
+  const update = _pendingUpdate
+    .then(() => updateVirtualModules(message.changes ?? {}))
+    .then(
+      () => sendMessage({ event: "virtual-modules-updated", id: message.id }),
+      (error) =>
+        sendMessage({
+          event: "virtual-modules-updated",
+          id: message.id,
+          error: error?.message || String(error),
+        }),
+    );
+  _pendingUpdate = update.catch(() => {});
+  return _pendingUpdate;
 }
+
+/** The live `key => source` view of all registrations (the latest wins), following updates. */
+export function registeredVirtualModules(): Record<string, string> {
+  const merged: Record<string, string> = {};
+  for (const registration of [..._hooksRegistrations, ..._bunRegistrations].reverse()) {
+    Object.assign(merged, registration.virtual);
+  }
+  return merged;
+}
+
+type VirtualRegistration = HooksRegistration | BunRegistration;
+
+// Serializes `handleUpdateVirtualModules()` (registering can await).
+let _pendingUpdate: Promise<void> = Promise.resolve();
+
+// Unregisters of registrations created by `updateVirtualModules()`, run by the
+// unregister of an empty `registerVirtualModules()`.
+const _lazyUnregisters: (() => void)[] = [];
 
 interface HooksRegistration {
   virtual: Record<string, string>;
   versions: Map<string, number>;
+  // Last version handed out: unique per registration, so a key and the disk
+  // file it overrides (or uncovers) never share a `?v=<n>` URL.
+  version: number;
   // Resolved `module => importers` edges (keys and disk files), recorded by
   // the hooks; `versions` also covers the disk files.
   importers: Map<string, Set<string>>;
   transformSource?: (specifier: string, source: string) => string;
+  updateKeys: (keys: Iterable<string>) => void;
+}
+
+function _updateHooksRegistration(
+  registration: HooksRegistration,
+  changes: Record<string, string | null>,
+): void {
+  const { virtual, versions, importers } = registration;
+  const added: string[] = [];
+  const removed: string[] = [];
+  for (const [key, source] of Object.entries(changes)) {
+    if (source === null) {
+      removed.push(key);
+      continue;
+    }
+    if (!Object.hasOwn(virtual, key)) {
+      added.push(key);
+    }
+    virtual[key] = source;
+  }
+  registration.updateKeys(added);
+  // Path keys also expand from their file URL, which tracks disk importers of
+  // the file an added key now overrides and versions the file a removed key
+  // uncovers. Removed keys are still in `virtual` for the quoted scan.
+  const targets = Object.keys(changes).flatMap((key) => {
+    const url = virtualKeyURL(key);
+    return url && url !== key ? [key, url] : [key];
+  });
+  for (const node of expandVirtualInvalidation(virtual, targets, importers)) {
+    versions.set(node, ++registration.version);
+  }
+  for (const key of removed) {
+    delete virtual[key];
+  }
+  registration.updateKeys(removed);
 }
 
 // Live registerHooks registrations, latest first. Registrations stack, so
@@ -175,8 +273,16 @@ interface BunRegistration {
   paths: Map<string, string>;
   namespaced: Set<string>;
   modules: Set<string>;
+  // Paths of keys added by updates, which no setup `onLoad` filter matches:
+  // served with {@link BUN_VIRTUAL_MARKER} for the shared marker `onLoad`.
+  dynamic: Set<string>;
+  // `path => key` of removed path keys: resolved to the real file under a
+  // fresh id with {@link BUN_DISK_MARKER}, until the key is added again.
+  removed: Map<string, string>;
   // Bumped to serve a fresh `?v=<n>` identity (`onResolve`-served keys only).
   versions: Map<string, number>;
+  // Last version handed out (unique per registration, see `HooksRegistration`).
+  version: number;
   // Resolved `key => importer keys` edges, recorded by `onResolve`.
   importers: Map<string, Set<string>>;
   // `key => module ids` served since the last bump, evicted on the next one.
@@ -193,6 +299,24 @@ const _bunRegistrations: BunRegistration[] = [];
 
 const BUN_NAMESPACE = "env-runner-virtual";
 
+// Leading query params of served path ids. `onLoad` can't decline a module
+// (returning nothing throws), so these route by filter instead:
+// - virtual marker: matched by the one shared `onLoad` serving keys added by
+//   updates (per-update filters would slow down every import, see below).
+// - disk marker: excluded from every `onLoad` filter, so Bun loads the real
+//   file (any format), or reports it missing.
+const BUN_VIRTUAL_MARKER = "__env_runner_virtual";
+const BUN_DISK_MARKER = "__env_runner_disk";
+
+// Shared callbacks installed once: `onLoad` for the namespace, and the
+// catch-all `onResolve` plus marker `onLoad` for keys added by updates.
+let _bunNamespaceLoader = false;
+let _bunDynamicCallbacks = false;
+// Last segments (`_bunSpecifierName()`) of path and namespaced keys added by
+// updates, the catch-all's cheap pre-check. Never shrinks: removed path keys
+// still resolve.
+const _bunDynamicNames = new Set<string>();
+
 function _createBunRegistration(
   virtual: Record<string, string>,
   cache: Record<string, unknown>,
@@ -202,23 +326,35 @@ function _createBunRegistration(
     paths: new Map(),
     namespaced: new Set(),
     modules: new Set(),
+    dynamic: new Set(),
+    removed: new Map(),
     versions: new Map(),
+    version: 0,
     importers: new Map(),
     served: new Map(),
     cache,
   };
   for (const key of Object.keys(virtual)) {
-    const path = _bunKeyPath(key);
-    if (path === undefined) {
-      const resolvable = !key.includes(":") && _bunResolvable(key);
-      (resolvable ? registration.namespaced : registration.modules).add(key);
-    } else if (_bunResolvable(basename(path))) {
-      registration.paths.set(path, key);
-    } else {
-      registration.modules.add(key);
-    }
+    _addBunKey(registration, key);
   }
   return registration;
+}
+
+// Classify a key by how Bun can reach it; `true` for a path key.
+function _addBunKey(registration: BunRegistration, key: string): boolean {
+  const path = _bunKeyPath(key);
+  if (path === undefined) {
+    const resolvable = !key.includes(":") && _bunResolvable(key);
+    (resolvable ? registration.namespaced : registration.modules).add(key);
+    return false;
+  }
+  if (_bunResolvable(basename(path))) {
+    registration.paths.set(path, key);
+    registration.removed.delete(path);
+    return true;
+  }
+  registration.modules.add(key);
+  return false;
 }
 
 function _setupBunPlugin(build: any, registration: BunRegistration): void {
@@ -237,9 +373,11 @@ function _setupBunPlugin(build: any, registration: BunRegistration): void {
   }
   if (registration.paths.size > 0) {
     const paths = [...registration.paths.keys()].map(_escapeRegExp).join("|");
-    build.onLoad({ filter: new RegExp(`^(?:${paths})${query}`) }, _loadBunPath);
+    const loadQuery = String.raw`(?:\?(?!${BUN_DISK_MARKER}(?:&|$)).*)?$`;
+    build.onLoad({ filter: new RegExp(`^(?:${paths})${loadQuery}`) }, _loadBunPath);
   }
-  if (registration.namespaced.size > 0) {
+  if (registration.namespaced.size > 0 && !_bunNamespaceLoader) {
+    _bunNamespaceLoader = true;
     build.onLoad({ filter: /.*/, namespace: BUN_NAMESPACE }, _loadBunNamespaced);
   }
   for (const key of registration.modules) {
@@ -247,11 +385,91 @@ function _setupBunPlugin(build: any, registration: BunRegistration): void {
   }
 }
 
+// Setup filters only match the keys a registration started with. Keys added
+// later go through a catch-all `onResolve` and a marker `onLoad`, added once
+// through a saved builder (it still works after `setup()` returns), so the
+// callback count doesn't grow with updates. Measured on Bun 1.4.2 over 4000
+// disk module loads: one filter pair per update batch would cost ~0.4 µs per
+// load per batch (100 batches: 49 → 80 µs per load; 1000: 470 µs), while the
+// catch-all costs 49 → 52 µs for any batch count (56 µs without its pre-check).
+function _installBunDynamicCallbacks(build: any): void {
+  if (!_bunDynamicCallbacks) {
+    _bunDynamicCallbacks = true;
+    build.onResolve({ filter: /.*/ }, _resolveBunDynamic);
+    const marker = new RegExp(String.raw`\?${BUN_VIRTUAL_MARKER}(?:&|$)`);
+    build.onLoad({ filter: marker }, _loadBunPath);
+  }
+  if (!_bunNamespaceLoader) {
+    _bunNamespaceLoader = true;
+    build.onLoad({ filter: /.*/, namespace: BUN_NAMESPACE }, _loadBunNamespaced);
+  }
+}
+
+function _updateBunRegistration(
+  registration: BunRegistration,
+  changes: Record<string, string | null>,
+): void {
+  const { virtual } = registration;
+  const removed: string[] = [];
+  let dynamic = false;
+  for (const [key, source] of Object.entries(changes)) {
+    if (source === null) {
+      removed.push(key);
+      continue;
+    }
+    if (!Object.hasOwn(virtual, key)) {
+      const path = _bunKeyPath(key);
+      if (_addBunKey(registration, key)) {
+        registration.dynamic.add(path!);
+        _bunDynamicNames.add(_bunSpecifierName(path!));
+      } else if (registration.namespaced.has(key)) {
+        _bunDynamicNames.add(_bunSpecifierName(key));
+      }
+      dynamic ||= !registration.modules.has(key);
+    }
+    virtual[key] = source;
+  }
+  if (dynamic) {
+    _installBunDynamicCallbacks(registration.build);
+  }
+  // Removed keys are still in `virtual` for the quoted scan. Busting also
+  // registers added `build.module()` keys.
+  _bustBunModules(
+    registration,
+    expandVirtualInvalidation(virtual, Object.keys(changes), registration.importers),
+  );
+  for (const key of removed) {
+    _removeBunKey(registration, key);
+  }
+}
+
+function _removeBunKey(registration: BunRegistration, key: string): void {
+  const { virtual, paths } = registration;
+  delete virtual[key];
+  registration.namespaced.delete(key);
+  // A `build.module()` can't be unregistered: fresh loads throw.
+  registration.modules.delete(key);
+  const path = _bunKeyPath(key);
+  if (path === undefined || paths.get(path) !== key) {
+    return;
+  }
+  paths.delete(path);
+  registration.dynamic.delete(path);
+  registration.removed.set(path, key);
+  // Another key naming the same file (the latest) takes over.
+  for (const other of Object.keys(virtual)) {
+    if (_bunKeyPath(other) === path) {
+      paths.set(path, other);
+      registration.removed.delete(path);
+    }
+  }
+}
+
 // Bun passes `file:` specifiers as paths, and calls `onResolve` again on the
 // path it returned (with an empty importer), so the result must be stable.
 function _resolveBunModule(args: { path: string; importer: string }) {
   const specifier = _stripQuery(args.path);
-  const query = args.path.slice(specifier.length);
+  const query = _stripBunMarker(args.path.slice(specifier.length));
   let path: string | undefined;
   if (isAbsolute(specifier)) {
     path = resolve(specifier);
@@ -264,18 +482,71 @@ function _resolveBunModule(args: { path: string; importer: string }) {
     if (!key) {
       continue;
     }
-    const importer = _bunKeyOf(registration, args.importer);
-    if (importer !== undefined && importer !== key) {
-      _addToSetMap(registration.importers, key, importer);
-    }
+    _addBunImporter(registration, key, args.importer);
+    const marker = !namespaced && registration.dynamic.has(path!) ? BUN_VIRTUAL_MARKER : undefined;
     const served = _bunVersioned(
-      (namespaced ? specifier : path) + query,
+      (namespaced ? specifier : path) + _withBunMarker(query, marker),
       registration.versions.get(key),
     );
     _addToSetMap(registration.served, key, namespaced ? `${BUN_NAMESPACE}:${served}` : served);
     return namespaced ? { path: served, namespace: BUN_NAMESPACE } : { path: served };
   }
+  // A removed path key: the real file (or not found), under a fresh id, since
+  // the key's module may be cached under the plain path.
+  for (const registration of _bunRegistrations) {
+    const key = path && registration.removed.get(path);
+    if (!key) {
+      continue;
+    }
+    // Recorded for a later re-add.
+    _addBunImporter(registration, key, args.importer);
+    const served = _bunVersioned(
+      path + _withBunMarker(query, BUN_DISK_MARKER),
+      registration.versions.get(key),
+    );
+    _addToSetMap(registration.served, key, served);
+    return { path: served };
+  }
   return undefined;
+}
+
+// The catch-all only resolves specifiers named like a key added by an update,
+// sparing every other import the full resolution.
+function _resolveBunDynamic(args: { path: string; importer: string }) {
+  const name = _bunSpecifierName(_stripQuery(args.path));
+  return _bunDynamicNames.has(name) ? _resolveBunModule(args) : undefined;
+}
+
+// Last segment of a path or specifier (`#dir/x.mjs` → `x.mjs`).
+function _bunSpecifierName(specifier: string): string {
+  return specifier.slice(Math.max(specifier.lastIndexOf("/"), specifier.lastIndexOf("\\")) + 1);
+}
+
+function _addBunImporter(registration: BunRegistration, key: string, importerId: string): void {
+  const importer = _bunKeyOf(registration, importerId);
+  if (importer !== undefined && importer !== key) {
+    _addToSetMap(registration.importers, key, importer);
+  }
+}
+
+// Markers lead the query, so the import's own query follows them.
+function _withBunMarker(query: string, marker: string | undefined): string {
+  if (!marker) {
+    return query;
+  }
+  return `?${marker}` + (query ? `&${query.slice(1)}` : "");
+}
+
+function _stripBunMarker(query: string): string {
+  for (const marker of [BUN_VIRTUAL_MARKER, BUN_DISK_MARKER]) {
+    if (query === `?${marker}`) {
+      return "";
+    }
+    if (query.startsWith(`?${marker}&`)) {
+      return `?${query.slice(marker.length + 2)}`;
+    }
+  }
+  return query;
 }
 
 function _loadBunPath(args: { path: string }) {
@@ -333,7 +604,7 @@ function _bustBunModules(registration: BunRegistration, keys: string[]): void {
       registration.build.module(key, () => _loadBunModule(key));
       continue;
     }
-    registration.versions.set(key, (registration.versions.get(key) ?? 0) + 1);
+    registration.versions.set(key, ++registration.version);
     for (const id of registration.served.get(key) ?? []) {
       delete registration.cache[id];
     }

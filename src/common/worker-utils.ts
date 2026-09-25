@@ -3,7 +3,7 @@ import type { Hooks } from "crossws";
 import type { UpgradeContext } from "../types.ts";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { isAbsolute } from "node:path";
-import { refreshVirtualModule } from "./virtual-modules.ts";
+import { refreshVirtualModule, registeredVirtualModules } from "./virtual-modules.ts";
 import { findVirtualPathKey } from "../virtual-loader.ts";
 
 export interface AppEntryIPCContext {
@@ -97,11 +97,12 @@ export function isVirtualSpecifier(
 /**
  * Worker-side {@link isVirtualSpecifier} for `data.entry`, matching the backend
  * that serves `data.virtual`: path-aware with `module.registerHooks` (Node,
- * Deno), so load and reload both stay virtual; exact on Bun.
+ * Deno), so load and reload both stay virtual; exact on Bun. Checks the live
+ * registrations by default, which follow updates.
  */
 export function isVirtualEntry(
   entry: string | undefined,
-  virtual?: Record<string, string>,
+  virtual: Record<string, string> | undefined = registeredVirtualModules(),
 ): boolean {
   const registerHooks = process.getBuiltinModule?.("node:module")?.registerHooks;
   return isVirtualSpecifier(entry, virtual, typeof registerHooks === "function");

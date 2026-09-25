@@ -817,6 +817,407 @@ for (const { name, create, skip, bun, miniflare } of runners) {
   });
 }
 
+// --- Runtime updates (`updateVirtualModules()`) ---
+
+// Source of an expression importing `specifier`: its default export, or
+// "missing" when the import fails (miniflare stubs an unresolvable bare import
+// with an `undefined` default instead).
+const importOrMissing = (specifier: string, pick = "m.default") =>
+  `import(${JSON.stringify(specifier)}).then((m) => String(${pick} ?? "missing"), () => "missing")`;
+
+for (const { name, create, skip, bun, deno, miniflare } of runners) {
+  describe.skipIf(skip ?? false)(`${name} virtual module updates`, () => {
+    let runner: EnvRunner;
+
+    afterEach(async () => {
+      await runner?.close();
+    });
+
+    const text = async () => (await runner.fetch("http://localhost/")).text();
+    const valueEntry = (value: string) => ({
+      "#entry": `import value from "#value";
+        export default { fetch: () => new Response(String(value)) };`,
+      "#value": `export default ${JSON.stringify(value)};`,
+    });
+
+    it("adds a `#` key that a failed importer picks up after reload", async () => {
+      runner = create({
+        name: "virtual-update-add",
+        data: {
+          entry: "#entry",
+          virtual: {
+            "#entry": `export default {
+              fetch: async () => new Response(await ${importOrMissing("#mid", "m.value")}),
+            };`,
+            // Fails to link until `#new` exists.
+            "#mid": `import value from "#new"; export { value };`,
+          },
+        },
+      });
+      await runner.waitForReady();
+      expect(await text()).toBe("missing");
+      await runner.updateVirtualModules!({ "#new": `export default "added";` });
+      await runner.reloadModule!();
+      expect(await text()).toBe("added");
+    });
+
+    it("adds a path key that a relative import finds, and removes it again", async () => {
+      const entry = resolve(ghostDir, "entry.mjs");
+      const dep = resolve(ghostDir, "dep.mjs");
+      runner = create({
+        name: "virtual-update-add-path",
+        data: {
+          entry,
+          virtual: {
+            [entry]: `export default {
+              fetch: async () => new Response(await ${importOrMissing("./dep.mjs")}),
+            };`,
+          },
+        },
+      });
+      await runner.waitForReady();
+      expect(await text()).toBe("missing");
+      await runner.updateVirtualModules!({ [dep]: `export default "added dep";` });
+      await runner.reloadModule!();
+      expect(await text()).toBe("added dep");
+      // No file on disk: not found again.
+      await runner.updateVirtualModules!({ [dep]: null });
+      await runner.reloadModule!();
+      expect(await text()).toBe("missing");
+    });
+
+    // Starts without `data.virtual`: the first update registers the backend.
+    it("overrides a real file imported by the disk entry, and uncovers it on removal", async () => {
+      const config = resolve(pathsDir, "config.mjs");
+      runner = create({
+        name: "virtual-update-override",
+        data: { entry: resolve(pathsDir, "app.mjs") },
+      });
+      await runner.waitForReady();
+      expect(await text()).toBe("disk config");
+      await runner.updateVirtualModules!({ [config]: `export default "virtual config";` });
+      await runner.reloadModule!();
+      expect(await text()).toBe("virtual config");
+      await runner.updateVirtualModules!({ [config]: null });
+      await runner.reloadModule!();
+      expect(await text()).toBe("disk config");
+    });
+
+    // The key was served under the file's own id first, so the real file must
+    // come back under a fresh one.
+    it("uncovers a real file overridden from the start on removal", async () => {
+      const config = resolve(pathsDir, "config.mjs");
+      runner = create({
+        name: "virtual-update-uncover",
+        data: {
+          entry: resolve(pathsDir, "app.mjs"),
+          virtual: { [config]: `export default "virtual config";` },
+        },
+      });
+      await runner.waitForReady();
+      expect(await text()).toBe("virtual config");
+      await runner.updateVirtualModules!({ [config]: null });
+      await runner.reloadModule!();
+      expect(await text()).toBe("disk config");
+      await runner.updateVirtualModules!({ [config]: `export default "virtual again";` });
+      await runner.reloadModule!();
+      expect(await text()).toBe("virtual again");
+    });
+
+    it("overrides the disk entry itself, and restores it on removal", async () => {
+      const entry = resolve(pathsDir, "app.mjs");
+      runner = create({ name: "virtual-update-entry", data: { entry } });
+      await runner.waitForReady();
+      expect(await text()).toBe("disk config");
+      await runner.updateVirtualModules!({
+        [entry]: `export default { fetch: () => new Response("virtual entry") };`,
+      });
+      await runner.reloadModule!();
+      expect(await text()).toBe("virtual entry");
+      await runner.updateVirtualModules!({ [entry]: null });
+      await runner.reloadModule!();
+      expect(await text()).toBe("disk config");
+    });
+
+    it("replaces a string source reached through relative importers", async () => {
+      const entry = resolve(ghostDir, "entry.mjs");
+      const dep = resolve(ghostDir, "dep.mjs");
+      runner = create({
+        name: "virtual-update-replace",
+        data: {
+          entry,
+          virtual: {
+            [entry]: `import { value } from "./mid.mjs";
+              export default { fetch: () => new Response(value) };`,
+            [resolve(ghostDir, "mid.mjs")]: `export { default as value } from "./dep.mjs";`,
+            [dep]: `export default "v1";`,
+          },
+        },
+      });
+      await runner.waitForReady();
+      expect(await text()).toBe("v1");
+      for (const value of ["v2", "v3"]) {
+        await runner.updateVirtualModules!({ [dep]: `export default "${value}";` });
+        await runner.reloadModule!();
+        expect(await text()).toBe(value);
+      }
+    });
+
+    it("removes a key so that importing it fails", async () => {
+      runner = create({
+        name: "virtual-update-remove",
+        data: {
+          entry: "#entry",
+          virtual: {
+            "#entry": `export default {
+              fetch: async () => new Response(await ${importOrMissing("#gone")}),
+            };`,
+            "#gone": `export default "here";`,
+          },
+        },
+      });
+      await runner.waitForReady();
+      expect(await text()).toBe("here");
+      await runner.updateVirtualModules!({ "#gone": null });
+      await runner.reloadModule!();
+      expect(await text()).toBe("missing");
+      await expect(runner.invalidateModule!("#gone")).rejects.toThrow('Cannot invalidate "#gone"');
+    });
+
+    it("applies a batch of changes in one round trip", async () => {
+      runner = create({
+        name: "virtual-update-batch",
+        data: {
+          entry: "#entry",
+          virtual: {
+            "#entry": `import a from "#a"; import b from "#b";
+              export default { fetch: () => new Response(a + b) };`,
+            "#a": `export default "a";`,
+            "#b": `export default "b";`,
+          },
+        },
+      });
+      await runner.waitForReady();
+      expect(await text()).toBe("ab");
+      let acks = 0;
+      runner.onMessage((message: any) => {
+        if (message?.event === "virtual-modules-updated") acks++;
+      });
+      await runner.updateVirtualModules!({
+        "#entry": `import a from "#a"; import c from "#c";
+          export default { fetch: () => new Response(a + c) };`,
+        "#a": `export default "A";`,
+        "#b": null,
+        "#c": async () => `export default "C";`,
+      });
+      await runner.reloadModule!();
+      expect(await text()).toBe("AC");
+      // Miniflare applies updates on the host, without IPC.
+      expect(acks).toBe(miniflare ? 0 : 1);
+    });
+
+    // Deno pre-transforms sources (see "resolves virtual TypeScript modules").
+    it.skipIf(deno && !denoTypeStripping)("adds TypeScript and JSON modules", async () => {
+      runner = create({
+        name: "virtual-update-formats",
+        data: {
+          entry: "#entry",
+          virtual: {
+            "#entry": `export default {
+              fetch: async () => new Response(
+                (await ${importOrMissing("#util.ts")}) + ":" +
+                (await ${importOrMissing("#data.json", "m.default?.value")}),
+              ),
+            };`,
+          },
+        },
+      });
+      await runner.waitForReady();
+      expect(await text()).toBe("missing:missing");
+      await runner.updateVirtualModules!({
+        "#util.ts": `const value: string = "ts"; export default value;`,
+        "#data.json": JSON.stringify({ value: "json" }),
+      });
+      await runner.reloadModule!();
+      expect(await text()).toBe("ts:json");
+    });
+
+    it("re-runs a factory set by an update on invalidation", async () => {
+      let counter = 0;
+      runner = create({
+        name: "virtual-update-factory",
+        data: { entry: "#entry", virtual: valueEntry("static") },
+      });
+      await runner.waitForReady();
+      expect(await text()).toBe("static");
+      await runner.updateVirtualModules!({ "#value": () => `export default ${counter++};` });
+      await runner.reloadModule!();
+      expect(await text()).toBe("0");
+      await runner.invalidateModule!("#value");
+      await runner.reloadModule!();
+      expect(await text()).toBe("1");
+    });
+
+    it("applies updates in call order, even behind a slower factory", async () => {
+      runner = create({
+        name: "virtual-update-order",
+        data: { entry: "#entry", virtual: valueEntry("initial") },
+      });
+      await runner.waitForReady();
+      const slow = runner.updateVirtualModules!({
+        "#value": () =>
+          new Promise<string>((resolve) =>
+            setTimeout(() => resolve(`export default "slow";`), 100),
+          ),
+      });
+      const fast = runner.updateVirtualModules!({ "#value": `export default "fast";` });
+      await Promise.all([slow, fast]);
+      await runner.reloadModule!();
+      expect(await text()).toBe("fast");
+    });
+
+    it("applies an update made before the runner is ready", async () => {
+      runner = create({
+        name: "virtual-update-early",
+        data: { entry: "#entry", virtual: valueEntry("initial") },
+      });
+      // No `waitForReady()`: the update waits for it, and so does the reload.
+      const update = runner.updateVirtualModules!({ "#value": `export default "early";` });
+      await runner.reloadModule!();
+      await update;
+      expect(await text()).toBe("early");
+    });
+
+    it("keeps update messages out of the entry's `ipc.onMessage`", async () => {
+      runner = create({
+        name: "virtual-update-ipc",
+        data: { entry: resolve(_dir, "./fixtures/app-ipc-log.mjs") },
+      });
+      await runner.waitForReady();
+      await runner.updateVirtualModules!({ "#unused": `export default 1;` });
+      const reply = new Promise<any>((resolve) => {
+        runner.onMessage((message: any) => {
+          if (message?.type === "ipc-log-reply") resolve(message);
+        });
+      });
+      runner.sendMessage({ type: "ipc-log" });
+      expect((await reply).received).toEqual([{ type: "ipc-log" }]);
+    });
+
+    it("warns about an added path key naming the same file as a key", async () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      // Unique per runner: each pair only warns once per process.
+      const file = resolve(ghostDir, `update-collision-${name}.mjs`);
+      try {
+        runner = create({
+          name: "virtual-update-collision",
+          data: { entry: "#entry", virtual: { ...valueEntry("ok"), [file]: `export default 1;` } },
+        });
+        await runner.waitForReady();
+        await runner.updateVirtualModules!({ [pathToFileURL(file).href]: `export default 2;` });
+        const warnings = warn.mock.calls.filter(([m]) => String(m).includes("same file"));
+        expect(warnings).toHaveLength(1);
+        expect(warnings[0]![0]).toContain(`"${file}" and "${pathToFileURL(file).href}"`);
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it("never mutates the caller's `data.virtual`", async () => {
+      const virtual = valueEntry("initial");
+      const snapshot = { ...virtual };
+      runner = create({ name: "virtual-update-options", data: { entry: "#entry", virtual } });
+      await runner.waitForReady();
+      await runner.updateVirtualModules!({ "#value": `export default "updated";`, "#new": "" });
+      expect(virtual).toEqual(snapshot);
+    });
+
+    // Needs resolve hooks to observe disk importers (see "disk importers").
+    it.skipIf(bun || miniflare)(
+      "an added path key reaches disk modules importing the file it overrides",
+      async () => {
+        const config = resolve(pathsDir, "config.mjs");
+        runner = create({
+          name: "virtual-update-disk-importer",
+          data: {
+            entry: "#entry",
+            virtual: {
+              // `app.mjs` (disk) imports `./config.mjs` (disk).
+              "#entry": `export { default } from ${JSON.stringify(resolve(pathsDir, "app.mjs"))};`,
+            },
+          },
+        });
+        await runner.waitForReady();
+        expect(await text()).toBe("disk config");
+        await runner.updateVirtualModules!({ [config]: `export default "virtual config";` });
+        await runner.reloadModule!();
+        expect(await text()).toBe("virtual config");
+        await runner.updateVirtualModules!({ [config]: null });
+        await runner.reloadModule!();
+        expect(await text()).toBe("disk config");
+      },
+    );
+  });
+}
+
+describe("MiniflareEnvRunner virtual module updates", () => {
+  it("updates the instance shared by persistent runners, and evicts it from the cache", async () => {
+    const text = async (runner: EnvRunner) => (await runner.fetch("http://localhost/")).text();
+    const data = {
+      entry: "#entry",
+      virtual: {
+        "#entry": `import value from "#value";
+          export default { fetch: () => new Response(value) };`,
+        "#value": `export default "initial";`,
+      },
+    };
+    const create = () =>
+      new MiniflareEnvRunner({
+        miniflare,
+        name: "virtual-update-persistent",
+        persistent: true,
+        data,
+      });
+    // Mirror a RunnerManager swap: the second runner attaches to the cached instance.
+    const first = create();
+    await first.waitForReady();
+    const second = create();
+    let third: MiniflareEnvRunner | undefined;
+    try {
+      await second.waitForReady();
+      await first.close();
+      // The update must reach the state the live fallback actually serves.
+      await second.updateVirtualModules({ "#value": `export default "updated";` });
+      await second.reloadModule();
+      expect(await text(second)).toBe("updated");
+      // The instance no longer matches the original sources: a fresh one.
+      third = create();
+      await third.waitForReady();
+      expect(await text(third)).toBe("initial");
+      expect(await text(second)).toBe("updated");
+    } finally {
+      await third?.close();
+      await second.close();
+      await first.close();
+      await MiniflareEnvRunner.disposeAll();
+    }
+  });
+});
+
+describe("SelfEnvRunner virtual module updates", () => {
+  it("rejects updateVirtualModules instead of leaking the IPC message to the entry", async () => {
+    const { SelfEnvRunner } = await import("../src/runners/self/runner.ts");
+    await using runner = new SelfEnvRunner({
+      name: "self-update",
+      data: { entry: resolve(_dir, "./fixtures/app.mjs") },
+    });
+    await runner.waitForReady();
+    await expect(runner.updateVirtualModules({ "#x": "export default 1;" })).rejects.toThrow(
+      "does not support virtual modules",
+    );
+  });
+});
+
 // --- Entry spelled differently from its path key ---
 
 // A real `app.mjs` exists at the entry path; the virtual source must win on

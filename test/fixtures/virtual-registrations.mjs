@@ -3,7 +3,7 @@
 // subprocess (node or bun), like virtual-unregister.mjs.
 import {
   registerVirtualModules,
-  invalidateVirtualModule,
+  updateVirtualModules,
   refreshVirtualModule,
 } from "../../src/common/virtual-modules.ts";
 
@@ -41,8 +41,8 @@ expectValue((await import("#stack.mjs")).default, "newer");
 expectValue((await import("#stack")).default, "newer");
 expectValue((await import("#older-only.mjs")).default, "older only");
 
-// Invalidation reaches the (older) registration that owns the key.
-invalidateVirtualModule("#older-only.mjs", `export default "older only v2";`);
+// An update reaches the (older) registration that owns the key.
+await updateVirtualModules({ "#older-only.mjs": `export default "older only v2";` });
 expectValue((await import("#older-only.mjs")).default, "older only v2");
 
 newer();

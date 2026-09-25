@@ -101,6 +101,7 @@ Details in [`.agents/MINIFLARE.md`](.agents/MINIFLARE.md). In short: the wrapper
 - **Immediate shutdown** — `close()` terminates the worker/process, no graceful handshake
 - **Orphan protection** — node-process/bun-process/deno-process workers call `process.on("disconnect", () => process.exit(0))` before the data handshake and entry import
 - **Data passing** — `workerData` (threads), IPC handshake (processes: worker listens, sends `request-init-data`, host replies `{ event: "init-data", data: "<JSON>" }`; env vars are size-limited, see [`NODE-RUNNERS.md`](.agents/NODE-RUNNERS.md)), direct in-process import (self), in-memory `script` + `unsafeModuleFallbackService` (miniflare)
+- **Virtual module updates** — `updateVirtualModules()` sets/removes (`null`) keys in one `update-virtual-modules` round trip (miniflare: host-side); `invalidateModule()` is the same update with the current source. The host keeps its own map in sync, see [`VIRTUAL-MODULES.md`](.agents/VIRTUAL-MODULES.md#runtime-updates)
 - **Terminal capabilities** — spawned workers get piped stdout, so `hostEnv()` forwards `FORCE_COLOR`/`COLUMNS` from the host TTY
 - **Stdio forwarding** — all runners forward entry stdout/stderr to the host
 - **Socket cleanup** — `_closeSocket()` skips Windows named pipes and abstract sockets

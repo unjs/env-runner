@@ -220,6 +220,10 @@ const result = await runner.rpc<string>("transformHTML", "<html>...</html>");
 // re-read under its own URL; modules it imports stay cached)
 await runner.reloadModule();
 
+// Add, replace or remove (`null`) virtual modules in one round trip, then reload
+await runner.updateVirtualModules({ "#routes": `export default []`, "#old": null });
+await runner.reloadModule();
+
 // Invalidate a virtual module (re-runs a factory source), then reload
 await runner.invalidateModule("#config.json");
 await runner.reloadModule();
@@ -349,6 +353,24 @@ await runner.reloadModule(); // re-imports the entry, picking up the fresh modul
 ```
 
 When fetching through `RunnerManager` or `EnvServer`, the reload is automatic: `invalidateModule()` marks the manager dirty and the next `fetch()` reloads the entry once before serving (concurrent fetches share the reload), so no explicit `reloadModule()` call is needed.
+
+To change the map itself while the runner is running, call `updateVirtualModules(changes)`. A source (string or factory) **adds or replaces** a key, and `null` **removes** it. All changes of one call are applied together in a single round trip to the worker:
+
+```ts
+await runner.updateVirtualModules({
+  "#routes": `export default ["/", "/about"]`, // add or replace
+  [resolve("src/generated/api.mjs")]: () => generateApi(), // factories run on the host
+  "#legacy": null, // remove
+});
+await runner.reloadModule(); // or let RunnerManager/EnvServer reload on the next fetch
+```
+
+Changed and removed keys are invalidated like `invalidateModule()` does, together with the modules importing them, so the next `reloadModule()` sees the new map:
+
+- An **added** key resolves from then on, path keys included. An importer that failed to import it, or that loaded the real file it now overrides, picks it up once it is re-evaluated: the reloaded entry, virtual importers, and on Node.js and Deno also real files between them. A runner started without `data.virtual` registers its virtual modules on the first update, and real files it loaded before aren't tracked as importers.
+- A **removed** key falls through to normal resolution: the real file it overrode, or a "not found" error. On Bun, a removed key without a file extension (see the Bun notes above) fails to load instead of falling through, and on miniflare an unresolvable bare specifier gets an empty module, as usual there.
+
+Calls are applied one at a time in call order (a later call never loses to a slower factory of an earlier one), and `reloadModule()` waits for pending ones. A call made before the runner is ready waits for it. `invalidateModule(specifier)` is the same as updating the key with its current source. The runner keeps its own copy of the map, never changing your `data.virtual`. `RunnerManager.updateVirtualModules()` marks the manager dirty like `invalidateModule()`, and `EnvServer` also keeps the changes for the runners it creates later (`reload()`, watch mode). Changes made before the server started are only recorded, and the first runner starts with them.
 
 The module format is derived from the specifier extension: `.ts`/`.mts` sources are served as **TypeScript** and `.json` sources as **JSON modules**; everything else is plain JavaScript ESM:
 
@@ -631,6 +653,8 @@ const runner2 = new MiniflareEnvRunner({
 
 // Fully destroy: runner.dispose() or MiniflareEnvRunner.disposeAll()
 ```
+
+An instance is only reused by runners with the same virtual module sources. Once `invalidateModule()` or `updateVirtualModules()` changes them, the instance leaves the cache (runners attached to it keep using it), and later runners start a fresh one.
 
 #### Vercel Runner
 

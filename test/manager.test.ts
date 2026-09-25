@@ -347,6 +347,50 @@ describe("RunnerManager", () => {
     expect(reloads).toBe(1);
   });
 
+  it("fetch after updateVirtualModules reloads the entry automatically", async () => {
+    const runner = new NodeWorkerEnvRunner({
+      name: "manager-update",
+      workerEntry,
+      data: {
+        entry: "#entry",
+        virtual: {
+          "#entry": `import value from "#value";
+            export default { fetch: () => new Response(value) };`,
+          "#value": `export default "v1";`,
+        },
+      },
+    });
+    runners.push(runner);
+    manager = new RunnerManager(runner);
+    await waitForReady(runner);
+
+    let reloads = 0;
+    manager.onMessage((msg: any) => {
+      if (msg?.event === "module-reloaded") reloads++;
+    });
+
+    expect(await (await manager.fetch("http://localhost/")).text()).toBe("v1");
+
+    // No explicit reloadModule(): the next fetch reloads once, and sees the
+    // batch (a replaced entry importing an added key).
+    await manager.updateVirtualModules({
+      "#entry": `import value from "#added";
+        export default { fetch: () => new Response(value) };`,
+      "#added": `export default "v2";`,
+      "#value": null,
+    });
+    expect(await (await manager.fetch("http://localhost/")).text()).toBe("v2");
+    expect(await (await manager.fetch("http://localhost/")).text()).toBe("v2");
+    expect(reloads).toBe(1);
+  });
+
+  it("rejects updateVirtualModules without an active runner", async () => {
+    manager = new RunnerManager();
+    await expect(manager.updateVirtualModules({ "#x": "" })).rejects.toThrow(
+      "Active runner does not support updateVirtualModules()",
+    );
+  });
+
   it("explicit reloadModule satisfies a pending invalidation", async () => {
     let counter = 0;
     const runner = createVirtualCounterRunner("manager-invalidate-explicit", () => counter++);

@@ -15,6 +15,7 @@ export {
   type EnvRunnerData,
   type VirtualModules,
   type VirtualModuleSource,
+  type VirtualModuleUpdates,
   BaseEnvRunner,
 } from "./common/base-runner.ts";
 export { RunnerManager } from "./manager.ts";

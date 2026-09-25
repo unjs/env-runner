@@ -5,10 +5,18 @@ import type { RunnerMessageListener, EnvRunner, WorkerAddress, WorkerHooks } fro
 import { rm } from "node:fs/promises";
 import { proxyFetch, proxyUpgrade } from "httpxy";
 import { resolveVirtualModules, warnVirtualPathCollisions } from "../virtual-loader.ts";
-import type { VirtualModules } from "../virtual-loader.ts";
+import type {
+  VirtualModules,
+  VirtualModuleSource,
+  VirtualModuleUpdates,
+} from "../virtual-loader.ts";
 import { hostEnv } from "./host-env.ts";
 
-export type { VirtualModules, VirtualModuleSource } from "../virtual-loader.ts";
+export type {
+  VirtualModules,
+  VirtualModuleSource,
+  VirtualModuleUpdates,
+} from "../virtual-loader.ts";
 
 export interface EnvRunnerData {
   name?: string;
@@ -16,7 +24,8 @@ export interface EnvRunnerData {
   /**
    * Virtual modules importable from the entry, e.g.
    * `{ "#virtual-import": "export const foo = 1" }`. Factory sources run once
-   * on the host before spawn. Not supported by the `self` runner (it closes
+   * on the host before spawn. Change them at runtime with
+   * `updateVirtualModules()`. Not supported by the `self` runner (it closes
    * with an error).
    */
   virtual?: VirtualModules;
@@ -38,6 +47,9 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
   protected _pendingRequests: Set<(cause?: unknown) => void>;
   protected _closeCause?: unknown;
   protected _virtualResolved?: Promise<void>;
+  // Tail of the virtual module update queue (never rejects).
+  protected _virtualUpdates: Promise<void> = Promise.resolve();
+  #virtualUpdateId = 0;
   // Runner data JSON for process workers, snapshotted at spawn (`_processEnv()`).
   protected _processData?: string;
 
@@ -147,7 +159,9 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
     ).then((msg) => msg.data);
   }
 
+  /** Re-import the entry, after any pending `updateVirtualModules()` call. */
   async reloadModule(timeout = 5000): Promise<void> {
+    await this._virtualUpdates;
     await this._request(
       { event: "reload-module" },
       {
@@ -159,19 +173,30 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
   }
 
   /**
-   * Invalidate a virtual module so the next `reloadModule()` re-evaluates it.
-   * Factory sources are re-run on the host. Rejects for unknown specifiers.
+   * Set (add or replace) and remove (`null`) virtual modules in one round trip.
+   * Factory sources run on the host. Changed and removed keys, and the modules
+   * importing them, evaluate fresh on the next `reloadModule()`; a removed key
+   * falls through to normal resolution. Calls apply in order, waiting for the
+   * runner to become ready. The runner keeps its own copy of the map in sync,
+   * never changing the caller's `data.virtual`.
    */
-  async invalidateModule(specifier: string, timeout = 5000): Promise<void> {
-    const source = await this._refreshVirtualSource(specifier);
-    await this._request(
-      { event: "invalidate-module", specifier, source },
-      {
-        match: (msg) => msg?.event === "module-invalidated" && msg.specifier === specifier,
-        timeout,
-        timeoutError: `Module invalidation timed out for "${specifier}"`,
-      },
-    );
+  updateVirtualModules(changes: VirtualModuleUpdates, timeout = 5000): Promise<void> {
+    return this._enqueueVirtualUpdate(() => changes, timeout);
+  }
+
+  /**
+   * Invalidate a virtual module so the next `reloadModule()` re-evaluates it:
+   * `updateVirtualModules()` with its current source, so a factory re-runs.
+   * Rejects for unknown specifiers.
+   */
+  invalidateModule(specifier: string, timeout = 5000): Promise<void> {
+    return this._enqueueVirtualUpdate(() => {
+      const source = this._virtualSources?.[specifier];
+      if (source === undefined) {
+        throw new Error(`Cannot invalidate "${specifier}" (not a registered virtual module)`);
+      }
+      return { [specifier]: source };
+    }, timeout);
   }
 
   async close(cause?: unknown) {
@@ -332,11 +357,16 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
    */
   protected _resolveVirtualData(): Promise<void> | undefined {
     const virtual = this._data?.virtual;
-    // Keep the original sources (including factories) so `invalidateModule()`
-    // can re-run a factory for fresh contents.
-    this._virtualSources = virtual;
+    // Own copies, since updates change them in place (never the caller's
+    // options). The original sources, factories included, let
+    // `invalidateModule()` re-run a factory.
+    this._virtualSources = { ...virtual };
+    this._data = { ...this._data };
     warnVirtualPathCollisions(Object.keys(virtual ?? {}));
     if (!virtual || !Object.values(virtual).some((v) => typeof v === "function")) {
+      if (virtual) {
+        this._data.virtual = { ...virtual };
+      }
       return undefined;
     }
     this._virtualResolved = resolveVirtualModules(virtual).then((resolved) => {
@@ -345,21 +375,73 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
     return this._virtualResolved;
   }
 
-  /** Re-run a factory virtual source and sync `data.virtual`; `undefined` if not a factory. */
-  protected async _refreshVirtualSource(specifier: string): Promise<string | undefined> {
-    // Until the initial resolution settles, `_data.virtual` aliases the factory
-    // map; writing a string into it would replace the factory for good.
-    await this._virtualResolved?.catch(() => {});
-    const original = this._virtualSources?.[specifier];
-    if (typeof original !== "function") {
-      return undefined;
-    }
-    const source = await original();
-    const resolved = this._data?.virtual as Record<string, string> | undefined;
-    if (resolved) {
-      resolved[specifier] = source;
-    }
-    return source;
+  /**
+   * Queue a virtual module update. Updates apply one at a time in call order
+   * (`changes` is read when its turn comes), each after the initial factory
+   * resolution: until it settles, `_data.virtual` aliases the factory map.
+   */
+  protected _enqueueVirtualUpdate(
+    changes: () => VirtualModuleUpdates,
+    timeout: number,
+  ): Promise<void> {
+    const update = this._virtualUpdates.then(async () => {
+      // A failed initial resolution closes the runner (and leaves the alias).
+      await this._virtualResolved;
+      if (this.closed) {
+        throw new Error("Runner is closed");
+      }
+      const entries = Object.entries(changes()).filter(([, source]) => source !== undefined);
+      if (entries.length === 0) {
+        return;
+      }
+      // Factories run on the host; one that throws rejects before any change.
+      const sets: VirtualModules = Object.fromEntries(
+        entries.filter((entry): entry is [string, VirtualModuleSource] => entry[1] !== null),
+      );
+      const resolved: Record<string, string | null> = await resolveVirtualModules(sets);
+      const sources = (this._virtualSources ??= {});
+      const virtual = ((this._data ??= {}).virtual ??= {}) as Record<string, string>;
+      let added = false;
+      for (const [key, source] of entries) {
+        if (source === null) {
+          resolved[key] = null;
+          delete sources[key];
+          delete virtual[key];
+        } else {
+          added ||= !Object.hasOwn(sources, key);
+          sources[key] = source;
+          virtual[key] = resolved[key] as string;
+        }
+      }
+      if (added) {
+        warnVirtualPathCollisions(Object.keys(virtual));
+      }
+      if (!this.ready) {
+        await this.waitForReady();
+      }
+      await this._applyVirtualUpdates(resolved, timeout);
+    });
+    this._virtualUpdates = update.catch(() => {});
+    return update;
+  }
+
+  /**
+   * Apply resolved changes (`null` removes) to the running worker in one round
+   * trip. Overridden by runners serving virtual modules from the host.
+   */
+  protected async _applyVirtualUpdates(
+    changes: Record<string, string | null>,
+    timeout: number,
+  ): Promise<void> {
+    const id = ++this.#virtualUpdateId;
+    await this._request(
+      { event: "update-virtual-modules", id, changes },
+      {
+        match: (msg) => msg?.event === "virtual-modules-updated" && msg.id === id,
+        timeout,
+        timeoutError: "Virtual module update timed out",
+      },
+    );
   }
 
   /**

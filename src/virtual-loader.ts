@@ -8,6 +8,9 @@ export type VirtualModuleSource = string | (() => string | Promise<string>);
 /** Virtual modules as a `specifier => source` map. */
 export type VirtualModules = Record<string, VirtualModuleSource>;
 
+/** Changes to apply to a running map: a source sets (adds or replaces) a key, `null` removes it. */
+export type VirtualModuleUpdates = Record<string, VirtualModuleSource | null>;
+
 /** Resolve factory sources to strings (safe to pass to workers and {@link createVirtualHooks}). */
 export async function resolveVirtualModules(
   virtual: VirtualModules,
@@ -58,6 +61,11 @@ export function createVirtualHooks(
 ): {
   resolve: ResolveHookSync;
   load: LoadHookSync;
+  /**
+   * Re-index keys added to or removed from `virtual` in place. Sources are
+   * read live, so replacing one needs no call.
+   */
+  updateKeys: (keys: Iterable<string>) => void;
 } {
   const { versions, importers, forcePlainModule } = opts;
   const baseURL = opts.baseURL ?? _defaultBaseURL();
@@ -169,7 +177,32 @@ export function createVirtualHooks(
     return result;
   };
 
-  return { resolve, load };
+  const updateKeys = (keys: Iterable<string>) => {
+    for (const key of keys) {
+      const url = keyURLs.get(key) ?? _virtualKeyURL(key);
+      if (!url) {
+        continue;
+      }
+      if (Object.hasOwn(virtual, key)) {
+        // An added key is the latest, so it wins the URL.
+        keyURLs.set(key, url);
+        urlKeys.set(url, key);
+        continue;
+      }
+      keyURLs.delete(key);
+      if (urlKeys.get(url) === key) {
+        urlKeys.delete(url);
+        // Another key naming the same file (the latest) takes over.
+        for (const [other, otherURL] of keyURLs) {
+          if (otherURL === url) {
+            urlKeys.set(url, other);
+          }
+        }
+      }
+    }
+  };
+
+  return { resolve, load, updateKeys };
 }
 
 /** Format by extension (`module-typescript` is native on Node >= 22.18 / 23.6). */
@@ -212,14 +245,14 @@ export function stripVirtualTypeScript(
  * {@link VirtualHooksOptions.importers}), which may add disk files by bare
  * `file:` URL, plus a quoted scan of the sources for each key, a fallback for
  * imports that record no edge (Bun `build.module()` keys). Over-matching only
- * forces a re-evaluation.
+ * forces a re-evaluation. Several specifiers expand in one walk.
  */
 export function expandVirtualInvalidation(
   virtual: Record<string, string>,
-  specifier: string,
+  specifier: string | Iterable<string>,
   importers?: ReadonlyMap<string, ReadonlySet<string>>,
 ): string[] {
-  const invalidated = [specifier];
+  const invalidated = [...new Set(typeof specifier === "string" ? [specifier] : specifier)];
   const seen = new Set(invalidated);
   const add = (key: string) => {
     if (!seen.has(key)) {
@@ -296,6 +329,12 @@ export function warnVirtualPathCollisions(keys: Iterable<string>): void {
     // Best effort: a warning must never break startup.
   }
 }
+
+/**
+ * `file:` URL (no query or hash) of a path key, else `undefined`. Disk files are
+ * tracked under it in {@link VirtualHooksOptions}.
+ */
+export const virtualKeyURL: (key: string) => string | undefined = _virtualKeyURL;
 
 // `file:` URL of a path key (absolute path or `file:` URL), else `undefined`:
 // `#name`, bare and relative keys only match verbatim.

@@ -127,12 +127,31 @@ export interface MiniflareEnvRunnerOptions {
 
 const IPC_PATH = "/__env_runner_ipc";
 
+/**
+ * Virtual modules an instance's fallback service serves, read live (so
+ * updates need no restart) and adopted by the runners attaching to it.
+ */
+interface MiniflareVirtualModules {
+  /** Served sources (TS already stripped). */
+  sources: Record<string, string>;
+  /**
+   * Removed keys: their importers keep versioning the import, so a re-served
+   * importer misses workerd's cache and the fallback serves the real module.
+   */
+  removed: Set<string>;
+  versions: Map<string, number>;
+  /** Last version handed out (unique, so no two instances share a name). */
+  version: number;
+  /** Import specifier → served key. */
+  keyOf: VirtualKeyResolver;
+  /** Import specifier → served or removed key, for versioning imports. */
+  versionedKeyOf: VirtualKeyResolver;
+}
+
 interface MiniflareCacheEntry {
   mf: InstanceType<any>;
   refCount: number;
-  // Served live by the instance's fallback service; adopted by attaching runners.
-  virtual?: Record<string, string>;
-  versions: Map<string, number>;
+  virtual: MiniflareVirtualModules;
   // Receiver of the instance's `__ENV_RUNNER_IPC` binding; retargeted to the
   // runner that attaches last (like the IPC WebSocket).
   ipc: { runner: MiniflareEnvRunner };
@@ -146,8 +165,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
   #miniflareOptions: Record<string, unknown>;
   #transformRequest?: (id: string) => Promise<TransformResult | null | undefined>;
   #reloadCounter = 0;
-  #virtual?: Record<string, string>;
-  #virtualVersions = new Map<string, number>();
+  #virtual?: MiniflareVirtualModules;
   #cacheEntry?: MiniflareCacheEntry;
   #ws?: { send(data: string): void; close(): void };
   #persistent: boolean;
@@ -260,6 +278,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
 
   /** Hot-reload the entry without recreating the Miniflare instance. */
   override async reloadModule(timeout = 5000): Promise<void> {
+    await this._virtualUpdates;
     if (!this.#ws) {
       throw new Error("Miniflare env runner should be initialized before reloading.");
     }
@@ -280,27 +299,43 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
   }
 
   /**
-   * Host-side only: the fallback service serves a live map, so bumping versions
-   * (see {@link rewriteVirtualImports}) is enough.
+   * Host-side only: the fallback service serves a live map, so changing it and
+   * bumping versions (see {@link applyVirtualVersions}) is enough.
    */
-  override async invalidateModule(specifier: string, _timeout?: number): Promise<void> {
+  protected override async _applyVirtualUpdates(
+    changes: Record<string, string | null>,
+  ): Promise<void> {
     const virtual = this.#virtual;
-    if (!virtual || !Object.hasOwn(virtual, specifier)) {
-      const hasVirtual = Object.keys((this._data?.virtual as object) ?? {}).length > 0;
-      throw !virtual && hasVirtual && !this.closed
-        ? new Error("Miniflare env runner should be initialized before invalidating modules.")
-        : new Error(`Cannot invalidate "${specifier}" (not a registered virtual module)`);
+    if (!virtual) {
+      throw new Error("Miniflare env runner should be initialized before updating modules.");
     }
-    const source = await this._refreshVirtualSource(specifier);
-    if (source !== undefined) {
-      virtual[specifier] = await this.#prepareVirtualSource(specifier, source);
+    // Prepared first: a source that fails to strip changes nothing.
+    const prepared: Record<string, string> = {};
+    for (const [key, source] of Object.entries(changes)) {
+      if (source !== null) {
+        prepared[key] = await this.#prepareVirtualSource(key, source);
+      }
     }
+    // Importers over the sources before and after the change: a removed key
+    // keeps its importers, and an added one finds those that already import it.
     // Import edges catch importers the quoted key scan misses (`./dep.mjs`).
     await initEsmLexer;
-    const importers = virtualImporters(virtual, createVirtualKeyResolver(virtual));
-    for (const key of expandVirtualInvalidation(virtual, specifier, importers)) {
-      this.#virtualVersions.set(key, (this.#virtualVersions.get(key) ?? 0) + 1);
+    const merged = { ...virtual.sources, ...prepared };
+    const importers = virtualImporters(merged, createVirtualKeyResolver(Object.keys(merged)));
+    const invalidated = expandVirtualInvalidation(merged, Object.keys(changes), importers);
+    for (const key of Object.keys(changes)) {
+      if (Object.hasOwn(prepared, key)) {
+        virtual.sources[key] = prepared[key]!;
+        virtual.removed.delete(key);
+      } else if (Object.hasOwn(virtual.sources, key)) {
+        delete virtual.sources[key];
+        virtual.removed.add(key);
+      }
     }
+    for (const key of invalidated) {
+      virtual.versions.set(key, ++virtual.version);
+    }
+    refreshVirtualKeyResolvers(virtual);
     // Sources no longer match the cache key; current handles stay ref-counted.
     if (this.#cacheKey && _miniflareCache.get(this.#cacheKey) === this.#cacheEntry) {
       _miniflareCache.delete(this.#cacheKey);
@@ -390,11 +425,8 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
   }
 
   /** workerd parses every `esModule` as JS, so TS is stripped here (JSON is served natively). */
-  async #prepareVirtualModules(): Promise<Record<string, string> | undefined> {
-    const virtual = this._data?.virtual as Record<string, string> | undefined;
-    if (!virtual || Object.keys(virtual).length === 0) {
-      return undefined;
-    }
+  async #prepareVirtualModules(): Promise<Record<string, string>> {
+    const virtual = (this._data?.virtual ?? {}) as Record<string, string>;
     const out: Record<string, string> = {};
     for (const [specifier, source] of Object.entries(virtual)) {
       out[specifier] = await this.#prepareVirtualSource(specifier, source);
@@ -417,7 +449,9 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
     const supportedCompatibilityDate = await resolveSupportedCompatibilityDate(miniflare);
 
     const entryPath = this._data?.entry as string | undefined;
-    const virtual = await this.#prepareVirtualModules();
+    const initialVirtual = await this.#prepareVirtualModules();
+    // Always created, even empty: updates may add keys later.
+    const virtual = createMiniflareVirtualModules({ ...initialVirtual });
     this.#virtual = virtual;
 
     // Optional wrangler config → Miniflare options (compat date/flags +
@@ -479,8 +513,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
     if (entryPath && !options.script && !options.scriptPath) {
       // A virtual entry is matched like the fallback service matches imports:
       // verbatim (don't resolve "#entry" against cwd), or by path for path keys.
-      const virtualKeyOf = virtual && createVirtualKeyResolver(virtual);
-      const entryKey = virtualKeyOf?.(entryPath) ?? virtualKeyOf?.(resolve(entryPath));
+      const entryKey = virtual.keyOf(entryPath) ?? virtual.keyOf(resolve(entryPath));
       const entryIsVirtual = entryKey !== undefined;
       // Path keys load by path (workerd has no `file:` scheme).
       const resolvedEntry = entryIsVirtual
@@ -494,7 +527,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
       const entryDir = dirname(entryBase);
 
       // Auto-detect exported classes from entry source (skipped for a module specifier)
-      const entrySource = entryIsVirtual ? virtual![entryKey] : _tryReadFile(resolvedEntry);
+      const entrySource = entryIsVirtual ? virtual.sources[entryKey] : _tryReadFile(resolvedEntry);
       const detectedExports =
         this.#exports === false || typeof this.#exports === "string"
           ? []
@@ -582,18 +615,15 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
       // (e.g. imports from node_modules, parent dirs, cache-busted reload imports)
       if (!options.unsafeModuleFallbackService) {
         const _require = createRequire(entryBase);
+        // Read live: updates change it in place.
         const _virtual = virtual;
-        const _virtualKeyOf = virtualKeyOf;
-        const _virtualVersions = this.#virtualVersions;
         const _transformRequest = this.#transformRequest;
         const _exportConditions = this.#exportConditions;
         // `modulePath`: the served module's path, which its relative imports join onto.
         const _applyVirtualVersions = (code: string, modulePath: string | undefined) =>
-          _virtualKeyOf
-            ? applyVirtualVersions(code, _virtualVersions, (specifier) =>
-                _virtualKeyOf(specifier, modulePath),
-              )
-            : code;
+          applyVirtualVersions(code, _virtual.versions, (specifier) =>
+            _virtual.versionedKeyOf(specifier, modulePath),
+          );
         options.unsafeUseModuleFallbackService = true;
         // Map workerd module names to real filesystem paths for correct
         // relative import resolution from bare-specifier modules.
@@ -613,41 +643,39 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
 
           // Virtual modules override real files. Keep the `?t=` query in the name
           // so reloads get a fresh workerd module identity.
-          if (_virtual && _virtualKeyOf) {
-            const bareSpecifier = cleanSpecifier.startsWith("/")
-              ? cleanSpecifier.slice(1)
-              : cleanSpecifier;
-            // workerd joins a `file:` specifier onto the referrer's directory
-            // like a relative path, so only the raw one maps to a path key.
-            const virtualKey =
-              [cleanRaw, cleanSpecifier, bareSpecifier].find(
-                (key) => key !== undefined && Object.hasOwn(_virtual, key),
-              ) ??
-              _virtualKeyOf(cleanSpecifier) ??
-              (cleanRaw?.startsWith("file:") ? _virtualKeyOf(cleanRaw) : undefined);
-            if (virtualKey !== undefined) {
-              const query = specifier.includes("?") ? specifier.slice(specifier.indexOf("?")) : "";
-              const keyPath = virtualKeyPath(virtualKey);
-              // Redirect a `file:` import to the key's path: one module identity
-              // for both spellings, and its relative imports resolve. workerd
-              // requests the location verbatim (no `file:` left, so no loop) and
-              // reads header bytes as UTF-8.
-              if (
-                keyPath &&
-                cleanRaw?.startsWith("file:") &&
-                cleanSpecifier !== keyPath &&
-                cleanSpecifier.includes("file:")
-              ) {
-                const location = Buffer.from(keyPath + query, "utf8").toString("latin1");
-                return new Response(null, { status: 301, headers: { location } });
-              }
-              const name = bareSpecifier + query;
-              const source = _virtual[virtualKey]!;
-              // workerd parses `json` natively; TS was already stripped on the host.
-              return virtualModuleFormat(virtualKey) === "json"
-                ? Response.json({ name, json: source })
-                : Response.json({ name, esModule: _applyVirtualVersions(source, keyPath) });
+          const bareSpecifier = cleanSpecifier.startsWith("/")
+            ? cleanSpecifier.slice(1)
+            : cleanSpecifier;
+          // workerd joins a `file:` specifier onto the referrer's directory
+          // like a relative path, so only the raw one maps to a path key.
+          const virtualKey =
+            [cleanRaw, cleanSpecifier, bareSpecifier].find(
+              (key) => key !== undefined && Object.hasOwn(_virtual.sources, key),
+            ) ??
+            _virtual.keyOf(cleanSpecifier) ??
+            (cleanRaw?.startsWith("file:") ? _virtual.keyOf(cleanRaw) : undefined);
+          if (virtualKey !== undefined) {
+            const query = specifier.includes("?") ? specifier.slice(specifier.indexOf("?")) : "";
+            const keyPath = virtualKeyPath(virtualKey);
+            // Redirect a `file:` import to the key's path: one module identity
+            // for both spellings, and its relative imports resolve. workerd
+            // requests the location verbatim (no `file:` left, so no loop) and
+            // reads header bytes as UTF-8.
+            if (
+              keyPath &&
+              cleanRaw?.startsWith("file:") &&
+              cleanSpecifier !== keyPath &&
+              cleanSpecifier.includes("file:")
+            ) {
+              const location = Buffer.from(keyPath + query, "utf8").toString("latin1");
+              return new Response(null, { status: 301, headers: { location } });
             }
+            const name = bareSpecifier + query;
+            const source = _virtual.sources[virtualKey]!;
+            // workerd parses `json` natively; TS was already stripped on the host.
+            return virtualModuleFormat(virtualKey) === "json"
+              ? Response.json({ name, json: source })
+              : Response.json({ name, esModule: _applyVirtualVersions(source, keyPath) });
           }
 
           let resolvedPath: string;
@@ -780,7 +808,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
         _exports: this.#exports,
         // The fallback service closure captures the virtual map, so instances
         // are only shareable when the resolved sources are identical.
-        _virtual: virtual,
+        _virtual: initialVirtual,
       });
       const cached = _miniflareCache.get(this.#cacheKey);
       if (cached) {
@@ -788,9 +816,8 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
         cached.refCount++;
         this.#cacheEntry = cached;
         cached.ipc.runner = this;
-        // Adopt the maps the live fallback service closes over.
+        // Adopt the state the live fallback service closes over.
         this.#virtual = cached.virtual;
-        this.#virtualVersions = cached.versions;
       }
     }
 
@@ -802,7 +829,6 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
           mf: this.#miniflare,
           refCount: 1,
           virtual,
-          versions: this.#virtualVersions,
           ipc,
         };
         _miniflareCache.set(this.#cacheKey, this.#cacheEntry);
@@ -996,16 +1022,33 @@ function virtualKeyPath(key: string): string | undefined {
   return isAbsolute(key) ? resolve(key) : undefined;
 }
 
+type VirtualKeyResolver = (specifier: string, importerPath?: string) => string | undefined;
+
+function createMiniflareVirtualModules(sources: Record<string, string>): MiniflareVirtualModules {
+  const virtual = { sources, removed: new Set<string>(), versions: new Map(), version: 0 };
+  return refreshVirtualKeyResolvers(virtual as MiniflareVirtualModules);
+}
+
+/** Rebuild the resolvers after keys were added or removed. */
+function refreshVirtualKeyResolvers(virtual: MiniflareVirtualModules): MiniflareVirtualModules {
+  const keys = Object.keys(virtual.sources);
+  virtual.keyOf = createVirtualKeyResolver(keys);
+  virtual.versionedKeyOf =
+    virtual.removed.size > 0
+      ? createVirtualKeyResolver([...keys, ...virtual.removed])
+      : virtual.keyOf;
+  return virtual;
+}
+
 /**
  * Virtual key an import specifier refers to, resolved like workerd: verbatim
  * (query stripped), else by path for path keys. Relative specifiers join onto
  * the importer's path as plain text (workerd doesn't percent-decode them).
  */
-function createVirtualKeyResolver(
-  virtual: Record<string, string>,
-): (specifier: string, importerPath?: string) => string | undefined {
+function createVirtualKeyResolver(keys: Iterable<string>): VirtualKeyResolver {
+  const verbatim = new Set(keys);
   const pathKeys = new Map<string, string>();
-  for (const key of Object.keys(virtual)) {
+  for (const key of verbatim) {
     const path = virtualKeyPath(key);
     if (path !== undefined) {
       pathKeys.set(path, key);
@@ -1013,7 +1056,7 @@ function createVirtualKeyResolver(
   }
   return (specifier, importerPath) => {
     const clean = specifier.split("?")[0]!;
-    if (Object.hasOwn(virtual, clean)) {
+    if (verbatim.has(clean)) {
       return clean;
     }
     if (pathKeys.size === 0) {
