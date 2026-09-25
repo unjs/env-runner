@@ -19,6 +19,33 @@ describe("MiniflareEnvRunner (custom exports)", () => {
     runner = undefined;
   });
 
+  it("loads re-exported Durable Objects from a separate virtual module", async () => {
+    runner = new MiniflareEnvRunner({
+      miniflare,
+      name: "test-virtual-exports",
+      exports: "#server-exports",
+      data: {
+        entry: "#entry",
+        virtual: {
+          "#entry": `export { default } from ${JSON.stringify(workerDoEntry)};`,
+          "#server-exports": async () =>
+            `export { Counter as RenamedCounter } from ${JSON.stringify(workerDoEntry)};`,
+        },
+      },
+      miniflareOptions: {
+        durableObjects: { COUNTER: "RenamedCounter" },
+      },
+    });
+    await runner.waitForReady();
+    for (const count of [1, 2]) {
+      const res = await runner.fetch("http://localhost/counter/increment");
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ count });
+    }
+    await runner.reloadModule!();
+    expect(await (await runner.fetch("http://localhost/counter")).json()).toEqual({ count: 2 });
+  });
+
   it("fetch waits for initialization instead of returning 503", async () => {
     runner = new MiniflareEnvRunner({
       miniflare,

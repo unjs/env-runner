@@ -17,7 +17,7 @@ export function generateWrapper(
   opts?: {
     dynamicOnly?: boolean;
     captureErrors?: boolean;
-    exports?: string[];
+    exports?: string[] | string;
     /** Import `node:process` as the `process` global (needs `nodejs_compat`). Default: `true`. */
     nodeCompat?: boolean;
   },
@@ -35,11 +35,13 @@ if (!globalThis.process) { globalThis.process = __process; }`;
   // In dynamicOnly mode, we still need explicit re-exports for DO/Entrypoint
   // classes since workerd requires them as static named exports.
   const explicitExports =
-    opts?.dynamicOnly && opts.exports?.length
-      ? opts.exports
-          .map((name) => `export { ${name} } from ${JSON.stringify(entryPath)};`)
-          .join("\n")
-      : "";
+    typeof opts?.exports === "string"
+      ? `export * from ${JSON.stringify(opts.exports)};`
+      : opts?.dynamicOnly && opts.exports?.length
+        ? opts.exports
+            .map((name) => `export { ${name} } from ${JSON.stringify(entryPath)};`)
+            .join("\n")
+        : "";
 
   const captureErrors = opts?.captureErrors ?? true;
 

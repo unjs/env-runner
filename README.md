@@ -338,7 +338,7 @@ await using runner = new NodeWorkerEnvRunner({
 
 Virtual modules are registered inside the worker, before the entry is imported. On Node.js (>= 22.15 / 23.5) and Deno (>= 2.x) this uses [ESM customization hooks](https://nodejs.org/api/module.html#moduleregisterhooksoptions) (`module.registerHooks`); on Bun (which does not implement `registerHooks`) it uses [`Bun.plugin()`](https://bun.com/docs/runtime/plugins) virtual modules instead. The source string is treated as an ES module, and virtual specifiers (including a virtual entry) resolve across `reloadModule()`. On runtimes supporting neither mechanism, a warning is logged and registration is skipped. When the worker shuts down gracefully the registration is unregistered again (the `registerHooks` registration is deregistered; on Bun, which has no plugin-removal API, the in-memory source map is detached so fresh loads and reloads stop resolving).
 
-On `MiniflareEnvRunner` there is no in-worker registration: the runner's module fallback service serves virtual specifiers to workerd directly (taking precedence over disk files and the `transformRequest` pipeline, so a virtual key overrides a real file with the same path). One limitation: named `exports` (Durable Objects / WorkerEntrypoints) cannot be combined with a **virtual entry** — the wrapper would need a static re-export that miniflare cannot resolve at startup — and the runner fails fast with a clear error in that case.
+On `MiniflareEnvRunner` there is no in-worker registration: the runner's module fallback service serves virtual specifiers to workerd directly (taking precedence over disk files and the `transformRequest` pipeline, so a virtual key overrides a real file with the same path). Named `exports` (Durable Objects / WorkerEntrypoints) also work with virtual entries.
 
 #### Miniflare Runner
 
@@ -528,6 +528,25 @@ await using runner = new MiniflareEnvRunner({
 ```
 
 Auto-wired bindings are merged with Durable Object bindings from `miniflareOptions` and a wrangler config: exports whose class is already bound (or whose binding name is taken) are skipped. Set `exports: false` to disable auto-detection entirely.
+
+To load named exports from a separate module, set `exports` to its absolute path or a virtual module specifier. This preserves re-exports and exported aliases. Configure the bindings explicitly with `wrangler` or `miniflareOptions`; this mode does not auto-detect bindings.
+
+```ts
+const runner = new MiniflareEnvRunner({
+  name: "app",
+  miniflare,
+  data: {
+    entry: "/path/to/server.mjs",
+    virtual: {
+      "#server-exports": 'export { Counter } from "/path/to/counter.mjs";',
+    },
+  },
+  exports: "#server-exports",
+  miniflareOptions: { durableObjects: { COUNTER: "Counter" } },
+});
+```
+
+Named exports are registered when the worker starts. Recreate the runner when their implementation or export list changes; `reloadModule()` only reloads the request entry.
 
 #### Error Capture
 
