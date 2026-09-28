@@ -68,8 +68,8 @@ export function compileFilter<T>(
 }
 
 /**
- * Test an `id` pattern: globs with `path.matchesGlob` (relative ones resolve
- * from cwd), RegExps as is. The id is `/`-separated.
+ * Test an `id` pattern: globs with `path.matchesGlob` (resolved with
+ * {@link resolveGlob} first), RegExps as is. The id is `/`-separated.
  */
 export function matchId(pattern: string | RegExp, id: string): boolean {
   if (typeof pattern !== "string") {
@@ -81,7 +81,7 @@ export function matchId(pattern: string | RegExp, id: string): boolean {
       "[env-runner] glob `id` filters need `path.matchesGlob` (Node.js >= 22.5); use a RegExp instead.",
     );
   }
-  return nodePath.matchesGlob(id, resolveGlob(pattern));
+  return nodePath.matchesGlob(id, pattern);
 }
 
 /** Relative globs resolve from cwd (`**` patterns are left as they are). */

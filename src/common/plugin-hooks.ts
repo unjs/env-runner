@@ -11,6 +11,7 @@ import {
 } from "./plugin-filter.ts";
 import type { SerializedPrefilter } from "./plugin-filter.ts";
 import { createTransformClient } from "./transform-channel.ts";
+import { commonJSToESM, loadCommonJSLexer } from "./virtual-modules.ts";
 import type { TransformChannel } from "./transform-channel.ts";
 
 /** Runner data key of {@link PluginWorkerData} (only set with `data.plugins`). */
@@ -38,10 +39,15 @@ export function servedByPluginHooks(path: string): boolean {
  * matches; the runner's reply is served instead of the file. Warns once and
  * skips on runtimes without either backend:
  *
+ * Output the plugins left as TypeScript is served for the runtime to strip,
+ * like an untransformed file. Per runtime:
+ *
  * - Node.js/Deno: a `module.registerHooks` load hook. Deno evaluates hook
- *   output as ESM, so CommonJS files fall back to its native loader.
+ *   output as plain ESM, so TypeScript is stripped here and CommonJS wrapped
+ *   (`commonJSToESM()`).
  * - Bun: a `Bun.plugin` `onLoad` (can't be removed) with {@link createBunFilter}.
- *   Its output is always evaluated as ESM.
+ *   Its output is always evaluated as ESM, so CommonJS is wrapped, also for
+ *   files the filter passes but no plugin matches.
  */
 export async function registerPluginHooks(config?: PluginWorkerData): Promise<() => void> {
   if (!config) {
@@ -54,19 +60,35 @@ export async function registerPluginHooks(config?: PluginWorkerData): Promise<()
   };
   const transform = createTransformClient(config);
   await initEsmLexer;
-  const { registerHooks } = await import("node:module");
+  const { registerHooks, stripTypeScriptTypes } = await import("node:module");
+  const isDeno = "Deno" in globalThis;
+  if (isDeno || typeof (globalThis as any).Bun?.plugin === "function") {
+    await loadCommonJSLexer();
+  }
   if (typeof registerHooks === "function") {
-    const isDeno = "Deno" in globalThis;
     const hooks = registerHooks({
       load(url, context, nextLoad) {
         if (url.startsWith("file:")) {
           const path = fileURLToPath(stripQuery(url));
           if (matches(path)) {
-            const source = transform(path, readFileSync(path, "utf8"));
-            const format =
-              source === undefined ? undefined : transformedFormat(path, source, context.format);
-            if (format && !(isDeno && format === "commonjs")) {
-              return { format, source, shortCircuit: true };
+            const result = transform(path, readFileSync(path, "utf8"));
+            if (result) {
+              const format = transformedFormat(path, result.code, context.format);
+              if (!isDeno) {
+                return {
+                  format: result.moduleType === "ts" ? `${format}-typescript` : format,
+                  source: result.code,
+                  shortCircuit: true,
+                };
+              }
+              let source = result.code;
+              if (result.moduleType === "ts") {
+                source = _stripTypes(path, source, stripTypeScriptTypes);
+              }
+              if (format === "commonjs") {
+                source = commonJSToESM(path, source);
+              }
+              return { format: "module", source, shortCircuit: true };
             }
           }
         }
@@ -90,11 +112,17 @@ export async function registerPluginHooks(config?: PluginWorkerData): Promise<()
       setup(build: any) {
         build.onLoad({ filter }, ({ path }: { path: string }) => {
           const contents = readFileSync(path, "utf8");
-          const code = _active === served && matches(path) ? transform(path, contents) : undefined;
-          // `onLoad` can't decline: untouched code goes to Bun's native loader.
-          return code === undefined
-            ? { contents, loader: _bunLoader(path) }
-            : { contents: code, loader: "js" };
+          const result =
+            _active === served && matches(path) ? transform(path, contents) : undefined;
+          // `onLoad` can't decline: untouched code is served with the loader
+          // Bun would use.
+          const code = result?.code ?? contents;
+          const loader = result ? (result.moduleType === "ts" ? "ts" : "js") : _bunLoader(path);
+          return {
+            contents:
+              transformedFormat(path, code) === "commonjs" ? commonJSToESM(path, code) : code,
+            loader,
+          };
         });
       },
     });
@@ -109,6 +137,27 @@ export async function registerPluginHooks(config?: PluginWorkerData): Promise<()
     "[env-runner] `plugins` requires `module.registerHooks` (Node.js >= 22.15 / Deno >= 2.8) or `Bun.plugin`; skipping.",
   );
   return _noop;
+}
+
+// Deno parses hook output as JavaScript: strip what the plugins left typed.
+function _stripTypes(
+  path: string,
+  code: string,
+  stripTypeScriptTypes: ((code: string) => string) | undefined,
+): string {
+  if (typeof stripTypeScriptTypes !== "function") {
+    throw new TypeError(
+      `[env-runner] "${path}" is still TypeScript after its plugins, which needs \`module.stripTypeScriptTypes\` (Deno >= 2.8.2) here: upgrade Deno or compile it in a plugin.`,
+    );
+  }
+  try {
+    return stripTypeScriptTypes(code);
+  } catch (error: any) {
+    throw new SyntaxError(
+      `[env-runner] failed to strip types from "${path}" after its plugins: ${error?.message || error}`,
+      { cause: error },
+    );
+  }
 }
 
 const CJS_MARKERS = /\b(?:module\.exports\b|exports\.\w|require\s*\()/;

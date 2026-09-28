@@ -744,9 +744,7 @@ async function _prepareVirtualModules(
       ([key, module]) => module !== null && virtualModuleFormat(key, module).startsWith("commonjs"),
     );
     if (commonJS) {
-      const lexer = await import("cjs-module-lexer");
-      await lexer.init();
-      _cjsLexer = lexer;
+      await loadCommonJSLexer();
     }
   }
   const out: Record<string, ResolvedVirtualModule | null> = {};
@@ -757,6 +755,24 @@ async function _prepareVirtualModules(
 }
 
 let _cjsLexer: { parse: (source: string) => { exports: string[] } } | undefined;
+
+/** Load the lexer {@link commonJSToESM} needs (once). */
+export async function loadCommonJSLexer(): Promise<void> {
+  if (!_cjsLexer) {
+    const lexer = await import("cjs-module-lexer");
+    await lexer.init();
+    _cjsLexer = lexer;
+  }
+}
+
+/**
+ * The CommonJS-as-ESM wrapper of {@link _commonJSToESM} for other in-memory
+ * sources (plugin output on Bun and Deno); `path` is the module's file.
+ * Await {@link loadCommonJSLexer} first.
+ */
+export function commonJSToESM(path: string, source: string): string {
+  return _commonJSToESM(path, source);
+}
 
 // Node loads every format but JSX (the load hook serves raw formats as ES
 // modules), so JSX fails here instead of on import.

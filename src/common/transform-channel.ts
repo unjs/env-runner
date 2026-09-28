@@ -1,4 +1,4 @@
-import { rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -18,8 +18,9 @@ import type { PluginPipeline } from "./plugins.ts";
 // - process workers: a local socket the runner listens on (unix socket, or
 //   named pipe on Windows), bridged by a helper thread in the worker.
 //
-// Messages: `{ id, path, code }` → `{ id, code? }` (no `code`: unchanged) or
-// `{ id, error }`. The socket carries them as newline-delimited JSON.
+// Messages: `{ id, path, code }` → `{ id, code?, moduleType? }` (no `code`:
+// unchanged) or `{ id, error }`. The socket carries them as newline-delimited
+// JSON.
 
 export interface TransformRequest {
   id: number;
@@ -31,6 +32,7 @@ export interface TransformRequest {
 export interface TransformReply {
   id?: number;
   code?: string;
+  moduleType?: "js" | "ts";
   error?: string;
   /** Set by the bridge when the socket closed (no `id`). */
   closed?: boolean;
@@ -57,7 +59,7 @@ export async function handleTransformRequest(
 ): Promise<TransformReply> {
   try {
     const result = await pipeline.transform(request.path, request.code);
-    return { id: request.id, code: result?.code };
+    return { id: request.id, code: result?.code, moduleType: result?.moduleType };
   } catch (error: any) {
     return { id: request.id, error: error?.message || String(error) };
   }
@@ -81,12 +83,12 @@ export function openTransformPort(pipeline: PluginPipeline): TransformChannelHos
 }
 
 /**
- * Runner side for process workers: listen on a fresh local socket. Binding a
- * local socket is synchronous, so the path is usable once this returns (the
- * worker connects after its data handshake).
+ * Runner side for process workers: listen on a fresh local socket, in a
+ * private (0700) temporary directory on POSIX. The worker connects after its
+ * data handshake, by which time the socket is bound.
  */
 export function openTransformSocket(pipeline: PluginPipeline): TransformChannelHost {
-  const path = _socketPath();
+  const { path, dir } = _socketPath();
   const server = createServer((socket) => {
     let buffer = "";
     socket.setEncoding("utf8");
@@ -95,7 +97,13 @@ export function openTransformSocket(pipeline: PluginPipeline): TransformChannelH
       buffer += chunk;
       let index: number;
       while ((index = buffer.indexOf("\n")) !== -1) {
-        const request = JSON.parse(buffer.slice(0, index)) as TransformRequest;
+        let request: TransformRequest;
+        try {
+          request = JSON.parse(buffer.slice(0, index));
+        } catch {
+          socket.destroy();
+          return;
+        }
         buffer = buffer.slice(index + 1);
         handleTransformRequest(pipeline, request).then((reply) => {
           if (!socket.destroyed) {
@@ -110,26 +118,45 @@ export function openTransformSocket(pipeline: PluginPipeline): TransformChannelH
   });
   server.listen(path);
   server.unref();
+  // Node doesn't unlink unix sockets, also not on exit.
+  const cleanup = () => {
+    if (dir) {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  };
+  process.once("exit", cleanup);
   return {
     channel: { socket: path },
     close: () => {
       server.close();
-      if (process.platform !== "win32") {
-        rmSync(path, { force: true });
-      }
+      process.off("exit", cleanup);
+      cleanup();
     },
   };
 }
 
-function _socketPath(): string {
-  const name = `env-runner-${process.pid}-${Math.random().toString(36).slice(2, 10)}`;
+function _socketPath(): { path: string; dir?: string } {
   if (process.platform === "win32") {
-    return `\\\\.\\pipe\\${name}`;
+    const name = `env-runner-${process.pid}-${crypto.randomUUID()}`;
+    return { path: `\\\\.\\pipe\\${name}` };
   }
-  const path = join(tmpdir(), `${name}.sock`);
   // Unix socket paths are limited to ~104 bytes (macOS) / 108 (Linux).
-  return path.length < 100 ? path : join("/tmp", `${name}.sock`);
+  let base = tmpdir();
+  if (join(base, "env-runner-XXXXXX", "transform.sock").length >= 100) {
+    base = "/tmp";
+  }
+  const dir = mkdtempSync(join(base, "env-runner-"));
+  return { path: join(dir, "transform.sock"), dir };
 }
+
+/** New code from the runner, `ts` when it still needs type stripping. */
+export interface TransformedCode {
+  code: string;
+  moduleType: "js" | "ts";
+}
+
+// A transform taking longer than this logs a warning (once per module).
+const SLOW_TRANSFORM_MS = 10_000;
 
 /**
  * Worker side: a synchronous `transform(path, code)` over the channel,
@@ -137,7 +164,7 @@ function _socketPath(): string {
  */
 export function createTransformClient(
   channel: TransformChannel,
-): (path: string, code: string) => string | undefined {
+): (path: string, code: string) => TransformedCode | undefined {
   let port: MessagePort;
   let state: Int32Array;
   if (channel.port && channel.state) {
@@ -159,12 +186,20 @@ export function createTransformClient(
   let lastId = 0;
   return (path, code) => {
     const id = ++lastId;
-    const seen = Atomics.load(state, 0);
     port.postMessage({ id, path, code } satisfies TransformRequest);
+    let warned = false;
     for (;;) {
+      // Read before receiving: a reply posted after the read bumps the counter,
+      // so the wait below returns at once.
+      const seen = Atomics.load(state, 0);
       const received = receiveMessageOnPort(port);
       if (!received) {
-        Atomics.wait(state, 0, seen);
+        if (Atomics.wait(state, 0, seen, SLOW_TRANSFORM_MS) === "timed-out" && !warned) {
+          warned = true;
+          console.warn(
+            `[env-runner] still waiting for the runner's plugins to transform "${path}" (plugin handlers must not wait on this runner).`,
+          );
+        }
         continue;
       }
       const reply = received.message as TransformReply;
@@ -178,7 +213,9 @@ export function createTransformClient(
       if (reply.error !== undefined) {
         throw new Error(reply.error);
       }
-      return reply.code;
+      return reply.code === undefined
+        ? undefined
+        : { code: reply.code, moduleType: reply.moduleType ?? "js" };
     }
   };
 }
@@ -190,6 +227,8 @@ const BRIDGE_SOURCE = /* js */ `
 const { workerData } = require("node:worker_threads");
 const { connect } = require("node:net");
 const { port, state, socket } = workerData;
+// A crash here would leave the worker blocked: answer with an error instead.
+process.on("uncaughtException", (error) => onClose(error));
 const reply = (message) => {
   port.postMessage(message);
   Atomics.add(state, 0, 1);

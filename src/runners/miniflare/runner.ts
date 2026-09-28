@@ -658,7 +658,12 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
         const _virtual = virtual;
         const _transformRequest = this.#transformRequest;
         // `data.plugins` run here, on the host (workerd only parses JS).
-        const _plugins = this._plugins;
+        // Read from the live runner: a persistent instance is adopted by later
+        // runners, which bring their own plugins.
+        const _livePlugins = () => ipc.runner._plugins;
+        // Plugin output of CommonJS modules, from the shim request until its
+        // `?__cjs` request (so they are transformed once).
+        const _cjsOutput = new Map<string, string>();
         const _exportConditions = this.#exportConditions;
         // `modulePath`: the served module's path, which its relative imports join onto.
         const _applyVirtualVersions = (code: string, modulePath: string | undefined) =>
@@ -864,10 +869,25 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
           // Track the real path so relative imports from this module resolve correctly
           modulePathMap.set(name, resolvedPath);
 
+          const _plugins = _livePlugins();
+          const cjsSuffix = "?__cjs";
           let transformed: string | undefined;
-          if (_plugins?.filter(resolvedPath)) {
+          if (specifier.endsWith(cjsSuffix) && _cjsOutput.has(resolvedPath)) {
+            transformed = _cjsOutput.get(resolvedPath);
+            _cjsOutput.delete(resolvedPath);
+          } else if (_plugins?.filter(resolvedPath)) {
             try {
-              transformed = (await _plugins.transform(resolvedPath, contents))?.code;
+              const result = await _plugins.transform(resolvedPath, contents);
+              transformed = result?.code;
+              if (result?.moduleType === "ts") {
+                const strip = await _getStripTypeScriptTypes();
+                if (typeof strip !== "function") {
+                  throw new TypeError(
+                    `[env-runner] "${resolvedPath}" is still TypeScript after its plugins, which needs \`module.stripTypeScriptTypes\` on the host: upgrade Node.js or compile it in a plugin.`,
+                  );
+                }
+                transformed = strip(result.code);
+              }
             } catch (error: any) {
               // A named import of this module fails at link time before the
               // throw runs (hiding it), so also report it on the host.
@@ -875,7 +895,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
               console.error(message);
               return Response.json({
                 name,
-                esModule: `throw new SyntaxError(${JSON.stringify(message)});`,
+                esModule: `throw new Error(${JSON.stringify(message)});`,
               });
             }
           }
@@ -898,9 +918,11 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
             });
           }
           // Importers expect ESM: serve raw CJS under a suffixed name behind an ESM shim.
-          const cjsSuffix = "?__cjs";
           if (specifier.endsWith(cjsSuffix)) {
             return Response.json({ name, commonJsModule: contents });
+          }
+          if (transformed !== undefined) {
+            _cjsOutput.set(resolvedPath, transformed);
           }
           const shimSpecifier = "./" + basename(resolvedPath) + cjsSuffix;
           const esModule = createCjsEsmShim(shimSpecifier, contents);
@@ -915,9 +937,8 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
         ...this.#miniflareOptions,
         _exportConditions: this.#exportConditions,
         _exports: this.#exports,
-        // The fallback service closure runs the first instance's plugins:
-        // instances with plugins of the same names share it.
-        _plugins: this._plugins?.names,
+        // Plugins are read from the adopting runner, but change the module rules.
+        _plugins: Boolean(this._plugins),
         // The fallback service closure captures the virtual map, so instances
         // are only shareable when the resolved sources are identical (bytes
         // compared as base64, not as JSON objects of indices).

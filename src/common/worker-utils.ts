@@ -120,8 +120,13 @@ export function isVirtualEntry(
  * function.
  */
 export async function registerWorkerHooks(data: Record<string, any>): Promise<() => void> {
+  // Virtual modules must win for keys overriding a file. The latest
+  // `registerHooks` registration runs first, but Bun asks the earliest
+  // `onLoad` whose filter matches.
+  const bun = "Bun" in globalThis;
+  const unregisterVirtualFirst = bun ? await registerVirtualModules(data.virtual) : undefined;
   const unregisterPlugins = await registerPluginHooks(data[PLUGINS_DATA_KEY]);
-  const unregisterVirtual = await registerVirtualModules(data.virtual);
+  const unregisterVirtual = unregisterVirtualFirst ?? (await registerVirtualModules(data.virtual));
   return () => {
     unregisterVirtual();
     unregisterPlugins();
@@ -148,7 +153,8 @@ export async function resolveEntry(entryPath: string, virtual?: boolean): Promis
  * messages mostly don't. env-runner's own errors are left as they are.
  */
 export function formatInitError(error: any): string {
-  const message = error?.message || String(error);
+  // Deno prefixes errors thrown by module hooks with their name.
+  const message = (error?.message || String(error)).replace(/^(?:Error: )+(?=\[env-runner\])/, "");
   if (message.startsWith("[env-runner]") || /:\d+:\d+/.test(message)) {
     return message;
   }
@@ -228,11 +234,12 @@ async function _importFresh(entryPath: string, virtual?: boolean): Promise<AppEn
   const filePath = qIndex === -1 ? entryPath : entryPath.slice(0, qIndex);
 
   let mod: any;
-  if (!virtual && "Bun" in globalThis && servedByPluginHooks(filePath)) {
+  const bunPath = filePath.startsWith("file:") ? fileURLToPath(filePath) : filePath;
+  if (!virtual && "Bun" in globalThis && servedByPluginHooks(bunPath)) {
     // Bun drops the query of a file served by the plugins' `onLoad`: evict it
-    // instead (`require.cache` also holds ESM there).
-    delete createRequire(import.meta.url).cache[filePath];
-    mod = await import(filePath);
+    // instead (`require.cache` also holds ESM there, by path).
+    delete createRequire(import.meta.url).cache[bunPath];
+    mod = await import(bunPath);
   } else if (virtual && refreshVirtualModule(filePath)) {
     // Bun: `refreshVirtualModule()` bumped or re-registered the key (a `?query`
     // doesn't reach every key there).

@@ -77,7 +77,6 @@ const runners = [
     name: "BunProcessEnvRunner",
     create: (opts: any) => new BunProcessEnvRunner(opts),
     skip: !hasRuntime("bun"),
-    bun: true,
   },
   {
     name: "DenoProcessEnvRunner",
@@ -92,7 +91,7 @@ const runners = [
   },
 ];
 
-for (const { name, create, skip, bun, cjsOptions } of runners) {
+for (const { name, create, skip, cjsOptions } of runners) {
   const miniflareRunner = name === "MiniflareEnvRunner";
   describe.skipIf(skip ?? false)(`${name} plugins`, () => {
     let runner: EnvRunner;
@@ -188,7 +187,7 @@ for (const { name, create, skip, bun, cjsOptions } of runners) {
         transform: {
           filter: { id: /dep\.ts$/ },
           handler() {
-            this.error("nope");
+            throw new Error("nope");
           },
         },
       };
@@ -198,7 +197,11 @@ for (const { name, create, skip, bun, cjsOptions } of runners) {
       });
       // Miniflare: a named import fails to link first (the error is logged on the host).
       const error = await runner.waitForReady().catch((error) => error);
-      expect(error.cause.message).toMatch(miniflareRunner ? /Status/ : /plugin "failing".*nope/);
+      expect(error.cause.message).toMatch(
+        miniflareRunner
+          ? /Status/
+          : /^\[env-runner\] plugin "failing" failed on ".*dep\.ts": nope$/,
+      );
       expect(runner.closed).toBe(true);
     });
 
@@ -225,16 +228,42 @@ for (const { name, create, skip, bun, cjsOptions } of runners) {
       expect(await res.text()).toBe("ok");
     });
 
-    // Bun evaluates plugin output as ESM, so CommonJS `.ts` can't be transformed there.
-    it.skipIf(bun)("serves CommonJS `.ts` (package without `type`) and `.cts`", async () => {
+    it("serves CommonJS `.ts` (package without `type`), `.cts` and untouched `.js`", async () => {
+      // The glob-only `id` filter sends every script file through Bun's
+      // `onLoad`, including the untouched CommonJS `plain.js`.
       runner = create({
         ...cjsOptions,
         name: "plugins-cjs",
-        data: { entry: fixture("app-cjs.ts"), plugins: [oxc()] },
+        data: { entry: fixture("app-cjs.ts"), plugins: [oxc(), greeting({ id: "**/cjs/**" })] },
       });
       await runner.waitForReady();
       const res = await runner.fetch("http://localhost/");
-      expect(await res.json()).toEqual(["lib", "cts"]);
+      expect(await res.json()).toEqual(["lib", "cts", "plain"]);
+    });
+
+    it("leaves TypeScript no plugin compiled to the runtime", async () => {
+      runner = create({
+        name: "plugins-typed",
+        data: { entry: fixture("typed.ts"), plugins: [greeting()] },
+      });
+      await runner.waitForReady();
+      const res = await runner.fetch("http://localhost/");
+      expect(await res.text()).toBe("hi");
+    });
+
+    it("serves a virtual path key over the file plugins would transform", async () => {
+      runner = create({
+        ...cjsOptions,
+        name: "plugins-virtual-path",
+        data: {
+          entry: fixture("app-vendor.ts"),
+          plugins: [oxc(), greeting()],
+          virtual: { [fixture("vendor/plain.ts")]: `export const value: string = "virtual";` },
+        },
+      });
+      await runner.waitForReady();
+      const res = await runner.fetch("http://localhost/");
+      expect(await res.json()).toEqual(["cts", "virtual"]);
     });
 
     // `vendor/plain.ts` would become "hi" if the greeting plugin ran on it.
@@ -257,9 +286,37 @@ for (const { name, create, skip, bun, cjsOptions } of runners) {
   });
 }
 
+describe("MiniflareEnvRunner plugins (persistent)", () => {
+  it("runs the plugins of the runner that adopted the instance", async () => {
+    const create = (value: string) =>
+      new MiniflareEnvRunner({
+        miniflare,
+        persistent: true,
+        name: "plugins-persistent",
+        data: { entry: fixture("typed.ts"), plugins: [greeting({ greeting: value })] },
+      } as any);
+    const first = create("one");
+    await first.waitForReady();
+    expect(await (await first.fetch("http://localhost/")).text()).toBe("one");
+    await first.close();
+    const second = create("two");
+    try {
+      await second.waitForReady();
+      await second.reloadModule();
+      expect(await (await second.fetch("http://localhost/")).text()).toBe("two");
+    } finally {
+      await second.close();
+    }
+  });
+});
+
 describe("plugins", () => {
   it("validates `data.plugins`", () => {
     expect(createPluginPipeline(undefined)).toBeUndefined();
+    expect(createPluginPipeline(null as any)).toBeUndefined();
+    expect(() =>
+      createPluginPipeline([{ transform: { filter: { moduleType: "ts" as any }, handler() {} } }]),
+    ).toThrow(/invalid `transform\.filter\.moduleType`/);
     expect(() => createPluginPipeline("oxc" as any)).toThrow(/must be an array/);
     expect(() => createPluginPipeline([{} as any])).toThrow(
       /`data\.plugins\[0\]` has no `transform`/,
@@ -351,13 +408,17 @@ describe("plugins", () => {
       mappings: "AAAA",
       sources: ["file:///app/a.ts"],
     });
-    // Unchanged code, and changed code that is still TypeScript.
+    // Unchanged code, changed code that is still TypeScript (left to the
+    // runtime), and still JSX.
     expect(await createPluginPipeline([{ transform: () => null }])!.transform("/a.ts", "x")).toBe(
       undefined,
     );
+    const append = createPluginPipeline([{ transform: (code) => code + ";" }])!;
+    expect(await append.transform("/a.ts", "x")).toEqual({ code: "x;", moduleType: "ts" });
+    await expect(append.transform("/a.tsx", "x")).rejects.toThrow(/still tsx after its plugins/);
     await expect(
-      createPluginPipeline([{ transform: (code) => code + ";" }])!.transform("/a.ts", "x"),
-    ).rejects.toThrow(/still ts after its plugins/);
+      createPluginPipeline([{ transform: () => ({ code: 1 as any }) }])!.transform("/a.js", "x"),
+    ).rejects.toThrow(/non-string `code`/);
   });
 
   it("transforms virtual modules in their format's module system", async () => {

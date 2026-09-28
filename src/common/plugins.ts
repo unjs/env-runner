@@ -8,6 +8,7 @@ import {
   matchId,
   moduleTypeOf,
   normalizeFilterId,
+  resolveGlob,
   serializePattern,
   stripQuery,
   testRegExp,
@@ -99,8 +100,13 @@ export interface EnvRunnerPlugin {
 
 /** Result of {@link PluginPipeline.transform}. */
 export interface PluginTransformOutput {
-  /** JavaScript, with an inline source map when a plugin returned one. */
+  /** The new code, with an inline source map when a plugin returned one. */
   code: string;
+  /**
+   * `js`, or `ts` when no plugin compiled it (the worker strips the types
+   * where the runtime does it natively, like for untransformed files).
+   */
+  moduleType: "js" | "ts";
 }
 
 /** The `data.plugins` of a runner, ready to run on the host. */
@@ -117,8 +123,9 @@ export interface PluginPipeline {
   filter(id: string, moduleType?: PluginModuleType): boolean;
   /**
    * Run the plugins: `undefined` when none changed the code (load it as if
-   * unmatched). Rejects with their errors, and when the code changed but is
-   * still not JavaScript (no plugin returned `moduleType: "js"`).
+   * unmatched). Rejects with their errors (naming the plugin and id), and when
+   * the code changed but is still neither JavaScript nor TypeScript (e.g. JSX
+   * no plugin compiled).
    */
   transform(
     id: string,
@@ -139,7 +146,7 @@ interface NormalizedPlugin {
 export function createPluginPipeline(
   plugins: EnvRunnerPlugin[] | undefined,
 ): PluginPipeline | undefined {
-  if (plugins === undefined) {
+  if (plugins == null) {
     return undefined;
   }
   if (!Array.isArray(plugins)) {
@@ -176,10 +183,26 @@ export function createPluginPipeline(
       if (!plugin.matches(matchId, moduleType, code)) {
         continue;
       }
-      const result = await plugin.handler.call(_createContext(plugin.name, id), code, id, {
-        moduleType,
-      });
+      let result: PluginTransformResult;
+      try {
+        result = await plugin.handler.call(_createContext(plugin.name, id), code, id, {
+          moduleType,
+        });
+      } catch (error: any) {
+        const message = error?.message || String(error);
+        // `this.error()` messages already name the plugin and id.
+        throw message.startsWith("[env-runner]")
+          ? error
+          : new Error(`[env-runner] plugin "${plugin.name}" failed on "${id}": ${message}`, {
+              cause: error,
+            });
+      }
       const next = typeof result === "string" ? result : (result?.code ?? code);
+      if (typeof next !== "string") {
+        throw new TypeError(
+          `[env-runner] plugin "${plugin.name}" returned non-string \`code\` for "${id}".`,
+        );
+      }
       if (result && typeof result === "object") {
         moduleType = result.moduleType ?? moduleType;
       }
@@ -202,7 +225,7 @@ export function createPluginPipeline(
     if (!changed) {
       return undefined;
     }
-    if (moduleType !== "js") {
+    if (moduleType !== "js" && moduleType !== "ts") {
       throw new TypeError(
         `[env-runner] "${id}" is still ${moduleType} after its plugins: add one that compiles it to JavaScript (returning \`moduleType: "js"\`) or narrow the plugins' filters.`,
       );
@@ -212,7 +235,7 @@ export function createPluginPipeline(
       const json = JSON.stringify({ ...map, sources: [source], file: undefined });
       code += `\n//# sourceMappingURL=data:application/json;base64,${Buffer.from(json).toString("base64")}\n`;
     }
-    return { code };
+    return { code, moduleType: moduleType as "js" | "ts" };
   };
 
   return {
@@ -236,7 +259,8 @@ const VIRTUAL_MODULE_TYPES: Partial<Record<string, PluginModuleType>> = {
 /**
  * Transform the virtual modules plugins match, on the host before they are
  * sent: code formats, with the format as initial module type. A transformed
- * module stays in its format's module system (virtual `.ts`/`.tsx` stay ESM).
+ * module stays in its format's module system (virtual `.ts`/`.tsx` stay ESM),
+ * as TypeScript when no plugin compiled it.
  * Others, and untouched modules, are returned as they are.
  */
 export async function transformVirtualModules<T extends ResolvedVirtualModule | null>(
@@ -256,9 +280,10 @@ export async function transformVirtualModules<T extends ResolvedVirtualModule | 
     const source = typeof module === "string" ? module : (module.source as string);
     const result = await pipeline.transform(key, source, moduleType);
     if (result) {
+      const system = format.startsWith("commonjs") ? "commonjs" : "module";
       out[key] = {
         source: result.code,
-        format: format.startsWith("commonjs") ? "commonjs" : "module",
+        format: result.moduleType === "ts" ? `${system}-typescript` : system,
       };
     }
   }
@@ -292,12 +317,26 @@ function _normalizePlugin(plugin: unknown, index: number): NormalizedPlugin {
     return fail("has no `transform` function or `transform.handler`");
   }
 
-  const id = filter?.id === undefined ? undefined : _compileStringFilter(filter.id, matchId);
+  // Relative globs resolve from cwd now, like the worker's prefilter.
+  const id =
+    filter?.id === undefined
+      ? undefined
+      : _compileStringFilter(filter.id, matchId, (pattern) =>
+          typeof pattern === "string" ? resolveGlob(pattern) : pattern,
+        );
   const code =
     filter?.code === undefined ? undefined : _compileStringFilter(filter.code, _matchCode);
-  const moduleTypes = Array.isArray(filter?.moduleType)
-    ? filter.moduleType
-    : filter?.moduleType?.include;
+  const moduleTypeFilter = filter?.moduleType;
+  const moduleTypes = Array.isArray(moduleTypeFilter)
+    ? moduleTypeFilter
+    : moduleTypeFilter === undefined
+      ? undefined
+      : moduleTypeFilter?.include;
+  if (moduleTypeFilter !== undefined && !Array.isArray(moduleTypes)) {
+    return fail(
+      "has an invalid `transform.filter.moduleType` (expected an array or `{ include: [...] }`)",
+    );
+  }
   return {
     name,
     order,
@@ -333,11 +372,12 @@ function _createContext(name: string, id: string): PluginContext {
 function _compileStringFilter(
   filter: PluginStringFilter,
   match: (pattern: string | RegExp, value: string) => boolean,
+  map: (pattern: string | RegExp) => string | RegExp = (pattern) => pattern,
 ): CompiledFilter<string | RegExp> {
   const formal =
     filter && typeof filter === "object" && !Array.isArray(filter) && !(filter instanceof RegExp);
   const toList = (value: MaybeArray<string | RegExp> | undefined) =>
-    value === undefined ? [] : Array.isArray(value) ? value : [value];
+    (value === undefined ? [] : Array.isArray(value) ? value : [value]).map(map);
   return compileFilter(
     formal ? toList(filter.include) : toList(filter as MaybeArray<string | RegExp>),
     formal ? toList(filter.exclude) : [],
