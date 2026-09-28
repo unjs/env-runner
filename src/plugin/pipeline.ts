@@ -741,7 +741,9 @@ function _resolveLikeRuntime(
     return { id: source, external: true };
   }
   const from =
-    importer && isAbsolute(stripQuery(importer)) ? stripQuery(importer) : `${process.cwd()}/`;
+    importer && isAbsolute(stripQuery(importer))
+      ? stripQuery(importer)
+      : pathToFileURL(`${process.cwd()}/`).href;
   const path = resolveModulePath(stripQuery(source), { from, conditions, try: true, cache: false });
   return path ? { id: path + queryOf(source), external: false } : null;
 }
@@ -763,21 +765,25 @@ async function _callHook<T>(
     if (message.startsWith("[env-runner]")) {
       throw error;
     }
-    const at = `${id}${_formatPosition(code, _logPosition(error))}`;
+    const at = `${id}${_formatPosition(code, _logPosition(error, id, code))}`;
     throw new Error(`[env-runner] plugin "${name}" ${what} "${at}": ${message}${_frame(error)}`, {
       cause: error,
     });
   }
 }
 
-// Position of a log or error: `loc` (1-based line, 0-based
-// column), else a `pos` offset.
-function _logPosition(log: unknown): PluginLogPosition | undefined {
-  const { loc, pos } = (log ?? {}) as { loc?: { line?: unknown; column?: unknown }; pos?: unknown };
+// Position in `id` of a log or error: `loc` (1-based line, 0-based column;
+// not when it names another file), else a `pos` offset (only with `code`).
+function _logPosition(log: unknown, id: string, code: string): PluginLogPosition | undefined {
+  const { loc, pos } = (log ?? {}) as {
+    loc?: { line?: unknown; column?: unknown; file?: unknown };
+    pos?: unknown;
+  };
   if (typeof loc?.line === "number" && typeof loc.column === "number") {
-    return { line: loc.line, column: loc.column };
+    const other = typeof loc.file === "string" && loc.file !== stripQuery(id) && loc.file !== id;
+    return other ? undefined : { line: loc.line, column: loc.column };
   }
-  return typeof pos === "number" ? pos : undefined;
+  return typeof pos === "number" && code ? pos : undefined;
 }
 
 // A log's code frame, on lines of its own.
@@ -1177,7 +1183,7 @@ function _createContext(
   const format = (log: PluginLog, pos?: PluginLogPosition) =>
     typeof log === "string"
       ? `[env-runner] plugin "${name}" (${id}${_formatPosition(code, pos)}): ${log}`
-      : `[env-runner] plugin "${name}" (${id}${_formatPosition(code, pos ?? _logPosition(log))}): ${log?.message}${_frame(log)}`;
+      : `[env-runner] plugin "${name}" (${id}${_formatPosition(code, pos ?? _logPosition(log, id, code))}): ${log?.message}${_frame(log)}`;
   return {
     warn: (log, pos) => console.warn(format(log, pos)),
     info: (log, pos) => console.info(format(log, pos)),

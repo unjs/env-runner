@@ -6,6 +6,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -1329,7 +1330,7 @@ describe("plugin filters", () => {
           filter: { id: /thrown/ },
           handler() {
             throw Object.assign(new SyntaxError("Unexpected token"), {
-              loc: { line: 2, column: 0, file: "/a.js" },
+              loc: { line: 2, column: 0, file: "/thrown.js" },
               frame: `${frame}\n`,
             });
           },
@@ -1347,6 +1348,10 @@ describe("plugin filters", () => {
     ])!;
     await expect(pipeline.transform("/thrown.js", "a\nb")).rejects.toThrow(
       `[env-runner] plugin "parse" failed on "/thrown.js:2:0": Unexpected token\n\n${frame}`,
+    );
+    // A `loc` in another file isn't this module's position.
+    await expect(pipeline.transform("/other/thrown.js", "a\nb")).rejects.toThrow(
+      `[env-runner] plugin "parse" failed on "/other/thrown.js": Unexpected token\n\n${frame}`,
     );
     await expect(pipeline.transform("/logged.js", "a\nb")).rejects.toThrow(
       /^\[env-runner\] plugin "log" \(\/logged\.js:2:0\): bad$/,
@@ -1485,7 +1490,8 @@ describe("plugin `resolveId`/`load` hooks", () => {
   });
 
   it("resolves with `this.resolve()`: other plugins, then like the runtime", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "env-runner-plugins-"));
+    // Real paths, as resolved (macOS's temp dir is behind a symlink).
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "env-runner-plugins-")));
     const write = (path: string, code: string) => {
       mkdirSync(dirname(join(dir, path)), { recursive: true });
       writeFileSync(join(dir, path), code);
