@@ -10,17 +10,17 @@ import {
   moduleTypeOf,
   normalizeFilterId,
   stripQuery,
-} from "./plugin-filter.ts";
+} from "./filter.ts";
 import type {
   PluginModuleType,
   SerializedFilterExpression,
   SerializedFilterNode,
   SerializedPattern,
   SerializedPrefilter,
-} from "./plugin-filter.ts";
-import { globToRegExp, resolveGlob } from "./plugin-glob.ts";
+} from "./filter.ts";
+import { globToRegExp, resolveGlob } from "./glob.ts";
 
-export type { PluginModuleType } from "./plugin-filter.ts";
+export type { PluginModuleType } from "./filter.ts";
 
 type MaybeArray<T> = T | T[];
 

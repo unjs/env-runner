@@ -18,12 +18,12 @@ import type {
   VirtualModuleUpdates,
 } from "../virtual-loader.ts";
 import { hostEnv } from "./host-env.ts";
-import { PLUGINS_DATA_KEY } from "./plugin-hooks.ts";
-import type { PluginWorkerData } from "./plugin-hooks.ts";
-import { createPluginPipeline, transformVirtualModules } from "./plugins.ts";
-import type { EnvRunnerPluginOption, PluginPipeline } from "./plugins.ts";
-import { openTransformPort, openTransformSocket } from "./transform-channel.ts";
-import type { TransformChannelHost } from "./transform-channel.ts";
+import { PLUGINS_DATA_KEY } from "../plugin/hooks.ts";
+import type { PluginWorkerData } from "../plugin/hooks.ts";
+import { createPluginPipeline, transformVirtualModules } from "../plugin/pipeline.ts";
+import type { EnvRunnerPluginOption, PluginPipeline } from "../plugin/pipeline.ts";
+import { openTransformPort, openTransformSocket } from "../plugin/channel.ts";
+import type { TransformChannelHost } from "../plugin/channel.ts";
 
 export type {
   VirtualModule,
@@ -47,7 +47,7 @@ export type {
   PluginTransformHandler,
   PluginTransformMeta,
   PluginTransformResult,
-} from "./plugins.ts";
+} from "../plugin/pipeline.ts";
 
 export interface EnvRunnerData {
   name?: string;

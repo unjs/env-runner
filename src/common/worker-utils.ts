@@ -9,7 +9,7 @@ import {
   registeredVirtualModules,
   registerVirtualModules,
 } from "./virtual-modules.ts";
-import { PLUGINS_DATA_KEY, registerPluginHooks, servedByPluginHooks } from "./plugin-hooks.ts";
+import { PLUGINS_DATA_KEY, registerPluginHooks, servedByPluginHooks } from "../plugin/hooks.ts";
 import { findVirtualPathKey } from "../virtual-loader.ts";
 
 export interface AppEntryIPCContext {

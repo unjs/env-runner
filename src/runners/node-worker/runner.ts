@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
 
 import { BaseEnvRunner } from "../../common/base-runner.ts";
-import { PLUGINS_DATA_KEY } from "../../common/plugin-hooks.ts";
+import { PLUGINS_DATA_KEY } from "../../plugin/hooks.ts";
 import { hostEnv } from "../../common/host-env.ts";
 import type { EnvRunnerData, EnvRunnerPluginOption } from "../../common/base-runner.ts";
 

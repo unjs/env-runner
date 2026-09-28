@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MessageChannel, receiveMessageOnPort, Worker } from "node:worker_threads";
 import type { MessagePort } from "node:worker_threads";
-import type { PluginPipeline } from "./plugins.ts";
+import type { PluginPipeline } from "./pipeline.ts";
 
 // Transform requests from worker loader hooks to the runner's plugins.
 //

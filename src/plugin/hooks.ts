@@ -7,11 +7,11 @@ import {
   moduleTypeOf,
   normalizeFilterId,
   stripQuery,
-} from "./plugin-filter.ts";
-import type { SerializedPattern, SerializedPrefilter } from "./plugin-filter.ts";
-import { createTransformClient } from "./transform-channel.ts";
-import { commonJSToESM, loadCommonJSLexer } from "./virtual-modules.ts";
-import type { TransformChannel } from "./transform-channel.ts";
+} from "./filter.ts";
+import type { SerializedPattern, SerializedPrefilter } from "./filter.ts";
+import { createTransformClient } from "./channel.ts";
+import { commonJSToESM, loadCommonJSLexer } from "../common/virtual-modules.ts";
+import type { TransformChannel } from "./channel.ts";
 
 /** Runner data key of {@link PluginWorkerData} (only set with the `plugins` option). */
 export const PLUGINS_DATA_KEY = "__envRunnerPlugins";

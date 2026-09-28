@@ -11,7 +11,7 @@ import { proxyUpgrade } from "httpxy";
 import { BaseEnvRunner } from "../../common/base-runner.ts";
 import type { EnvRunnerData, EnvRunnerPluginOption } from "../../common/base-runner.ts";
 import { resolveRuntimeDep } from "../../common/runtime-deps.ts";
-import { transformedFormat } from "../../common/plugin-hooks.ts";
+import { transformedFormat } from "../../plugin/hooks.ts";
 import type { RuntimeDep } from "../../common/runtime-deps.ts";
 import {
   encodeVirtualModules,

@@ -15,9 +15,9 @@ import { SelfEnvRunner } from "../src/runners/self/runner.ts";
 import { EnvServer } from "../src/server.ts";
 import * as miniflare from "miniflare";
 import { MiniflareEnvRunner } from "../src/runners/miniflare/runner.ts";
-import { createPluginPipeline, transformVirtualModules } from "../src/common/plugins.ts";
-import { createPrefilter } from "../src/common/plugin-filter.ts";
-import { createBunFilter, transformedFormat } from "../src/common/plugin-hooks.ts";
+import { createPluginPipeline, transformVirtualModules } from "../src/plugin/pipeline.ts";
+import { createPrefilter } from "../src/plugin/filter.ts";
+import { createBunFilter, transformedFormat } from "../src/plugin/hooks.ts";
 
 function hasRuntime(cmd: string): boolean {
   try {
