@@ -11,7 +11,7 @@ import { proxyUpgrade } from "httpxy";
 import { BaseEnvRunner } from "../../common/base-runner.ts";
 import type { EnvRunnerData, EnvRunnerPluginOption } from "../../common/base-runner.ts";
 import { resolveRuntimeDep } from "../../common/runtime-deps.ts";
-import { transformedFormat } from "../../plugin/hooks.ts";
+import { jsonModuleCode, transformedFormat } from "../../plugin/hooks.ts";
 import type { PluginTransformOutput } from "../../plugin/pipeline.ts";
 import type { RuntimeDep } from "../../common/runtime-deps.ts";
 import {
@@ -718,7 +718,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
         // A module a plugin loaded under an id that isn't a path.
         const _servePluginModule = async (id: string, result: PluginTransformOutput) => {
           if (result.moduleType === "json") {
-            return { json: result.code };
+            return { esModule: jsonModuleCode(id, result.code) };
           }
           const code = await _pluginCode(id, result);
           if (transformedFormat(id, code) === "module") {
@@ -812,6 +812,8 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
             (cleanSpecifier.startsWith("/") ? cleanSpecifier.slice(1) : cleanSpecifier) + rawQuery;
 
           let resolvedPath: string | undefined;
+          // Returned by a `resolveId` hook (may be under node_modules).
+          let pluginResolved = false;
 
           // The plugins' `resolveId` hooks, after virtual modules (as in workers).
           const _resolvePlugins = _livePlugins();
@@ -827,6 +829,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
                 const idPath = id.split("?")[0]!;
                 if (isAbsolute(idPath)) {
                   resolvedPath = idPath;
+                  pluginResolved = true;
                 } else {
                   // Not a file: a `load` hook serves it.
                   const result = (await _resolvePlugins.load(id))!;
@@ -939,7 +942,8 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
           const _plugins = _livePlugins();
           const cjsSuffix = "?__cjs";
           const cachedCJS = specifier.endsWith(cjsSuffix) && _cjsOutput.has(resolvedPath);
-          const pluginFile = !cachedCJS && _plugins?.filter(resolvedPath);
+          const pluginFile =
+            !cachedCJS && _plugins?.filter(resolvedPath, undefined, pluginResolved);
           if (contents === undefined && !cachedCJS && !pluginFile) {
             return new Response(null, { status: 404 });
           }
@@ -953,14 +957,18 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
           } else if (pluginFile) {
             try {
               const file = resolvedPath;
-              const result = await _plugins!.load(file, () => {
-                if (contents === undefined) {
-                  throw new Error(`Cannot find module "${file}"`);
-                }
-                return contents;
-              });
+              const result = await _plugins!.load(
+                file,
+                () => {
+                  if (contents === undefined) {
+                    throw new Error(`Cannot find module "${file}"`);
+                  }
+                  return contents;
+                },
+                { resolved: pluginResolved },
+              );
               if (result?.moduleType === "json") {
-                return Response.json({ name, json: result.code });
+                return Response.json({ name, esModule: jsonModuleCode(file, result.code) });
               }
               transformed = result && (await _pluginCode(resolvedPath, result));
             } catch (error: any) {

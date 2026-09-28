@@ -1,6 +1,14 @@
 import { execFileSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  cpSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve, dirname, join } from "node:path";
 import { describe, expect, it, afterEach, vi } from "vitest";
@@ -18,6 +26,8 @@ import { MiniflareEnvRunner } from "../src/runners/miniflare/runner.ts";
 import { createPluginPipeline, transformVirtualModules } from "../src/plugin/pipeline.ts";
 import { createPrefilter, moduleTypeOf } from "../src/plugin/filter.ts";
 import { globToRegExp, resolveGlob } from "../src/plugin/glob.ts";
+import { openTransformSocket } from "../src/plugin/channel.ts";
+import { connect } from "node:net";
 import {
   createBunFilter,
   createBunResolveFilter,
@@ -193,6 +203,7 @@ for (const { name, create, skip, cjsOptions } of runners) {
         aliased: "aliased",
         yaml: { name: "env-runner", kind: "yaml" },
         json: { name: "data", patched: true },
+        jsonName: "data",
       });
       expect(seen).toEqual([
         ["virtual:message", fixture("app-resolve.ts")],
@@ -246,6 +257,53 @@ for (const { name, create, skip, cjsOptions } of runners) {
       await runner.waitForReady();
       const res = await runner.fetch("http://localhost/");
       expect(await res.json()).toEqual({ ...expected, children: ["Ok", "hey from tsx"] });
+    });
+
+    it("sends node_modules files only to filters naming them, or paths `resolveId` returned", async () => {
+      const dir = mkdtempSync(join(tmpdir(), "env-runner-plugins-"));
+      const write = (path: string, code: string) => {
+        mkdirSync(dirname(join(dir, path)), { recursive: true });
+        writeFileSync(join(dir, path), code);
+      };
+      for (const pkg of ["named", "other", "resolved"]) {
+        write(`node_modules/${pkg}/index.mjs`, 'export const value = "__V__";');
+      }
+      write(
+        "app.mjs",
+        `import { value as named } from "./node_modules/named/index.mjs";
+        import { value as other } from "./node_modules/other/index.mjs";
+        import { value as resolved } from "#resolved.mjs";
+        export default { fetch: () => Response.json({ named, other, resolved }) };`,
+      );
+      runner = create({
+        name: "plugins-node-modules",
+        plugins: [
+          {
+            name: "named",
+            transform: {
+              filter: { id: "**/node_modules/named/**" },
+              handler: (code: string) => code.replace("__V__", "named"),
+            },
+          },
+          {
+            name: "alias",
+            resolveId: {
+              filter: { id: /^#resolved\.mjs$/ },
+              handler: () => join(dir, "node_modules/resolved/index.mjs"),
+            },
+          },
+          // Unfiltered: only gets the resolved path.
+          { name: "any", transform: (code: string) => code.replace("__V__", "any") },
+        ],
+        data: { entry: join(dir, "app.mjs") },
+      });
+      try {
+        await runner.waitForReady();
+        const res = await runner.fetch("http://localhost/");
+        expect(await res.json()).toEqual({ named: "named", other: "__V__", resolved: "any" });
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
     });
 
     it("re-transforms the entry on reloadModule()", async () => {
@@ -1190,6 +1248,86 @@ describe("plugin `resolveId`/`load` hooks", () => {
       moduleType: "js",
     });
     expect(seen).toEqual(["/app/a.vue:js"]);
+  });
+
+  it("orders plugins by `enforce`, then each hook by its `order`", async () => {
+    const calls: string[] = [];
+    const plugin = (name: string, enforce?: "pre" | "post", order?: "pre" | "post") =>
+      ({
+        name,
+        enforce,
+        transform: { order, handler: () => void calls.push(name) },
+      }) as EnvRunnerPlugin;
+    const pipeline = createPluginPipeline([
+      plugin("post", "post"),
+      plugin("normal"),
+      plugin("normal-hook-pre", undefined, "pre"),
+      plugin("pre", "pre"),
+      plugin("post-hook-pre", "post", "pre"),
+    ])!;
+    await pipeline.transform("/a.ts", "x");
+    expect(calls).toEqual(["normal-hook-pre", "post-hook-pre", "pre", "normal", "post"]);
+    expect(pipeline.names).toEqual(["post", "normal", "normal-hook-pre", "pre", "post-hook-pre"]);
+    expect(() => createPluginPipeline([{ enforce: "first" } as any])).toThrow(
+      /`plugins\[0\]` has an invalid `enforce` \("first"\)/,
+    );
+  });
+
+  it("gives handlers no-op watch file methods and `meta`", async () => {
+    const pipeline = createPluginPipeline([
+      {
+        transform() {
+          this.addWatchFile("/other.txt");
+          return `${JSON.stringify(this.getWatchFiles())} ${this.meta.watchMode}`;
+        },
+      },
+    ])!;
+    expect((await pipeline.transform("/a.ts", "x"))!.code).toBe("[] false");
+  });
+
+  it("opts node_modules in for `id` includes naming it, and resolved paths", () => {
+    const pipeline = (filter: any) =>
+      createPluginPipeline([{ transform: { filter, handler() {} } }])!;
+    const any = pipeline(undefined);
+    expect(any.filter("/app/node_modules/pkg/a.ts")).toBe(false);
+    expect(any.filter("/app/node_modules/pkg/a.ts", undefined, true)).toBe(true);
+    expect(any.filter("/app/node_modules/pkg/a.ts", "ts")).toBe(true);
+    const named = pipeline({ id: ["**/node_modules/pkg/**", "**/src/**"] });
+    expect(named.filter("/app/node_modules/pkg/a.ts")).toBe(true);
+    expect(named.filter(String.raw`C:\app\node_modules\pkg\a.ts`)).toBe(true);
+    // Another include matching doesn't count.
+    expect(named.filter("/app/node_modules/other/src/a.ts")).toBe(false);
+    const expr = pipeline([
+      { kind: "include", expr: { kind: "id", pattern: /node_modules\/pkg\// } },
+    ]);
+    expect(expr.filter("/app/node_modules/pkg/a.ts")).toBe(true);
+    expect(expr.filter("/app/node_modules/other/a.ts")).toBe(false);
+    // Bun: only plugins whose folded includes name it drop the guard.
+    expect(createBunFilter(named.prefilters, false).test("/app/node_modules/pkg/a.ts")).toBe(true);
+    expect(createBunFilter(named.prefilters, false).test("/app/node_modules/x/a.ts")).toBe(false);
+    expect(createBunFilter(any.prefilters, false).test("/app/node_modules/pkg/a.ts")).toBe(false);
+  });
+
+  it("accepts only the worker's connection on the process socket", async () => {
+    if (process.platform === "win32") {
+      return;
+    }
+    const host = openTransformSocket(createPluginPipeline([{ transform: () => {} }])!);
+    const path = host.channel.socket!;
+    try {
+      const first = connect(path);
+      await new Promise((resolve, reject) => first.once("connect", resolve).once("error", reject));
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      // The socket file (and its directory) is gone: nobody else can connect.
+      expect(existsSync(dirname(path))).toBe(false);
+      const second = connect(path);
+      await expect(
+        new Promise((resolve, reject) => second.once("connect", resolve).once("error", reject)),
+      ).rejects.toMatchObject({ code: "ENOENT" });
+      first.destroy();
+    } finally {
+      host.close();
+    }
   });
 
   it("keeps other file types out of Bun's `onLoad` filter", () => {

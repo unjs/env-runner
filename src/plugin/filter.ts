@@ -49,12 +49,13 @@ export interface SerializedPrefilter {
 }
 
 /**
- * A disk module plugins may load or transform: not under `/node_modules/`
- * (linked workspace packages resolve outside it). Takes a `/`-separated path
- * without query.
+ * A module under `/node_modules/` (linked workspace packages resolve outside
+ * it). Plugins only get those when an `id` include naming `node_modules`
+ * matches, or a `resolveId` hook returned the path. Takes a `/`-separated
+ * path.
  */
-export function isPluginFile(path: string): boolean {
-  return !path.includes("/node_modules/");
+export function isNodeModulesId(id: string): boolean {
+  return id.includes("/node_modules/");
 }
 
 /** Initial module type of a module, from its extension. */
@@ -212,14 +213,27 @@ export function requiredMatch(moduleType: PluginModuleType): "named" | "typed" |
     : "named";
 }
 
-export function compilePrefilter(
-  filter: SerializedPrefilter,
-): (id: string, moduleType: PluginModuleType) => PrefilterMatch {
+/**
+ * `resolved`: a path a `resolveId` hook returned, which may be under
+ * `/node_modules/` without a filter naming it ({@link isNodeModulesId}).
+ */
+export type PrefilterTest = (
+  id: string,
+  moduleType: PluginModuleType,
+  resolved?: boolean,
+) => PrefilterMatch;
+
+export function compilePrefilter(filter: SerializedPrefilter): PrefilterTest {
   const namedLevel = filter.load ? "typed" : "named";
+  // `id` includes naming `node_modules`, the only ones reaching it.
+  const nodeModules = nodeModulesIncludes(filter).map(deserializePattern);
+  const excluded = (id: string, resolved?: boolean) =>
+    !resolved && isNodeModulesId(id) && !nodeModules.some((pattern) => pattern.test(id));
   if (filter.expr) {
     const test = compileFilterExpressions(filter.expr);
     const named = filter.expr.some((expr) => expr.kind === "include") && namedLevel;
-    return (id, moduleType) => test(id, moduleType) !== false && (named || true);
+    return (id, moduleType, resolved) =>
+      !excluded(id, resolved) && test(id, moduleType) !== false && (named || true);
   }
   const idFilter =
     filter.id &&
@@ -229,7 +243,8 @@ export function compilePrefilter(
       (pattern, value) => pattern.test(value),
     );
   const named = Boolean(idFilter?.include.length);
-  return (id, moduleType) =>
+  return (id, moduleType, resolved) =>
+    !excluded(id, resolved) &&
     (!filter.moduleTypes || filter.moduleTypes.includes(moduleType)) &&
     (!idFilter || idFilter.test(id)) &&
     (filter.moduleTypes ? "typed" : named ? namedLevel : true);
@@ -254,10 +269,35 @@ export function satisfiesMatch(
  */
 export function createPrefilter(
   filters: SerializedPrefilter[],
-): (id: string, moduleType: PluginModuleType) => boolean {
+): (id: string, moduleType: PluginModuleType, resolved?: boolean) => boolean {
   const compiled = filters.map(compilePrefilter);
-  return (id, moduleType) => {
+  return (id, moduleType, resolved) => {
     const required = requiredMatch(moduleType);
-    return compiled.some((test) => satisfiesMatch(test(id, moduleType), required));
+    return compiled.some((test) => satisfiesMatch(test(id, moduleType, resolved), required));
   };
+}
+
+/**
+ * A filter's `id` include patterns naming `node_modules` (in include
+ * expressions: any `id` pattern that does).
+ */
+export function nodeModulesIncludes(filter: SerializedPrefilter): SerializedPattern[] {
+  const names = (pattern: SerializedPattern) => pattern.source.includes("node_modules");
+  if (!filter.expr) {
+    return filter.id?.include.filter(names) ?? [];
+  }
+  const patterns: SerializedPattern[] = [];
+  const walk = (node: SerializedFilterNode) => {
+    if (node.kind === "id" && names(node.pattern)) {
+      patterns.push(node.pattern);
+    } else if (node.kind === "and" || node.kind === "or") {
+      node.args.forEach(walk);
+    }
+  };
+  for (const { kind, expr } of filter.expr) {
+    if (kind === "include") {
+      walk(expr);
+    }
+  }
+  return patterns;
 }

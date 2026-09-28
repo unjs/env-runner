@@ -4,7 +4,8 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { init as initEsmLexer, parse as parseEsm } from "es-module-lexer";
 import {
   createPrefilter,
-  isPluginFile,
+  isNodeModulesId,
+  nodeModulesIncludes,
   moduleTypeOf,
   normalizeFilterId,
   stripQuery,
@@ -85,14 +86,17 @@ export async function registerPluginHooks(
     return _noop;
   }
   const prefilter = createPrefilter(config.prefilters);
-  const matches = (path: string) => {
+  // `resolved`: a path a `resolveId` hook returned (may be in node_modules).
+  const matches = (path: string, resolved?: boolean) => {
     const id = normalizeFilterId(path);
-    return isPluginFile(id) && prefilter(id, moduleTypeOf(id));
+    return prefilter(id, moduleTypeOf(id), resolved);
   };
+  // Paths `resolveId` hooks returned (Node.js/Deno).
+  const pluginResolved = new Set<string>();
   const resolvePrefilters = config.resolvePrefilters ?? [];
   const resolvePrefilter = createPrefilter(resolvePrefilters);
   const resolves = (source: string) =>
-    resolvePrefilters.length > 0 && resolvePrefilter(normalizeFilterId(source), "js");
+    resolvePrefilters.length > 0 && resolvePrefilter(normalizeFilterId(source), "js", true);
   const entryId = entry && (entry.startsWith("file:") ? _urlPath(entry) : stripQuery(entry));
   const client = createTransformClient(config);
   await initEsmLexer;
@@ -114,8 +118,11 @@ export async function registerPluginHooks(
         if (context.importAttributes?.type === "json" || context.conditions?.includes("require")) {
           return { format: "json" as const, source: result.code, shortCircuit: true };
         }
-        const source = `export default JSON.parse(${JSON.stringify(result.code)});\n`;
-        return { format: "module" as const, source, shortCircuit: true };
+        return {
+          format: "module" as const,
+          source: jsonModuleCode(path, result.code),
+          shortCircuit: true,
+        };
       }
       const format = transformedFormat(path, result.code, context.format);
       if (!isDeno) {
@@ -146,6 +153,9 @@ export async function registerPluginHooks(
               attributes: context.importAttributes as Record<string, string> | undefined,
             });
             if (resolved && !resolved.external) {
+              if (_idPath(resolved.id)) {
+                pluginResolved.add(stripQuery(resolved.id));
+              }
               return { url: _idURL(resolved.id), shortCircuit: true };
             }
             if (resolved && resolved.id !== source) {
@@ -166,8 +176,9 @@ export async function registerPluginHooks(
         }
         if (url.startsWith("file:")) {
           const path = fileURLToPath(stripQuery(url));
-          if (matches(path)) {
-            const result = client.load(path);
+          const resolved = pluginResolved.has(path);
+          if (matches(path, resolved)) {
+            const result = client.load(path, false, resolved);
             if (result) {
               return serve(path, result, context);
             }
@@ -206,8 +217,8 @@ export async function registerPluginHooks(
     // result (it loads any file natively, unknown ones as a path): served
     // with a marker query, kept here until Bun loads them.
     const loaded = new Map<string, TransformedCode>();
-    const loadOther = (file: string) => {
-      const result = matches(file) ? client.load(file) : undefined;
+    const loadOther = (file: string, resolved?: boolean) => {
+      const result = matches(file, resolved) ? client.load(file, false, resolved) : undefined;
       if (!result) {
         return undefined;
       }
@@ -233,12 +244,11 @@ export async function registerPluginHooks(
           return undefined;
         }
         if (_idPath(resolved.id)) {
+          // Other file types, and node_modules files the `onLoad` filter
+          // leaves out, are loaded here.
           const file = stripQuery(resolved.id);
-          return (
-            (!resolved.external && BUN_OTHER_FILE.test(file) && loadOther(file)) || {
-              path: resolved.id,
-            }
-          );
+          const here = BUN_OTHER_FILE.test(file) || isNodeModulesId(normalizeFilterId(file));
+          return (!resolved.external && here && loadOther(file, true)) || { path: resolved.id };
         }
         return resolved.external
           ? undefined
@@ -362,6 +372,29 @@ function _bunFilePath(specifier: string, importer: string): string | undefined {
   return resolve(isAbsolute(from) ? dirname(from) : process.cwd(), path);
 }
 
+/**
+ * JSON as an ES module: the value as default export, and the top-level keys
+ * of an object as named exports (any key, as string export names). Throws for
+ * invalid JSON, naming `path`.
+ */
+export function jsonModuleCode(path: string, json: string): string {
+  const value = _parseJSON(path, json);
+  const lines = [`const json = JSON.parse(${JSON.stringify(json)});`, "export default json;"];
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    let index = 0;
+    for (const key of Object.keys(value)) {
+      if (key !== "default") {
+        const local = `json${index++}`;
+        lines.push(
+          `const ${local} = json[${JSON.stringify(key)}];`,
+          `export { ${local} as ${JSON.stringify(key)} };`,
+        );
+      }
+    }
+  }
+  return lines.join("\n") + "\n";
+}
+
 // Names the file, as Node's JSON errors do.
 function _parseJSON(path: string, source: string): unknown {
   try {
@@ -440,8 +473,9 @@ const BUN_EXTENSIONS: Record<string, string[]> = {
 /**
  * Bun's `onLoad` filter (a single RegExp) for these plugins. Bun evaluates
  * plugin output as ESM and `onLoad` can't decline, so it follows the plugins'
- * prefilters as closely as a RegExp can: no `/node_modules/` (either
- * separator), then one alternative per plugin with
+ * prefilters as closely as a RegExp can: one alternative per plugin with no
+ * `/node_modules/` (either separator; unless its folded `id` includes name
+ * it), and
  *
  * - the extensions its `moduleType` filter implies (all non-CommonJS script
  *   extensions without one, or with filter expressions), never `.cjs`/`.cts`;
@@ -463,18 +497,25 @@ export function createBunFilter(
   const escape = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const sep = String.raw`(?:\\|\/)`;
   const foldable = (pattern: SerializedPattern) => pattern.glob || !windows;
-  const plugins = prefilters.map(({ id, moduleTypes, expr }) => ({
-    moduleTypes: expr ? undefined : moduleTypes,
-    exclude: id?.exclude.filter(foldable) ?? [],
-    include: id && id.include.length > 0 && id.include.every(foldable) ? id.include : [],
-  }));
+  const plugins = prefilters.map((prefilter) => {
+    const { id, moduleTypes, expr } = prefilter;
+    const include = id && id.include.length > 0 && id.include.every(foldable) ? id.include : [];
+    return {
+      moduleTypes: expr ? undefined : moduleTypes,
+      exclude: id?.exclude.filter(foldable) ?? [],
+      include,
+      // Its includes name `node_modules` and fold: no `node_modules` guard.
+      nodeModules: include.length > 0 && nodeModulesIncludes(prefilter).length > 0,
+    };
+  });
   const folded = plugins.flatMap(({ include, exclude }) => [...include, ...exclude]);
   const flagSet = new Set(folded.map((pattern) => pattern.flags));
   // Group numbers shift and group names may repeat once sources are joined.
   const foldIds =
     flagSet.size <= 1 && !folded.some(({ source }) => /\\[1-9]|\\k<|\(\?<(?![=!])/.test(source));
   const branches = new Set<string>();
-  for (const { moduleTypes, include, exclude } of plugins) {
+  const guard = `(?!.*${sep}node_modules${sep})`;
+  for (const { moduleTypes, include, exclude, nodeModules } of plugins) {
     const extensions = moduleTypes
       ? moduleTypes.flatMap((type) => BUN_EXTENSIONS[type] ?? [])
       : Object.values(BUN_EXTENSIONS).flat();
@@ -488,10 +529,15 @@ export function createBunFilter(
     if (foldIds && include.length > 0) {
       lookaheads += `(?=.*?(?:${include.map(({ source }) => source).join("|")}))`;
     }
+    if (nodeModules && !foldIds) {
+      lookaheads = guard;
+    } else if (!nodeModules) {
+      lookaheads = guard + lookaheads;
+    }
     branches.add(`${lookaheads}.*(?:${[...new Set(extensions)].map(escape).join("|")})$`);
   }
   return new RegExp(
-    `^(?!.*${sep}node_modules${sep})(?:${[...branches].join("|") || "(?!)"})`,
+    `^(?:${[...branches].join("|") || "(?!)"})`,
     foldIds ? ([...flagSet][0] ?? "") : "",
   );
 }

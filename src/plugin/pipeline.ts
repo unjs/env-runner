@@ -7,7 +7,6 @@ import {
   compileFilterExpressions,
   compilePrefilter,
   createPrefilter,
-  isPluginFile,
   moduleTypeOf,
   normalizeFilterId,
   requiredMatch,
@@ -17,6 +16,7 @@ import {
 import type {
   PluginModuleType,
   PrefilterMatch,
+  PrefilterTest,
   SerializedFilterExpression,
   SerializedFilterNode,
   SerializedPattern,
@@ -114,6 +114,12 @@ export interface PluginContext {
   debug(log: PluginLog, pos?: PluginLogPosition): void;
   /** Throw an error (an `Error` or log object given is kept as its `cause`). */
   error(log: PluginLog, pos?: PluginLogPosition): never;
+  /** Ignored: the runner doesn't watch files (nothing is ever returned). */
+  addWatchFile(id: string): void;
+  /** Always empty (see `addWatchFile`). */
+  getWatchFiles(): string[];
+  /** `watchMode` is `false`: plugins aren't told about file changes. */
+  meta: { watchMode: boolean };
 }
 
 /** Runs on the host and may be async. Return nullish to keep the code. */
@@ -225,8 +231,8 @@ export type PluginHook<Handler, Filter> =
  * A runner plugin. Plugins live on the host: workers send the imports and
  * modules their filters match to the runner, which runs the hooks and sends
  * the result back. Each hook runs in `plugins` order within its `order`
- * group: `"pre"`, then unordered, then `"post"`. Other properties (and hooks)
- * are ignored.
+ * group: `"pre"`, then unordered, then `"post"` (plugins are sorted by
+ * `enforce` first). Other properties (and hooks) are ignored.
  *
  * - `resolveId`: resolve an import; the first result wins.
  * - `load`: provide a module's code; the first result wins.
@@ -234,6 +240,12 @@ export type PluginHook<Handler, Filter> =
  */
 export interface EnvRunnerPlugin {
   name?: string;
+  /**
+   * Orders the whole plugin: `"pre"` plugins come first and `"post"` last,
+   * keeping `plugins` order within each group. Each hook's own `order`
+   * applies on top of that.
+   */
+  enforce?: "pre" | "post";
   resolveId?: PluginHook<PluginResolveIdHandler, PluginHookFilter>;
   load?: PluginHook<PluginLoadHandler, PluginHookFilter>;
   transform?: PluginHook<PluginTransformHandler, PluginTransformFilter>;
@@ -275,13 +287,14 @@ export interface PluginPipeline {
   /** The `resolveId` filters as the worker's prefilter checks them. */
   resolvePrefilters: SerializedPrefilter[];
   /**
-   * Whether a module goes through the plugins: a disk module
-   * ({@link isPluginFile}), or any id with a `moduleType`, and some `load` or
-   * `transform` filter may match (its `code` parts aren't checked). Modules
-   * of other than script types only match filters naming them (see
-   * {@link requiredMatch}).
+   * Whether a module goes through the plugins: some `load` or `transform`
+   * filter may match (its `code` parts aren't checked). Modules of other than
+   * script types only match filters naming them (see {@link requiredMatch}),
+   * and disk modules under `/node_modules/` only ones naming that, unless
+   * `resolved` (a `resolveId` hook returned the path) or an id with a
+   * `moduleType` (virtual modules) is given.
    */
-  filter(id: string, moduleType?: PluginModuleType): boolean;
+  filter(id: string, moduleType?: PluginModuleType, resolved?: boolean): boolean;
   /** Whether some `resolveId` filter matches an import specifier. */
   resolveFilter(source: string): boolean;
   /**
@@ -299,7 +312,11 @@ export interface PluginPipeline {
    * the id isn't a file), and the result is `undefined` when no plugin changed
    * it (load it as if unmatched). Rejects like {@link PluginPipeline.transform}.
    */
-  load(id: string, read?: () => string): Promise<PluginTransformOutput | undefined>;
+  load(
+    id: string,
+    read?: () => string,
+    options?: { resolved?: boolean },
+  ): Promise<PluginTransformOutput | undefined>;
   /**
    * Run the `transform` hooks: `undefined` when none changed the code (load it
    * as if unmatched). Rejects with their errors (naming the plugin and id), and
@@ -319,13 +336,22 @@ interface NormalizedHook<Handler> {
   name: string;
   order: "pre" | "normal" | "post";
   prefilter: SerializedPrefilter;
-  /** The full filter (code-aware for `transform`), see {@link PrefilterMatch}. */
-  match(id: string, moduleType: PluginModuleType, code?: string): PrefilterMatch;
+  /**
+   * The full filter (code-aware for `transform`), see {@link PrefilterMatch}
+   * (`resolved`: see {@link PrefilterTest}).
+   */
+  match(
+    id: string,
+    moduleType: PluginModuleType,
+    code?: string,
+    resolved?: boolean,
+  ): PrefilterMatch;
   handler: Handler;
 }
 
 interface NormalizedPlugin {
   name: string;
+  enforce: "pre" | "normal" | "post";
   resolveId?: NormalizedHook<PluginResolveIdHandler>;
   load?: NormalizedHook<PluginLoadHandler>;
   transform?: NormalizedHook<PluginTransformHandler>;
@@ -347,8 +373,11 @@ export function createPluginPipeline(
   const normalized = _flattenPlugins(plugins, "").map(([plugin, path]) =>
     _normalizePlugin(plugin, path),
   );
+  // `enforce` groups (a stable sort keeps `plugins` order within each).
+  const rank = { pre: 0, normal: 1, post: 2 };
+  const enforced = normalized.toSorted((a, b) => rank[a.enforce] - rank[b.enforce]);
   const ordered = <K extends HookKind>(kind: K) => {
-    const hooks = normalized.flatMap((plugin) => (plugin[kind] ? [plugin[kind]!] : []));
+    const hooks = enforced.flatMap((plugin) => (plugin[kind] ? [plugin[kind]!] : []));
     const byOrder = (order: NormalizedHook<unknown>["order"]) =>
       hooks.filter((hook) => hook.order === order);
     return [...byOrder("pre"), ...byOrder("normal"), ...byOrder("post")] as NonNullable<
@@ -365,15 +394,9 @@ export function createPluginPipeline(
   const prefilter = createPrefilter(prefilters);
   const resolvePrefilter = createPrefilter(resolvePrefilters);
 
-  const filter = (id: string, moduleType?: PluginModuleType) => {
+  const filter = (id: string, moduleType?: PluginModuleType, resolved?: boolean) => {
     const path = normalizeFilterId(id);
-    if (!moduleType) {
-      if (!isPluginFile(path)) {
-        return false;
-      }
-      moduleType = moduleTypeOf(path);
-    }
-    return prefilter(path, moduleType);
+    return prefilter(path, moduleType ?? moduleTypeOf(path), resolved || moduleType !== undefined);
   };
 
   const resolveId = async (
@@ -387,7 +410,8 @@ export function createPluginPipeline(
       attributes: options?.attributes ?? {},
     };
     for (const hook of resolveHooks) {
-      if (!hook.match(matchId, "js")) {
+      // The `node_modules` rule is for modules, not specifiers.
+      if (!hook.match(matchId, "js", undefined, true)) {
         continue;
       }
       const result = await _callHook(hook.name, `failed to resolve "${source}"`, () =>
@@ -410,14 +434,15 @@ export function createPluginPipeline(
     return undefined;
   };
 
-  const load = async (id: string, read?: () => string) => {
+  const load = async (id: string, read?: () => string, options?: { resolved?: boolean }) => {
     const matchId = normalizeFilterId(id);
     let moduleType = moduleTypeOf(id);
     // Plugin ids (no `read`) have no fallback: every matching hook may load
     // them, whatever their extension.
     const required = read ? requiredMatch(moduleType) : undefined;
+    const resolved = !read || options?.resolved;
     for (const hook of loadHooks) {
-      if (!satisfiesMatch(hook.match(matchId, moduleType), required)) {
+      if (!satisfiesMatch(hook.match(matchId, moduleType, undefined, resolved), required)) {
         continue;
       }
       const result = await _callHook(hook.name, `failed to load "${id}"`, () =>
@@ -439,6 +464,7 @@ export function createPluginPipeline(
         moduleType = "js";
       }
       return _transform(id, code, moduleType, {
+        resolved,
         changed: true,
         map,
         mappedBy: map ? hook.name : undefined,
@@ -449,10 +475,10 @@ export function createPluginPipeline(
         `[env-runner] no plugin loaded "${id}": a \`resolveId\` hook resolved an import to it, so a \`load\` hook must return its code.`,
       );
     }
-    if (!filter(id)) {
+    if (!filter(id, undefined, resolved)) {
       return undefined;
     }
-    return _transform(id, read(), moduleType, { changed: false });
+    return _transform(id, read(), moduleType, { resolved, changed: false });
   };
 
   // The `transform` hooks, from the code of `id`.
@@ -463,12 +489,13 @@ export function createPluginPipeline(
     // Maps aren't composed: the first map is kept, a second one would be
     // relative to already-mapped code, so both are dropped. Code-only steps
     // keep the current map (they should preserve lines).
-    state: { changed: boolean; map?: SourceMapLike; mappedBy?: string },
+    state: { resolved?: boolean; changed: boolean; map?: SourceMapLike; mappedBy?: string },
   ): Promise<PluginTransformOutput | undefined> => {
     let { changed, map, mappedBy } = state;
     const matchId = normalizeFilterId(id);
     for (const hook of transformHooks) {
-      if (!satisfiesMatch(hook.match(matchId, moduleType, code), requiredMatch(moduleType))) {
+      const match = hook.match(matchId, moduleType, code, state.resolved);
+      if (!satisfiesMatch(match, requiredMatch(moduleType))) {
         continue;
       }
       const result = await _callHook(hook.name, `failed on "${id}"`, () =>
@@ -531,7 +558,8 @@ export function createPluginPipeline(
 
   const transform = (id: string, code: string, sourceType?: PluginModuleType) => {
     id = stripQuery(id);
-    return _transform(id, code, sourceType ?? moduleTypeOf(id), { changed: false });
+    // Virtual modules, and modules the caller already sent here.
+    return _transform(id, code, sourceType ?? moduleTypeOf(id), { resolved: true, changed: false });
   };
 
   return {
@@ -539,7 +567,7 @@ export function createPluginPipeline(
     prefilters,
     resolvePrefilters,
     filter,
-    resolveFilter: (source) => resolvePrefilter(normalizeFilterId(source), "js"),
+    resolveFilter: (source) => resolvePrefilter(normalizeFilterId(source), "js", true),
     resolveId,
     load,
     transform,
@@ -623,9 +651,12 @@ function _normalizePlugin(plugin: unknown, path: string): NormalizedPlugin {
   if (typeof plugin !== "object") {
     return fail("is not a plugin object");
   }
-  const { name: pluginName } = plugin as Partial<EnvRunnerPlugin>;
+  const { name: pluginName, enforce } = plugin as Partial<EnvRunnerPlugin>;
   const name = typeof pluginName === "string" ? pluginName : `plugins${path}`;
-  const normalized: NormalizedPlugin = { name };
+  if (enforce != null && enforce !== "pre" && enforce !== "post") {
+    return fail(`has an invalid \`enforce\` (${JSON.stringify(enforce)})`);
+  }
+  const normalized: NormalizedPlugin = { name, enforce: enforce ?? "normal" };
   for (const kind of HOOK_KINDS) {
     const hook = (plugin as Record<string, unknown>)[kind];
     if (hook != null) {
@@ -676,8 +707,8 @@ function _normalizeHook(
       order,
       prefilter,
       // Without code (prefilter), a `code` expression may match.
-      match: (id, moduleType, code) =>
-        test(id, moduleType, code) !== false && level(id, moduleType),
+      match: (id, moduleType, code, resolved) =>
+        test(id, moduleType, code) !== false && level(id, moduleType, resolved),
       handler,
     };
   }
@@ -726,8 +757,9 @@ function _normalizeHook(
     name,
     order,
     prefilter,
-    match: (idValue, moduleType, codeValue) =>
-      (codeValue === undefined || !code || code.test(codeValue)) && level(idValue, moduleType),
+    match: (idValue, moduleType, codeValue, resolved) =>
+      (codeValue === undefined || !code || code.test(codeValue)) &&
+      level(idValue, moduleType, resolved),
     handler,
   };
 }
@@ -925,6 +957,9 @@ function _createContext(name: string, id: string, code: string): PluginContext {
     error: (log, pos) => {
       throw new Error(format(log, pos), typeof log === "string" ? undefined : { cause: log });
     },
+    addWatchFile: () => {},
+    getWatchFiles: () => [],
+    meta: { watchMode: false },
   };
 }
 

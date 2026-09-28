@@ -1,5 +1,6 @@
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { createServer } from "node:net";
+import type { Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MessageChannel, receiveMessageOnPort, Worker } from "node:worker_threads";
@@ -41,6 +42,8 @@ export type TransformRequest =
       /** Absolute file path, or a module id a plugin resolved (`virtual`). */
       path: string;
       virtual?: boolean;
+      /** A path a `resolveId` hook returned (may be under `node_modules`). */
+      resolved?: boolean;
     };
 
 export interface TransformReply {
@@ -81,6 +84,7 @@ export async function handleTransformRequest(
     const result = await pipeline.load(
       path,
       request.virtual ? undefined : () => readFileSync(path, "utf8"),
+      { resolved: request.resolved },
     );
     return { id: request.id, code: result?.code, moduleType: result?.moduleType };
   } catch (error: any) {
@@ -108,11 +112,22 @@ export function openTransformPort(pipeline: PluginPipeline): TransformChannelHos
 /**
  * Runner side for process workers: listen on a fresh local socket, in a
  * private (0700) temporary directory on POSIX. The worker connects after its
- * data handshake, by which time the socket is bound.
+ * data handshake, by which time the socket is bound. Only that first
+ * connection is accepted: the listener then closes and the directory is
+ * removed (open connections don't need the socket file).
  */
 export function openTransformSocket(pipeline: PluginPipeline): TransformChannelHost {
   const { path, dir } = _socketPath();
+  let connection: Socket | undefined;
   const server = createServer((socket) => {
+    if (connection) {
+      socket.destroy();
+      return;
+    }
+    connection = socket;
+    server.close();
+    process.off("exit", cleanup);
+    cleanup();
     let buffer = "";
     socket.setEncoding("utf8");
     socket.on("error", () => {});
@@ -141,7 +156,8 @@ export function openTransformSocket(pipeline: PluginPipeline): TransformChannelH
   });
   server.listen(path);
   server.unref();
-  // Node doesn't unlink unix sockets, also not on exit.
+  // Node doesn't unlink unix sockets, also not on exit (until the worker
+  // connects, which removes them).
   const cleanup = () => {
     if (dir) {
       rmSync(dir, { recursive: true, force: true });
@@ -152,6 +168,7 @@ export function openTransformSocket(pipeline: PluginPipeline): TransformChannelH
     channel: { socket: path },
     close: () => {
       server.close();
+      connection?.destroy();
       process.off("exit", cleanup);
       cleanup();
     },
@@ -190,7 +207,7 @@ export interface TransformClient {
    * The module from the `load` and `transform` hooks, `undefined` when no
    * plugin changed the file (`virtual` ids always have code).
    */
-  load(path: string, virtual?: boolean): TransformedCode | undefined;
+  load(path: string, virtual?: boolean, resolved?: boolean): TransformedCode | undefined;
 }
 
 // A request taking longer than this logs a warning (once per request).
@@ -255,8 +272,8 @@ export function createTransformClient(channel: TransformChannel): TransformClien
   return {
     resolve: (source, importer, options) =>
       send({ type: "resolve", source, importer, ...options }, `to resolve "${source}"`).resolved,
-    load: (path, virtual) => {
-      const reply = send({ type: "load", path, virtual }, `to load "${path}"`);
+    load: (path, virtual, resolved) => {
+      const reply = send({ type: "load", path, virtual, resolved }, `to load "${path}"`);
       return reply.code === undefined
         ? undefined
         : { code: reply.code, moduleType: reply.moduleType ?? "js" };
