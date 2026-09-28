@@ -9,17 +9,17 @@ Source transforms (TypeScript beyond erasable syntax, JSX, custom) for the entry
 - `loadTransformer()` (in the worker; on the host for miniflare) imports `oxc-transform` via `resolveRuntimeDep({ required: true })` unless `oxc: false`, then imports each transformer.
 - `normalizeTransformer()` (`src/common/transform-plugin.ts`) accepts a default export that is either:
   - a function (the handler), or
-  - a rolldown-like `{ name?, transform }` object, where `transform` is a function or `{ order?, filter?, handler }`.
+  - a `{ name?, transform }` plugin object, where `transform` is a function or `{ order?, filter?, handler }`.
 
-  Plugin factories aren't detected: a function is always the handler. Bad shapes throw a `TypeError` naming the specifier. A handler returning a thenable throws, since hooks are sync. Handlers get `(code, id, { moduleType })` with no rolldown plugin context.
+  Plugin factories aren't detected: a function is always the handler. Bad shapes throw a `TypeError` naming the specifier. A handler returning a thenable throws, since hooks are sync. Handlers get `(code, id, { moduleType })` with no plugin context (`this`).
 
-- Hook filters mirror rolldown:
-  - `id`: glob strings go through `path.matchesGlob` (namespace access, since a named import fails to link before Node 22.5). Relative globs resolve from cwd, like Vite's `createFilter`, because rolldown's docs don't say. RegExps are tested against the `/`-separated id.
+- Hook filters:
+  - `id`: glob strings go through `path.matchesGlob` (namespace access, since a named import fails to link before Node 22.5). Relative globs resolve from cwd. RegExps are tested against the `/`-separated id.
   - `code`: strings are substrings.
   - `moduleType`: a list or `{ include }`.
   - Any value can be `{ include, exclude }`, and exclude wins. All given properties must match. `lastIndex` is reset for `g`/`y` RegExps.
 - Pipeline, keeping list order within each group:
-  1. `pre` handlers, which see the source (`moduleType` from the extension, as in rolldown, where plugin transforms precede the built-in TS/JSX transform)
+  1. `pre` handlers, which see the TS/JSX source (`moduleType` from the extension or virtual module format)
   2. oxc (`sourcemap` forced from `transform.sourcemap`, default `true`), after which `moduleType` becomes `js`
   3. functions and default-order plugins
   4. `post` handlers
@@ -37,7 +37,7 @@ Source transforms (TypeScript beyond erasable syntax, JSX, custom) for the entry
 
 - `include` is a single RegExp. `normalizeTransformOptions()` serializes it to `{ source, flags }`, because JSON (process runners) drops RegExps, and validates it. It also strips `g`/`y`, which would make `test()` alternate through `lastIndex`. `loadTransformer()` accepts either form.
 - `oxc-transform` is a devDependency, external in `build.config.mjs`, and never imported statically.
-- `OxcTransformOptions`/`OxcJsxOptions` are declared locally and structurally, with nested groups typed as `object`. Inlining oxc's own declarations breaks assignability: its `const enum`s such as `HelperMode` are nominal, so objects typed with the real package would no longer be assignable.
+- `oxc` is typed as a plain `object`: options are passed through to `transformSync()` untyped, since env-runner doesn't own their shape. `object` rather than `Record<string, unknown>`, so an object typed with `oxc-transform`'s own `TransformOptions` interface is still assignable (interfaces have no implicit index signature). Bundling oxc's declarations also fails: its `const enum`s (`HelperMode`) are nominal.
 
 ## Runtimes
 
@@ -85,7 +85,7 @@ Further fixtures:
 - `cjs/` has a package.json without `"type"`: `lib.ts` (CommonJS with an enum), `dep.cts`, and `vendor/plain.ts` (CommonJS, excluded).
 - `app-cjs.ts` and `app-vendor.ts` import them.
 - `mapped.mjs` is a transformer returning its own map.
-- `greeting-plugin.mjs` is a rolldown-like object: `pre` order, with a glob `id` filter and a `code` filter.
+- `greeting-plugin.mjs` is a plugin object: `pre` order, with a glob `id` filter and a `code` filter.
 - `order-*.mjs` and `async.mjs` exercise ordering and the async error.
 - `count.mjs` counts its runs; it asserts an invalidated virtual source is transformed once.
 
@@ -101,4 +101,4 @@ Cases:
 - `include` with a case-insensitive RegExp that leaves out `vendor/plain.ts`, which would return `"hi"` instead of `"vendor"` if transformed
 - a plugin-object transformer (`"hi from tsx"` proves it ran on the source, before oxc)
 
-Option-level tests cover normalization, filtering, errors, source maps, plugin ordering, rolldown filter semantics, invalid exports and `oxc: false`.
+Option-level tests cover normalization, filtering, errors, source maps, plugin ordering, hook filters, invalid exports and `oxc: false`.

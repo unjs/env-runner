@@ -1,4 +1,4 @@
-// Rolldown-like plugin object: `pre` sees the TS/JSX source (before oxc).
+// Plugin object: `pre` sees the TS/JSX source (before oxc).
 export default {
   name: "greeting-plugin",
   transform: {

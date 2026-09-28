@@ -2,7 +2,7 @@ import * as nodePath from "node:path";
 
 type MaybeArray<T> = T | T[];
 
-/** Rolldown's `GeneralHookFilter`: include values, or `{ include, exclude }` (exclude wins). */
+/** Include values, or `{ include, exclude }` (exclude wins). */
 export type TransformStringFilter =
   | MaybeArray<string | RegExp>
   | { include?: MaybeArray<string | RegExp>; exclude?: MaybeArray<string | RegExp> };
@@ -11,7 +11,7 @@ export type TransformStringFilter =
 export type TransformModuleType = "js" | "jsx" | "ts" | "tsx" | (string & {});
 
 /**
- * Rolldown-style `transform` hook filter (all given properties must match).
+ * `transform` hook filter (all given properties must match).
  * - `id`: strings are globs (`path.matchesGlob`; relative ones resolve from
  *   cwd), RegExps are tested; both against the `/`-separated id.
  * - `code`: strings are substrings, RegExps are tested.
@@ -45,7 +45,7 @@ export interface SourceMapLike {
 }
 
 /**
- * Rolldown-like plugin object (only `transform` is used). `order: "pre"` runs
+ * Plugin object (only `transform` is used). `order: "pre"` runs
  * before oxc (on the TS/JSX source), otherwise after it; `"post"` last.
  */
 export interface TransformPlugin {
@@ -79,7 +79,7 @@ export function normalizeTransformer(value: unknown, specifier: string): Normali
   const fail = (reason: string): never => {
     throw new TypeError(
       `[env-runner] transformer "${specifier}" ${reason}: default-export a function ` +
-        "`(code, id, meta) => string | { code, map } | undefined` or a rolldown-like " +
+        "`(code, id, meta) => string | { code, map } | undefined` or a " +
         "`{ name?, transform }` object (not a plugin factory).",
     );
   };
@@ -152,7 +152,7 @@ function _matchId(pattern: string | RegExp, id: string): boolean {
       "[env-runner] glob `id` filters need `path.matchesGlob` (Node.js >= 22.5); use a RegExp instead.",
     );
   }
-  // Like Vite's `createFilter`: relative globs resolve from cwd.
+  // Relative globs resolve from cwd.
   const glob =
     nodePath.isAbsolute(pattern) || pattern.startsWith("*")
       ? pattern

@@ -20,8 +20,6 @@ export {
   type VirtualModuleSource,
   type VirtualModuleUpdates,
   type TransformOptions,
-  type OxcTransformOptions,
-  type OxcJsxOptions,
   type SerializedRegExp,
   type SourceTransformer,
   type TransformHandler,

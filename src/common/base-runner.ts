@@ -31,8 +31,6 @@ export type {
 } from "../virtual-loader.ts";
 export type {
   TransformOptions,
-  OxcTransformOptions,
-  OxcJsxOptions,
   SerializedRegExp,
   SourceTransformer,
   TransformHandler,

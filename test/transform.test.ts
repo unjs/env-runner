@@ -71,7 +71,7 @@ for (const { name, create, skip, bun, miniflare, cjsOptions } of runners) {
       expect(await res.json()).toEqual(expected);
     });
 
-    it('runs a rolldown-like plugin object (filter, `order: "pre"`)', async () => {
+    it('runs a plugin object transformer (filter, `order: "pre"`)', async () => {
       runner = create({
         name: "transform-plugin",
         data: {
@@ -318,7 +318,7 @@ describe("transform options", () => {
     expect(calls).toEqual(["pre:ts:typed", "fn:js:untyped", "post:js:untyped"]);
   });
 
-  it("applies rolldown hook filter semantics", async () => {
+  it("applies hook filters (id, code, moduleType, include/exclude)", async () => {
     const { normalizeTransformer } = await import("../src/common/transform-plugin.ts");
     const matches = (filter: any, id: string, code = "", moduleType = "ts") =>
       normalizeTransformer({ transform: { filter, handler: () => {} } }, "t").matches(

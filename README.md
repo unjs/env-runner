@@ -447,7 +447,7 @@ const runner = new NodeProcessEnvRunner({
     transform: {
       // oxc-transform `TransformOptions` (`true` or omitted: defaults, `false`: skip oxc)
       oxc: { jsx: { runtime: "automatic", importSource: "preact" } },
-      // Custom transforms: specifiers whose default export is a function or a rolldown-like plugin object (see below)
+      // Custom transforms: specifiers whose default export is a function or a plugin object (see below)
       transformers: ["./build/inline-env.mjs"],
       // extensions: [".ts", ".mts", ".cts", ".tsx", ".jsx"], // default
       // include: /\/src\//,                                  // only matching paths / virtual keys
@@ -467,12 +467,12 @@ export default (code, id, meta) => code.replaceAll("__VERSION__", '"1.0.0"');
 ```
 
 ```js
-// A rolldown-like plugin object (only the `transform` hook is used)
+// A plugin object (only the `transform` hook is used)
 export default {
   name: "inline-env",
   transform: {
     order: "pre", // before oxc, on the TS/JSX source (default: after oxc; "post": last)
-    filter: { id: "src/**", code: "import.meta.env" }, // rolldown hook filter
+    filter: { id: "src/**", code: "import.meta.env" }, // only matching modules
     handler(code, id, meta) {
       // meta.moduleType: "ts" | "tsx" | "jsx" | "js" ("js" once oxc ran)
       return { code: code.replaceAll("import.meta.env", "process.env") };
@@ -486,11 +486,11 @@ export default {
 **Rules:**
 
 - **Sync only:** handlers must be synchronous (Node.js module hooks are), and returning a Promise throws.
-- **Not rolldown's plugin context:** `this` isn't one.
+- **No plugin context:** `this` is not bound to one.
 - **Pass the plugin object, not a factory:** a function default export is treated as the handler.
 - **Order:** `pre` handlers → oxc → functions and default-order plugins → `post` handlers. Within each group, list order is kept.
 
-**Filters** follow rolldown's semantics. All given properties must match:
+**Filters**: all given properties must match.
 
 - `id`: strings are globs (`path.matchesGlob`, Node.js >= 22.5), with relative globs resolved from the working directory. RegExps are tested against the `/`-separated id.
 - `code`: strings are substrings, RegExps are tested.

@@ -21,40 +21,6 @@ export type {
   TransformStringFilter,
 } from "./transform-plugin.ts";
 
-/**
- * [`oxc-transform`](https://oxc.rs/docs/guide/usage/transformer)
- * `TransformOptions`, declared structurally so `env-runner` types don't depend
- * on the package: nested groups are loosely typed, so an object typed with
- * `oxc-transform`'s own `TransformOptions` is assignable. `sourcemap` follows
- * {@link TransformOptions.sourcemap}.
- */
-export interface OxcTransformOptions {
-  lang?: "js" | "jsx" | "ts" | "tsx" | "dts";
-  sourceType?: "script" | "module" | "commonjs" | "unambiguous";
-  cwd?: string;
-  assumptions?: object;
-  typescript?: object;
-  decorator?: object;
-  plugins?: object;
-  jsx?: "preserve" | OxcJsxOptions;
-  target?: string | string[];
-  helpers?: object;
-  inject?: Record<string, string | [string, string]>;
-  define?: Record<string, string>;
-}
-
-/** `oxc-transform` `JsxOptions`. */
-export interface OxcJsxOptions {
-  runtime?: "classic" | "automatic";
-  development?: boolean;
-  throwIfNamespace?: boolean;
-  pure?: boolean;
-  importSource?: string;
-  pragma?: string;
-  pragmaFrag?: string;
-  refresh?: boolean | object;
-}
-
 interface OxcTransformResult {
   code: string;
   map?: SourceMapLike;
@@ -72,15 +38,16 @@ interface OxcTransformModule {
  */
 export interface TransformOptions {
   /**
-   * [`oxc-transform`](https://oxc.rs/docs/guide/usage/transformer) options
-   * (`true` for defaults), or `false` to only run `transformers`.
+   * Options passed as-is to `oxc-transform`'s `transformSync()` (`true` for
+   * defaults), or `false` to only run `transformers`. `sourcemap` follows
+   * {@link TransformOptions.sourcemap}.
    * @default true
    */
-  oxc?: OxcTransformOptions | boolean;
+  oxc?: object | boolean;
 
   /**
    * Module specifiers (resolved from cwd) whose default export is a sync
-   * {@link SourceTransformer}: a function or a rolldown-like plugin object.
+   * {@link SourceTransformer}: a function or a `{ transform }` plugin object.
    * They run in order after oxc, on plain JS; plugins with `order: "pre"`
    * run before it (on the TS/JSX source), `"post"` ones last.
    */
@@ -498,7 +465,7 @@ function _bunLoader(path: string): string {
   }
 }
 
-// Module type before oxc, from the extension (rolldown's `moduleType`).
+// Module type before oxc, from the extension.
 function _moduleType(id: string): TransformModuleType {
   const ext = id.slice(id.lastIndexOf(".") + 1);
   if (ext === "tsx" || ext === "jsx") {
