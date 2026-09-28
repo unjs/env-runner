@@ -151,7 +151,7 @@ export interface EnvRunnerPlugin {
       };
 }
 
-/** `data.plugins` entries: nested arrays are flattened, falsy ones skipped. */
+/** `plugins` option entries: nested arrays are flattened, falsy ones skipped. */
 export type EnvRunnerPluginOption =
   | EnvRunnerPlugin
   | EnvRunnerPluginOption[]
@@ -170,7 +170,7 @@ export interface PluginTransformOutput {
   moduleType: "js" | "ts";
 }
 
-/** The `data.plugins` of a runner, ready to run on the host. */
+/** The `plugins` option of a runner, ready to run on the host. */
 export interface PluginPipeline {
   /** Plugin names, in `plugins` order. */
   names: string[];
@@ -203,7 +203,7 @@ interface NormalizedPlugin {
   handler: PluginTransformHandler;
 }
 
-/** Validate `data.plugins` (throws a descriptive `TypeError`). */
+/** Validate the `plugins` option (throws a descriptive `TypeError`). */
 export function createPluginPipeline(
   plugins: EnvRunnerPluginOption[] | undefined,
 ): PluginPipeline | undefined {
@@ -211,7 +211,7 @@ export function createPluginPipeline(
     return undefined;
   }
   if (!Array.isArray(plugins)) {
-    throw new TypeError("[env-runner] `data.plugins` must be an array of plugin objects.");
+    throw new TypeError("[env-runner] `plugins` must be an array of plugin objects.");
   }
   const normalized = _flattenPlugins(plugins, "").map(([plugin, path]) =>
     _normalizePlugin(plugin, path),
@@ -366,12 +366,12 @@ type FilterFail = (key: string, reason: string) => never;
 function _normalizePlugin(plugin: unknown, path: string): NormalizedPlugin {
   const fail = (reason: string): never => {
     throw new TypeError(
-      `[env-runner] \`data.plugins${path}\` ${reason}: expected \`{ name?, transform }\`, where \`transform\` is a function or \`{ order?, filter?, handler }\`.`,
+      `[env-runner] \`plugins${path}\` ${reason}: expected \`{ name?, transform }\`, where \`transform\` is a function or \`{ order?, filter?, handler }\`.`,
     );
   };
   const failFilter: FilterFail = (key, reason) => {
     throw new TypeError(
-      `[env-runner] \`data.plugins${path}\` has an invalid \`transform.filter${key}\` ${reason}.`,
+      `[env-runner] \`plugins${path}\` has an invalid \`transform.filter${key}\` ${reason}.`,
     );
   };
   if (typeof plugin !== "object") {

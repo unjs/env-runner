@@ -12,6 +12,7 @@ import { NodeProcessEnvRunner } from "../src/runners/node-process/runner.ts";
 import { BunProcessEnvRunner } from "../src/runners/bun-process/runner.ts";
 import { DenoProcessEnvRunner } from "../src/runners/deno-process/runner.ts";
 import { SelfEnvRunner } from "../src/runners/self/runner.ts";
+import { EnvServer } from "../src/server.ts";
 import * as miniflare from "miniflare";
 import { MiniflareEnvRunner } from "../src/runners/miniflare/runner.ts";
 import { createPluginPipeline, transformVirtualModules } from "../src/common/plugins.ts";
@@ -104,7 +105,8 @@ for (const { name, create, skip, cjsOptions } of runners) {
       const seen: string[] = [];
       runner = create({
         name: "plugins",
-        data: { entry: fixture("app.tsx"), plugins: [oxc(), greeting({ seen })] },
+        plugins: [oxc(), greeting({ seen })],
+        data: { entry: fixture("app.tsx") },
       });
       await runner.waitForReady();
       const res = await runner.fetch("http://localhost/");
@@ -126,7 +128,8 @@ for (const { name, create, skip, cjsOptions } of runners) {
       };
       runner = create({
         name: "plugins-pre",
-        data: { entry: fixture("app.tsx"), plugins: [oxc(), pre] },
+        plugins: [oxc(), pre],
+        data: { entry: fixture("app.tsx") },
       });
       await runner.waitForReady();
       const res = await runner.fetch("http://localhost/");
@@ -139,7 +142,8 @@ for (const { name, create, skip, cjsOptions } of runners) {
       const entry = join(dir, "app.tsx");
       runner = create({
         name: "plugins-reload",
-        data: { entry, plugins: [oxc(), greeting()] },
+        plugins: [oxc(), greeting()],
+        data: { entry },
       });
       try {
         await runner.waitForReady();
@@ -155,9 +159,9 @@ for (const { name, create, skip, cjsOptions } of runners) {
     it("transforms matching virtual modules (by extension or format)", async () => {
       runner = create({
         name: "plugins-virtual",
+        plugins: [oxc(), greeting()],
         data: {
           entry: "#entry.tsx",
-          plugins: [oxc(), greeting()],
           virtual: {
             "#entry.tsx": `import { mode } from "#mode.ts";
               import view from "#view";
@@ -193,7 +197,8 @@ for (const { name, create, skip, cjsOptions } of runners) {
       };
       runner = create({
         name: "plugins-error",
-        data: { entry: fixture("app.tsx"), plugins: [failing, oxc()] },
+        plugins: [failing, oxc()],
+        data: { entry: fixture("app.tsx") },
       });
       // Miniflare: a named import fails to link first (the error is logged on the host).
       const error = await runner.waitForReady().catch((error) => error);
@@ -209,9 +214,9 @@ for (const { name, create, skip, cjsOptions } of runners) {
       let source = `export const value: string = "ok";`;
       runner = create({
         name: "plugins-invalidate",
+        plugins: [oxc()],
         data: {
           entry: "#entry.ts",
-          plugins: [oxc()],
           virtual: {
             "#entry.ts": `import { value } from "#value.tsx";
               export default { fetch: () => new Response(value) };`,
@@ -234,7 +239,8 @@ for (const { name, create, skip, cjsOptions } of runners) {
       runner = create({
         ...cjsOptions,
         name: "plugins-cjs",
-        data: { entry: fixture("app-cjs.ts"), plugins: [oxc(), greeting({ id: "**/cjs/**" })] },
+        plugins: [oxc(), greeting({ id: "**/cjs/**" })],
+        data: { entry: fixture("app-cjs.ts") },
       });
       await runner.waitForReady();
       const res = await runner.fetch("http://localhost/");
@@ -244,7 +250,8 @@ for (const { name, create, skip, cjsOptions } of runners) {
     it("leaves TypeScript no plugin compiled to the runtime", async () => {
       runner = create({
         name: "plugins-typed",
-        data: { entry: fixture("typed.ts"), plugins: [greeting()] },
+        plugins: [greeting()],
+        data: { entry: fixture("typed.ts") },
       });
       await runner.waitForReady();
       const res = await runner.fetch("http://localhost/");
@@ -255,9 +262,9 @@ for (const { name, create, skip, cjsOptions } of runners) {
       runner = create({
         ...cjsOptions,
         name: "plugins-virtual-path",
+        plugins: [oxc(), greeting()],
         data: {
           entry: fixture("app-vendor.ts"),
-          plugins: [oxc(), greeting()],
           virtual: { [fixture("vendor/plain.ts")]: `export const value: string = "virtual";` },
         },
       });
@@ -272,9 +279,9 @@ for (const { name, create, skip, cjsOptions } of runners) {
         runner = create({
           ...cjsOptions,
           name: "plugins-id",
+          plugins: [oxc(), { ...greeting({ id }), name: "greeting" }],
           data: {
             entry: fixture("app-vendor.ts"),
-            plugins: [oxc(), { ...greeting({ id }), name: "greeting" }],
           },
         });
         await runner.waitForReady();
@@ -289,30 +296,30 @@ for (const { name, create, skip, cjsOptions } of runners) {
       const { handler } = greeting({ seen }).transform as { handler: PluginTransformHandler };
       runner = create({
         name: "plugins-expressions",
+        plugins: [
+          oxc(),
+          {
+            name: "greeting",
+            transform: {
+              filter: [
+                { kind: "exclude", expr: { kind: "id", pattern: "**/vendor/**" } },
+                {
+                  kind: "include",
+                  expr: {
+                    kind: "and",
+                    args: [
+                      { kind: "id", pattern: "**/*.ts" },
+                      { kind: "code", pattern: "__GREETING__" },
+                    ],
+                  },
+                },
+              ],
+              handler,
+            },
+          },
+        ],
         data: {
           entry: fixture("app-dot.ts"),
-          plugins: [
-            oxc(),
-            {
-              name: "greeting",
-              transform: {
-                filter: [
-                  { kind: "exclude", expr: { kind: "id", pattern: "**/vendor/**" } },
-                  {
-                    kind: "include",
-                    expr: {
-                      kind: "and",
-                      args: [
-                        { kind: "id", pattern: "**/*.ts" },
-                        { kind: "code", pattern: "__GREETING__" },
-                      ],
-                    },
-                  },
-                ],
-                handler,
-              },
-            },
-          ],
         },
       });
       await runner.waitForReady();
@@ -330,7 +337,8 @@ describe("MiniflareEnvRunner plugins (persistent)", () => {
         miniflare,
         persistent: true,
         name: "plugins-persistent",
-        data: { entry: fixture("typed.ts"), plugins: [greeting({ greeting: value })] },
+        plugins: [greeting({ greeting: value })],
+        data: { entry: fixture("typed.ts") },
       } as any);
     const first = create("one");
     await first.waitForReady();
@@ -347,17 +355,27 @@ describe("MiniflareEnvRunner plugins (persistent)", () => {
   });
 });
 
+describe("EnvServer plugins", () => {
+  it("passes `plugins` to the runners it creates", async () => {
+    const server = new EnvServer({ entry: fixture("app.tsx"), plugins: [oxc(), greeting()] });
+    try {
+      const res = await server.fetch(new Request("http://localhost/"));
+      expect(await res.json()).toEqual(expected);
+    } finally {
+      await server.close();
+    }
+  });
+});
+
 describe("plugins", () => {
-  it("validates `data.plugins`", () => {
+  it("validates `plugins`", () => {
     expect(createPluginPipeline(undefined)).toBeUndefined();
     expect(createPluginPipeline(null as any)).toBeUndefined();
     expect(() =>
       createPluginPipeline([{ transform: { filter: { moduleType: "ts" as any }, handler() {} } }]),
     ).toThrow(/invalid `transform\.filter\.moduleType`/);
     expect(() => createPluginPipeline("oxc" as any)).toThrow(/must be an array/);
-    expect(() => createPluginPipeline([{} as any])).toThrow(
-      /`data\.plugins\[0\]` has no `transform`/,
-    );
+    expect(() => createPluginPipeline([{} as any])).toThrow(/`plugins\[0\]` has no `transform`/);
     expect(() => createPluginPipeline([(() => {}) as any])).toThrow(/is not a plugin object/);
     expect(() =>
       createPluginPipeline([{ transform: { order: "first", handler() {} } } as any]),
@@ -366,18 +384,22 @@ describe("plugins", () => {
       () =>
         new NodeWorkerEnvRunner({
           name: "bad",
-          data: { entry: fixture("app.tsx"), plugins: [{} as any] },
+          plugins: [{} as any],
+          data: { entry: fixture("app.tsx") },
         }),
-    ).toThrow(/data\.plugins\[0\]/);
+    ).toThrow(/`plugins\[0\]`/);
   });
 
   it("closes the self runner", async () => {
     const runner = new SelfEnvRunner({
       name: "self",
-      data: { entry: fixture("app.tsx"), plugins: [oxc()] },
+      plugins: [oxc()],
+      data: { entry: fixture("app.tsx") },
     });
     await expect(runner.waitForReady()).rejects.toMatchObject({
-      cause: { message: expect.stringMatching(/self runner does not support plugins/) },
+      cause: {
+        message: expect.stringMatching(/Cannot use plugins: the self runner does not support them/),
+      },
     });
   });
 
@@ -651,7 +673,7 @@ describe("plugin filters", () => {
     const create = (filter: any) => () =>
       createPluginPipeline([{ name: "p", transform: { filter, handler() {} } }]);
     expect(create({ id: [1] })).toThrow(
-      /`data\.plugins\[0\]` has an invalid `transform\.filter\.id` \(got 1\): expected strings or RegExps/,
+      /`plugins\[0\]` has an invalid `transform\.filter\.id` \(got 1\): expected strings or RegExps/,
     );
     expect(create({ code: { exclude: [{}] } })).toThrow(
       /invalid `transform\.filter\.code` \(got an object\)/,
@@ -786,7 +808,7 @@ describe("plugin filters", () => {
     warn.mockRestore();
     debug.mockRestore();
     expect(() => createPluginPipeline([null, [{}]] as any)).toThrow(
-      /`data\.plugins\[1\]\[0\]` has no `transform`/,
+      /`plugins\[1\]\[0\]` has no `transform`/,
     );
   });
 });

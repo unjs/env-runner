@@ -7,7 +7,7 @@ import { Worker } from "node:worker_threads";
 import { BaseEnvRunner } from "../../common/base-runner.ts";
 import { PLUGINS_DATA_KEY } from "../../common/plugin-hooks.ts";
 import { hostEnv } from "../../common/host-env.ts";
-import type { EnvRunnerData } from "../../common/base-runner.ts";
+import type { EnvRunnerData, EnvRunnerPluginOption } from "../../common/base-runner.ts";
 
 export type { EnvRunnerData };
 
@@ -21,6 +21,8 @@ export class NodeWorkerEnvRunner extends BaseEnvRunner {
     workerEntry?: string;
     hooks?: WorkerHooks;
     data?: EnvRunnerData;
+    /** Host-side transform plugins (see `EnvRunnerPluginOption`). */
+    plugins?: EnvRunnerPluginOption[];
   }) {
     _defaultEntry ||= fileURLToPath(import.meta.resolve("env-runner/runners/node-worker/worker"));
     super({ ...opts, workerEntry: opts.workerEntry || _defaultEntry });

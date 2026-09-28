@@ -9,7 +9,7 @@ import { init as initCjsLexer, parse as parseCjs } from "cjs-module-lexer";
 import { init as initEsmLexer, parse as parseEsm } from "es-module-lexer";
 import { proxyUpgrade } from "httpxy";
 import { BaseEnvRunner } from "../../common/base-runner.ts";
-import type { EnvRunnerData } from "../../common/base-runner.ts";
+import type { EnvRunnerData, EnvRunnerPluginOption } from "../../common/base-runner.ts";
 import { resolveRuntimeDep } from "../../common/runtime-deps.ts";
 import { transformedFormat } from "../../common/plugin-hooks.ts";
 import type { RuntimeDep } from "../../common/runtime-deps.ts";
@@ -57,6 +57,8 @@ export interface MiniflareEnvRunnerOptions {
   name: string;
   hooks?: WorkerHooks;
   data?: EnvRunnerData;
+  /** Host-side transform plugins (see `EnvRunnerPluginOption`). */
+  plugins?: EnvRunnerPluginOption[];
   /**
    * The `miniflare` package (`import * as miniflare from "miniflare"`) or a
    * specifier resolved from cwd. Omitted: imported optionally.
@@ -634,7 +636,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
         },
       };
 
-      // When transformRequest or `data.plugins` is provided, add module rules
+      // When transformRequest or `plugins` is provided, add module rules
       // so miniflare's ModuleLocator doesn't reject non-JS extensions (e.g. .ts,
       // .tsx, .jsx). v5 has no ModuleLocator (and rejects `modulesRules`):
       // imports all go through the fallback service.
@@ -657,7 +659,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
         // Read live: updates change it in place.
         const _virtual = virtual;
         const _transformRequest = this.#transformRequest;
-        // `data.plugins` run here, on the host (workerd only parses JS).
+        // The `plugins` run here, on the host (workerd only parses JS).
         // Read from the live runner: a persistent instance is adopted by later
         // runners, which bring their own plugins.
         const _livePlugins = () => ipc.runner._plugins;

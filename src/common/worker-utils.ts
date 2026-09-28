@@ -115,7 +115,7 @@ export function isVirtualEntry(
 }
 
 /**
- * Register the loader hooks for the runner's `data.plugins` and `data.virtual`;
+ * Register the loader hooks for the runner's `plugins` and `data.virtual`;
  * await before importing the entry. Resolves to an idempotent unregister
  * function.
  */

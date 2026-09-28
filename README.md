@@ -427,17 +427,17 @@ The code formats are named like Node's [load formats](https://nodejs.org/api/mod
   - On Node.js, after a module re-exported by CommonJS (`module.exports = require("./dep.cjs")`) changes, Node reads it as an empty, circular module (this happens with real files too after deleting them from `require.cache`). Assign it first (`const dep = require("./dep.cjs"); module.exports = dep;`).
 - **Text and bytes** can't be imported from memory natively on every runtime, so they are served as ES modules where needed. `bytes` gives each module instance its own `Uint8Array`. Bytes survive every transport, including the process runners' JSON IPC (as base64) and `updateVirtualModules()`.
 - **WebAssembly** default-exports a compiled [`WebAssembly.Module`](https://developer.mozilla.org/docs/WebAssembly/Reference/JavaScript_interface/Module) on every runtime, so instantiate it yourself with `WebAssembly.instantiate(module, imports)`. This follows workerd, which compiles `.wasm` modules ahead of time and disallows compiling Wasm at runtime. Node.js and Deno's own `.wasm` imports instantiate the module instead ([Wasm ESM integration](https://github.com/WebAssembly/esm-integration)), and Bun's give a file path, so those aren't used.
-- **JSX** is only supported on Bun, by its `jsx`/`tsx` loaders (configure the JSX runtime with `tsconfig.json` or pragma comments like `/** @jsxImportSource preact */`). Node.js, Deno and miniflare can't load JSX from memory and fail with an error naming the key: pre-transpile it to JavaScript, and pass `{ source, format: "module" }` to keep a `.jsx`/`.tsx` key, or compile it with [plugins](#plugins-dataplugins).
+- **JSX** is only supported on Bun, by its `jsx`/`tsx` loaders (configure the JSX runtime with `tsconfig.json` or pragma comments like `/** @jsxImportSource preact */`). Node.js, Deno and miniflare can't load JSX from memory and fail with an error naming the key: pre-transpile it to JavaScript, and pass `{ source, format: "module" }` to keep a `.jsx`/`.tsx` key, or compile it with [plugins](#plugins-plugins).
 
 Virtual modules are registered inside the worker, before the entry is imported. On Node.js (>= 22.15 / 23.5) and Deno (>= 2.8) this uses [ESM customization hooks](https://nodejs.org/api/module.html#moduleregisterhooksoptions) (`module.registerHooks`); on Bun (which does not implement `registerHooks`) it uses a [`Bun.plugin()`](https://bun.com/docs/runtime/plugins) runtime plugin instead, also for the Node.js runners when the host runtime is Bun. Each source is served in its format, and virtual specifiers (including a virtual entry) resolve across `reloadModule()`. On runtimes supporting neither mechanism, a warning is logged and registration is skipped. When the worker shuts down gracefully the registration is unregistered again (the `registerHooks` registration is deregistered; on Bun, which has no plugin-removal API, the registration is detached so fresh loads and reloads stop resolving, and an overridden real file loads from disk again).
 
 On `MiniflareEnvRunner` there is no in-worker registration: the runner's module fallback service serves virtual specifiers to workerd directly (taking precedence over disk files and the `transformRequest` pipeline, so a virtual key overrides a real file with the same path). Named `exports` (Durable Objects / WorkerEntrypoints) also work with virtual entries. One limitation on miniflare v4: a **real** entry with auto-detected named exports can't import virtual modules, because miniflare's module locator reads its imports from disk at startup. Use a virtual entry, a separate `exports` module or miniflare v5 instead.
 
-#### Plugins (`data.plugins`)
+#### Plugins (`plugins`)
 
-Pass `data.plugins` to transform the entry, its imports and virtual modules with **plugins that run on the host**. While loading a module, the worker sends it to the runner, the runner runs the plugins' `transform` handlers and sends the result back, and the worker loads that result. Plugins are plain objects in the host process, so handlers can be async, close over host state and share work with the rest of your tooling. It works on every runner except `SelfEnvRunner`, which closes with an error.
+Pass the `plugins` runner option to transform the entry, its imports and virtual modules with **plugins that run on the host**. While loading a module, the worker sends it to the runner, the runner runs the plugins' `transform` handlers and sends the result back, and the worker loads that result. Plugins are plain objects in the host process, so handlers can be async, close over host state and share work with the rest of your tooling. It works on every runner except `SelfEnvRunner`, which closes with an error. `loadRunner()` and `EnvServer` take the same `plugins` option (`EnvServer` passes it to every runner it creates).
 
-> `data.plugins` is unrelated to the srvx server `plugins` of your [app entry](#app-entry): those stay on the entry's default export.
+> The runner `plugins` option is unrelated to the srvx server `plugins` of your [app entry](#app-entry): those stay on the entry's default export.
 
 TypeScript enums, namespaces and JSX need a compiler. A plugin with [`oxc-transform`](https://oxc.rs/docs/guide/usage/transformer) (`npm i -D oxc-transform`) covers them:
 
@@ -471,7 +471,8 @@ const version = {
 
 const runner = new NodeProcessEnvRunner({
   name: "my-app",
-  data: { entry: "./src/server.tsx", plugins: [oxc, version] },
+  plugins: [oxc, version],
+  data: { entry: "./src/server.tsx" },
 });
 ```
 

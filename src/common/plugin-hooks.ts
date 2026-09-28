@@ -13,10 +13,10 @@ import { createTransformClient } from "./transform-channel.ts";
 import { commonJSToESM, loadCommonJSLexer } from "./virtual-modules.ts";
 import type { TransformChannel } from "./transform-channel.ts";
 
-/** Runner data key of {@link PluginWorkerData} (only set with `data.plugins`). */
+/** Runner data key of {@link PluginWorkerData} (only set with the `plugins` option). */
 export const PLUGINS_DATA_KEY = "__envRunnerPlugins";
 
-/** What a worker gets for the runner's `data.plugins`. */
+/** What a worker gets for the runner's `plugins`. */
 export interface PluginWorkerData extends TransformChannel {
   prefilters: SerializedPrefilter[];
 }

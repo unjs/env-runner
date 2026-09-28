@@ -1,7 +1,11 @@
 import type { WorkerHooks } from "../../types.ts";
 
 import { BaseEnvRunner } from "../../common/base-runner.ts";
-import type { EnvRunnerData, VirtualModuleUpdates } from "../../common/base-runner.ts";
+import type {
+  EnvRunnerData,
+  EnvRunnerPluginOption,
+  VirtualModuleUpdates,
+} from "../../common/base-runner.ts";
 import type { AppEntry } from "../../common/worker-utils.ts";
 import { resolveEntry, reloadEntryModule } from "../../common/worker-utils.ts";
 
@@ -21,7 +25,13 @@ export class SelfEnvRunner extends BaseEnvRunner {
   #entry?: AppEntry;
   #wsAdapter?: NodeWSAdapter;
 
-  constructor(opts: { name: string; hooks?: WorkerHooks; data?: EnvRunnerData }) {
+  constructor(opts: {
+    name: string;
+    hooks?: WorkerHooks;
+    data?: EnvRunnerData;
+    /** Not supported: the runner closes with an error. */
+    plugins?: EnvRunnerPluginOption[];
+  }) {
     super({ ...opts, workerEntry: "" });
     this.#init();
   }
@@ -148,7 +158,7 @@ export class SelfEnvRunner extends BaseEnvRunner {
     }
     // Plugin transforms need a worker to block while the host runs them.
     if (this._plugins) {
-      this.close(new Error("Cannot use data.plugins: the self runner does not support plugins"));
+      this.close(new Error("Cannot use plugins: the self runner does not support them"));
       return;
     }
     this.#active = true;

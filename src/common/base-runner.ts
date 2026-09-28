@@ -62,15 +62,6 @@ export interface EnvRunnerData {
    */
   virtual?: VirtualModules;
 
-  /**
-   * Plugins whose `transform` hooks run on the host for the entry, its disk
-   * imports and virtual modules their filters match (e.g. compiling
-   * TypeScript enums and JSX). The worker sends each matching module to the
-   * runner and loads the result. Nested arrays are flattened and falsy
-   * entries skipped. Not supported by the `self` runner.
-   */
-  plugins?: EnvRunnerPluginOption[];
-
   [key: string]: unknown;
 }
 
@@ -93,7 +84,7 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
   #virtualUpdateId = 0;
   // Runner data JSON for process workers, snapshotted at spawn (`_processEnv()`).
   protected _processData?: string;
-  // `data.plugins` (kept out of `_data`, which is sent to the worker).
+  // The `plugins` option, run on the host.
   protected _plugins?: PluginPipeline;
   protected _transformChannel?: TransformChannelHost;
 
@@ -102,17 +93,20 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
     workerEntry: string;
     hooks?: WorkerHooks;
     data?: EnvRunnerData;
+    /**
+     * Plugins whose `transform` hooks run on the host for the entry, its disk
+     * imports and virtual modules their filters match (e.g. compiling
+     * TypeScript enums and JSX). The worker sends each matching module to the
+     * runner and loads the result. Nested arrays are flattened and falsy
+     * entries skipped. Not supported by the `self` runner.
+     */
+    plugins?: EnvRunnerPluginOption[];
   }) {
     this._name = opts.name;
     this._workerEntry = opts.workerEntry;
-    if (opts.data?.plugins === undefined) {
-      this._data = opts.data;
-    } else {
-      // Throws for invalid plugins.
-      const { plugins, ...data } = opts.data;
-      this._plugins = createPluginPipeline(plugins);
-      this._data = data;
-    }
+    this._data = opts.data;
+    // Throws for invalid plugins.
+    this._plugins = createPluginPipeline(opts.plugins);
     this._hooks = opts.hooks || {};
     this._messageListeners = new Set();
     this._pendingRequests = new Set();
@@ -338,7 +332,7 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
   }
 
   /**
-   * Runner data entries for `data.plugins` (none without plugins): the
+   * Runner data entries for the `plugins` option (none without plugins): the
    * plugins' prefilters and a transform channel, opened on the first call.
    * A `port` channel's `MessagePort` must be transferred to the worker.
    */

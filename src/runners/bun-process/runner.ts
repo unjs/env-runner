@@ -7,7 +7,7 @@ import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 
 import { BaseEnvRunner } from "../../common/base-runner.ts";
-import type { EnvRunnerData } from "../../common/base-runner.ts";
+import type { EnvRunnerData, EnvRunnerPluginOption } from "../../common/base-runner.ts";
 
 export type { EnvRunnerData as BunProcessEnvRunnerData } from "../../common/base-runner.ts";
 
@@ -66,6 +66,8 @@ export class BunProcessEnvRunner extends BaseEnvRunner {
     workerEntry?: string;
     hooks?: WorkerHooks;
     data?: EnvRunnerData;
+    /** Host-side transform plugins (see `EnvRunnerPluginOption`). */
+    plugins?: EnvRunnerPluginOption[];
     execArgv?: string[];
   }) {
     _defaultEntry ||= fileURLToPath(import.meta.resolve("env-runner/runners/bun-process/worker"));

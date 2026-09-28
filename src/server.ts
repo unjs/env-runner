@@ -1,5 +1,6 @@
 import { type FSWatcher, watch as watchFile } from "node:fs";
 import type { EnvRunner, WorkerHooks } from "./types.ts";
+import type { EnvRunnerPluginOption } from "./common/base-runner.ts";
 import type { RunnerName } from "./loader.ts";
 import type { VirtualModules, VirtualModuleUpdates } from "./virtual-loader.ts";
 
@@ -17,6 +18,8 @@ export interface EnvServerOptions {
   hooks?: WorkerHooks;
   /** Additional data passed to the runner. */
   data?: Record<string, unknown>;
+  /** Host-side transform plugins, passed to every runner the server creates. */
+  plugins?: EnvRunnerPluginOption[];
   /** Custom exec arguments (e.g. `--inspect`). */
   execArgv?: string[];
   /** Enable watch mode to auto-reload on entry file changes. */
@@ -126,6 +129,7 @@ export class EnvServer extends RunnerManager {
       ...this._opts.runnerOptions,
       name: this._opts.name || this._opts.entry,
       hooks: this._opts.hooks,
+      plugins: this._opts.plugins,
       data: {
         ...this._opts.data,
         ...(this._virtual && { virtual: { ...this._virtual } }),
