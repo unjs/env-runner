@@ -125,7 +125,7 @@ export async function registerWorkerHooks(data: Record<string, any>): Promise<()
   // `onLoad` whose filter matches.
   const bun = "Bun" in globalThis;
   const unregisterVirtualFirst = bun ? await registerVirtualModules(data.virtual) : undefined;
-  const unregisterPlugins = await registerPluginHooks(data[PLUGINS_DATA_KEY]);
+  const unregisterPlugins = await registerPluginHooks(data[PLUGINS_DATA_KEY], data.entry);
   const unregisterVirtual = unregisterVirtualFirst ?? (await registerVirtualModules(data.virtual));
   return () => {
     unregisterVirtual();

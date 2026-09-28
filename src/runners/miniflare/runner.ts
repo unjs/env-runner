@@ -12,6 +12,7 @@ import { BaseEnvRunner } from "../../common/base-runner.ts";
 import type { EnvRunnerData, EnvRunnerPluginOption } from "../../common/base-runner.ts";
 import { resolveRuntimeDep } from "../../common/runtime-deps.ts";
 import { transformedFormat } from "../../plugin/hooks.ts";
+import type { PluginTransformOutput } from "../../plugin/pipeline.ts";
 import type { RuntimeDep } from "../../common/runtime-deps.ts";
 import {
   encodeVirtualModules,
@@ -701,6 +702,45 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
             }
           }
         };
+        // Plugin output as workerd runs it: TypeScript stripped on the host.
+        const _pluginCode = async (id: string, result: PluginTransformOutput) => {
+          if (result.moduleType !== "ts") {
+            return result.code;
+          }
+          const strip = await _getStripTypeScriptTypes();
+          if (typeof strip !== "function") {
+            throw new TypeError(
+              `[env-runner] "${id}" is still TypeScript after its plugins, which needs \`module.stripTypeScriptTypes\` on the host: upgrade Node.js or compile it in a plugin.`,
+            );
+          }
+          return strip(result.code);
+        };
+        // A module a plugin loaded under an id that isn't a path.
+        const _servePluginModule = async (id: string, result: PluginTransformOutput) => {
+          if (result.moduleType === "json") {
+            return { json: result.code };
+          }
+          const code = await _pluginCode(id, result);
+          if (transformedFormat(id, code) === "module") {
+            return { esModule: _applyVirtualVersions(code, undefined) };
+          }
+          return {
+            commonJsModule: code,
+            namedExports: commonJSExports(code).filter((e) => e !== "default"),
+          };
+        };
+        // Plugin ids served (by workerd module name), the importers of their imports.
+        const _pluginModuleIds = new Map<string, string>();
+        // A named import of this module fails at link time before the throw
+        // runs (hiding it), so also report it on the host.
+        const _pluginErrorModule = (name: string, error: any) => {
+          const message = error?.message || String(error);
+          console.error(message);
+          return Response.json({
+            name,
+            esModule: `throw new Error(${JSON.stringify(message)});`,
+          });
+        };
         options.unsafeUseModuleFallbackService = true;
         // Map workerd module names to real filesystem paths for correct
         // relative import resolution from bare-specifier modules.
@@ -765,11 +805,45 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
             });
           }
 
-          let resolvedPath: string;
+          // workerd requires name to match specifier
+          // Preserve query string in name for cache-busting (workerd caches by name)
+          const rawQuery = specifier.includes("?") ? specifier.slice(specifier.indexOf("?")) : "";
+          const name =
+            (cleanSpecifier.startsWith("/") ? cleanSpecifier.slice(1) : cleanSpecifier) + rawQuery;
+
+          let resolvedPath: string | undefined;
+
+          // The plugins' `resolveId` hooks, after virtual modules (as in workers).
+          const _resolvePlugins = _livePlugins();
+          const source = cleanRaw || bareSpecifier;
+          if (_resolvePlugins?.resolveFilter(source)) {
+            try {
+              const resolved = await _resolvePlugins.resolveId(
+                source.startsWith("file:") ? fileURLToPath(source) : source,
+                referrerPath ?? _pluginModuleIds.get(referrerKey),
+              );
+              if (resolved && !resolved.external) {
+                const id = resolved.id;
+                const idPath = id.split("?")[0]!;
+                if (isAbsolute(idPath)) {
+                  resolvedPath = idPath;
+                } else {
+                  // Not a file: a `load` hook serves it.
+                  const result = (await _resolvePlugins.load(id))!;
+                  _pluginModuleIds.set(name, id);
+                  return Response.json({ name, ...(await _servePluginModule(id, result)) });
+                }
+              }
+            } catch (error: any) {
+              return _pluginErrorModule(name, error);
+            }
+          }
 
           // file:// URL specifier — convert to filesystem path
           const fileUrlRaw = cleanRaw || cleanSpecifier;
-          if (fileUrlRaw.startsWith("file://")) {
+          if (resolvedPath !== undefined) {
+            // Resolved by a plugin.
+          } else if (fileUrlRaw.startsWith("file://")) {
             try {
               resolvedPath = fileURLToPath(fileUrlRaw);
             } catch {
@@ -840,12 +914,6 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
             }
           }
 
-          // workerd requires name to match specifier
-          // Preserve query string in name for cache-busting (workerd caches by name)
-          const rawQuery = specifier.includes("?") ? specifier.slice(specifier.indexOf("?")) : "";
-          const name =
-            (cleanSpecifier.startsWith("/") ? cleanSpecifier.slice(1) : cleanSpecifier) + rawQuery;
-
           // Try Vite transform pipeline first (TS/JSX → JS, etc.)
           if (_transformRequest) {
             try {
@@ -862,47 +930,49 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
             }
           }
 
-          let contents: string;
+          let contents: string | undefined;
           try {
             contents = readFileSync(resolvedPath, "utf8");
           } catch {
+            // Missing: maybe a plugin loads it.
+          }
+          const _plugins = _livePlugins();
+          const cjsSuffix = "?__cjs";
+          const cachedCJS = specifier.endsWith(cjsSuffix) && _cjsOutput.has(resolvedPath);
+          const pluginFile = !cachedCJS && _plugins?.filter(resolvedPath);
+          if (contents === undefined && !cachedCJS && !pluginFile) {
             return new Response(null, { status: 404 });
           }
           // Track the real path so relative imports from this module resolve correctly
           modulePathMap.set(name, resolvedPath);
 
-          const _plugins = _livePlugins();
-          const cjsSuffix = "?__cjs";
           let transformed: string | undefined;
-          if (specifier.endsWith(cjsSuffix) && _cjsOutput.has(resolvedPath)) {
+          if (cachedCJS) {
             transformed = _cjsOutput.get(resolvedPath);
             _cjsOutput.delete(resolvedPath);
-          } else if (_plugins?.filter(resolvedPath)) {
+          } else if (pluginFile) {
             try {
-              const result = await _plugins.transform(resolvedPath, contents);
-              transformed = result?.code;
-              if (result?.moduleType === "ts") {
-                const strip = await _getStripTypeScriptTypes();
-                if (typeof strip !== "function") {
-                  throw new TypeError(
-                    `[env-runner] "${resolvedPath}" is still TypeScript after its plugins, which needs \`module.stripTypeScriptTypes\` on the host: upgrade Node.js or compile it in a plugin.`,
-                  );
+              const file = resolvedPath;
+              const result = await _plugins!.load(file, () => {
+                if (contents === undefined) {
+                  throw new Error(`Cannot find module "${file}"`);
                 }
-                transformed = strip(result.code);
-              }
-            } catch (error: any) {
-              // A named import of this module fails at link time before the
-              // throw runs (hiding it), so also report it on the host.
-              const message = error?.message || String(error);
-              console.error(message);
-              return Response.json({
-                name,
-                esModule: `throw new Error(${JSON.stringify(message)});`,
+                return contents;
               });
+              if (result?.moduleType === "json") {
+                return Response.json({ name, json: result.code });
+              }
+              transformed = result && (await _pluginCode(resolvedPath, result));
+            } catch (error: any) {
+              return _pluginErrorModule(name, error);
+            }
+            if (transformed === undefined && contents === undefined) {
+              return new Response(null, { status: 404 });
             }
           }
           let isESM: boolean;
           if (transformed === undefined) {
+            contents = contents!;
             // Detect module type: .mjs is always ESM, .cjs is always CJS,
             // otherwise check for ESM syntax indicators
             isESM =

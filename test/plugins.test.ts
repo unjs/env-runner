@@ -16,8 +16,13 @@ import { EnvServer } from "../src/server.ts";
 import * as miniflare from "miniflare";
 import { MiniflareEnvRunner } from "../src/runners/miniflare/runner.ts";
 import { createPluginPipeline, transformVirtualModules } from "../src/plugin/pipeline.ts";
-import { createPrefilter } from "../src/plugin/filter.ts";
-import { createBunFilter, transformedFormat } from "../src/plugin/hooks.ts";
+import { createPrefilter, moduleTypeOf } from "../src/plugin/filter.ts";
+import {
+  createBunFilter,
+  createBunResolveFilter,
+  resolveSchemes,
+  transformedFormat,
+} from "../src/plugin/hooks.ts";
 
 function hasRuntime(cmd: string): boolean {
   try {
@@ -71,6 +76,63 @@ function greeting(opts: { greeting?: string; id?: any; seen?: string[] } = {}): 
 
 const expected = { tag: "div", props: { kind: "page" }, children: ["Ok", "hi"] };
 
+// `resolveId`/`load` plugins: `virtual:` modules (one importing another, one
+// loaded as TypeScript for the oxc plugin), an alias to a file, a `.yaml` file
+// and a JSON module. Records `[source, importer]` of resolved imports.
+function resolvers(seen: [string, string | undefined][]): EnvRunnerPlugin[] {
+  return [
+    {
+      name: "virtual",
+      resolveId: {
+        filter: { id: /^virtual:/ },
+        handler(source, importer) {
+          seen.push([source, importer]);
+          return `\0${source}`;
+        },
+      },
+      load: {
+        filter: { id: /^\0virtual:/ },
+        async handler(id) {
+          await new Promise((r) => setTimeout(r, 1));
+          if (id === "\0virtual:message") {
+            return 'import suffix from "virtual:suffix"; export default "hello" + suffix;';
+          }
+          if (id === "\0virtual:suffix") {
+            return { code: 'export default "!" as string;', moduleType: "ts" };
+          }
+        },
+      },
+    },
+    {
+      name: "alias",
+      resolveId: {
+        filter: { id: "@alias/**" },
+        handler: async (source) => fixture(source.slice("@alias/".length)),
+      },
+    },
+    {
+      name: "yaml",
+      transform: {
+        filter: { id: /\.yaml$/ },
+        handler(code) {
+          const entries = code
+            .trim()
+            .split("\n")
+            .map((line) => line.split(": "));
+          return `export default ${JSON.stringify(Object.fromEntries(entries))};`;
+        },
+      },
+    },
+    {
+      name: "json",
+      transform: {
+        filter: { moduleType: ["json"], id: "**/plugins/data.json" },
+        handler: (code) => JSON.stringify({ ...JSON.parse(code), patched: true }),
+      },
+    },
+  ];
+}
+
 const runners = [
   { name: "NodeWorkerEnvRunner", create: (opts: any) => new NodeWorkerEnvRunner(opts) },
   { name: "NodeProcessEnvRunner", create: (opts: any) => new NodeProcessEnvRunner(opts) },
@@ -113,6 +175,27 @@ for (const { name, create, skip, cjsOptions } of runners) {
       expect(await res.json()).toEqual(expected);
       // The handler ran in this process, with the file path as id.
       expect(seen).toEqual([fixture("app.tsx")]);
+    });
+
+    it("resolves and loads modules with `resolveId`/`load` hooks", async () => {
+      const seen: [string, string | undefined][] = [];
+      runner = create({
+        name: "plugins-resolve",
+        plugins: [oxc(), resolvers(seen)],
+        data: { entry: fixture("app-resolve.ts") },
+      });
+      await runner.waitForReady();
+      const res = await runner.fetch("http://localhost/");
+      expect(await res.json()).toEqual({
+        message: "hello!",
+        aliased: "aliased",
+        yaml: { name: "env-runner", kind: "yaml" },
+        json: { name: "data", patched: true },
+      });
+      expect(seen).toEqual([
+        ["virtual:message", fixture("app-resolve.ts")],
+        ["virtual:suffix", "\0virtual:message"],
+      ]);
     });
 
     it('runs `order: "pre"` handlers first', async () => {
@@ -375,7 +458,27 @@ describe("plugins", () => {
       createPluginPipeline([{ transform: { filter: { moduleType: "ts" as any }, handler() {} } }]),
     ).toThrow(/invalid `transform\.filter\.moduleType`/);
     expect(() => createPluginPipeline("oxc" as any)).toThrow(/must be an array/);
-    expect(() => createPluginPipeline([{} as any])).toThrow(/`plugins\[0\]` has no `transform`/);
+    // Other hooks are ignored: a plugin may have none of these.
+    expect(createPluginPipeline([{ name: "other", buildStart() {} } as any])!.names).toEqual([
+      "other",
+    ]);
+    expect(() => createPluginPipeline([{ transform: 1 } as any])).toThrow(
+      /`plugins\[0\]` has an invalid `transform` hook \(got 1\)/,
+    );
+    expect(() => createPluginPipeline([{ load: {} } as any])).toThrow(/invalid `load` hook/);
+    expect(() =>
+      createPluginPipeline([{ load: { filter: { code: "x" }, handler() {} } } as any]),
+    ).toThrow(/invalid `load\.filter\.code` \(`load` filters take `id` only\)/);
+    expect(() =>
+      createPluginPipeline([
+        {
+          resolveId: {
+            filter: [{ kind: "include", expr: { kind: "moduleType", pattern: "js" } }],
+            handler() {},
+          },
+        },
+      ]),
+    ).toThrow(/`moduleType` doesn't apply to `resolveId`/);
     expect(() => createPluginPipeline([(() => {}) as any])).toThrow(/is not a plugin object/);
     expect(() =>
       createPluginPipeline([{ transform: { order: "first", handler() {} } } as any]),
@@ -384,7 +487,7 @@ describe("plugins", () => {
       () =>
         new NodeWorkerEnvRunner({
           name: "bad",
-          plugins: [{} as any],
+          plugins: [{ transform: "x" } as any],
           data: { entry: fixture("app.tsx") },
         }),
     ).toThrow(/`plugins\[0\]`/);
@@ -807,8 +910,268 @@ describe("plugin filters", () => {
     info.mockRestore();
     warn.mockRestore();
     debug.mockRestore();
-    expect(() => createPluginPipeline([null, [{}]] as any)).toThrow(
-      /`plugins\[1\]\[0\]` has no `transform`/,
+    expect(() => createPluginPipeline([null, [{ resolveId: 1 }]] as any)).toThrow(
+      /`plugins\[1\]\[0\]` has an invalid `resolveId` hook/,
     );
+  });
+});
+
+describe("plugin `resolveId`/`load` hooks", () => {
+  it("resolves with the first matching `resolveId` result, in order", async () => {
+    const calls: string[] = [];
+    const hook = (name: string, result: unknown, order?: "pre" | "post"): EnvRunnerPlugin => ({
+      name,
+      resolveId: {
+        order,
+        filter: { id: /^virtual:/ },
+        handler(source, importer, options) {
+          calls.push(`${name}:${source}:${importer}:${options.isEntry}`);
+          return result as any;
+        },
+      },
+    });
+    const pipeline = createPluginPipeline([
+      hook("none", null),
+      hook("first", "\0first"),
+      hook("pre", undefined, "pre"),
+    ])!;
+    expect(pipeline.resolveFilter("virtual:x?q")).toBe(true);
+    expect(pipeline.resolveFilter("./x.ts")).toBe(false);
+    expect(await pipeline.resolveId("virtual:x", "/app/a.ts")).toEqual({
+      id: "\0first",
+      external: false,
+    });
+    expect(calls).toEqual([
+      "pre:virtual:x:/app/a.ts:false",
+      "none:virtual:x:/app/a.ts:false",
+      "first:virtual:x:/app/a.ts:false",
+    ]);
+    expect(await pipeline.resolveId("./other.ts")).toBeUndefined();
+
+    const external = createPluginPipeline([
+      { resolveId: (source) => (source === "a" ? false : { id: "b2", external: "absolute" }) },
+    ])!;
+    expect(await external.resolveId("a")).toEqual({ id: "a", external: true });
+    expect(await external.resolveId("b")).toEqual({ id: "b2", external: true });
+
+    const invalid = createPluginPipeline([{ name: "bad", resolveId: () => ({ id: 1 }) as any }])!;
+    await expect(invalid.resolveId("x")).rejects.toThrow(
+      /plugin "bad" resolved "x" to an invalid id \(got 1\)/,
+    );
+    const failing = createPluginPipeline([
+      {
+        name: "failing",
+        resolveId() {
+          throw new Error("nope");
+        },
+      },
+    ])!;
+    await expect(failing.resolveId("x")).rejects.toThrow(
+      '[env-runner] plugin "failing" failed to resolve "x": nope',
+    );
+  });
+
+  it("matches `resolveId` globs against specifiers as written", () => {
+    const pipeline = createPluginPipeline([
+      { resolveId: { filter: { id: ["virtual:*", "~icons/**"] }, handler() {} } },
+    ])!;
+    expect(pipeline.resolveFilter("virtual:a")).toBe(true);
+    expect(pipeline.resolveFilter("~icons/mdi/home")).toBe(true);
+    expect(pipeline.resolveFilter("./virtual:a")).toBe(false);
+    expect(resolveSchemes(pipeline.resolvePrefilters)).toEqual(["virtual"]);
+    expect(createBunResolveFilter(pipeline.resolvePrefilters).test("virtual:a")).toBe(true);
+    expect(createBunResolveFilter(pipeline.resolvePrefilters).test("./a.ts")).toBe(false);
+  });
+
+  it("finds the schemes of `resolveId` filters for Bun namespaces", () => {
+    const schemes = (filter: any) =>
+      resolveSchemes(
+        createPluginPipeline([{ resolveId: { filter, handler() {} } }])!.resolvePrefilters,
+      );
+    expect(schemes({ id: [/^virtual:/, /^my\.scheme:x/, /^node:/, /^C:/, /icons:/] })).toEqual([
+      "virtual",
+      "my.scheme",
+    ]);
+    expect(
+      schemes([
+        {
+          kind: "include",
+          expr: {
+            kind: "or",
+            args: [
+              { kind: "id", pattern: /^a-b:/ },
+              { kind: "id", pattern: "xy:*" },
+            ],
+          },
+        },
+      ]),
+    ).toEqual(["a-b", "xy"]);
+    // No includes: any specifier.
+    const all = createPluginPipeline([{ resolveId: () => null }])!.resolvePrefilters;
+    expect(createBunResolveFilter(all).test("anything")).toBe(true);
+  });
+
+  it("loads modules with `load` hooks, then transforms them", async () => {
+    const pipeline = createPluginPipeline([
+      {
+        name: "virtual",
+        load: {
+          filter: { id: /^\0virtual:/ },
+          handler(id) {
+            if (id === "\0virtual:ts") {
+              return {
+                code: "export const x: number = 1;",
+                map: { mappings: "AAAA" },
+                moduleType: "ts",
+              };
+            }
+            return id === "\0virtual:plain" ? "export default 1;" : null;
+          },
+        },
+        transform: {
+          filter: { moduleType: ["ts"] },
+          handler: (code) => ({ code: code.replace(": number", ""), moduleType: "js" }),
+        },
+      },
+    ])!;
+    const ts = (await pipeline.load("\0virtual:ts"))!;
+    expect(ts.moduleType).toBe("js");
+    expect(ts.code).toMatch(/^export const x = 1;\n\/\/# sourceMappingURL=data:/);
+    // Loaded modules always have code, also when no `transform` changes them.
+    expect(await pipeline.load("\0virtual:plain")).toEqual({
+      code: "export default 1;",
+      moduleType: "js",
+    });
+    await expect(pipeline.load("\0virtual:missing")).rejects.toThrow(
+      /no plugin loaded "\0virtual:missing": a `resolveId` hook resolved an import to it/,
+    );
+    // Files no `load` hook returns code for are read (only when a filter matches).
+    const read = vi.fn(() => "export const a: number = 1;");
+    expect(await pipeline.load("/app/a.ts", read)).toEqual({
+      code: "export const a = 1;",
+      moduleType: "js",
+    });
+    expect(await pipeline.load("/app/a.js", read)).toBeUndefined();
+    expect(read).toHaveBeenCalledOnce();
+  });
+
+  it("reports `load` errors and invalid code", async () => {
+    const pipeline = createPluginPipeline([
+      {
+        name: "failing",
+        load(id) {
+          if (id === "\0bad") {
+            return { code: 1 } as any;
+          }
+          throw new Error("nope");
+        },
+      },
+    ])!;
+    await expect(pipeline.load("\0x")).rejects.toThrow(
+      '[env-runner] plugin "failing" failed to load "\0x": nope',
+    );
+    await expect(pipeline.load("\0bad")).rejects.toThrow(
+      /plugin "failing" loaded non-string `code` for "\0bad" \(got 1\)/,
+    );
+  });
+
+  it("only sends other file types to filters naming them", async () => {
+    expect(moduleTypeOf("/app/a.vue")).toBe("vue");
+    expect(moduleTypeOf("/app/a.JSON?x")).toBe("json");
+    expect(moduleTypeOf("/app/a.mts")).toBe("ts");
+    expect(moduleTypeOf("\0virtual:x")).toBe("js");
+    const any = createPluginPipeline([{ transform: () => {} }])!;
+    const named = createPluginPipeline([
+      { transform: { filter: { id: "**/*.vue" }, handler() {} } },
+    ])!;
+    const dir = createPluginPipeline([{ transform: { filter: { id: "/app/**" }, handler() {} } }])!;
+    const json = createPluginPipeline([
+      { transform: { filter: { moduleType: ["json"] }, handler() {} } },
+    ])!;
+    const load = createPluginPipeline([{ load: { filter: { id: "/app/**" }, handler() {} } }])!;
+    expect(any.filter("/app/a.ts")).toBe(true);
+    expect(any.filter("/app/a.vue")).toBe(false);
+    expect(named.filter("/app/a.vue")).toBe(true);
+    expect(dir.filter("/app/a.vue")).toBe(true);
+    // Files the runtime loads itself need their type listed (or a `load` filter).
+    expect(dir.filter("/app/a.json")).toBe(false);
+    expect(json.filter("/app/a.json")).toBe(true);
+    expect(json.filter("/app/node_modules/x/a.json")).toBe(false);
+    expect(load.filter("/app/a.json")).toBe(true);
+    expect(load.filter("/app/a.wasm")).toBe(true);
+    // The worker's prefilter agrees.
+    const prefilter = createPrefilter(JSON.parse(JSON.stringify(dir.prefilters)));
+    expect(prefilter("/app/a.vue", "vue")).toBe(true);
+    expect(prefilter("/app/a.json", "json")).toBe(false);
+  });
+
+  it("types other files `js` once a plugin turns them into code", async () => {
+    const seen: string[] = [];
+    const pipeline = createPluginPipeline([
+      {
+        name: "vue",
+        transform: {
+          filter: { id: /\.vue$/ },
+          handler: (code) => `export default ${JSON.stringify(code)};`,
+        },
+      },
+      // Unfiltered: sees the module once it is JavaScript.
+      {
+        name: "any",
+        transform: (_code, id, { moduleType }) => void seen.push(`${id}:${moduleType}`),
+      },
+      {
+        name: "json",
+        transform: {
+          filter: { moduleType: ["json"] },
+          handler: (code, id) =>
+            id.endsWith("code.json") ? `export default ${code};` : code.replace("1", "2"),
+        },
+      },
+    ])!;
+    expect(await pipeline.transform("/app/a.vue", "<template/>")).toEqual({
+      code: 'export default "<template/>";',
+      moduleType: "js",
+    });
+    expect(seen).toEqual(["/app/a.vue:js"]);
+    // JSON stays JSON, unless a plugin rewrote it as code.
+    expect(await pipeline.transform("/app/a.json", '{"a":1}')).toEqual({
+      code: '{"a":2}',
+      moduleType: "json",
+    });
+    expect(await pipeline.transform("/app/code.json", '{"a":1}')).toEqual({
+      code: 'export default {"a":1};',
+      moduleType: "js",
+    });
+    expect(seen).toEqual(["/app/a.vue:js"]);
+  });
+
+  it("adds other file types to Bun's `onLoad` filter only when the filter folds", () => {
+    const filter = (plugin: EnvRunnerPlugin) =>
+      createBunFilter(createPluginPipeline([plugin])!.prefilters);
+    const vue = filter({ transform: { filter: { id: /\.vue$/ }, handler() {} } });
+    expect(vue.test("/app/a.vue")).toBe(true);
+    expect(vue.test("/app/a.vue?x")).toBe(false);
+    expect(vue.test("/app/a.json")).toBe(false);
+    expect(vue.test("/app/a.cjs")).toBe(false);
+    const json = filter({ transform: { filter: { moduleType: ["json"] }, handler() {} } });
+    expect(json.test("/app/a.json")).toBe(true);
+    expect(json.test("/app/a.ts")).toBe(false);
+    const load = filter({ load: { filter: { id: /\.json$/ }, handler() {} } });
+    expect(load.test("/app/a.json")).toBe(true);
+    // Expressions only cover scripts.
+    const expr = filter({
+      transform: {
+        filter: [{ kind: "include", expr: { kind: "id", pattern: /\.vue$/ } }],
+        handler() {},
+      },
+    });
+    expect(expr.test("/app/a.vue")).toBe(false);
+    // Not folded on Windows (RegExps see `\`): other files are left out.
+    const windows = createBunFilter(
+      createPluginPipeline([{ transform: { filter: { id: /\.vue$/ }, handler() {} } }])!.prefilters,
+      true,
+    );
+    expect(windows.test(String.raw`C:\app\a.vue`)).toBe(false);
   });
 });

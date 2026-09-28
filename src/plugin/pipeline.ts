@@ -5,14 +5,18 @@ import type { ResolvedVirtualModule } from "../virtual-loader.ts";
 import {
   compileFilter,
   compileFilterExpressions,
-  deserializePattern,
-  isTransformCandidate,
+  compilePrefilter,
+  createPrefilter,
+  isPluginFile,
   moduleTypeOf,
   normalizeFilterId,
+  requiredMatch,
+  satisfiesMatch,
   stripQuery,
 } from "./filter.ts";
 import type {
   PluginModuleType,
+  PrefilterMatch,
   SerializedFilterExpression,
   SerializedFilterNode,
   SerializedPattern,
@@ -51,9 +55,20 @@ export interface PluginTransformFilter {
 }
 
 /**
+ * `resolveId` and `load` hook filter: `id` only, matched like
+ * {@link PluginTransformFilter} `id`. For `resolveId` it is the import
+ * specifier (without its query) and globs match it as written (not resolved
+ * from the working directory).
+ */
+export interface PluginHookFilter {
+  id?: PluginStringFilter;
+}
+
+/**
  * A filter expression, matched like the {@link PluginTransformFilter}
  * properties. `query` sees no query (only `pattern: false` matches), and
- * `importerId` is rejected (there is no importer here).
+ * `importerId` is rejected. `resolveId` and `load` filters take no `code` or
+ * `moduleType` expressions.
  */
 export type PluginFilterExpression =
   | { kind: "and" | "or"; args: PluginFilterExpression[] }
@@ -126,6 +141,69 @@ export type PluginTransformResult =
   | null
   | undefined;
 
+/** Passed to `resolveId` handlers. */
+export interface PluginResolveIdOptions {
+  /** Whether this is the runner's entry. */
+  isEntry: boolean;
+  /** Import attributes (`with { type: "json" }`), when the runtime reports them. */
+  attributes: Record<string, string>;
+}
+
+/**
+ * Runs on the host for the imports its filter matches (the import specifier
+ * as written, `file:` URLs as paths) and may be async. `importer` is the
+ * importing module's id (a path, or an id a `resolveId` returned), `undefined`
+ * for the entry.
+ */
+export type PluginResolveIdHandler = (
+  this: PluginContext,
+  source: string,
+  importer: string | undefined,
+  options: PluginResolveIdOptions,
+) => PluginResolveIdResult | Promise<PluginResolveIdResult>;
+
+/**
+ * The module's id, or nullish to try the next plugin (then the runtime
+ * resolves it). An absolute path loads that file (through `load` hooks,
+ * then from disk); any other id (like `\0virtual:foo`) must be loaded by a
+ * `load` hook. `false` or `external` leaves the import (or the returned id)
+ * to the runtime. `moduleSideEffects`, `meta` and other properties are
+ * ignored.
+ */
+export type PluginResolveIdResult =
+  | string
+  | false
+  | { id: string; external?: boolean | "absolute" | "relative"; [key: string]: unknown }
+  | null
+  | undefined;
+
+/**
+ * Runs on the host for the modules its filter matches and may be async:
+ * return the module's code, or nullish to try the next plugin (then the file
+ * is read from disk). `transform` hooks run on the result.
+ */
+export type PluginLoadHandler = (
+  this: PluginContext,
+  id: string,
+) => PluginLoadResult | Promise<PluginLoadResult>;
+
+/**
+ * Code, or `{ code, map, moduleType }`: without a `moduleType`, it is the
+ * id's ({@link PluginModuleType}), `js` for other extensions.
+ * `moduleSideEffects` and `meta` are accepted and ignored.
+ */
+export type PluginLoadResult =
+  | string
+  | {
+      code: string;
+      map?: SourceMapLike | string | null;
+      moduleType?: PluginModuleType;
+      moduleSideEffects?: unknown;
+      meta?: unknown;
+    }
+  | null
+  | undefined;
+
 export interface SourceMapLike {
   version?: number;
   mappings: string;
@@ -134,21 +212,31 @@ export interface SourceMapLike {
   sourcesContent?: (string | null)[];
 }
 
+/** A hook: its handler, or `{ order, filter, handler }`. */
+export type PluginHook<Handler, Filter> =
+  | Handler
+  | {
+      order?: "pre" | "post" | null;
+      filter?: Filter | PluginTopLevelFilterExpression[];
+      handler: Handler;
+    };
+
 /**
- * A runner plugin. Plugins live on the host: workers send the modules their
- * filters match to the runner, which runs the `transform` handlers and sends
- * the result back. Handlers run in `plugins` order within their `order` group:
- * `"pre"`, then unordered, then `"post"`. Other properties are ignored.
+ * A runner plugin. Plugins live on the host: workers send the imports and
+ * modules their filters match to the runner, which runs the hooks and sends
+ * the result back. Each hook runs in `plugins` order within its `order`
+ * group: `"pre"`, then unordered, then `"post"`. Other properties (and hooks)
+ * are ignored.
+ *
+ * - `resolveId`: resolve an import; the first result wins.
+ * - `load`: provide a module's code; the first result wins.
+ * - `transform`: change a module's code; every matching handler runs.
  */
 export interface EnvRunnerPlugin {
   name?: string;
-  transform:
-    | PluginTransformHandler
-    | {
-        order?: "pre" | "post" | null;
-        filter?: PluginTransformFilter | PluginTopLevelFilterExpression[];
-        handler: PluginTransformHandler;
-      };
+  resolveId?: PluginHook<PluginResolveIdHandler, PluginHookFilter>;
+  load?: PluginHook<PluginLoadHandler, PluginHookFilter>;
+  transform?: PluginHook<PluginTransformHandler, PluginTransformFilter>;
 }
 
 /** `plugins` option entries: nested arrays are flattened, falsy ones skipped. */
@@ -159,34 +247,64 @@ export type EnvRunnerPluginOption =
   | null
   | undefined;
 
-/** Result of {@link PluginPipeline.transform}. */
+/** Result of {@link PluginPipeline.transform} and {@link PluginPipeline.load}. */
 export interface PluginTransformOutput {
   /** The new code, with an inline source map when a plugin returned one. */
   code: string;
   /**
-   * `js`, or `ts` when no plugin compiled it (the worker strips the types
-   * where the runtime does it natively, like for untransformed files).
+   * `js`; `ts` when no plugin compiled it (the worker strips the types where
+   * the runtime does it natively, like for untransformed files); `json` for
+   * JSON (served as a JSON module).
    */
-  moduleType: "js" | "ts";
+  moduleType: "js" | "ts" | "json";
+}
+
+/** Result of {@link PluginPipeline.resolveId}. */
+export interface PluginResolvedId {
+  id: string;
+  /** Leave the import (as `id`) to the runtime. */
+  external: boolean;
 }
 
 /** The `plugins` option of a runner, ready to run on the host. */
 export interface PluginPipeline {
   /** Plugin names, in `plugins` order. */
   names: string[];
-  /** Each plugin's filter as the worker's prefilter checks it. */
+  /** The `load` and `transform` filters as the worker's prefilter checks them. */
   prefilters: SerializedPrefilter[];
+  /** The `resolveId` filters as the worker's prefilter checks them. */
+  resolvePrefilters: SerializedPrefilter[];
   /**
    * Whether a module goes through the plugins: a disk module
-   * ({@link isTransformCandidate}), or any id with a `moduleType`, and some
-   * plugin's filter may match (its `code` parts aren't checked).
+   * ({@link isPluginFile}), or any id with a `moduleType`, and some `load` or
+   * `transform` filter may match (its `code` parts aren't checked). Modules
+   * of other than script types only match filters naming them (see
+   * {@link requiredMatch}).
    */
   filter(id: string, moduleType?: PluginModuleType): boolean;
+  /** Whether some `resolveId` filter matches an import specifier. */
+  resolveFilter(source: string): boolean;
   /**
-   * Run the plugins: `undefined` when none changed the code (load it as if
-   * unmatched). Rejects with their errors (naming the plugin and id), and when
-   * the code changed but is still neither JavaScript nor TypeScript (e.g. JSX
-   * no plugin compiled).
+   * Run the `resolveId` hooks: the first result, or `undefined` when none
+   * resolved it (the runtime resolves it). Rejects with their errors.
+   */
+  resolveId(
+    source: string,
+    importer?: string,
+    options?: Partial<PluginResolveIdOptions>,
+  ): Promise<PluginResolvedId | undefined>;
+  /**
+   * Run the `load` hooks, then the `transform` hooks on the loaded code. When
+   * no `load` hook returned code, `read()` reads the module (none: rejects,
+   * the id isn't a file), and the result is `undefined` when no plugin changed
+   * it (load it as if unmatched). Rejects like {@link PluginPipeline.transform}.
+   */
+  load(id: string, read?: () => string): Promise<PluginTransformOutput | undefined>;
+  /**
+   * Run the `transform` hooks: `undefined` when none changed the code (load it
+   * as if unmatched). Rejects with their errors (naming the plugin and id), and
+   * when the code changed but is still neither JavaScript, TypeScript nor JSON
+   * (e.g. JSX no plugin compiled).
    */
   transform(
     id: string,
@@ -195,13 +313,26 @@ export interface PluginPipeline {
   ): Promise<PluginTransformOutput | undefined>;
 }
 
-interface NormalizedPlugin {
+type HookKind = "resolveId" | "load" | "transform";
+
+interface NormalizedHook<Handler> {
   name: string;
   order: "pre" | "normal" | "post";
   prefilter: SerializedPrefilter;
-  matches(id: string, moduleType: PluginModuleType, code?: string): boolean;
-  handler: PluginTransformHandler;
+  /** The full filter (code-aware for `transform`), see {@link PrefilterMatch}. */
+  match(id: string, moduleType: PluginModuleType, code?: string): PrefilterMatch;
+  handler: Handler;
 }
+
+interface NormalizedPlugin {
+  name: string;
+  resolveId?: NormalizedHook<PluginResolveIdHandler>;
+  load?: NormalizedHook<PluginLoadHandler>;
+  transform?: NormalizedHook<PluginTransformHandler>;
+}
+
+// Module types a result may leave without a `moduleType` (others become `js`).
+const KNOWN_MODULE_TYPES: readonly string[] = ["js", "jsx", "ts", "tsx", "json"];
 
 /** Validate the `plugins` option (throws a descriptive `TypeError`). */
 export function createPluginPipeline(
@@ -216,77 +347,172 @@ export function createPluginPipeline(
   const normalized = _flattenPlugins(plugins, "").map(([plugin, path]) =>
     _normalizePlugin(plugin, path),
   );
-  const byOrder = (order: NormalizedPlugin["order"]) =>
-    normalized.filter((plugin) => plugin.order === order);
-  const ordered = [...byOrder("pre"), ...byOrder("normal"), ...byOrder("post")];
+  const ordered = <K extends HookKind>(kind: K) => {
+    const hooks = normalized.flatMap((plugin) => (plugin[kind] ? [plugin[kind]!] : []));
+    const byOrder = (order: NormalizedHook<unknown>["order"]) =>
+      hooks.filter((hook) => hook.order === order);
+    return [...byOrder("pre"), ...byOrder("normal"), ...byOrder("post")] as NonNullable<
+      NormalizedPlugin[K]
+    >[];
+  };
+  const resolveHooks = ordered("resolveId");
+  const loadHooks = ordered("load");
+  const transformHooks = ordered("transform");
+  const prefilters = normalized.flatMap((plugin) =>
+    [plugin.load, plugin.transform].flatMap((hook) => (hook ? [hook.prefilter] : [])),
+  );
+  const resolvePrefilters = resolveHooks.map((hook) => hook.prefilter);
+  const prefilter = createPrefilter(prefilters);
+  const resolvePrefilter = createPrefilter(resolvePrefilters);
 
   const filter = (id: string, moduleType?: PluginModuleType) => {
     const path = normalizeFilterId(id);
     if (!moduleType) {
-      if (!isTransformCandidate(path)) {
+      if (!isPluginFile(path)) {
         return false;
       }
       moduleType = moduleTypeOf(path);
     }
-    return normalized.some((plugin) => plugin.matches(path, moduleType));
+    return prefilter(path, moduleType);
   };
 
-  const transform = async (id: string, code: string, sourceType?: PluginModuleType) => {
-    id = stripQuery(id);
-    const matchId = id.replaceAll("\\", "/");
-    let moduleType = sourceType ?? moduleTypeOf(id);
+  const resolveId = async (
+    source: string,
+    importer?: string,
+    options?: Partial<PluginResolveIdOptions>,
+  ): Promise<PluginResolvedId | undefined> => {
+    const matchId = normalizeFilterId(source);
+    const extra: PluginResolveIdOptions = {
+      isEntry: options?.isEntry ?? false,
+      attributes: options?.attributes ?? {},
+    };
+    for (const hook of resolveHooks) {
+      if (!hook.match(matchId, "js")) {
+        continue;
+      }
+      const result = await _callHook(hook.name, `failed to resolve "${source}"`, () =>
+        hook.handler.call(_createContext(hook.name, source, ""), source, importer, extra),
+      );
+      if (result == null) {
+        continue;
+      }
+      if (result === false) {
+        return { id: source, external: true };
+      }
+      const id = typeof result === "string" ? result : result.id;
+      if (typeof id !== "string" || id === "") {
+        throw new TypeError(
+          `[env-runner] plugin "${hook.name}" resolved "${source}" to an invalid id (got ${_describe(id)}): return a string, \`{ id }\` or nullish.`,
+        );
+      }
+      return { id, external: typeof result === "object" && Boolean(result.external) };
+    }
+    return undefined;
+  };
+
+  const load = async (id: string, read?: () => string) => {
+    const matchId = normalizeFilterId(id);
+    let moduleType = moduleTypeOf(id);
+    const required = requiredMatch(moduleType);
+    for (const hook of loadHooks) {
+      if (!satisfiesMatch(hook.match(matchId, moduleType), required)) {
+        continue;
+      }
+      const result = await _callHook(hook.name, `failed to load "${id}"`, () =>
+        hook.handler.call(_createContext(hook.name, id, ""), id),
+      );
+      if (result == null) {
+        continue;
+      }
+      const code = typeof result === "string" ? result : result.code;
+      if (typeof code !== "string") {
+        throw new TypeError(
+          `[env-runner] plugin "${hook.name}" loaded non-string \`code\` for "${id}" (got ${_describe(code)}).`,
+        );
+      }
+      const map = typeof result === "object" ? _parseMap(result.map) : undefined;
+      if (typeof result === "object" && result.moduleType) {
+        moduleType = result.moduleType;
+      } else if (!KNOWN_MODULE_TYPES.includes(moduleType)) {
+        moduleType = "js";
+      }
+      return _transform(id, code, moduleType, {
+        changed: true,
+        map,
+        mappedBy: map ? hook.name : undefined,
+      });
+    }
+    if (!read) {
+      throw new Error(
+        `[env-runner] no plugin loaded "${id}": a \`resolveId\` hook resolved an import to it, so a \`load\` hook must return its code.`,
+      );
+    }
+    if (!filter(id)) {
+      return undefined;
+    }
+    return _transform(id, read(), moduleType, { changed: false });
+  };
+
+  // The `transform` hooks, from the code of `id`.
+  const _transform = async (
+    id: string,
+    code: string,
+    moduleType: PluginModuleType,
     // Maps aren't composed: the first map is kept, a second one would be
     // relative to already-mapped code, so both are dropped. Code-only steps
     // keep the current map (they should preserve lines).
-    let map: SourceMapLike | null | undefined;
-    // Name of the plugin whose map was kept first.
-    let mappedBy: string | undefined;
-    let changed = false;
-    for (const plugin of ordered) {
-      if (!plugin.matches(matchId, moduleType, code)) {
+    state: { changed: boolean; map?: SourceMapLike; mappedBy?: string },
+  ): Promise<PluginTransformOutput | undefined> => {
+    let { changed, map, mappedBy } = state;
+    const matchId = normalizeFilterId(id);
+    for (const hook of transformHooks) {
+      if (!satisfiesMatch(hook.match(matchId, moduleType, code), requiredMatch(moduleType))) {
         continue;
       }
-      let result: PluginTransformResult;
-      try {
-        result = await plugin.handler.call(_createContext(plugin.name, id, code), code, id, {
-          moduleType,
-        });
-      } catch (error: any) {
-        const message = error?.message || String(error);
-        // `this.error()` messages already name the plugin and id.
-        throw message.startsWith("[env-runner]")
-          ? error
-          : new Error(`[env-runner] plugin "${plugin.name}" failed on "${id}": ${message}`, {
-              cause: error,
-            });
-      }
+      const result = await _callHook(hook.name, `failed on "${id}"`, () =>
+        hook.handler.call(_createContext(hook.name, id, code), code, id, { moduleType }),
+      );
       const next = typeof result === "string" ? result : (result?.code ?? code);
       if (typeof next !== "string") {
         throw new TypeError(
-          `[env-runner] plugin "${plugin.name}" returned non-string \`code\` for "${id}" (got ${_describe(next)}): convert it to a string (e.g. \`s.toString()\`, with \`map: s.generateMap()\`).`,
+          `[env-runner] plugin "${hook.name}" returned non-string \`code\` for "${id}" (got ${_describe(next)}): convert it to a string (e.g. \`s.toString()\`, with \`map: s.generateMap()\`).`,
         );
       }
-      if (result && typeof result === "object") {
-        moduleType = result.moduleType ?? moduleType;
+      const resultType = result && typeof result === "object" ? result.moduleType : undefined;
+      if (resultType) {
+        moduleType = resultType;
       }
       if (next === code) {
         continue;
       }
       code = next;
       changed = true;
+      // A plugin turning another file type into code without saying which.
+      if (!resultType && !KNOWN_MODULE_TYPES.includes(moduleType)) {
+        moduleType = "js";
+      }
       const nextMap = typeof result === "object" ? _parseMap(result?.map) : undefined;
       if (nextMap) {
         if (mappedBy === undefined) {
           map = nextMap;
-          mappedBy = plugin.name;
+          mappedBy = hook.name;
         } else {
           map = undefined;
-          _warnDroppedMap(mappedBy, plugin.name);
+          _warnDroppedMap(mappedBy, hook.name);
         }
       }
     }
     if (!changed) {
       return undefined;
+    }
+    if (moduleType === "json") {
+      // JSON a plugin rewrote as code, without saying so.
+      try {
+        JSON.parse(code);
+        return { code, moduleType: "json" };
+      } catch {
+        moduleType = "js";
+      }
     }
     if (moduleType !== "js" && moduleType !== "ts") {
       throw new TypeError(
@@ -301,12 +527,33 @@ export function createPluginPipeline(
     return { code, moduleType: moduleType as "js" | "ts" };
   };
 
+  const transform = (id: string, code: string, sourceType?: PluginModuleType) => {
+    id = stripQuery(id);
+    return _transform(id, code, sourceType ?? moduleTypeOf(id), { changed: false });
+  };
+
   return {
     names: normalized.map((plugin) => plugin.name),
-    prefilters: normalized.map((plugin) => plugin.prefilter),
+    prefilters,
+    resolvePrefilters,
     filter,
+    resolveFilter: (source) => resolvePrefilter(normalizeFilterId(source), "js"),
+    resolveId,
+    load,
     transform,
   };
+}
+
+// Run a handler; errors name the plugin (`this.error()` messages already do).
+async function _callHook<T>(name: string, what: string, call: () => T | Promise<T>): Promise<T> {
+  try {
+    return await call();
+  } catch (error: any) {
+    const message = error?.message || String(error);
+    throw message.startsWith("[env-runner]")
+      ? error
+      : new Error(`[env-runner] plugin "${name}" ${what}: ${message}`, { cause: error });
+  }
 }
 
 // Initial module type of each virtual module code format.
@@ -363,54 +610,80 @@ function _flattenPlugins(plugins: unknown[], path: string): [unknown, string][] 
 
 type FilterFail = (key: string, reason: string) => never;
 
+const HOOK_KINDS: HookKind[] = ["resolveId", "load", "transform"];
+
 function _normalizePlugin(plugin: unknown, path: string): NormalizedPlugin {
   const fail = (reason: string): never => {
     throw new TypeError(
-      `[env-runner] \`plugins${path}\` ${reason}: expected \`{ name?, transform }\`, where \`transform\` is a function or \`{ order?, filter?, handler }\`.`,
-    );
-  };
-  const failFilter: FilterFail = (key, reason) => {
-    throw new TypeError(
-      `[env-runner] \`plugins${path}\` has an invalid \`transform.filter${key}\` ${reason}.`,
+      `[env-runner] \`plugins${path}\` ${reason}: expected a plugin object with \`resolveId\`, \`load\` or \`transform\` hooks, each a function or \`{ order?, filter?, handler }\`.`,
     );
   };
   if (typeof plugin !== "object") {
     return fail("is not a plugin object");
   }
-  const { name: pluginName, transform: hook } = plugin as Partial<EnvRunnerPlugin>;
+  const { name: pluginName } = plugin as Partial<EnvRunnerPlugin>;
   const name = typeof pluginName === "string" ? pluginName : `plugins${path}`;
-  let order: NormalizedPlugin["order"] = "normal";
-  let filter: unknown;
-  let handler: PluginTransformHandler;
-  if (typeof hook === "function") {
-    handler = hook;
-  } else if (hook && typeof hook === "object" && typeof hook.handler === "function") {
-    if (hook.order != null && hook.order !== "pre" && hook.order !== "post") {
-      return fail(`has an invalid \`transform.order\` (${JSON.stringify(hook.order)})`);
+  const normalized: NormalizedPlugin = { name };
+  for (const kind of HOOK_KINDS) {
+    const hook = (plugin as Record<string, unknown>)[kind];
+    if (hook != null) {
+      (normalized as any)[kind] = _normalizeHook(kind, hook, name, path, fail);
     }
-    order = hook.order ?? "normal";
-    filter = hook.filter;
-    handler = hook.handler;
-  } else {
-    return fail("has no `transform` function or `transform.handler`");
   }
+  return normalized;
+}
+
+function _normalizeHook(
+  kind: HookKind,
+  hook: unknown,
+  name: string,
+  path: string,
+  fail: (reason: string) => never,
+): NormalizedHook<any> {
+  const failFilter: FilterFail = (key, reason) => {
+    throw new TypeError(
+      `[env-runner] \`plugins${path}\` has an invalid \`${kind}.filter${key}\` ${reason}.`,
+    );
+  };
+  let order: NormalizedHook<unknown>["order"] = "normal";
+  let filter: unknown;
+  let handler: (...args: any[]) => unknown;
+  if (typeof hook === "function") {
+    handler = hook as typeof handler;
+  } else if (hook && typeof hook === "object" && typeof (hook as any).handler === "function") {
+    const object = hook as { order?: unknown; filter?: unknown; handler: typeof handler };
+    if (object.order != null && object.order !== "pre" && object.order !== "post") {
+      return fail(`has an invalid \`${kind}.order\` (${JSON.stringify(object.order)})`);
+    }
+    order = (object.order as "pre" | "post" | undefined) ?? "normal";
+    filter = object.filter;
+    handler = object.handler;
+  } else {
+    return fail(`has an invalid \`${kind}\` hook (got ${_describe(hook)})`);
+  }
+  // `load` filters can't name module types: a matching `id` include does.
+  const load = kind === "load" ? { load: true as const } : {};
 
   if (Array.isArray(filter)) {
-    const expr = _normalizeExpressions(filter, failFilter);
+    const expr = _normalizeExpressions(filter, kind, failFilter);
     const test = compileFilterExpressions(expr);
+    const prefilter: SerializedPrefilter = { expr, ...load };
+    const level = compilePrefilter(prefilter);
     return {
       name,
       order,
-      prefilter: { expr },
+      prefilter,
       // Without code (prefilter), a `code` expression may match.
-      matches: (id, moduleType, code) => test(id, moduleType, code) !== false,
+      match: (id, moduleType, code) =>
+        test(id, moduleType, code) !== false && level(id, moduleType),
       handler,
     };
   }
+  const keys = kind === "transform" ? "`{ id?, code?, moduleType? }`" : "`{ id? }`";
   if (filter != null && typeof filter !== "object") {
     return failFilter(
       "",
-      `(got ${_describe(filter)}): expected \`{ id?, code?, moduleType? }\` or an array of filter expressions`,
+      `(got ${_describe(filter)}): expected ${keys} or an array of filter expressions`,
     );
   }
   const {
@@ -418,19 +691,24 @@ function _normalizePlugin(plugin: unknown, path: string): NormalizedPlugin {
     code: codeValue,
     moduleType: moduleTypeValue,
   } = (filter ?? {}) as PluginTransformFilter;
-  // Relative globs resolve from cwd now, for this process and the workers.
+  if (kind !== "transform") {
+    for (const [key, value] of [
+      ["code", codeValue],
+      ["moduleType", moduleTypeValue],
+    ] as const) {
+      if (value) {
+        failFilter(`.${key}`, `(\`${kind}\` filters take \`id\` only)`);
+      }
+    }
+  }
+  // Relative globs resolve from cwd now, for this process and the workers
+  // (not for `resolveId`, which matches specifiers).
   const idPatterns = _stringFilter(idValue, ".id", failFilter);
+  const toPattern = (pattern: string | RegExp) => _idPattern(pattern, kind !== "resolveId");
   const id = idPatterns && {
-    include: idPatterns.include.map(_idPattern),
-    exclude: idPatterns.exclude.map(_idPattern),
+    include: idPatterns.include.map(toPattern),
+    exclude: idPatterns.exclude.map(toPattern),
   };
-  const idTest =
-    id &&
-    compileFilter(
-      id.include.map(deserializePattern),
-      id.exclude.map(deserializePattern),
-      (pattern, value) => pattern.test(value),
-    );
   const codePatterns = _stringFilter(codeValue, ".code", failFilter);
   const code =
     codePatterns &&
@@ -440,14 +718,14 @@ function _normalizePlugin(plugin: unknown, path: string): NormalizedPlugin {
       _matchCode,
     );
   const moduleTypes = _moduleTypes(moduleTypeValue, failFilter);
+  const prefilter: SerializedPrefilter = { id, moduleTypes, ...load };
+  const level = compilePrefilter(prefilter);
   return {
     name,
     order,
-    prefilter: { id, moduleTypes },
-    matches: (idValue, moduleType, codeValue) =>
-      (!moduleTypes || moduleTypes.includes(moduleType)) &&
-      (!idTest || idTest.test(idValue)) &&
-      (codeValue === undefined || !code || code.test(codeValue)),
+    prefilter,
+    match: (idValue, moduleType, codeValue) =>
+      (codeValue === undefined || !code || code.test(codeValue)) && level(idValue, moduleType),
     handler,
   };
 }
@@ -503,10 +781,14 @@ function _moduleTypes(filter: unknown, fail: FilterFail): PluginModuleType[] | u
   return list;
 }
 
-// Globs compiled (resolved from cwd), RegExps without stateful flags.
-function _idPattern(pattern: string | RegExp): SerializedPattern {
+// Globs compiled (resolved from cwd with `resolve`), RegExps without stateful flags.
+function _idPattern(pattern: string | RegExp, resolve = true): SerializedPattern {
   return typeof pattern === "string"
-    ? { source: globToRegExp(resolveGlob(pattern)).source, flags: "", glob: true }
+    ? {
+        source: globToRegExp(resolve ? resolveGlob(pattern) : pattern).source,
+        flags: "",
+        glob: true,
+      }
     : { source: pattern.source, flags: _statelessFlags(pattern) };
 }
 
@@ -521,7 +803,11 @@ function _statelessFlags(pattern: RegExp): string {
   return pattern.flags.replace(/[gy]/g, "");
 }
 
-function _normalizeExpressions(list: unknown[], fail: FilterFail): SerializedFilterExpression[] {
+function _normalizeExpressions(
+  list: unknown[],
+  kind: HookKind,
+  fail: FilterFail,
+): SerializedFilterExpression[] {
   return list.map((value: any, index) => {
     if (value?.kind !== "include" && value?.kind !== "exclude") {
       return fail(
@@ -529,11 +815,19 @@ function _normalizeExpressions(list: unknown[], fail: FilterFail): SerializedFil
         `(got ${_describe(value?.kind ?? value)}): expected an \`include\` or \`exclude\` expression`,
       );
     }
-    return { kind: value.kind, expr: _normalizeNode(value.expr, `[${index}].expr`, fail) };
+    return {
+      kind: value.kind,
+      expr: _normalizeNode(value.expr, `[${index}].expr`, kind, fail),
+    };
   });
 }
 
-function _normalizeNode(node: any, key: string, fail: FilterFail): SerializedFilterNode {
+function _normalizeNode(
+  node: any,
+  key: string,
+  hook: HookKind,
+  fail: FilterFail,
+): SerializedFilterNode {
   const pattern = (allowed: (value: unknown) => boolean, expected: string) => {
     if (!allowed(node.pattern)) {
       fail(`${key}.pattern`, `(got ${_describe(node.pattern)}): expected ${expected}`);
@@ -549,17 +843,23 @@ function _normalizeNode(node: any, key: string, fail: FilterFail): SerializedFil
       return {
         kind: node.kind,
         args: node.args.map((arg: unknown, index: number) =>
-          _normalizeNode(arg, `${key}.args[${index}]`, fail),
+          _normalizeNode(arg, `${key}.args[${index}]`, hook, fail),
         ),
       };
     }
     case "not": {
-      return { kind: "not", expr: _normalizeNode(node.expr, `${key}.expr`, fail) };
+      return { kind: "not", expr: _normalizeNode(node.expr, `${key}.expr`, hook, fail) };
     }
     case "id": {
-      return { kind: "id", pattern: _idPattern(pattern(_isPattern, "a string or RegExp")) };
+      return {
+        kind: "id",
+        pattern: _idPattern(pattern(_isPattern, "a string or RegExp"), hook !== "resolveId"),
+      };
     }
     case "code": {
+      if (hook !== "transform") {
+        return fail(key, `(\`code\` doesn't apply to \`${hook}\`)`);
+      }
       const value = _codePattern(pattern(_isPattern, "a string or RegExp"));
       return {
         kind: "code",
@@ -567,6 +867,9 @@ function _normalizeNode(node: any, key: string, fail: FilterFail): SerializedFil
       };
     }
     case "moduleType": {
+      if (hook !== "transform") {
+        return fail(key, `(\`moduleType\` doesn't apply to \`${hook}\`)`);
+      }
       return {
         kind: "moduleType",
         pattern: pattern((value) => typeof value === "string", "a string"),
@@ -587,7 +890,7 @@ function _normalizeNode(node: any, key: string, fail: FilterFail): SerializedFil
       };
     }
     case "importerId": {
-      return fail(key, "(`importerId` doesn't apply to `transform`)");
+      return fail(key, `(\`importerId\` isn't supported)`);
     }
     default: {
       return fail(key, `(got ${_describe(node?.kind ?? node)}): unknown expression kind`);

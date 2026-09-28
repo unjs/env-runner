@@ -1,12 +1,12 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MessageChannel, receiveMessageOnPort, Worker } from "node:worker_threads";
 import type { MessagePort } from "node:worker_threads";
-import type { PluginPipeline } from "./pipeline.ts";
+import type { PluginPipeline, PluginResolvedId } from "./pipeline.ts";
 
-// Transform requests from worker loader hooks to the runner's plugins.
+// Requests from worker loader hooks to the runner's plugins.
 //
 // Loader hooks are synchronous, so the worker blocks (`Atomics.wait`) until
 // the runner replies, and the reply can't come through the runner IPC channel
@@ -18,21 +18,36 @@ import type { PluginPipeline } from "./pipeline.ts";
 // - process workers: a local socket the runner listens on (unix socket, or
 //   named pipe on Windows), bridged by a helper thread in the worker.
 //
-// Messages: `{ id, path, code }` → `{ id, code?, moduleType? }` (no `code`:
-// unchanged) or `{ id, error }`. The socket carries them as newline-delimited
-// JSON.
+// Messages (`{ id, error }` on failure; the socket carries them as
+// newline-delimited JSON):
+// - `{ id, type: "resolve", source, importer?, isEntry, attributes? }` →
+//   `{ id, resolved? }` (none: the runtime resolves it).
+// - `{ id, type: "load", path, virtual? }` → `{ id, code?, moduleType? }` (no
+//   `code`: load the file as usual). The runner reads the file itself;
+//   `virtual` ids (not files) must be loaded by a plugin.
 
-export interface TransformRequest {
-  id: number;
-  /** Absolute file path. */
-  path: string;
-  code: string;
-}
+export type TransformRequest =
+  | {
+      id: number;
+      type: "resolve";
+      source: string;
+      importer?: string;
+      isEntry: boolean;
+      attributes?: Record<string, string>;
+    }
+  | {
+      id: number;
+      type: "load";
+      /** Absolute file path, or a module id a plugin resolved (`virtual`). */
+      path: string;
+      virtual?: boolean;
+    };
 
 export interface TransformReply {
   id?: number;
   code?: string;
-  moduleType?: "js" | "ts";
+  moduleType?: "js" | "ts" | "json";
+  resolved?: PluginResolvedId;
   error?: string;
   /** Set by the bridge when the socket closed (no `id`). */
   closed?: boolean;
@@ -58,7 +73,15 @@ export async function handleTransformRequest(
   request: TransformRequest,
 ): Promise<TransformReply> {
   try {
-    const result = await pipeline.transform(request.path, request.code);
+    if (request.type === "resolve") {
+      const resolved = await pipeline.resolveId(request.source, request.importer, request);
+      return { id: request.id, resolved };
+    }
+    const { path } = request;
+    const result = await pipeline.load(
+      path,
+      request.virtual ? undefined : () => readFileSync(path, "utf8"),
+    );
     return { id: request.id, code: result?.code, moduleType: result?.moduleType };
   } catch (error: any) {
     return { id: request.id, error: error?.message || String(error) };
@@ -152,19 +175,31 @@ function _socketPath(): { path: string; dir?: string } {
 /** New code from the runner, `ts` when it still needs type stripping. */
 export interface TransformedCode {
   code: string;
-  moduleType: "js" | "ts";
+  moduleType: "js" | "ts" | "json";
 }
 
-// A transform taking longer than this logs a warning (once per module).
-const SLOW_TRANSFORM_MS = 10_000;
+/** Worker side of the channel: synchronous calls to the runner's plugins. */
+export interface TransformClient {
+  /** The `resolveId` hooks' result, `undefined` when none resolved it. */
+  resolve(
+    source: string,
+    importer: string | undefined,
+    options: { isEntry: boolean; attributes?: Record<string, string> },
+  ): PluginResolvedId | undefined;
+  /**
+   * The module from the `load` and `transform` hooks, `undefined` when no
+   * plugin changed the file (`virtual` ids always have code).
+   */
+  load(path: string, virtual?: boolean): TransformedCode | undefined;
+}
+
+// A request taking longer than this logs a warning (once per request).
+const SLOW_REQUEST_MS = 10_000;
 
 /**
- * Worker side: a synchronous `transform(path, code)` over the channel,
- * returning the new code, or `undefined` when unchanged. Throws plugin errors.
+ * Worker side: synchronous requests over the channel. Throws plugin errors.
  */
-export function createTransformClient(
-  channel: TransformChannel,
-): (path: string, code: string) => TransformedCode | undefined {
+export function createTransformClient(channel: TransformChannel): TransformClient {
   let port: MessagePort;
   let state: Int32Array;
   if (channel.port && channel.state) {
@@ -184,9 +219,10 @@ export function createTransformClient(
     throw new TypeError("[env-runner] invalid plugin transform channel");
   }
   let lastId = 0;
-  return (path, code) => {
+  // `request` without its `id`, described as `what` in messages.
+  const send = (request: Record<string, unknown>, what: string): TransformReply => {
     const id = ++lastId;
-    port.postMessage({ id, path, code } satisfies TransformRequest);
+    port.postMessage({ ...request, id });
     let warned = false;
     for (;;) {
       // Read before receiving: a reply posted after the read bumps the counter,
@@ -194,17 +230,17 @@ export function createTransformClient(
       const seen = Atomics.load(state, 0);
       const received = receiveMessageOnPort(port);
       if (!received) {
-        if (Atomics.wait(state, 0, seen, SLOW_TRANSFORM_MS) === "timed-out" && !warned) {
+        if (Atomics.wait(state, 0, seen, SLOW_REQUEST_MS) === "timed-out" && !warned) {
           warned = true;
           console.warn(
-            `[env-runner] still waiting for the runner's plugins to transform "${path}" (plugin handlers must not wait on this runner).`,
+            `[env-runner] still waiting for the runner's plugins ${what} (plugin handlers must not wait on this runner).`,
           );
         }
         continue;
       }
       const reply = received.message as TransformReply;
       if (reply.closed) {
-        throw new Error(`[env-runner] cannot transform "${path}": ${reply.error}`);
+        throw new Error(`[env-runner] cannot ${what.replace(/^to /, "")}: ${reply.error}`);
       }
       // Replies to earlier requests can't be pending (requests are sequential).
       if (reply.id !== id) {
@@ -213,10 +249,18 @@ export function createTransformClient(
       if (reply.error !== undefined) {
         throw new Error(reply.error);
       }
+      return reply;
+    }
+  };
+  return {
+    resolve: (source, importer, options) =>
+      send({ type: "resolve", source, importer, ...options }, `to resolve "${source}"`).resolved,
+    load: (path, virtual) => {
+      const reply = send({ type: "load", path, virtual }, `to load "${path}"`);
       return reply.code === undefined
         ? undefined
         : { code: reply.code, moduleType: reply.moduleType ?? "js" };
-    }
+    },
   };
 }
 

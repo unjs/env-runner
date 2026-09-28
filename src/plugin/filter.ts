@@ -2,8 +2,15 @@
 // (the prefilter deciding which modules to send). The host compiles filters
 // to this serializable form (`id` globs as RegExps).
 
-/** Module type of code (`js` once a plugin compiled it). */
-export type PluginModuleType = "js" | "jsx" | "ts" | "tsx" | (string & {});
+/**
+ * Module type of code: `js`, `jsx`, `ts`, `tsx` and `json` from the
+ * extension, other extensions as themselves (`vue` for `.vue`), `js` without
+ * an extension.
+ */
+export type PluginModuleType = "js" | "jsx" | "ts" | "tsx" | "json" | (string & {});
+
+/** Module types every plugin sees; others only reach plugins naming them. */
+export const SCRIPT_MODULE_TYPES: readonly string[] = ["js", "jsx", "ts", "tsx"];
 
 /** A RegExp as sent to workers (`glob`: compiled from an `id` glob). */
 export interface SerializedPattern {
@@ -34,27 +41,32 @@ export interface SerializedPrefilter {
   id?: { include: SerializedPattern[]; exclude: SerializedPattern[] };
   moduleTypes?: PluginModuleType[];
   expr?: SerializedFilterExpression[];
+  /**
+   * A `load` filter: it can't name module types, so a matching `id` include
+   * (or include expression) counts as `"typed"` ({@link PrefilterMatch}).
+   */
+  load?: true;
 }
-
-/** File extensions of modules plugins can transform. */
-export const SCRIPT_EXTENSIONS = [".js", ".mjs", ".cjs", ".ts", ".mts", ".cts", ".jsx", ".tsx"];
 
 /**
- * A disk module plugins may transform: a script extension, and not under
- * `/node_modules/` (linked workspace packages resolve outside it). Takes a
- * `/`-separated path without query.
+ * A disk module plugins may load or transform: not under `/node_modules/`
+ * (linked workspace packages resolve outside it). Takes a `/`-separated path
+ * without query.
  */
-export function isTransformCandidate(path: string): boolean {
-  return !path.includes("/node_modules/") && SCRIPT_EXTENSIONS.some((ext) => path.endsWith(ext));
+export function isPluginFile(path: string): boolean {
+  return !path.includes("/node_modules/");
 }
 
-/** Initial module type of a file, from its extension. */
+/** Initial module type of a module, from its extension. */
 export function moduleTypeOf(path: string): PluginModuleType {
-  const ext = path.slice(path.lastIndexOf(".") + 1);
-  if (ext === "tsx" || ext === "jsx") {
-    return ext;
+  const ext = /\.([^./\\?]+)$/.exec(stripQuery(path))?.[1]?.toLowerCase();
+  if (!ext || /^[cm]?js$/.test(ext)) {
+    return "js";
   }
-  return /^[cm]?ts$/.test(ext) ? "ts" : "js";
+  if (/^[cm]?ts$/.test(ext)) {
+    return "ts";
+  }
+  return ext;
 }
 
 /** `/`-separated path without query, as filters see it. */
@@ -180,30 +192,72 @@ function _compileNode(node: SerializedFilterNode): FilterExpressionTest {
 }
 
 /**
- * Worker side: whether some plugin may transform a module, from the plugins'
- * serialized filters (the host checks the full filters). `id` is
- * `/`-separated.
+ * How a filter matches a module without its code: `false`, `true`, `"named"`
+ * when an `id` include (or, for filter expressions, an include) matches it,
+ * or `"typed"` when its `moduleType` filter lists the module's type.
+ */
+export type PrefilterMatch = boolean | "named" | "typed";
+
+/**
+ * The match a module of this type needs ({@link PrefilterMatch}): any for
+ * {@link SCRIPT_MODULE_TYPES}, `"typed"` for types the runtime loads itself
+ * (`json`, `node`, `wasm`), `"named"` for others.
+ */
+export function requiredMatch(moduleType: PluginModuleType): "named" | "typed" | undefined {
+  if (SCRIPT_MODULE_TYPES.includes(moduleType)) {
+    return undefined;
+  }
+  return moduleType === "json" || moduleType === "node" || moduleType === "wasm"
+    ? "typed"
+    : "named";
+}
+
+export function compilePrefilter(
+  filter: SerializedPrefilter,
+): (id: string, moduleType: PluginModuleType) => PrefilterMatch {
+  const namedLevel = filter.load ? "typed" : "named";
+  if (filter.expr) {
+    const test = compileFilterExpressions(filter.expr);
+    const named = filter.expr.some((expr) => expr.kind === "include") && namedLevel;
+    return (id, moduleType) => test(id, moduleType) !== false && (named || true);
+  }
+  const idFilter =
+    filter.id &&
+    compileFilter(
+      filter.id.include.map(deserializePattern),
+      filter.id.exclude.map(deserializePattern),
+      (pattern, value) => pattern.test(value),
+    );
+  const named = Boolean(idFilter?.include.length);
+  return (id, moduleType) =>
+    (!filter.moduleTypes || filter.moduleTypes.includes(moduleType)) &&
+    (!idFilter || idFilter.test(id)) &&
+    (filter.moduleTypes ? "typed" : named ? namedLevel : true);
+}
+
+/** Whether a {@link PrefilterMatch} is at least `required`. */
+export function satisfiesMatch(
+  match: PrefilterMatch,
+  required: "named" | "typed" | undefined,
+): boolean {
+  if (match === false) {
+    return false;
+  }
+  return !required || match === "typed" || (required === "named" && match === "named");
+}
+
+/**
+ * Worker side: whether some plugin may load or transform a module, from the
+ * plugins' serialized filters (the host checks the full filters). `id` is
+ * `/`-separated. Modules of other than {@link SCRIPT_MODULE_TYPES} only
+ * count when a filter names them ({@link requiredMatch}).
  */
 export function createPrefilter(
   filters: SerializedPrefilter[],
 ): (id: string, moduleType: PluginModuleType) => boolean {
-  const compiled = filters.map(
-    (filter): ((id: string, moduleType: PluginModuleType) => boolean) => {
-      if (filter.expr) {
-        const test = compileFilterExpressions(filter.expr);
-        return (id, moduleType) => test(id, moduleType) !== false;
-      }
-      const idFilter =
-        filter.id &&
-        compileFilter(
-          filter.id.include.map(deserializePattern),
-          filter.id.exclude.map(deserializePattern),
-          (pattern, value) => pattern.test(value),
-        );
-      return (id, moduleType) =>
-        (!filter.moduleTypes || filter.moduleTypes.includes(moduleType)) &&
-        (!idFilter || idFilter.test(id));
-    },
-  );
-  return (id, moduleType) => compiled.some((test) => test(id, moduleType));
+  const compiled = filters.map(compilePrefilter);
+  return (id, moduleType) => {
+    const required = requiredMatch(moduleType);
+    return compiled.some((test) => satisfiesMatch(test(id, moduleType), required));
+  };
 }

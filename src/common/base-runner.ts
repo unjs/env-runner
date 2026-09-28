@@ -38,9 +38,16 @@ export type {
   EnvRunnerPluginOption,
   PluginContext,
   PluginFilterExpression,
+  PluginHook,
+  PluginHookFilter,
+  PluginLoadHandler,
+  PluginLoadResult,
   PluginLog,
   PluginLogPosition,
   PluginModuleType,
+  PluginResolveIdHandler,
+  PluginResolveIdOptions,
+  PluginResolveIdResult,
   PluginStringFilter,
   PluginTopLevelFilterExpression,
   PluginTransformFilter,
@@ -94,11 +101,12 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
     hooks?: WorkerHooks;
     data?: EnvRunnerData;
     /**
-     * Plugins whose `transform` hooks run on the host for the entry, its disk
-     * imports and virtual modules their filters match (e.g. compiling
-     * TypeScript enums and JSX). The worker sends each matching module to the
-     * runner and loads the result. Nested arrays are flattened and falsy
-     * entries skipped. Not supported by the `self` runner.
+     * Plugins whose `resolveId`, `load` and `transform` hooks run on the host
+     * for the imports, disk modules and virtual modules their filters match
+     * (e.g. compiling TypeScript enums and JSX, or serving generated modules).
+     * The worker sends each matching import or module to the runner and uses
+     * the result. Nested arrays are flattened and falsy entries skipped. Not
+     * supported by the `self` runner.
      */
     plugins?: EnvRunnerPluginOption[];
   }) {
@@ -345,6 +353,7 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
     return {
       [PLUGINS_DATA_KEY]: {
         prefilters: this._plugins.prefilters,
+        resolvePrefilters: this._plugins.resolvePrefilters,
         ...this._transformChannel.channel,
       },
     };
