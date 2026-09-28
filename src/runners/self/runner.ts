@@ -146,6 +146,11 @@ export class SelfEnvRunner extends BaseEnvRunner {
       );
       return;
     }
+    // Plugin transforms need a worker to block while the host runs them.
+    if (this._plugins) {
+      this.close(new Error("Cannot use data.plugins: the self runner does not support plugins"));
+      return;
+    }
     this.#active = true;
     resolveEntry(entryPath)
       .then(async (entry) => {

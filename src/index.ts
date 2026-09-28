@@ -19,6 +19,14 @@ export {
   type VirtualModules,
   type VirtualModuleSource,
   type VirtualModuleUpdates,
+  type EnvRunnerPlugin,
+  type PluginContext,
+  type PluginModuleType,
+  type PluginStringFilter,
+  type PluginTransformFilter,
+  type PluginTransformHandler,
+  type PluginTransformMeta,
+  type PluginTransformResult,
   BaseEnvRunner,
 } from "./common/base-runner.ts";
 export { RunnerManager } from "./manager.ts";

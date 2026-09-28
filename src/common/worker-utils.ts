@@ -2,8 +2,14 @@ import type { ServerOptions, Server } from "srvx";
 import type { Hooks } from "crossws";
 import type { UpgradeContext } from "../types.ts";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { createRequire } from "node:module";
 import { isAbsolute } from "node:path";
-import { refreshVirtualModule, registeredVirtualModules } from "./virtual-modules.ts";
+import {
+  refreshVirtualModule,
+  registeredVirtualModules,
+  registerVirtualModules,
+} from "./virtual-modules.ts";
+import { PLUGINS_DATA_KEY, registerPluginHooks, servedByPluginHooks } from "./plugin-hooks.ts";
 import { findVirtualPathKey } from "../virtual-loader.ts";
 
 export interface AppEntryIPCContext {
@@ -108,6 +114,20 @@ export function isVirtualEntry(
   return isVirtualSpecifier(entry, virtual, typeof registerHooks === "function");
 }
 
+/**
+ * Register the loader hooks for the runner's `data.plugins` and `data.virtual`;
+ * await before importing the entry. Resolves to an idempotent unregister
+ * function.
+ */
+export async function registerWorkerHooks(data: Record<string, any>): Promise<() => void> {
+  const unregisterPlugins = await registerPluginHooks(data[PLUGINS_DATA_KEY]);
+  const unregisterVirtual = await registerVirtualModules(data.virtual);
+  return () => {
+    unregisterVirtual();
+    unregisterPlugins();
+  };
+}
+
 export async function resolveEntry(entryPath: string, virtual?: boolean): Promise<AppEntry> {
   // Import virtual keys verbatim: Bun matches extensionless keys as-is and drops
   // `file:` queries (`registerHooks` resolves path keys by URL either way).
@@ -208,7 +228,12 @@ async function _importFresh(entryPath: string, virtual?: boolean): Promise<AppEn
   const filePath = qIndex === -1 ? entryPath : entryPath.slice(0, qIndex);
 
   let mod: any;
-  if (virtual && refreshVirtualModule(filePath)) {
+  if (!virtual && "Bun" in globalThis && servedByPluginHooks(filePath)) {
+    // Bun drops the query of a file served by the plugins' `onLoad`: evict it
+    // instead (`require.cache` also holds ESM there).
+    delete createRequire(import.meta.url).cache[filePath];
+    mod = await import(filePath);
+  } else if (virtual && refreshVirtualModule(filePath)) {
     // Bun: `refreshVirtualModule()` bumped or re-registered the key (a `?query`
     // doesn't reach every key there).
     mod = await import(filePath);

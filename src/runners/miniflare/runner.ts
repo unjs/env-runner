@@ -11,6 +11,7 @@ import { proxyUpgrade } from "httpxy";
 import { BaseEnvRunner } from "../../common/base-runner.ts";
 import type { EnvRunnerData } from "../../common/base-runner.ts";
 import { resolveRuntimeDep } from "../../common/runtime-deps.ts";
+import { transformedFormat } from "../../common/plugin-hooks.ts";
 import type { RuntimeDep } from "../../common/runtime-deps.ts";
 import {
   encodeVirtualModules,
@@ -633,18 +634,19 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
         },
       };
 
-      // When transformRequest is provided, add module rules so miniflare's
-      // ModuleLocator doesn't reject non-JS extensions (e.g. .ts, .tsx, .jsx).
-      // v5 has no ModuleLocator (and rejects `modulesRules`): imports all go
-      // through the fallback service.
+      // When transformRequest or `data.plugins` is provided, add module rules
+      // so miniflare's ModuleLocator doesn't reject non-JS extensions (e.g. .ts,
+      // .tsx, .jsx). v5 has no ModuleLocator (and rejects `modulesRules`):
+      // imports all go through the fallback service.
       if (
-        this.#transformRequest &&
+        (this.#transformRequest || this._plugins) &&
         !options.modulesRules &&
         !miniflare.convertV4MiniflareOptions &&
         !skipLocator
       ) {
+        const extensions = [".ts", ".tsx", ".jsx", ".mts", ...(this._plugins ? [".cts"] : [])];
         options.modulesRules = [
-          { type: "ESModule", include: ["**/*.ts", "**/*.tsx", "**/*.jsx", "**/*.mts"] },
+          { type: "ESModule", include: extensions.map((ext) => `**/*${ext}`) },
         ];
       }
 
@@ -655,6 +657,8 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
         // Read live: updates change it in place.
         const _virtual = virtual;
         const _transformRequest = this.#transformRequest;
+        // `data.plugins` run here, on the host (workerd only parses JS).
+        const _plugins = this._plugins;
         const _exportConditions = this.#exportConditions;
         // `modulePath`: the served module's path, which its relative imports join onto.
         const _applyVirtualVersions = (code: string, modulePath: string | undefined) =>
@@ -851,33 +855,56 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
             }
           }
 
+          let contents: string;
           try {
-            const contents = readFileSync(resolvedPath, "utf8");
-            // Track the real path so relative imports from this module resolve correctly
-            modulePathMap.set(name, resolvedPath);
-            // Detect module type: .mjs is always ESM, .cjs is always CJS,
-            // otherwise check for ESM syntax indicators
-            const isESM =
-              resolvedPath.endsWith(".mjs") ||
-              (!resolvedPath.endsWith(".cjs") &&
-                /\b(import\s|import\(|export\s|export\{|import\.meta\b)/.test(contents));
-            if (isESM) {
-              return Response.json({
-                name,
-                esModule: _applyVirtualVersions(contents, resolvedPath),
-              });
-            }
-            // Importers expect ESM: serve raw CJS under a suffixed name behind an ESM shim.
-            const cjsSuffix = "?__cjs";
-            if (specifier.endsWith(cjsSuffix)) {
-              return Response.json({ name, commonJsModule: contents });
-            }
-            const shimSpecifier = "./" + basename(resolvedPath) + cjsSuffix;
-            const esModule = createCjsEsmShim(shimSpecifier, contents);
-            return Response.json({ name, esModule });
+            contents = readFileSync(resolvedPath, "utf8");
           } catch {
             return new Response(null, { status: 404 });
           }
+          // Track the real path so relative imports from this module resolve correctly
+          modulePathMap.set(name, resolvedPath);
+
+          let transformed: string | undefined;
+          if (_plugins?.filter(resolvedPath)) {
+            try {
+              transformed = (await _plugins.transform(resolvedPath, contents))?.code;
+            } catch (error: any) {
+              // A named import of this module fails at link time before the
+              // throw runs (hiding it), so also report it on the host.
+              const message = error?.message || String(error);
+              console.error(message);
+              return Response.json({
+                name,
+                esModule: `throw new SyntaxError(${JSON.stringify(message)});`,
+              });
+            }
+          }
+          let isESM: boolean;
+          if (transformed === undefined) {
+            // Detect module type: .mjs is always ESM, .cjs is always CJS,
+            // otherwise check for ESM syntax indicators
+            isESM =
+              resolvedPath.endsWith(".mjs") ||
+              (!resolvedPath.endsWith(".cjs") &&
+                /\b(import\s|import\(|export\s|export\{|import\.meta\b)/.test(contents));
+          } else {
+            contents = transformed;
+            isESM = transformedFormat(resolvedPath, contents) === "module";
+          }
+          if (isESM) {
+            return Response.json({
+              name,
+              esModule: _applyVirtualVersions(contents, resolvedPath),
+            });
+          }
+          // Importers expect ESM: serve raw CJS under a suffixed name behind an ESM shim.
+          const cjsSuffix = "?__cjs";
+          if (specifier.endsWith(cjsSuffix)) {
+            return Response.json({ name, commonJsModule: contents });
+          }
+          const shimSpecifier = "./" + basename(resolvedPath) + cjsSuffix;
+          const esModule = createCjsEsmShim(shimSpecifier, contents);
+          return Response.json({ name, esModule });
         };
       }
     }
@@ -888,6 +915,9 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
         ...this.#miniflareOptions,
         _exportConditions: this.#exportConditions,
         _exports: this.#exports,
+        // The fallback service closure runs the first instance's plugins:
+        // instances with plugins of the same names share it.
+        _plugins: this._plugins?.names,
         // The fallback service closure captures the virtual map, so instances
         // are only shareable when the resolved sources are identical (bytes
         // compared as base64, not as JSON objects of indices).

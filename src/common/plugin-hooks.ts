@@ -1,0 +1,237 @@
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { init as initEsmLexer, parse as parseEsm } from "es-module-lexer";
+import {
+  createPrefilter,
+  deserializePattern,
+  isTransformCandidate,
+  moduleTypeOf,
+  normalizeFilterId,
+  stripQuery,
+} from "./plugin-filter.ts";
+import type { SerializedPrefilter } from "./plugin-filter.ts";
+import { createTransformClient } from "./transform-channel.ts";
+import type { TransformChannel } from "./transform-channel.ts";
+
+/** Runner data key of {@link PluginWorkerData} (only set with `data.plugins`). */
+export const PLUGINS_DATA_KEY = "__envRunnerPlugins";
+
+/** What a worker gets for the runner's `data.plugins`. */
+export interface PluginWorkerData extends TransformChannel {
+  prefilters: SerializedPrefilter[];
+}
+
+let _active: ((path: string) => boolean) | undefined;
+
+/**
+ * Whether this worker's plugin hooks serve a file (on Bun, its `onLoad`
+ * filter; used by entry reloads).
+ */
+export function servedByPluginHooks(path: string): boolean {
+  return _active?.(path) ?? false;
+}
+
+/**
+ * Send matching disk modules to the runner's plugins; await before importing
+ * the entry. A module is sent when it is a candidate
+ * ({@link isTransformCandidate}) and some plugin's `id`/`moduleType` filter
+ * matches; the runner's reply is served instead of the file. Warns once and
+ * skips on runtimes without either backend:
+ *
+ * - Node.js/Deno: a `module.registerHooks` load hook. Deno evaluates hook
+ *   output as ESM, so CommonJS files fall back to its native loader.
+ * - Bun: a `Bun.plugin` `onLoad` (can't be removed) with {@link createBunFilter}.
+ *   Its output is always evaluated as ESM.
+ */
+export async function registerPluginHooks(config?: PluginWorkerData): Promise<() => void> {
+  if (!config) {
+    return _noop;
+  }
+  const prefilter = createPrefilter(config.prefilters);
+  const matches = (path: string) => {
+    const id = normalizeFilterId(path);
+    return isTransformCandidate(id) && prefilter(id, moduleTypeOf(id));
+  };
+  const transform = createTransformClient(config);
+  await initEsmLexer;
+  const { registerHooks } = await import("node:module");
+  if (typeof registerHooks === "function") {
+    const isDeno = "Deno" in globalThis;
+    const hooks = registerHooks({
+      load(url, context, nextLoad) {
+        if (url.startsWith("file:")) {
+          const path = fileURLToPath(stripQuery(url));
+          if (matches(path)) {
+            const source = transform(path, readFileSync(path, "utf8"));
+            const format =
+              source === undefined ? undefined : transformedFormat(path, source, context.format);
+            if (format && !(isDeno && format === "commonjs")) {
+              return { format, source, shortCircuit: true };
+            }
+          }
+        }
+        return nextLoad(url, context);
+      },
+    });
+    _active = matches;
+    return () => {
+      if (_active === matches) {
+        _active = undefined;
+      }
+      hooks.deregister();
+    };
+  }
+  const bunPlugin = (globalThis as any).Bun?.plugin;
+  if (typeof bunPlugin === "function") {
+    const filter = createBunFilter(config.prefilters);
+    const served = (path: string) => filter.test(path);
+    bunPlugin({
+      name: "env-runner-plugins",
+      setup(build: any) {
+        build.onLoad({ filter }, ({ path }: { path: string }) => {
+          const contents = readFileSync(path, "utf8");
+          const code = _active === served && matches(path) ? transform(path, contents) : undefined;
+          // `onLoad` can't decline: untouched code goes to Bun's native loader.
+          return code === undefined
+            ? { contents, loader: _bunLoader(path) }
+            : { contents: code, loader: "js" };
+        });
+      },
+    });
+    _active = served;
+    return () => {
+      if (_active === served) {
+        _active = undefined;
+      }
+    };
+  }
+  console.warn(
+    "[env-runner] `plugins` requires `module.registerHooks` (Node.js >= 22.15 / Deno >= 2.8) or `Bun.plugin`; skipping.",
+  );
+  return _noop;
+}
+
+const CJS_MARKERS = /\b(?:module\.exports\b|exports\.\w|require\s*\()/;
+
+/**
+ * Module format of transformed code: the resolution hint when definite, then
+ * the extension, then syntax. Node's hint is missing for `.tsx`/`.jsx` and in
+ * packages without `"type"`, so CommonJS needs CommonJS markers and no ESM
+ * syntax (a marker-free file, e.g. only top-level `await`, stays ESM).
+ */
+export function transformedFormat(
+  path: string,
+  code: string,
+  hint?: string | null,
+): "module" | "commonjs" {
+  if (hint?.startsWith("module")) {
+    return "module";
+  }
+  if (hint?.startsWith("commonjs")) {
+    return "commonjs";
+  }
+  if (/\.m[jt]sx?$/.test(path)) {
+    return "module";
+  }
+  if (/\.c[jt]sx?$/.test(path)) {
+    return "commonjs";
+  }
+  if (!CJS_MARKERS.test(code)) {
+    return "module";
+  }
+  try {
+    return parseEsm(code)[3] ? "module" : "commonjs";
+  } catch {
+    return "module";
+  }
+}
+
+// Extensions a `moduleType` filter implies (never CommonJS ones, see below).
+const BUN_EXTENSIONS: Record<string, string[]> = {
+  js: [".js", ".mjs"],
+  ts: [".ts", ".mts"],
+  jsx: [".jsx"],
+  tsx: [".tsx"],
+};
+
+/**
+ * Bun's `onLoad` filter (a single RegExp) for these plugins. Bun evaluates
+ * plugin output as ESM and `onLoad` can't decline, so it follows the plugins'
+ * prefilters as closely as a RegExp can: no `/node_modules/` (either
+ * separator), then one alternative per plugin with
+ *
+ * - the extensions its `moduleType` filter implies (all non-CommonJS script
+ *   extensions without one), never `.cjs`/`.cts`;
+ * - its `id` filter: RegExp excludes as a negative lookahead, and includes as
+ *   a lookahead when they are all RegExps (otherwise any path).
+ *
+ * The RegExp takes the `id` RegExps' flags; if they differ, or one has
+ * backreferences or named groups (which don't survive being spliced together),
+ * no `id` filter is folded in. Bun paths keep native separators. The
+ * prefilter still decides per module; paths the RegExp lets through but no
+ * plugin matches load with Bun's native loader.
+ */
+export function createBunFilter(prefilters: SerializedPrefilter[]): RegExp {
+  const escape = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const sep = String.raw`(?:\\|\/)`;
+  const isRegExp = (pattern: string | RegExp): pattern is RegExp => pattern instanceof RegExp;
+  const plugins = prefilters.map(({ id, moduleTypes }) => ({
+    moduleTypes,
+    id: id && {
+      include: id.include.map(deserializePattern),
+      exclude: id.exclude.map(deserializePattern),
+    },
+  }));
+  const idRegExps = plugins.flatMap(({ id }) =>
+    id ? [...id.include, ...id.exclude].filter(isRegExp) : [],
+  );
+  // Stateful flags don't change what matches.
+  const flagSet = new Set(idRegExps.map((re) => re.flags.replace(/[gy]/g, "")));
+  // Group numbers shift and group names may repeat once sources are joined.
+  const foldIds =
+    flagSet.size <= 1 && !idRegExps.some((re) => /\\[1-9]|\\k<|\(\?<(?![=!])/.test(re.source));
+  const branches = new Set<string>();
+  for (const { moduleTypes, id } of plugins) {
+    const extensions = moduleTypes
+      ? moduleTypes.flatMap((type) => BUN_EXTENSIONS[type] ?? [])
+      : Object.values(BUN_EXTENSIONS).flat();
+    if (extensions.length === 0) {
+      continue;
+    }
+    let lookaheads = "";
+    if (id && foldIds) {
+      const exclude = id.exclude.filter(isRegExp);
+      if (exclude.length > 0) {
+        lookaheads += `(?!.*?(?:${exclude.map((re) => re.source).join("|")}))`;
+      }
+      if (id.include.length > 0 && id.include.every(isRegExp)) {
+        lookaheads += `(?=.*?(?:${id.include.map((re) => (re as RegExp).source).join("|")}))`;
+      }
+    }
+    branches.add(`${lookaheads}.*(?:${[...new Set(extensions)].map(escape).join("|")})$`);
+  }
+  return new RegExp(
+    `^(?!.*${sep}node_modules${sep})(?:${[...branches].join("|") || "(?!)"})`,
+    foldIds ? ([...flagSet][0] ?? "") : "",
+  );
+}
+
+// Bun's native loader, for untouched code and loads after unregistering.
+function _bunLoader(path: string): string {
+  const ext = path.slice(path.lastIndexOf(".") + 1);
+  switch (ext) {
+    case "ts":
+    case "mts": {
+      return "ts";
+    }
+    case "tsx":
+    case "jsx": {
+      return ext;
+    }
+    default: {
+      return "js";
+    }
+  }
+}
+
+const _noop = () => {};

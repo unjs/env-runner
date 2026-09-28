@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
 
 import { BaseEnvRunner } from "../../common/base-runner.ts";
+import { PLUGINS_DATA_KEY } from "../../common/plugin-hooks.ts";
 import { hostEnv } from "../../common/host-env.ts";
 import type { EnvRunnerData } from "../../common/base-runner.ts";
 
@@ -66,12 +67,16 @@ export class NodeWorkerEnvRunner extends BaseEnvRunner {
       return;
     }
 
+    const plugins = this._pluginWorkerData("port");
+    const port = plugins[PLUGINS_DATA_KEY]?.port;
     const worker = new Worker(this._workerEntry, {
       env: hostEnv(),
       workerData: {
         name: this._name,
         ...this._data,
+        ...plugins,
       },
+      transferList: port ? [port] : undefined,
     }) as Worker & { _exitCode?: number };
 
     worker.once("exit", (code) => {
