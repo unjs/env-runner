@@ -1,6 +1,18 @@
 # Changelog
 
 
+## v0.3.1
+
+[compare changes](https://github.com/unjs/env-runner/compare/v0.3.0...v0.3.1)
+
+### 🚀 Enhancements
+
+- Runner plugins ([#65](https://github.com/unjs/env-runner/pull/65))
+
+### ❤️ Contributors
+
+- Pi0x <x@pi0.io>
+
 ## v0.3.0
 
 [compare changes](https://github.com/unjs/env-runner/compare/v0.2.3...v0.3.0)
