@@ -18,7 +18,8 @@ src/
 │   ├── process-data.ts      # receiveProcessData() — runner data over IPC for process workers
 │   ├── ws-proxy.ts          # createRunnerWSProxyPlugin() — runtime-native WS upgrade proxy
 │   ├── plugins.ts           # data.plugins types + createPluginPipeline() (host: filters, ordering, source maps) + transformVirtualModules()
-│   ├── plugin-filter.ts     # filter matching shared by host and worker (candidates, globs/RegExps, serialized prefilters)
+│   ├── plugin-filter.ts     # filter matching shared by host and worker (candidates, serialized filters + expressions, prefilters)
+│   ├── plugin-glob.ts       # host: resolveGlob() + globToRegExp() — `id` globs compiled to RegExps for host and workers
 │   ├── plugin-hooks.ts      # worker: registerPluginHooks() — registerHooks/Bun.plugin load hooks that send modules to the runner
 │   ├── transform-channel.ts # sync transform requests: MessagePort (node-worker) / local socket + helper thread (process workers)
 │   └── virtual-modules.ts   # registerVirtualModules() — registerHooks()/Bun.plugin wiring for node/bun/deno workers

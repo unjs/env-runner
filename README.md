@@ -475,20 +475,44 @@ const runner = new NodeProcessEnvRunner({
 });
 ```
 
-`transform` can also be a plain function. Handlers get `(code, id, { moduleType })` and return a string, `{ code, map, moduleType }`, or nothing to keep the code. `this.warn(message)` logs a warning and `this.error(message)` throws, both prefixed with the plugin name and module id. Other errors are wrapped the same way (`[env-runner] plugin "version" failed on "/app/src/index.ts": ...`).
+`transform` can also be a plain function. Handlers get `(code, id, { moduleType })` and return a string, `{ code, map, moduleType }`, or nothing to keep the code (`moduleSideEffects` and `meta` in a result are ignored). `this.warn(message)` and `this.info(message)` log, and `this.error(message)` throws, all prefixed with the plugin name and module id; `message` can also be a `{ message }` log object, and a second argument (an offset in the code, or `{ line, column }`) is appended to the id as `:line:column`. `this.debug()` is ignored. Other errors are wrapped the same way (`[env-runner] plugin "version" failed on "/app/src/index.ts": ...`). Nested arrays in `plugins` are flattened and falsy entries skipped, so a plugin can be added conditionally (`isDev && plugin`).
 
 **Which modules are sent:**
 
 - Candidates are files with a script extension (`.js`, `.mjs`, `.cjs`, `.ts`, `.mts`, `.cts`, `.jsx`, `.tsx`) outside `/node_modules/`, and virtual modules with a code format.
-- The worker gets each plugin's `id` and `moduleType` filters, and only sends a candidate that one of them matches (a plugin without these filters matches every candidate). Anything else loads without a round trip, so **give every plugin a `moduleType` filter, and an `id` filter where you can**.
+- The worker gets each plugin's `id` and `moduleType` filters (or its filter expressions), and only sends a candidate that one of them may match (a plugin without these filters matches every candidate; the code isn't known there, so `code` filters are checked on the host). Anything else loads without a round trip, so **give every plugin a `moduleType` filter, and an `id` filter where you can**.
 - On the host, each handler runs only when its whole filter matches the current code.
 
-**Filters**: all given properties must match.
+**Filters**: all given properties must match, and empty ones (`""`, `null`, `[]`) are ignored. Ids are matched `/`-separated and **without their query string** (the handler gets the id without it too).
 
-- `id`: strings are globs (`path.matchesGlob`, relative ones resolved from the working directory when the runner is created), RegExps are tested against the `/`-separated path. `**` doesn't match dot directories (e.g. `.nitro/`): name them explicitly.
+- `id`: RegExps are tested, strings are globs: `*` (within a path segment), `?`, `**` (any number of segments, so `src/**` matches below `src/`), `[abc]`, `[a-z]`, `[!abc]`, `{a,b}` (also nested) and `\` escapes. Globs are case-sensitive, have no extglobs, and `*`/`**` also match dot files and directories (`**/*.ts` includes `.nitro/`). Globs not starting with `**` and not absolute are resolved from the working directory when the runner is created (`src/**`, `*.ts`).
 - `code`: strings are substrings, RegExps are tested.
-- `moduleType`: a list, or `{ include }`. It starts as the module's language (`js`, `jsx`, `ts`, `tsx`, from the extension or a virtual module's format).
-- Values can be arrays or `{ include, exclude }`, and exclude wins.
+- `moduleType`: a non-empty list, or `{ include }`. It starts as the module's language (`js`, `jsx`, `ts`, `tsx`, from the extension or a virtual module's format).
+- Values can be arrays or `{ include, exclude }`, and exclude wins. RegExp `g`/`y` flags are ignored (every test matches anywhere in the value).
+- Invalid values (a pattern that is neither a string nor a RegExp, an empty `moduleType` list) throw a `TypeError` when the runner is created.
+
+`filter` can also be a list of **filter expressions**, objects with a `kind`:
+
+```js
+const filter = [
+  { kind: "exclude", expr: { kind: "id", pattern: "**/vendor/**" } },
+  {
+    kind: "include",
+    expr: {
+      kind: "and",
+      args: [
+        { kind: "moduleType", pattern: "ts" },
+        { kind: "not", expr: { kind: "code", pattern: /@generated/ } },
+      ],
+    },
+  },
+];
+```
+
+- The list holds `include` and `exclude` entries, and the first one whose `expr` matches decides. If none matches, the module matches only when there are no `include` entries.
+- `expr` combines `and` / `or` (`args`) and `not` (`expr`) over `id`, `code` and `moduleType` (`pattern`), matched like the properties above.
+- `query` (`key`, `pattern`) sees no query, so only `pattern: false` matches. `importerId` is rejected.
+- The worker sends a module unless its expressions can't match whatever the code is.
 
 **Rules:**
 
@@ -502,7 +526,7 @@ How it works:
 
 - **Transport:** module loader hooks are synchronous, so the worker blocks until the runner replies. `NodeWorkerEnvRunner` (and the Vercel and Netlify runners) pass the worker a `MessagePort`. The process runners listen on a local socket (a unix socket in a private temporary directory, or a named pipe on Windows), which a helper thread in the worker connects to. If the runner goes away, a pending load throws instead of hanging.
 - **Node.js** and **Deno**: a `module.registerHooks` load hook. The output is ESM or CommonJS: by the package `"type"` when Node.js reports it, else `.mts`/`.cts`, else CommonJS only for output with CommonJS markers (`require()`, `module.exports`) and no ESM syntax. Deno evaluates hook output as plain ESM, so it gets TypeScript stripped and CommonJS wrapped as an ES module. Deno reads `require()`d files from disk, untransformed, and untouched CommonJS files load natively (CommonJS `.ts`/`.js` there needs `--unstable-detect-cjs` in the runner's `execArgv`).
-- **Bun**: a `Bun.plugin()` `onLoad` with one filter RegExp built from the plugins' `moduleType` filters (implied extensions) and `id` RegExps. Bun evaluates plugin output as ESM and can't decline a load, so CommonJS is wrapped as an ES module, also in files the RegExp covers but no plugin matches. `.cjs`/`.cts` never reach it. Virtual modules are registered first, so a virtual key overriding a file wins, like on Node.js.
+- **Bun**: a `Bun.plugin()` `onLoad` with one filter RegExp built from the plugins' `moduleType` filters (implied extensions) and `id` filters (globs match either path separator; on Windows, `id` RegExps are left to the per-module check), not from filter expressions. Bun evaluates plugin output as ESM and can't decline a load, so CommonJS is wrapped as an ES module, also in files the RegExp covers but no plugin matches. `.cjs`/`.cts` never reach it. Virtual modules are registered first, so a virtual key overriding a file wins, like on Node.js.
 - **Miniflare**: no worker round trip. Disk modules are transformed in the module fallback service, where modules that `transformRequest` returns code for are served as is. A transform error is logged on the host and thrown from the failing module. A persistent instance runs the plugins of the runner currently using it.
 - **Virtual modules** are transformed on the host before they are sent, also on `updateVirtualModules()`/`invalidateModule()` (a source that fails to transform rejects the update and changes nothing). This makes JSX work on every runner (e.g. `#entry.tsx`, or `{ source, format: "tsx" }`). The output stays in its format's module system.
 - `reloadModule()` sends the entry again; already-imported modules stay cached.

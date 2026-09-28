@@ -1,18 +1,39 @@
-import * as nodePath from "node:path";
-
 // Filter matching shared by the host (full `transform` filters) and workers
-// (the `id`/`moduleType` prefilter deciding which modules to send).
+// (the prefilter deciding which modules to send). The host compiles filters
+// to this serializable form (`id` globs as RegExps).
 
 /** Module type of code (`js` once a plugin compiled it). */
 export type PluginModuleType = "js" | "jsx" | "ts" | "tsx" | (string & {});
 
-/** A filter pattern as sent to workers: a glob, or a RegExp's parts. */
-export type SerializedPattern = string | { source: string; flags: string };
+/** A RegExp as sent to workers (`glob`: compiled from an `id` glob). */
+export interface SerializedPattern {
+  source: string;
+  flags: string;
+  glob?: true;
+}
 
-/** The part of a plugin's filter workers can check before sending a module. */
+/** A filter expression as sent to workers. */
+export type SerializedFilterNode =
+  | { kind: "and" | "or"; args: SerializedFilterNode[] }
+  | { kind: "not"; expr: SerializedFilterNode }
+  | { kind: "id"; pattern: SerializedPattern }
+  | { kind: "code"; pattern: string | SerializedPattern }
+  | { kind: "moduleType"; pattern: string }
+  | { kind: "query"; key: string; pattern: string | boolean | SerializedPattern };
+
+export interface SerializedFilterExpression {
+  kind: "include" | "exclude";
+  expr: SerializedFilterNode;
+}
+
+/**
+ * A plugin's filter as workers check it: its `id`/`moduleType` filters, or
+ * its filter expressions (`code` is unknown there).
+ */
 export interface SerializedPrefilter {
   id?: { include: SerializedPattern[]; exclude: SerializedPattern[] };
   moduleTypes?: PluginModuleType[];
+  expr?: SerializedFilterExpression[];
 }
 
 /** File extensions of modules plugins can transform. */
@@ -67,68 +88,122 @@ export function compileFilter<T>(
   };
 }
 
+export function deserializePattern(pattern: SerializedPattern): RegExp {
+  return new RegExp(pattern.source, pattern.flags);
+}
+
 /**
- * Test an `id` pattern: globs with `path.matchesGlob` (resolved with
- * {@link resolveGlob} first), RegExps as is. The id is `/`-separated.
+ * Whether filter expressions match: `undefined` when that depends on the
+ * code and `code` isn't given. The first include or exclude that matches
+ * decides; without any, the module matches unless there are includes.
  */
-export function matchId(pattern: string | RegExp, id: string): boolean {
-  if (typeof pattern !== "string") {
-    return testRegExp(pattern, id);
-  }
-  // Namespace access: a named import fails to link before Node.js 22.5.
-  if (typeof nodePath.matchesGlob !== "function") {
-    throw new TypeError(
-      "[env-runner] glob `id` filters need `path.matchesGlob` (Node.js >= 22.5); use a RegExp instead.",
-    );
-  }
-  return nodePath.matchesGlob(id, pattern);
+export type FilterExpressionTest = (
+  id: string,
+  moduleType: PluginModuleType,
+  code?: string,
+) => boolean | undefined;
+
+export function compileFilterExpressions(
+  expressions: SerializedFilterExpression[],
+): FilterExpressionTest {
+  const compiled = expressions.map(({ kind, expr }) => ({
+    include: kind === "include",
+    test: _compileNode(expr),
+  }));
+  const hasInclude = compiled.some((expr) => expr.include);
+  return (id, moduleType, code) => {
+    // An unknown result before the deciding one could have decided instead.
+    let unknown = false;
+    for (const expr of compiled) {
+      const result = expr.test(id, moduleType, code);
+      if (result === undefined) {
+        unknown = true;
+      } else if (result) {
+        return unknown ? undefined : expr.include;
+      }
+    }
+    return unknown ? undefined : !hasInclude;
+  };
 }
 
-/** Relative globs resolve from cwd (`**` patterns are left as they are). */
-export function resolveGlob(pattern: string): string {
-  return nodePath.isAbsolute(pattern) || pattern.startsWith("*")
-    ? pattern
-    : nodePath.join(process.cwd(), pattern).replaceAll("\\", "/");
-}
-
-// `g`/`y` RegExps are stateful through `lastIndex`.
-export function testRegExp(pattern: RegExp, value: string): boolean {
-  pattern.lastIndex = 0;
-  return pattern.test(value);
+// Three-valued: `undefined` is unknown (`code` without code).
+function _compileNode(node: SerializedFilterNode): FilterExpressionTest {
+  switch (node.kind) {
+    case "and":
+    case "or": {
+      const args = node.args.map(_compileNode);
+      const decisive = node.kind === "or";
+      return (id, moduleType, code) => {
+        let result: boolean | undefined = !decisive;
+        for (const arg of args) {
+          const value = arg(id, moduleType, code);
+          if (value === decisive) {
+            return decisive;
+          }
+          if (value === undefined) {
+            result = undefined;
+          }
+        }
+        return result;
+      };
+    }
+    case "not": {
+      const expr = _compileNode(node.expr);
+      return (id, moduleType, code) => {
+        const value = expr(id, moduleType, code);
+        return value === undefined ? undefined : !value;
+      };
+    }
+    case "id": {
+      const pattern = deserializePattern(node.pattern);
+      return (id) => pattern.test(id);
+    }
+    case "moduleType": {
+      return (_id, moduleType) => moduleType === node.pattern;
+    }
+    case "code": {
+      const pattern =
+        typeof node.pattern === "string" ? node.pattern : deserializePattern(node.pattern);
+      return (_id, _moduleType, code) =>
+        code === undefined
+          ? undefined
+          : typeof pattern === "string"
+            ? code.includes(pattern)
+            : pattern.test(code);
+    }
+    case "query": {
+      // Ids are matched without their query: only "absent" matches.
+      const absent = node.pattern === false;
+      return () => absent;
+    }
+  }
 }
 
 /**
  * Worker side: whether some plugin may transform a module, from the plugins'
- * serialized `id`/`moduleType` filters (the host checks the full filters).
- * `id` is `/`-separated.
+ * serialized filters (the host checks the full filters). `id` is
+ * `/`-separated.
  */
 export function createPrefilter(
   filters: SerializedPrefilter[],
 ): (id: string, moduleType: PluginModuleType) => boolean {
-  const compiled = filters.map((filter) => ({
-    moduleTypes: filter.moduleTypes,
-    id:
-      filter.id &&
-      compileFilter(
-        filter.id.include.map(deserializePattern),
-        filter.id.exclude.map(deserializePattern),
-        matchId,
-      ),
-  }));
-  return (id, moduleType) =>
-    compiled.some(
-      (filter) =>
+  const compiled = filters.map(
+    (filter): ((id: string, moduleType: PluginModuleType) => boolean) => {
+      if (filter.expr) {
+        const test = compileFilterExpressions(filter.expr);
+        return (id, moduleType) => test(id, moduleType) !== false;
+      }
+      const idFilter =
+        filter.id &&
+        compileFilter(
+          filter.id.include.map(deserializePattern),
+          filter.id.exclude.map(deserializePattern),
+          (pattern, value) => pattern.test(value),
+        );
+      return (id, moduleType) =>
         (!filter.moduleTypes || filter.moduleTypes.includes(moduleType)) &&
-        (!filter.id || filter.id.test(id)),
-    );
-}
-
-export function serializePattern(pattern: string | RegExp): SerializedPattern {
-  return typeof pattern === "string"
-    ? resolveGlob(pattern)
-    : { source: pattern.source, flags: pattern.flags };
-}
-
-export function deserializePattern(pattern: SerializedPattern): string | RegExp {
-  return typeof pattern === "string" ? pattern : new RegExp(pattern.source, pattern.flags);
+        (!idFilter || idFilter.test(id));
+    },
+  );
+  return (id, moduleType) => compiled.some((test) => test(id, moduleType));
 }

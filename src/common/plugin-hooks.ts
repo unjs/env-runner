@@ -3,13 +3,12 @@ import { fileURLToPath } from "node:url";
 import { init as initEsmLexer, parse as parseEsm } from "es-module-lexer";
 import {
   createPrefilter,
-  deserializePattern,
   isTransformCandidate,
   moduleTypeOf,
   normalizeFilterId,
   stripQuery,
 } from "./plugin-filter.ts";
-import type { SerializedPrefilter } from "./plugin-filter.ts";
+import type { SerializedPattern, SerializedPrefilter } from "./plugin-filter.ts";
 import { createTransformClient } from "./transform-channel.ts";
 import { commonJSToESM, loadCommonJSLexer } from "./virtual-modules.ts";
 import type { TransformChannel } from "./transform-channel.ts";
@@ -35,9 +34,9 @@ export function servedByPluginHooks(path: string): boolean {
 /**
  * Send matching disk modules to the runner's plugins; await before importing
  * the entry. A module is sent when it is a candidate
- * ({@link isTransformCandidate}) and some plugin's `id`/`moduleType` filter
- * matches; the runner's reply is served instead of the file. Warns once and
- * skips on runtimes without either backend:
+ * ({@link isTransformCandidate}) and some plugin's prefilter may match
+ * ({@link createPrefilter}); the runner's reply is served instead of the
+ * file. Warns once and skips on runtimes without either backend:
  *
  * Output the plugins left as TypeScript is served for the runtime to strip,
  * like an untransformed file. Per runtime:
@@ -210,37 +209,37 @@ const BUN_EXTENSIONS: Record<string, string[]> = {
  * separator), then one alternative per plugin with
  *
  * - the extensions its `moduleType` filter implies (all non-CommonJS script
- *   extensions without one), never `.cjs`/`.cts`;
- * - its `id` filter: RegExp excludes as a negative lookahead, and includes as
- *   a lookahead when they are all RegExps (otherwise any path).
+ *   extensions without one, or with filter expressions), never `.cjs`/`.cts`;
+ * - its `id` filter: excludes as a negative lookahead, and includes as a
+ *   lookahead (when they can all be folded).
  *
- * The RegExp takes the `id` RegExps' flags; if they differ, or one has
- * backreferences or named groups (which don't survive being spliced together),
- * no `id` filter is folded in. Bun paths keep native separators. The
- * prefilter still decides per module; paths the RegExp lets through but no
- * plugin matches load with Bun's native loader.
+ * Bun paths keep native separators: compiled globs match either one, RegExps
+ * written for `/` are only folded where that is the separator (`windows`
+ * false). The RegExp takes the folded patterns' flags; if they differ, or one
+ * has backreferences or named groups (which don't survive being spliced
+ * together), no `id` filter is folded in. The prefilter still decides per
+ * module; paths the RegExp lets through but no plugin matches load with Bun's
+ * native loader.
  */
-export function createBunFilter(prefilters: SerializedPrefilter[]): RegExp {
+export function createBunFilter(
+  prefilters: SerializedPrefilter[],
+  windows = process.platform === "win32",
+): RegExp {
   const escape = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const sep = String.raw`(?:\\|\/)`;
-  const isRegExp = (pattern: string | RegExp): pattern is RegExp => pattern instanceof RegExp;
-  const plugins = prefilters.map(({ id, moduleTypes }) => ({
-    moduleTypes,
-    id: id && {
-      include: id.include.map(deserializePattern),
-      exclude: id.exclude.map(deserializePattern),
-    },
+  const foldable = (pattern: SerializedPattern) => pattern.glob || !windows;
+  const plugins = prefilters.map(({ id, moduleTypes, expr }) => ({
+    moduleTypes: expr ? undefined : moduleTypes,
+    exclude: id?.exclude.filter(foldable) ?? [],
+    include: id && id.include.length > 0 && id.include.every(foldable) ? id.include : [],
   }));
-  const idRegExps = plugins.flatMap(({ id }) =>
-    id ? [...id.include, ...id.exclude].filter(isRegExp) : [],
-  );
-  // Stateful flags don't change what matches.
-  const flagSet = new Set(idRegExps.map((re) => re.flags.replace(/[gy]/g, "")));
+  const folded = plugins.flatMap(({ include, exclude }) => [...include, ...exclude]);
+  const flagSet = new Set(folded.map((pattern) => pattern.flags));
   // Group numbers shift and group names may repeat once sources are joined.
   const foldIds =
-    flagSet.size <= 1 && !idRegExps.some((re) => /\\[1-9]|\\k<|\(\?<(?![=!])/.test(re.source));
+    flagSet.size <= 1 && !folded.some(({ source }) => /\\[1-9]|\\k<|\(\?<(?![=!])/.test(source));
   const branches = new Set<string>();
-  for (const { moduleTypes, id } of plugins) {
+  for (const { moduleTypes, include, exclude } of plugins) {
     const extensions = moduleTypes
       ? moduleTypes.flatMap((type) => BUN_EXTENSIONS[type] ?? [])
       : Object.values(BUN_EXTENSIONS).flat();
@@ -248,14 +247,11 @@ export function createBunFilter(prefilters: SerializedPrefilter[]): RegExp {
       continue;
     }
     let lookaheads = "";
-    if (id && foldIds) {
-      const exclude = id.exclude.filter(isRegExp);
-      if (exclude.length > 0) {
-        lookaheads += `(?!.*?(?:${exclude.map((re) => re.source).join("|")}))`;
-      }
-      if (id.include.length > 0 && id.include.every(isRegExp)) {
-        lookaheads += `(?=.*?(?:${id.include.map((re) => (re as RegExp).source).join("|")}))`;
-      }
+    if (foldIds && exclude.length > 0) {
+      lookaheads += `(?!.*?(?:${exclude.map(({ source }) => source).join("|")}))`;
+    }
+    if (foldIds && include.length > 0) {
+      lookaheads += `(?=.*?(?:${include.map(({ source }) => source).join("|")}))`;
     }
     branches.add(`${lookaheads}.*(?:${[...new Set(extensions)].map(escape).join("|")})$`);
   }

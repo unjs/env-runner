@@ -21,7 +21,7 @@ import { hostEnv } from "./host-env.ts";
 import { PLUGINS_DATA_KEY } from "./plugin-hooks.ts";
 import type { PluginWorkerData } from "./plugin-hooks.ts";
 import { createPluginPipeline, transformVirtualModules } from "./plugins.ts";
-import type { EnvRunnerPlugin, PluginPipeline } from "./plugins.ts";
+import type { EnvRunnerPluginOption, PluginPipeline } from "./plugins.ts";
 import { openTransformPort, openTransformSocket } from "./transform-channel.ts";
 import type { TransformChannelHost } from "./transform-channel.ts";
 
@@ -35,9 +35,14 @@ export type {
 } from "../virtual-loader.ts";
 export type {
   EnvRunnerPlugin,
+  EnvRunnerPluginOption,
   PluginContext,
+  PluginFilterExpression,
+  PluginLog,
+  PluginLogPosition,
   PluginModuleType,
   PluginStringFilter,
+  PluginTopLevelFilterExpression,
   PluginTransformFilter,
   PluginTransformHandler,
   PluginTransformMeta,
@@ -61,9 +66,10 @@ export interface EnvRunnerData {
    * Plugins whose `transform` hooks run on the host for the entry, its disk
    * imports and virtual modules their filters match (e.g. compiling
    * TypeScript enums and JSX). The worker sends each matching module to the
-   * runner and loads the result. Not supported by the `self` runner.
+   * runner and loads the result. Nested arrays are flattened and falsy
+   * entries skipped. Not supported by the `self` runner.
    */
-  plugins?: EnvRunnerPlugin[];
+  plugins?: EnvRunnerPluginOption[];
 
   [key: string]: unknown;
 }

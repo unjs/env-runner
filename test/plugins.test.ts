@@ -6,7 +6,7 @@ import { resolve, dirname, join } from "node:path";
 import { describe, expect, it, afterEach, vi } from "vitest";
 import { transformSync } from "oxc-transform";
 
-import type { EnvRunner, EnvRunnerPlugin } from "../src/index.ts";
+import type { EnvRunner, EnvRunnerPlugin, PluginTransformHandler } from "../src/index.ts";
 import { NodeWorkerEnvRunner } from "../src/runners/node-worker/runner.ts";
 import { NodeProcessEnvRunner } from "../src/runners/node-process/runner.ts";
 import { BunProcessEnvRunner } from "../src/runners/bun-process/runner.ts";
@@ -283,6 +283,43 @@ for (const { name, create, skip, cjsOptions } of runners) {
         await runner.close();
       }
     });
+
+    it("scopes a plugin with filter expressions, into dot directories", async () => {
+      const seen: string[] = [];
+      const { handler } = greeting({ seen }).transform as { handler: PluginTransformHandler };
+      runner = create({
+        name: "plugins-expressions",
+        data: {
+          entry: fixture("app-dot.ts"),
+          plugins: [
+            oxc(),
+            {
+              name: "greeting",
+              transform: {
+                filter: [
+                  { kind: "exclude", expr: { kind: "id", pattern: "**/vendor/**" } },
+                  {
+                    kind: "include",
+                    expr: {
+                      kind: "and",
+                      args: [
+                        { kind: "id", pattern: "**/*.ts" },
+                        { kind: "code", pattern: "__GREETING__" },
+                      ],
+                    },
+                  },
+                ],
+                handler,
+              },
+            },
+          ],
+        },
+      });
+      await runner.waitForReady();
+      const res = await runner.fetch("http://localhost/");
+      expect(await res.json()).toEqual(["hi", "vendor"]);
+      expect(seen).toEqual([fixture(".hidden/value.ts")]);
+    });
   });
 }
 
@@ -360,13 +397,14 @@ describe("plugins", () => {
   it("sends the `id`/`moduleType` filters to the worker's prefilter", () => {
     const pipeline = createPluginPipeline([
       oxc({ id: { exclude: "**/vendor/**" } }),
-      greeting({ id: /plugins[/\\]app/i }),
+      greeting({ id: /plugins[/\\]app/giy }),
     ])!;
-    // Serializable: RegExps as source and flags, globs resolved from cwd.
+    // Serializable: RegExps as source and flags (without `g`/`y`), globs
+    // compiled.
     const prefilters = JSON.parse(JSON.stringify(pipeline.prefilters));
     expect(prefilters).toEqual([
       {
-        id: { include: [], exclude: ["**/vendor/**"] },
+        id: { include: [], exclude: [{ source: expect.any(String), flags: "", glob: true }] },
         moduleTypes: ["ts", "tsx", "jsx"],
       },
       { id: { include: [{ source: String.raw`plugins[/\\]app`, flags: "i" }], exclude: [] } },
@@ -418,7 +456,7 @@ describe("plugins", () => {
     await expect(append.transform("/a.tsx", "x")).rejects.toThrow(/still tsx after its plugins/);
     await expect(
       createPluginPipeline([{ transform: () => ({ code: 1 as any }) }])!.transform("/a.js", "x"),
-    ).rejects.toThrow(/non-string `code`/);
+    ).rejects.toThrow(/non-string `code` for "\/a\.js" \(got 1\): convert it to a string/);
   });
 
   it("transforms virtual modules in their format's module system", async () => {
@@ -470,8 +508,30 @@ describe("plugins", () => {
     expect(scoped.test("/app/src/a.ts")).toBe(true);
     expect(scoped.test("/app/src/gen/a.ts")).toBe(false);
     expect(scoped.test("/app/lib/a.ts")).toBe(false);
-    // Globs are left to the prefilter.
-    expect(filter([{ id: { include: ["/app/src/**"], exclude: [] } }]).test("/x/a.ts")).toBe(true);
+    // Compiled globs are folded too, matching either separator.
+    const [globbed] = createPluginPipeline([
+      {
+        transform: {
+          filter: { id: { include: "/app/src/**", exclude: "**/gen/**" } },
+          handler() {},
+        },
+      },
+    ])!.prefilters;
+    const globs = filter([globbed]);
+    expect(globs.test("/app/src/a.ts")).toBe(true);
+    expect(globs.test(String.raw`\app\src\a.ts`)).toBe(true);
+    expect(globs.test("/app/src/gen/a.ts")).toBe(false);
+    expect(globs.test("/x/a.ts")).toBe(false);
+    // RegExps are written for `/`: not folded where paths use `\`.
+    const regExpScoped = [{ id: { include: [{ source: "src", flags: "" }], exclude: [] } }];
+    expect(createBunFilter(regExpScoped, true).test("/x/a.ts")).toBe(true);
+    expect(createBunFilter([globbed!], true).test("/x/a.ts")).toBe(false);
+    // Filter expressions: extension branches only.
+    const expressions = filter([
+      { expr: [{ kind: "include", expr: { kind: "moduleType", pattern: "tsx" } }] },
+    ]);
+    expect(expressions.test("/x/a.ts")).toBe(true);
+    expect(expressions.test("/x/a.cts")).toBe(false);
     // Mixed flags: no `id` folding.
     const mixed = filter([
       { id: { include: [{ source: "a", flags: "i" }], exclude: [] } },
@@ -491,5 +551,242 @@ describe("plugins", () => {
     expect(transformedFormat("/a.tsx", "export default 1")).toBe("module");
     expect(transformedFormat("/a.tsx", "module.exports = 1")).toBe("commonjs");
     expect(transformedFormat("/a.tsx", "import x from 'y'; module.exports = x")).toBe("module");
+  });
+});
+
+describe("plugin filters", () => {
+  const cwd = process.cwd().replaceAll("\\", "/");
+  // The ids a plugin with this filter runs on (full filter, on the host).
+  const matching = async (filter: any, ids: string[], code = "code") => {
+    const seen: string[] = [];
+    const pipeline = createPluginPipeline([
+      { transform: { filter, handler: (_code, id) => void seen.push(id) } },
+    ])!;
+    for (const id of ids) {
+      await pipeline.transform(id, code, "ts");
+    }
+    return seen;
+  };
+
+  it("matches globs with `*` and `**` into dot files and directories", async () => {
+    const ids = ["/app/src/a.ts", "/app/.nitro/b.ts", "/app/src/.env.ts", "/app/src/A.TS"];
+    expect(await matching({ id: "**/*.ts" }, ids)).toEqual(ids.slice(0, 3));
+    expect(await matching({ id: "/app/src/*" }, ids)).toEqual([
+      "/app/src/a.ts",
+      "/app/src/.env.ts",
+      "/app/src/A.TS",
+    ]);
+    expect(await matching({ id: { exclude: "**/.nitro/**" } }, ids)).toEqual([
+      "/app/src/a.ts",
+      "/app/src/.env.ts",
+      "/app/src/A.TS",
+    ]);
+    // `src/**` needs something after `src/`; `**` within a segment is `*`.
+    expect(await matching({ id: "/app/src/**" }, ["/app/src", "/app/src/x/a.ts"])).toEqual([
+      "/app/src/x/a.ts",
+    ]);
+    expect(await matching({ id: "/app/**.ts" }, ["/app/a.ts", "/app/x/a.ts"])).toEqual([
+      "/app/a.ts",
+    ]);
+  });
+
+  it("resolves globs from cwd unless they start with `**` or are absolute", async () => {
+    const ids = [`${cwd}/a.ts`, `${cwd}/src/b.ts`, "a.ts", "/elsewhere/a.ts"];
+    expect(await matching({ id: "*.ts" }, ids)).toEqual([`${cwd}/a.ts`]);
+    expect(await matching({ id: "./src/../src/*.ts" }, ids)).toEqual([`${cwd}/src/b.ts`]);
+    expect(await matching({ id: "**/a.ts" }, ids)).toEqual([
+      `${cwd}/a.ts`,
+      "a.ts",
+      "/elsewhere/a.ts",
+    ]);
+  });
+
+  it("supports classes, braces and escapes, but no extglobs", async () => {
+    const ids = ["/r/a.ts", "/r/b.ts", "/r/c.tsx", "/r/[x].ts", "/r/*.ts"];
+    expect(await matching({ id: "/r/[!a*].ts" }, ids)).toEqual(["/r/b.ts"]);
+    expect(await matching({ id: "/r/[^ab*].ts" }, ids)).toEqual([]);
+    expect(await matching({ id: "/r/[a-b].ts" }, ids)).toEqual(["/r/a.ts", "/r/b.ts"]);
+    expect(await matching({ id: "/r/{a,{b,c}}.{ts,tsx}" }, ids)).toEqual(ids.slice(0, 3));
+    expect(await matching({ id: "/r/*.{ts}" }, ids)).toEqual([
+      "/r/a.ts",
+      "/r/b.ts",
+      "/r/[x].ts",
+      "/r/*.ts",
+    ]);
+    expect(await matching({ id: String.raw`/r/\[x\].ts` }, ids)).toEqual(["/r/[x].ts"]);
+    expect(await matching({ id: String.raw`/r/\*.ts` }, ids)).toEqual(["/r/*.ts"]);
+    expect(await matching({ id: "/r/+(a|b).ts" }, ids)).toEqual([]);
+    expect(await matching({ id: "/r/{a.ts" }, ["/r/{a.ts", "/r/a.ts"])).toEqual(["/r/{a.ts"]);
+  });
+
+  it("matches ids without their query, `/`-separated, and RegExps without `g`/`y`", async () => {
+    const seen = await matching({ id: /\/src\//y }, [
+      "/app/src/a.ts?v=1",
+      String.raw`C:\app\src\b.ts`,
+    ]);
+    expect(seen).toEqual(["/app/src/a.ts", String.raw`C:\app\src\b.ts`]);
+    expect(await matching({ id: /a\.ts\?v/ }, ["/app/a.ts?v=1"])).toEqual([]);
+    const global = /a/g;
+    expect(await matching({ id: global, code: global }, ["/a1.ts", "/a2.ts"], "a")).toEqual([
+      "/a1.ts",
+      "/a2.ts",
+    ]);
+    expect(global.flags).toBe("g");
+  });
+
+  it("ignores empty filter values and rejects invalid ones", async () => {
+    const ids = ["/a.ts", "/b.ts"];
+    for (const filter of [
+      { id: "" },
+      { id: null },
+      { id: [] },
+      { id: {} },
+      { code: "" },
+      {},
+      null,
+    ]) {
+      expect(await matching(filter, ids)).toEqual(ids);
+    }
+    expect(await matching({ id: { include: [], exclude: "/b.ts" } }, ids)).toEqual(["/a.ts"]);
+    const create = (filter: any) => () =>
+      createPluginPipeline([{ name: "p", transform: { filter, handler() {} } }]);
+    expect(create({ id: [1] })).toThrow(
+      /`data\.plugins\[0\]` has an invalid `transform\.filter\.id` \(got 1\): expected strings or RegExps/,
+    );
+    expect(create({ code: { exclude: [{}] } })).toThrow(
+      /invalid `transform\.filter\.code` \(got an object\)/,
+    );
+    expect(create({ moduleType: [] })).toThrow(
+      /invalid `transform\.filter\.moduleType` \(no module types\)/,
+    );
+    expect(create({ moduleType: { include: [] } })).toThrow(/no module types/);
+    expect(create({ moduleType: ["ts", 1] })).toThrow(/invalid `transform\.filter\.moduleType`/);
+    expect(create("**/*.ts")).toThrow(/invalid `transform\.filter` \(got "\*\*\/\*\.ts"\)/);
+  });
+
+  const include = (expr: any) => ({ kind: "include" as const, expr });
+  const exclude = (expr: any) => ({ kind: "exclude" as const, expr });
+  const id = (pattern: any) => ({ kind: "id", pattern });
+  const code = (pattern: any) => ({ kind: "code", pattern });
+  const moduleType = (pattern: any) => ({ kind: "moduleType", pattern });
+
+  it("evaluates filter expressions: the first matching include or exclude decides", async () => {
+    const ids = ["/app/a.ts", "/app/b.ts", "/app/vendor/c.ts"];
+    expect(await matching([include(id(/a\.ts$/))], ids)).toEqual(["/app/a.ts"]);
+    expect(await matching([exclude(id("**/vendor/**"))], ids)).toEqual(ids.slice(0, 2));
+    expect(await matching([include(id("**/vendor/**")), exclude(id("**/*.ts"))], ids)).toEqual([
+      "/app/vendor/c.ts",
+    ]);
+    expect(
+      await matching(
+        [include({ kind: "and", args: [moduleType("ts"), { kind: "not", expr: id(/b\.ts$/) }] })],
+        ids,
+      ),
+    ).toEqual(["/app/a.ts", "/app/vendor/c.ts"]);
+    expect(
+      await matching([include({ kind: "or", args: [id(/a\.ts$/), code("MARK")] })], ids, "MARK"),
+    ).toEqual(ids);
+    expect(await matching([include(moduleType("tsx"))], ids)).toEqual([]);
+    expect(await matching([], ids)).toEqual(ids);
+    // Ids have no query: only "absent" matches.
+    const query = (pattern: any) => [include({ kind: "query", key: "raw", pattern })];
+    expect(await matching(query(false), ["/a.ts?raw"])).toEqual(["/a.ts"]);
+    for (const pattern of [true, "", /x/]) {
+      expect(await matching(query(pattern), ["/a.ts?raw"])).toEqual([]);
+    }
+  });
+
+  it("validates filter expressions", () => {
+    const create = (filter: any) => () =>
+      createPluginPipeline([{ transform: { filter, handler() {} } }]);
+    expect(create([id("x")])).toThrow(
+      /invalid `transform\.filter\[0\]` \(got "id"\): expected an `include` or `exclude` expression/,
+    );
+    expect(create([include({ kind: "and", args: [] })])).toThrow(
+      /`transform\.filter\[0\]\.expr` \(`and` needs at least one argument\)/,
+    );
+    expect(create([include({ kind: "or", args: [id(1)] })])).toThrow(
+      /`transform\.filter\[0\]\.expr\.args\[0\]\.pattern` \(got 1\): expected a string or RegExp/,
+    );
+    expect(create([include({ kind: "importerId", pattern: /x/ })])).toThrow(/`importerId`/);
+    expect(create([include({ kind: "nope" })])).toThrow(/\(got "nope"\): unknown expression kind/);
+    expect(create([include({ kind: "query", key: 1, pattern: true })])).toThrow(/\.key` \(got 1\)/);
+  });
+
+  it("sends filter expressions to the prefilter, where `code` may match", () => {
+    const pipeline = createPluginPipeline([
+      {
+        transform: {
+          filter: [
+            exclude(id("**/vendor/**")),
+            include({ kind: "and", args: [id(/src/g), code(/MARK/)] }),
+          ],
+          handler() {},
+        },
+      },
+      { transform: { filter: [exclude(code("SKIP"))], handler() {} } },
+    ])!;
+    const prefilters = JSON.parse(JSON.stringify(pipeline.prefilters));
+    expect(prefilters[0].expr[1]).toEqual(
+      include({
+        kind: "and",
+        args: [id({ source: "src", flags: "" }), code({ source: "MARK", flags: "" })],
+      }),
+    );
+    const only = (index: number) => createPrefilter([prefilters[index]]);
+    expect(only(0)("/app/src/a.ts", "ts")).toBe(true);
+    expect(only(0)("/app/lib/a.ts", "ts")).toBe(false);
+    expect(only(0)("/app/src/vendor/a.ts", "ts")).toBe(false);
+    // An exclude that depends on the code: sent.
+    expect(only(1)("/app/a.ts", "ts")).toBe(true);
+    // The host's `filter()` doesn't know the code either.
+    expect(pipeline.filter("/app/src/a.ts")).toBe(true);
+    expect(pipeline.filter("/app/lib/a.js")).toBe(true);
+  });
+
+  it("gives handlers `this.info`/`this.debug` and log positions", async () => {
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const debug = vi.spyOn(console, "debug").mockImplementation(() => {});
+    const pipeline = createPluginPipeline([
+      [
+        false,
+        {
+          name: "log",
+          transform(code) {
+            this.info("hello");
+            this.debug("hidden");
+            this.warn({ message: "careful" }, code.indexOf("b"));
+            this.warn("here", { line: 3, column: 1 });
+            return { code: code + ";", moduleSideEffects: false, meta: { x: 1 } };
+          },
+        },
+      ],
+      null,
+      [
+        [
+          {
+            name: "fail",
+            transform() {
+              this.error({ message: "boom" }, 0);
+            },
+          },
+        ],
+      ],
+    ])!;
+    expect(pipeline.names).toEqual(["log", "fail"]);
+    await expect(pipeline.transform("/a.js", "a\nb")).rejects.toThrow(
+      /^\[env-runner\] plugin "fail" \(\/a\.js:1:0\): boom$/,
+    );
+    expect(info).toHaveBeenCalledWith('[env-runner] plugin "log" (/a.js): hello');
+    expect(warn).toHaveBeenCalledWith('[env-runner] plugin "log" (/a.js:2:0): careful');
+    expect(warn).toHaveBeenCalledWith('[env-runner] plugin "log" (/a.js:3:1): here');
+    expect(debug).not.toHaveBeenCalled();
+    info.mockRestore();
+    warn.mockRestore();
+    debug.mockRestore();
+    expect(() => createPluginPipeline([null, [{}]] as any)).toThrow(
+      /`data\.plugins\[1\]\[0\]` has no `transform`/,
+    );
   });
 });
