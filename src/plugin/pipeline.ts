@@ -1,5 +1,5 @@
 import { isBuiltin } from "node:module";
-import { isAbsolute } from "node:path";
+import { isAbsolute, normalize } from "node:path";
 import { pathToFileURL } from "node:url";
 import { resolveModulePath } from "exsolve";
 import { virtualModuleFormat } from "../virtual-loader.ts";
@@ -745,7 +745,8 @@ function _resolveLikeRuntime(
       ? stripQuery(importer)
       : pathToFileURL(`${process.cwd()}/`).href;
   const path = resolveModulePath(stripQuery(source), { from, conditions, try: true, cache: false });
-  return path ? { id: path + queryOf(source), external: false } : null;
+  // Native separators, like the ids of the modules workers load.
+  return path ? { id: normalize(path) + queryOf(source), external: false } : null;
 }
 
 // Run a handler; errors name the plugin and id (`this.error()` messages
