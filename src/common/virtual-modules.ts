@@ -72,10 +72,12 @@ export async function registerVirtualModules(
   if (typeof bunPlugin === "function") {
     _bunVirtual = virtual;
     _bunTransformer = transformer;
+    _bunTransformed.clear();
     _registerBunModules(Object.keys(virtual));
     return _once(() => {
       if (_bunVirtual === virtual) {
         _bunVirtual = undefined;
+        _bunTransformed.clear();
       }
     });
   }
@@ -120,9 +122,9 @@ export function invalidateVirtualModule(specifier: string, source?: string): boo
   if (_bunVirtual && Object.hasOwn(_bunVirtual, specifier)) {
     if (source !== undefined) {
       // Bun transforms lazily on load; validate now so a broken source is
-      // rejected here like on the other backends.
+      // rejected here like on the other backends (the output is reused on load).
       if (_bunTransformer?.filter(specifier)) {
-        _bunTransformer.transform(specifier, source);
+        _bunTransform(_bunTransformer, specifier, source);
       }
       _bunVirtual[specifier] = source;
     }
@@ -162,6 +164,19 @@ const _hooksRegistrations: HooksRegistration[] = [];
 
 let _bunVirtual: Record<string, string> | undefined;
 let _bunTransformer: Transformer | undefined;
+// Transform output per specifier, reused while its source is unchanged (across
+// invalidation-time validation and reload re-registrations).
+const _bunTransformed = new Map<string, { source: string; code: string }>();
+
+function _bunTransform(transformer: Transformer, specifier: string, source: string): string {
+  const cached = _bunTransformed.get(specifier);
+  if (cached?.source === source) {
+    return cached.code;
+  }
+  const code = transformer.transform(specifier, source);
+  _bunTransformed.set(specifier, { source, code });
+  return code;
+}
 
 // Read the live map so unregistering (detaching it) disables fresh loads;
 // Bun can't remove a `build.module` registration.
@@ -176,7 +191,7 @@ function _registerBunModules(specifiers: string[]): void {
             throw new Error(`Cannot find virtual module "${specifier}" (unregistered)`);
           }
           if (_bunTransformer?.filter(specifier)) {
-            return { contents: _bunTransformer.transform(specifier, source), loader: "js" };
+            return { contents: _bunTransform(_bunTransformer, specifier, source), loader: "js" };
           }
           const format = virtualModuleFormat(specifier);
           if (format === "json") {

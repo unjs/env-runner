@@ -52,7 +52,7 @@ Source transforms (TypeScript beyond erasable syntax, JSX, custom) for the entry
   - The RegExp is built inside the worker because RegExps aren't serializable.
   - Plugins can't be removed; unregister only detaches the active transformer.
 - `_active` is set only after a backend registered, so reload never takes the transform path without a hook behind it.
-- **Invalidation**: `handleInvalidateModule()` catches transform errors and acks with `error`, so the worker survives and keeps the previous source. Bun validates the transform eagerly on invalidation, since it otherwise transforms lazily on load.
+- **Invalidation**: `handleInvalidateModule()` catches transform errors and acks with `error`, so the worker survives and keeps the previous source. Bun validates the transform eagerly on invalidation, since it otherwise transforms lazily on load. `_bunTransformed` caches the output per specifier, keyed by the exact source, so validation, the next load and reload re-registrations share one transform. It is cleared when the Bun registration is replaced or removed.
 - **Virtual modules**: `registerVirtualModules(virtual, transformer)` transforms matching keys at registration and on invalidation (via `transformSource`) and forces the `module` format for them. On Bun, the `build.module` callback transforms lazily. Miniflare's `#prepareVirtualSource` transforms instead of type-stripping.
 - **Miniflare**: host-side in `unsafeModuleFallbackService`, after `transformRequest`. Transformed code goes through the same ESM/CommonJS split as raw files, with CommonJS behind `createCjsEsmShim`; `transformedFormat()` decides for transformed code, the existing regex for raw files.
   - Transform errors are `console.error`ed on the host and served as a module that throws the message. The host log matters because a named import of it fails at link time first, and a 500 from the fallback would only surface as "module not found". v4 `modulesRules` include the transform extensions. `data.transform` is part of the persistent cache key.
@@ -81,6 +81,7 @@ Further fixtures:
 - `mapped.mjs` is a transformer returning its own map.
 - `greeting-plugin.mjs` is a rolldown-like object: `pre` order, with a glob `id` filter and a `code` filter.
 - `order-*.mjs` and `async.mjs` exercise ordering and the async error.
+- `count.mjs` counts its runs; it asserts an invalidated virtual source is transformed once (Bun previously transformed it twice).
 
 Cases:
 

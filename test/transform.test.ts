@@ -151,6 +151,30 @@ for (const { name, create, skip, bun, miniflare, cjsOptions } of runners) {
       expect(await res.text()).toBe("ok");
     });
 
+    it("transforms an invalidated virtual module source once", async () => {
+      let source = `export const count: number = __COUNT__;`;
+      runner = create({
+        name: "transform-invalidate-once",
+        data: {
+          // Untransformed entry (no extension), so only `#count.ts` is counted.
+          entry: "#entry",
+          transform: { transformers: [fixture("count.mjs")] },
+          virtual: {
+            "#entry": `import { count } from "#count.ts";
+              export default { fetch: () => new Response(String(count)) };`,
+            "#count.ts": () => source,
+          },
+        },
+      });
+      await runner.waitForReady();
+      expect(await (await runner.fetch("http://localhost/")).text()).toBe("1");
+      source = `export const count: number = __COUNT__; // edited`;
+      await runner.invalidateModule!("#count.ts");
+      await runner.reloadModule!();
+      // Validation at invalidation and the reload share one transform.
+      expect(await (await runner.fetch("http://localhost/")).text()).toBe("2");
+    });
+
     // Bun evaluates plugin output as ESM, so CommonJS `.ts` can't be transformed there.
     it.skipIf(bun)("serves CommonJS `.ts` (package without `type`) and `.cts`", async () => {
       runner = create({
