@@ -74,6 +74,13 @@ export interface TransformOptions {
   extensions?: string[];
 
   /**
+   * Only transform paths (`/`-separated) and virtual keys matching this
+   * RegExp, on top of `extensions` and `exclude`. Sent to the worker as
+   * `{ source, flags }` (the `g`/`y` flags are dropped).
+   */
+  include?: RegExp | SerializedRegExp;
+
+  /**
    * Skip paths containing any of these substrings (`/`-separated).
    * @default ["/node_modules/"]
    */
@@ -90,6 +97,12 @@ export interface TransformOptions {
    * imported from the app.
    */
   oxcTransform?: string | URL;
+}
+
+/** A RegExp as `{ source, flags }`, the form `include` crosses into the worker in. */
+export interface SerializedRegExp {
+  source: string;
+  flags?: string;
 }
 
 /**
@@ -116,6 +129,8 @@ interface SourceMapLike {
 export interface Transformer {
   /** Transformed file extensions. */
   extensions: string[];
+  /** Included paths (tested `/`-separated), if restricted. */
+  include?: RegExp;
   /** Excluded path substrings (`/`-separated). */
   exclude: string[];
   /** Whether a path (or virtual key) is transformed. Queries are ignored. */
@@ -151,9 +166,21 @@ export function normalizeTransformOptions(
   });
   return {
     ...opts,
+    include: opts.include === undefined ? undefined : _serializeRegExp(opts.include),
     transformers,
     oxcTransform: opts.oxcTransform ? resolveSpecifier(opts.oxcTransform) : undefined,
   };
+}
+
+// Neither JSON nor `workerData` round-trips a RegExp uniformly: send its parts.
+// Stateful flags (`g`/`y`) would make `test()` depend on `lastIndex`.
+function _serializeRegExp(value: RegExp | SerializedRegExp): SerializedRegExp {
+  if (!(value instanceof RegExp) && typeof value?.source !== "string") {
+    throw new TypeError("[env-runner] `transform.include` must be a RegExp.");
+  }
+  const { source, flags = "" } = value;
+  // Validates `{ source, flags }` input too.
+  return { source, flags: new RegExp(source, flags.replace(/[gy]/g, "")).flags };
 }
 
 /** Load the pipeline (imports `oxc-transform` and custom transformers). */
@@ -168,6 +195,9 @@ export async function loadTransformer(
   }
   const extensions = opts.extensions ?? DEFAULT_EXTENSIONS;
   const exclude = opts.exclude ?? DEFAULT_EXCLUDE;
+  const include = opts.include
+    ? (({ source, flags }) => new RegExp(source, flags))(_serializeRegExp(opts.include))
+    : undefined;
   const sourcemap = opts.sourcemap ?? true;
 
   let oxcTransform: ((id: string, code: string) => OxcTransformResult) | undefined;
@@ -209,7 +239,9 @@ export async function loadTransformer(
   const filter = (id: string) => {
     const path = _stripQuery(id).replaceAll("\\", "/");
     return (
-      extensions.some((ext) => path.endsWith(ext)) && !exclude.some((part) => path.includes(part))
+      extensions.some((ext) => path.endsWith(ext)) &&
+      !exclude.some((part) => path.includes(part)) &&
+      (!include || include.test(path))
     );
   };
 
@@ -252,7 +284,7 @@ export async function loadTransformer(
     return code;
   };
 
-  return { extensions, exclude, filter, transform };
+  return { extensions, include, exclude, filter, transform };
 }
 
 let _active: Transformer | undefined;
@@ -364,17 +396,25 @@ export async function registerTransformHooks(transformer?: Transformer): Promise
   return _noop;
 }
 
-/** Extensions minus CommonJS ones, with `exclude` as a negative lookahead (either separator). */
+/**
+ * One RegExp (Bun's only filter): extensions minus CommonJS ones, `exclude` as
+ * a negative lookahead (either separator), `include` as a lookahead. It takes
+ * `include`'s flags, so the other parts stay valid in `u`/`v` mode. Bun paths
+ * keep native separators: on Windows, `include` must match `\\` too.
+ */
 function _bunFilter(transformer: Transformer): RegExp {
   const escape = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const extensions = transformer.extensions
     .filter((ext) => !/^\.c[jt]sx?$/.test(ext))
     .map((ext) => escape(ext));
   const exclude = transformer.exclude.map((part) =>
-    escape(part).replaceAll("/", String.raw`[\\/]`),
+    escape(part).replaceAll("/", String.raw`(?:\\|\/)`),
   );
-  const lookahead = exclude.length > 0 ? `(?!.*(?:${exclude.join("|")}))` : "";
-  return new RegExp(`^${lookahead}.*(?:${extensions.join("|") || "(?!)"})$`);
+  const { include } = transformer;
+  const lookaheads =
+    (exclude.length > 0 ? `(?!.*(?:${exclude.join("|")}))` : "") +
+    (include ? `(?=.*?(?:${include.source}))` : "");
+  return new RegExp(`^${lookaheads}.*(?:${extensions.join("|") || "(?!)"})$`, include?.flags);
 }
 
 // Bun's native loader, for loads after the transformer is unregistered.

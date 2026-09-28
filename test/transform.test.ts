@@ -164,6 +164,21 @@ for (const { name, create, skip, bun, miniflare, cjsOptions } of runners) {
       const res = await runner.fetch("http://localhost/");
       expect(await res.json()).toEqual(["cts", "vendor"]);
     });
+
+    // Crosses into the worker serialized, flags included; folded into Bun's filter.
+    it.skipIf(miniflare)("only transforms paths matching `include`", async () => {
+      runner = create({
+        ...cjsOptions,
+        name: "transform-include",
+        data: {
+          entry: fixture("app-vendor.ts"),
+          transform: { ...transform, include: /\/TRANSFORM\/(?:app-vendor\.ts|cjs\/dep\.cts)$/i },
+        },
+      });
+      await runner.waitForReady();
+      const res = await runner.fetch("http://localhost/");
+      expect(await res.json()).toEqual(["cts", "vendor"]);
+    });
   });
 }
 
@@ -179,6 +194,27 @@ describe("transform options", () => {
           data: { entry: fixture("app.tsx"), transform: { transformers: [{} as any] } },
         }),
     ).toThrow(/module specifiers/);
+  });
+
+  it("serializes `include` as `{ source, flags }` without stateful flags", () => {
+    expect(normalizeTransformOptions({ include: /\/src\//giu })!.include).toEqual({
+      source: String.raw`\/src\/`,
+      flags: "iu",
+    });
+    expect(() => normalizeTransformOptions({ include: "/src/" as any })).toThrow(/RegExp/);
+    expect(() => normalizeTransformOptions({ include: { source: "(" } })).toThrow();
+  });
+
+  it("filters by `include` (tested against `/`-separated paths)", async () => {
+    const transformer = (await loadTransformer(
+      normalizeTransformOptions({ include: /\/src\//g }),
+    ))!;
+    // A `g` flag would alternate results through `lastIndex`.
+    expect(transformer.filter("/app/src/a.ts")).toBe(true);
+    expect(transformer.filter("/app/src/a.ts")).toBe(true);
+    expect(transformer.filter(String.raw`C:\app\src\a.ts`)).toBe(true);
+    expect(transformer.filter("/app/lib/a.ts")).toBe(false);
+    expect(transformer.filter("/app/src/a.mjs")).toBe(false);
   });
 
   it("filters by extension and excludes node_modules", async () => {

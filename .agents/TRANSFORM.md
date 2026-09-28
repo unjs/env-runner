@@ -9,7 +9,14 @@ Source transforms (TypeScript beyond erasable syntax, JSX, custom) for the entry
 - `loadTransformer()` (in the worker; on the host for miniflare) imports `oxc-transform` via `resolveRuntimeDep({ required: true })` unless `oxc: false`, then imports each transformer (default export, sync `(code, id) => string | { code, map } | nullish`).
 - Pipeline: oxc (`sourcemap` forced from `transform.sourcemap`, default `true`) → custom transformers in order → inline `sourceMappingURL` (`sources` is the file URL for absolute ids). oxc diagnostics with severity `Error` throw a `SyntaxError` with codeframes and the id.
 - Maps are never composed. A transformer `map` is kept only when no earlier step changed the code, since it is relative to the transformer's input; otherwise it is dropped, because a wrong map is worse than none. Code-only results keep the previous map.
-- `filter(id)`: query stripped, `\` normalized to `/`; extension in `extensions` (default `.ts .mts .cts .tsx .jsx`) and no `exclude` substring (default `/node_modules/`). Applies to virtual keys too.
+- `filter(id)` strips the query and normalizes `\` to `/`, then checks all of:
+  - the extension is in `extensions` (default `.ts .mts .cts .tsx .jsx`)
+  - no `exclude` substring (default `/node_modules/`)
+  - `include` matches, if set
+
+  It applies to virtual keys too.
+
+- `include` is a single RegExp. `normalizeTransformOptions()` serializes it to `{ source, flags }`, because JSON (process runners) drops RegExps, and validates it. It also strips `g`/`y`, which would make `test()` alternate through `lastIndex`. `loadTransformer()` accepts either form.
 - `oxc-transform` is a devDependency, external in `build.config.mjs`, and never imported statically.
 - `OxcTransformOptions`/`OxcJsxOptions` are declared locally and structurally, with nested groups typed as `object`. Inlining oxc's own declarations breaks assignability: its `const enum`s such as `HelperMode` are nominal, so objects typed with the real package would no longer be assignable.
 
@@ -22,6 +29,7 @@ Source transforms (TypeScript beyond erasable syntax, JSX, custom) for the entry
   - Deno ignores the format and evaluates hook output as ESM, so CommonJS output falls back to `nextLoad` (Deno's native loader; CommonJS `.ts` needs `--unstable-detect-cjs`). Deno does call load hooks for disk files.
 - **Bun** (`Bun.plugin` `onLoad`): plugin output is always evaluated as ESM, regardless of `loader`.
   - `_bunFilter()` therefore drops `.c*` extensions and encodes `exclude` as a negative lookahead (either path separator), so those paths never reach the plugin and load natively. A transformed CommonJS `.ts` is unsupported.
+  - `_bunFilter()` also folds `include` in as a lookahead `(?=.*?(?:source))`, compiled with `include`'s flags. The escaped fixed parts stay valid in `u`/`v` mode; separators use `(?:\\|\/)` rather than a character class. Bun paths keep native separators, so on Windows `include` must match `\` itself.
   - The RegExp is built inside the worker because RegExps aren't serializable.
   - Plugins can't be removed; unregister only detaches the active transformer.
 - `_active` is set only after a backend registered, so reload never takes the transform path without a hook behind it.
@@ -62,5 +70,6 @@ Cases:
 - invalidation with a failing transform (rejects, worker survives)
 - CommonJS `.ts` + `.cts` (not Bun; Deno passes `--unstable-detect-cjs`)
 - `exclude` to the native loader (not miniflare: workerd can't parse TS)
+- `include` with a case-insensitive RegExp that leaves out `vendor/plain.ts`, which would return `"hi"` instead of `"vendor"` if transformed
 
 Option-level tests cover normalization, filtering, errors, source maps and `oxc: false`.

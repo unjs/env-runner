@@ -18,6 +18,7 @@ export {
   type TransformOptions,
   type OxcTransformOptions,
   type OxcJsxOptions,
+  type SerializedRegExp,
   type SourceTransformer,
   BaseEnvRunner,
 } from "./common/base-runner.ts";

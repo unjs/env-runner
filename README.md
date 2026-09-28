@@ -357,6 +357,7 @@ const runner = new NodeProcessEnvRunner({
       // Custom transforms: specifiers whose default export is `(code, id) => string | { code, map } | undefined`
       transformers: ["./build/inline-env.mjs"],
       // extensions: [".ts", ".mts", ".cts", ".tsx", ".jsx"], // default
+      // include: /\/src\//,                                  // only matching paths / virtual keys
       // exclude: ["/node_modules/"],                          // default (path substrings)
       // sourcemap: true,                                       // inline source maps (default)
       // oxcTransform: "oxc-transform",                         // package specifier (resolved from cwd)
@@ -365,7 +366,7 @@ const runner = new NodeProcessEnvRunner({
 });
 ```
 
-`data.transform: true` enables oxc with its defaults. The options must stay JSON-serializable (they cross into the worker), so custom transformers are **module specifiers** (resolved from the working directory) rather than functions. They run after oxc, in order, on plain JavaScript, and must be **synchronous** (Node.js module hooks are). Source maps are not composed: a transformer's returned `map` is only used when nothing earlier (oxc included) changed the code, and a code-only result keeps the previous map (so keep such changes line-preserving). Stack traces use the inline source maps with `--enable-source-maps`.
+`data.transform: true` enables oxc with its defaults. A file is transformed when its extension is in `extensions`, it contains no `exclude` substring, and it matches `include` (if set). `include` is a single RegExp, tested against `/`-separated paths and virtual keys. It is sent to the worker as `{ source, flags }`, with the stateful `g`/`y` flags dropped. On Bun it is folded into the plugin's filter RegExp, which sees native separators, so on Windows match `[\\/]`. The options must stay JSON-serializable (they cross into the worker), so custom transformers are **module specifiers** (resolved from the working directory) rather than functions. They run after oxc, in order, on plain JavaScript, and must be **synchronous** (Node.js module hooks are). Source maps are not composed: a transformer's returned `map` is only used when nothing earlier (oxc included) changed the code, and a code-only result keeps the previous map (so keep such changes line-preserving). Stack traces use the inline source maps with `--enable-source-maps`.
 
 How transforms are applied:
 

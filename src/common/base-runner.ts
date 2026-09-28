@@ -14,6 +14,7 @@ export type {
   TransformOptions,
   OxcTransformOptions,
   OxcJsxOptions,
+  SerializedRegExp,
   SourceTransformer,
 } from "./transform.ts";
 
