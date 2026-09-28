@@ -515,12 +515,25 @@ const yaml = {
     handler: (code) => `export default ${JSON.stringify(parseYAML(code))};`,
   },
 };
+
+// `import svg from "./logo.svg?raw"`: the file's text as the default export.
+const raw = {
+  name: "raw",
+  load: {
+    filter: [{ kind: "include", expr: { kind: "query", key: "raw", pattern: true } }],
+    handler(id) {
+      const code = readFileSync(id.slice(0, id.indexOf("?")), "utf8");
+      return { code: `export default ${JSON.stringify(code)};`, moduleType: "js" };
+    },
+  },
+};
 ```
 
-- `resolveId(source, importer, { isEntry, attributes })` runs for the imports its filter matches, with the specifier as written (`file:` URLs as paths). `importer` is the importing module's id, and `undefined` for the entry. The first handler returning a result wins. Returning nothing leaves the import to the next plugin, then to the runtime.
+- `resolveId(source, importer, { isEntry, attributes })` runs for the imports its filter matches, with the specifier as written, query included (`file:` URLs as paths). `importer` is the importing module's id (a path with its query, or an id a `resolveId` hook returned), and `undefined` for the entry. The first handler returning a result wins. Returning nothing leaves the import to the next plugin, then to the runtime.
 - A resolved absolute path (a query is kept) loads that file, through `load` hooks and then from disk. Any other id, like `\0virtual:routes`, must be returned by a `load` hook, and relative imports inside such a module resolve from the working directory. `false` or `{ id, external: true }` leaves the import (or the returned id) to the runtime. Only Node.js and Deno import a different non-path id returned with `external`; Bun and miniflare keep the original specifier, so return an unchanged id or a path for portable externals.
-- `load(id)` returns the module's code, or `{ code, map, moduleType }`. The first handler returning code wins, and `transform` hooks run on the result. Without a `moduleType`, it is the id's type (`js` for other extensions). When no `load` hook returns code, the file is read from disk.
-- `resolveId` and `load` filters take only `id` (or filter expressions without `code` and `moduleType`). For `resolveId`, `id` matches the specifier without its query, and globs aren't resolved from the working directory (`virtual:*`, `@/**`).
+- `load(id)` returns the module's code, or `{ code, map, moduleType }`. The first handler returning code wins, and `transform` hooks run on the result. Without a `moduleType`, it is the id's type (`js` for other extensions). When no `load` hook returns code, the file is read from disk (without the id's query).
+- **Queries:** ids keep the import's query (`/app/logo.svg?raw`), in `load`, `transform` and filters, and the query is part of the module's identity: `./dep.ts` and `./dep.ts?raw` are separate modules on every runner. The module type comes from the path (`svg` there). Query params env-runner adds itself (reload cache-busting, virtual module versions, Bun and miniflare markers) are removed from the ids plugins see, and the import's own params are kept as written.
+- `resolveId` and `load` filters take only `id` (or filter expressions without `code` and `moduleType`). For `resolveId`, `id` matches the specifier with its query, and globs aren't resolved from the working directory (`virtual:*`, `@/**`).
 - Error messages name the hook: `[env-runner] plugin "virtual" failed to load "\0virtual:routes": ...`.
 
 **Which modules are sent:**
@@ -534,7 +547,7 @@ const yaml = {
 - Only imports that some `resolveId` filter matches are sent, so give `resolveId` hooks an `id` filter: without one, every import goes to the runner.
 - On the host, each handler runs only when its whole filter matches the current code.
 
-**Filters**: all given properties must match, and empty ones (`""`, `null`, `[]`) are ignored. Ids are matched `/`-separated and **without their query string** (the handler gets the id without it too).
+**Filters**: all given properties must match, and empty ones (`""`, `null`, `[]`) are ignored. Ids are matched with their path `/`-separated and **with their query string**, by globs and RegExps alike: `**/*.svg` and `/\.svg$/` don't match `/app/logo.svg?raw`, while `/\.svg(\?.*)?$/` and `**/*.svg{?*,}` match it with or without a query. A `query` filter expression (below) matches the params.
 
 - `id`: RegExps are tested, strings are globs: `*` (within a path segment), `?`, `**` (any number of segments, so `src/**` matches below `src/`), `[abc]`, `[a-z]`, `[!abc]`, `{a,b}` (also nested) and `\` escapes. Globs are case-sensitive, have no extglobs, and `*`/`**` also match dot files and directories (`**/*.ts` includes `.nitro/`). Globs not starting with `**` and not absolute are resolved from the working directory when the runner is created (`src/**`, `*.ts`); characters like `[` or `{` in that directory match literally. On Windows, an absolute glob written with `\` separators only (`C:\app\*.ts`) treats them as separators, so use `/` to escape characters there.
 - `code`: strings are substrings, RegExps are tested.
@@ -562,7 +575,7 @@ const filter = [
 
 - The list holds `include` and `exclude` entries, and the first one whose `expr` matches decides. If none matches, the module matches only when there are no `include` entries.
 - `expr` combines `and` / `or` (`args`) and `not` (`expr`) over `id`, `code` and `moduleType` (`pattern`), matched like the properties above.
-- `query` (`key`, `pattern`) sees no query, so only `pattern: false` matches. `importerId` is rejected.
+- `query` (`key`, `pattern`) matches the id's query, parsed with `URLSearchParams` (decoded, without a `#` fragment): `pattern: true` matches when `key` is present (`?raw`, `?raw=0`), `false` when it's absent, a string equals its value (`""` for `?raw`), and a RegExp tests it (`""` when absent). `importerId` is rejected.
 - The worker sends a module unless its expressions can't match whatever the code is.
 
 **Rules:**

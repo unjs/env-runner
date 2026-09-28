@@ -52,10 +52,10 @@ export interface SerializedPrefilter {
  * A module under `/node_modules/` (linked workspace packages resolve outside
  * it). Plugins only get those when an `id` include naming `node_modules`
  * matches, or a `resolveId` hook returned the path. Takes a `/`-separated
- * path.
+ * id (its query is ignored).
  */
 export function isNodeModulesId(id: string): boolean {
-  return id.includes("/node_modules/");
+  return stripQuery(id).includes("/node_modules/");
 }
 
 /** Initial module type of a module, from its extension. */
@@ -70,14 +70,70 @@ export function moduleTypeOf(path: string): PluginModuleType {
   return ext;
 }
 
-/** `/`-separated path without query, as filters see it. */
+/** An id as filters see it: its path `/`-separated, with its query. */
 export function normalizeFilterId(id: string): string {
-  return stripQuery(id).replaceAll("\\", "/");
+  const path = stripQuery(id);
+  return path.replaceAll("\\", "/") + id.slice(path.length);
 }
 
 export function stripQuery(id: string): string {
   const qIndex = id.indexOf("?");
   return qIndex === -1 ? id : id.slice(0, qIndex);
+}
+
+/** The query of an id (`?a&b=1`, without a `#` fragment), or `""`. */
+export function queryOf(id: string): string {
+  const qIndex = id.indexOf("?");
+  if (qIndex === -1) {
+    return "";
+  }
+  const hashIndex = id.indexOf("#", qIndex);
+  return hashIndex === -1 ? id.slice(qIndex) : id.slice(qIndex, hashIndex);
+}
+
+// Query params env-runner adds itself: reload cache-busting, Bun's routing
+// markers (virtual and plugin-loaded modules) and miniflare's CommonJS shims.
+const INTERNAL_PARAMS: ReadonlySet<string> = new Set([
+  "__envRunnerReload",
+  "__env_runner_virtual",
+  "__env_runner_disk",
+  "__env_runner_plugin",
+  "__cjs",
+]);
+
+/**
+ * An id without the query params env-runner adds itself (reload
+ * cache-busting, Bun markers, miniflare's CommonJS shims), and without a
+ * virtual module version (`v=<version>`, always the last param) when
+ * `version` is given. Other params are kept as written, in order.
+ */
+export function stripInternalQuery(id: string, version?: number): string {
+  const qIndex = id.indexOf("?");
+  if (qIndex === -1) {
+    return id;
+  }
+  const params = id.slice(qIndex + 1).split("&");
+  if (version && params.at(-1) === `v=${version}`) {
+    params.pop();
+  }
+  const kept = params.filter((param) => !_isInternalParam(param));
+  return id.slice(0, qIndex) + (kept.length > 0 ? `?${kept.join("&")}` : "");
+}
+
+/**
+ * Append the params {@link stripInternalQuery} removes from `from` (a
+ * reload's cache-busting) to `id`, a URL or path a plugin resolved it to.
+ */
+export function restoreInternalQuery(id: string, from: string): string {
+  const internal = queryOf(from).slice(1).split("&").filter(_isInternalParam);
+  if (internal.length === 0) {
+    return id;
+  }
+  return id + (id.includes("?") ? "&" : "?") + internal.join("&");
+}
+
+function _isInternalParam(param: string): boolean {
+  return INTERNAL_PARAMS.has(param.split("=", 1)[0]!);
 }
 
 /** Include and exclude patterns (exclude wins; no includes match everything). */
@@ -185,9 +241,19 @@ function _compileNode(node: SerializedFilterNode): FilterExpressionTest {
             : pattern.test(code);
     }
     case "query": {
-      // Ids are matched without their query: only "absent" matches.
-      const absent = node.pattern === false;
-      return () => absent;
+      // Parsed with `URLSearchParams`: a boolean tests whether the key is
+      // present, a string equals its (first) value, a RegExp tests that value
+      // (`""` when absent).
+      const { key, pattern } = node;
+      const regexp = typeof pattern === "object" ? deserializePattern(pattern) : undefined;
+      return (id) => {
+        const params = new URLSearchParams(queryOf(id));
+        if (typeof pattern === "boolean") {
+          return params.has(key) === pattern;
+        }
+        const value = params.get(key);
+        return regexp ? regexp.test(value ?? "") : value === pattern;
+      };
     }
   }
 }
@@ -264,7 +330,7 @@ export function satisfiesMatch(
 /**
  * Worker side: whether some plugin may load or transform a module, from the
  * plugins' serialized filters (the host checks the full filters). `id` is
- * `/`-separated. Modules of other than {@link SCRIPT_MODULE_TYPES} only
+ * {@link normalizeFilterId normalized}. Modules of other than {@link SCRIPT_MODULE_TYPES} only
  * count when a filter names them ({@link requiredMatch}).
  */
 export function createPrefilter(

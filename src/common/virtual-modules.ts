@@ -121,6 +121,30 @@ export function refreshVirtualModule(specifier: string): boolean {
 }
 
 /**
+ * Version virtual modules serve a module under (the `v=<n>` param they append
+ * last to its query), so plugins can see ids without it: with `registerHooks`,
+ * disk files (importers of invalidated keys, uncovered files) by `file:` URL
+ * without query; on Bun, path keys and removed ones by path. `undefined` when
+ * unversioned.
+ */
+export function virtualFileVersion(file: string): number | undefined {
+  for (const registration of _hooksRegistrations) {
+    const version = registration.versions.get(file);
+    if (version) {
+      return version;
+    }
+  }
+  for (const registration of _bunRegistrations) {
+    const key = registration.paths.get(file) ?? registration.removed.get(file);
+    const version = key === undefined ? undefined : registration.versions.get(key);
+    if (version) {
+      return version;
+    }
+  }
+  return undefined;
+}
+
+/**
  * Set (string source) or remove (`null`) virtual modules in one step. A key
  * changes in the registration serving it and a new key goes to the latest one,
  * registering one if there is none. Changed keys and their importers (see

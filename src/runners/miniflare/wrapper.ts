@@ -201,7 +201,7 @@ async function __handleWsMessage(env, data) {
   if (msg.type === "reload" && env.__ENV_RUNNER_UNSAFE_EVAL__) {
     const version = msg.version || 0;
     try {
-      const newEntry = await __loadEntry(env, __entryPath + "?t=" + version);
+      const newEntry = await __loadEntry(env, __entryPath + "?__envRunnerReload=" + version);
       const newServer = __createServer(newEntry);
       if (__userEntry?.ipc?.onClose) {
         await __userEntry.ipc.onClose();

@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MessageChannel, receiveMessageOnPort, Worker } from "node:worker_threads";
 import type { MessagePort } from "node:worker_threads";
+import { stripQuery } from "./filter.ts";
 import type { PluginPipeline, PluginResolvedId } from "./pipeline.ts";
 
 // Requests from worker loader hooks to the runner's plugins.
@@ -24,7 +25,8 @@ import type { PluginPipeline, PluginResolvedId } from "./pipeline.ts";
 // - `{ id, type: "resolve", source, importer?, isEntry, attributes? }` →
 //   `{ id, resolved? }` (none: the runtime resolves it).
 // - `{ id, type: "load", path, virtual? }` → `{ id, code?, moduleType? }` (no
-//   `code`: load the file as usual). The runner reads the file itself;
+//   `code`: load the file as usual). The runner reads the file itself (the
+//   path without its query);
 //   `virtual` ids (not files) must be loaded by a plugin.
 
 export type TransformRequest =
@@ -39,7 +41,7 @@ export type TransformRequest =
   | {
       id: number;
       type: "load";
-      /** Absolute file path, or a module id a plugin resolved (`virtual`). */
+      /** Absolute file path with its query, or a module id a plugin resolved (`virtual`). */
       path: string;
       virtual?: boolean;
       /** A path a `resolveId` hook returned (may be under `node_modules`). */
@@ -83,7 +85,7 @@ export async function handleTransformRequest(
     const { path } = request;
     const result = await pipeline.load(
       path,
-      request.virtual ? undefined : () => readFileSync(path, "utf8"),
+      request.virtual ? undefined : () => readFileSync(stripQuery(path), "utf8"),
       { resolved: request.resolved },
     );
     return { id: request.id, code: result?.code, moduleType: result?.moduleType };

@@ -8,11 +8,14 @@ import {
   nodeModulesIncludes,
   moduleTypeOf,
   normalizeFilterId,
+  queryOf,
+  restoreInternalQuery,
+  stripInternalQuery,
   stripQuery,
 } from "./filter.ts";
 import type { SerializedFilterNode, SerializedPattern, SerializedPrefilter } from "./filter.ts";
 import { createTransformClient } from "./channel.ts";
-import { commonJSToESM, loadCommonJSLexer } from "../common/virtual-modules.ts";
+import { commonJSToESM, loadCommonJSLexer, virtualFileVersion } from "../common/virtual-modules.ts";
 import type { TransformChannel, TransformedCode } from "./channel.ts";
 
 /** Runner data key of {@link PluginWorkerData} (only set with the `plugins` option). */
@@ -32,10 +35,10 @@ const PLUGIN_SCHEME = "env-runner-plugin:";
 const BUN_NAMESPACE = "env-runner-plugin";
 
 // Bun: specifiers with another extension than scripts (with a query), and
-// the marker query of the files the plugins loaded for them.
+// the marker leading the query of the files the plugins loaded for them.
 const BUN_OTHER_FILE = /\.(?![cm]?[jt]sx?(?:\?|$))[\w-]+(?:\?.*)?$/i;
 const BUN_LOADED_MARKER = "__env_runner_plugin";
-const BUN_LOADED_FILE = new RegExp(String.raw`\?${BUN_LOADED_MARKER}$`);
+const BUN_LOADED_FILE = new RegExp(String.raw`\?${BUN_LOADED_MARKER}(?:&|$)`);
 
 interface BunResolveArgs {
   path: string;
@@ -86,10 +89,11 @@ export async function registerPluginHooks(
     return _noop;
   }
   const prefilter = createPrefilter(config.prefilters);
-  // `resolved`: a path a `resolveId` hook returned (may be in node_modules).
-  const matches = (path: string, resolved?: boolean) => {
-    const id = normalizeFilterId(path);
-    return prefilter(id, moduleTypeOf(id), resolved);
+  // `id`: a path with the import's query; `resolved`: a path a `resolveId`
+  // hook returned (may be in node_modules).
+  const matches = (id: string, resolved?: boolean) => {
+    const filterId = normalizeFilterId(id);
+    return prefilter(filterId, moduleTypeOf(filterId), resolved);
   };
   // Paths `resolveId` hooks returned (Node.js/Deno).
   const pluginResolved = new Set<string>();
@@ -144,7 +148,10 @@ export async function registerPluginHooks(
     const hooks = registerHooks({
       ...(resolvePrefilters.length > 0 && {
         resolve(specifier, context, nextResolve) {
-          const source = specifier.startsWith("file:") ? _urlPath(specifier, true) : specifier;
+          const raw = specifier.startsWith("file:") ? _urlPath(specifier, true) : specifier;
+          // A reload's cache-busting param stays out of the plugins' view, and
+          // goes back on the result.
+          const source = stripInternalQuery(raw);
           if (resolves(source)) {
             const isEntry = entryId !== undefined && stripQuery(source) === entryId;
             const importer = isEntry ? undefined : _importerId(context.parentURL);
@@ -156,10 +163,13 @@ export async function registerPluginHooks(
               if (_idPath(resolved.id)) {
                 pluginResolved.add(stripQuery(resolved.id));
               }
-              return { url: _idURL(resolved.id), shortCircuit: true };
+              return { url: restoreInternalQuery(_idURL(resolved.id), raw), shortCircuit: true };
             }
             if (resolved && resolved.id !== source) {
-              specifier = _idPath(resolved.id) ? _idURL(resolved.id) : resolved.id;
+              specifier = restoreInternalQuery(
+                _idPath(resolved.id) ? _idURL(resolved.id) : resolved.id,
+                raw,
+              );
             }
           }
           // Plugin ids aren't hierarchical: their imports resolve from cwd.
@@ -175,12 +185,12 @@ export async function registerPluginHooks(
           return serve(id, client.load(id, true)!, context);
         }
         if (url.startsWith("file:")) {
-          const path = fileURLToPath(stripQuery(url));
-          const resolved = pluginResolved.has(path);
-          if (matches(path, resolved)) {
-            const result = client.load(path, false, resolved);
+          const id = _fileId(url);
+          const resolved = pluginResolved.has(stripQuery(id));
+          if (matches(id, resolved)) {
+            const result = client.load(id, false, resolved);
             if (result) {
-              return serve(path, result, context);
+              return serve(stripQuery(id), result, context);
             }
           }
         }
@@ -215,15 +225,18 @@ export async function registerPluginHooks(
     };
     // Other file types are loaded while resolving, where Bun still accepts no
     // result (it loads any file natively, unknown ones as a path): served
-    // with a marker query, kept here until Bun loads them.
+    // with a marker param (before the import's query), kept here by id until
+    // Bun loads them (it resolves a static import twice first).
     const loaded = new Map<string, TransformedCode>();
-    const loadOther = (file: string, resolved?: boolean) => {
-      const result = matches(file, resolved) ? client.load(file, false, resolved) : undefined;
+    const loadOther = (id: string, resolved?: boolean) => {
+      const result =
+        loaded.get(id) ?? (matches(id, resolved) ? client.load(id, false, resolved) : undefined);
       if (!result) {
         return undefined;
       }
-      loaded.set(file, result);
-      return { path: `${file}?${BUN_LOADED_MARKER}` };
+      loaded.set(id, result);
+      const query = queryOf(id);
+      return { path: `${stripQuery(id)}?${BUN_LOADED_MARKER}${query && `&${query.slice(1)}`}` };
     };
     // Bun calls `onResolve` again with the path it returned and no importer.
     const onResolve =
@@ -232,7 +245,8 @@ export async function registerPluginHooks(
         if (_active !== served || (!namespace && importer === "")) {
           return undefined;
         }
-        const source = namespace ? `${namespace}:${path}` : path;
+        const raw = namespace ? `${namespace}:${path}` : path;
+        const source = stripInternalQuery(raw);
         if (!resolves(source)) {
           return undefined;
         }
@@ -248,7 +262,11 @@ export async function registerPluginHooks(
           // leaves out, are loaded here.
           const file = stripQuery(resolved.id);
           const here = BUN_OTHER_FILE.test(file) || isNodeModulesId(normalizeFilterId(file));
-          return (!resolved.external && here && loadOther(file, true)) || { path: resolved.id };
+          return (
+            (!resolved.external && here && loadOther(resolved.id, true)) || {
+              path: restoreInternalQuery(resolved.id, raw),
+            }
+          );
         }
         return resolved.external
           ? undefined
@@ -257,20 +275,23 @@ export async function registerPluginHooks(
     bunPlugin({
       name: "env-runner-plugins",
       setup(build: any) {
+        // Bun keeps a path's query, in `path` and the module's identity.
         build.onLoad({ filter }, ({ path }: { path: string }) => {
-          const result = _active === served && matches(path) ? client.load(path) : undefined;
+          const id = _bunId(path);
+          const file = stripQuery(path);
+          const result = _active === served && matches(id) ? client.load(id) : undefined;
           if (result) {
-            return serve(path, result);
+            return serve(file, result);
           }
           // `onLoad` can't decline: untouched code is served with the loader
           // Bun would use.
-          const contents = readFileSync(path, "utf8");
+          const contents = readFileSync(file, "utf8");
           return {
             contents:
-              transformedFormat(path, contents) === "commonjs"
-                ? commonJSToESM(path, contents)
+              transformedFormat(file, contents) === "commonjs"
+                ? commonJSToESM(file, contents)
                 : contents,
-            loader: _bunLoader(path),
+            loader: _bunLoader(file),
           };
         });
         if (resolvePrefilters.length > 0) {
@@ -282,16 +303,16 @@ export async function registerPluginHooks(
         }
         build.onResolve({ filter: BUN_OTHER_FILE }, ({ path, importer }: BunResolveArgs) => {
           const file = _active === served && importer ? _bunFilePath(path, importer) : undefined;
-          return file === undefined ? undefined : loadOther(file);
+          return file === undefined ? undefined : loadOther(_bunId(file + queryOf(path)));
         });
         build.onLoad({ filter: BUN_LOADED_FILE }, ({ path }: { path: string }) => {
-          const file = stripQuery(path);
-          const result = loaded.get(file) ?? client.load(file);
-          loaded.delete(file);
+          const id = _bunId(path);
+          const result = loaded.get(id) ?? client.load(id);
+          loaded.delete(id);
           if (!result) {
-            throw new Error(`[env-runner] no plugin loaded or transformed "${file}" anymore`);
+            throw new Error(`[env-runner] no plugin loaded or transformed "${id}" anymore`);
           }
-          return serve(file, result);
+          return serve(stripQuery(path), result);
         });
         build.onLoad({ filter: /.*/, namespace: BUN_NAMESPACE }, ({ path }: { path: string }) => {
           const id = decodeURIComponent(path);
@@ -331,10 +352,21 @@ function _schemeId(url: string): string {
   return decodeURIComponent(stripQuery(url.slice(PLUGIN_SCHEME.length)));
 }
 
-// Path of a `file:` URL (with its query when `keepQuery`).
+// Path of a `file:` URL (with its query, without a fragment, when `keepQuery`).
 function _urlPath(url: string, keepQuery = false): string {
-  const bare = stripQuery(url);
-  return fileURLToPath(bare) + (keepQuery ? url.slice(bare.length) : "");
+  return fileURLToPath(stripQuery(url)) + (keepQuery ? queryOf(url) : "");
+}
+
+// Module id of a `file:` URL: its path with the import's query, without the
+// params env-runner added (reloads, virtual module versions).
+function _fileId(url: string): string {
+  const bare = url.slice(0, url.search(/[?#]|$/));
+  return stripInternalQuery(_urlPath(url, true), virtualFileVersion(bare));
+}
+
+// Module id of a Bun path (Bun markers and virtual versions removed).
+function _bunId(path: string): string {
+  return stripInternalQuery(path, virtualFileVersion(stripQuery(path)));
 }
 
 // `importer` of a `resolveId` call: a path, a plugin id, or the URL.
@@ -343,7 +375,7 @@ function _importerId(parentURL: string | undefined): string | undefined {
     return undefined;
   }
   if (parentURL.startsWith("file:")) {
-    return _urlPath(parentURL);
+    return _fileId(parentURL);
   }
   return parentURL.startsWith(PLUGIN_SCHEME) ? _schemeId(parentURL) : parentURL;
 }
@@ -353,9 +385,10 @@ function _bunImporterId(importer: string): string | undefined {
     return undefined;
   }
   const prefix = `${BUN_NAMESPACE}:`;
-  return importer.startsWith(prefix)
-    ? decodeURIComponent(importer.slice(prefix.length))
-    : stripQuery(importer);
+  if (importer.startsWith(prefix)) {
+    return decodeURIComponent(importer.slice(prefix.length));
+  }
+  return isAbsolute(stripQuery(importer)) ? _bunId(importer) : stripQuery(importer);
 }
 
 // Path a relative or absolute Bun specifier (query stripped) refers to;
@@ -446,10 +479,11 @@ export function transformedFormat(
   if (hint?.startsWith("commonjs")) {
     return "commonjs";
   }
-  if (/\.m[jt]sx?$/.test(path)) {
+  const file = stripQuery(path);
+  if (/\.m[jt]sx?$/.test(file)) {
     return "module";
   }
-  if (/\.c[jt]sx?$/.test(path)) {
+  if (/\.c[jt]sx?$/.test(file)) {
     return "commonjs";
   }
   if (!CJS_MARKERS.test(code)) {
@@ -473,12 +507,14 @@ const BUN_EXTENSIONS: Record<string, string[]> = {
 /**
  * Bun's `onLoad` filter (a single RegExp) for these plugins. Bun evaluates
  * plugin output as ESM and `onLoad` can't decline, so it follows the plugins'
- * prefilters as closely as a RegExp can: one alternative per plugin with no
+ * prefilters as closely as a RegExp can: no Bun marker query
+ * (`__env_runner_*`), then one alternative per plugin with no
  * `/node_modules/` (either separator; unless its folded `id` includes name
  * it), and
  *
  * - the extensions its `moduleType` filter implies (all non-CommonJS script
- *   extensions without one, or with filter expressions), never `.cjs`/`.cts`;
+ *   extensions without one, or with filter expressions), never `.cjs`/`.cts`,
+ *   before an optional query;
  * - its `id` filter: excludes as a negative lookahead, and includes as a
  *   lookahead (when they can all be folded).
  *
@@ -514,7 +550,8 @@ export function createBunFilter(
   const foldIds =
     flagSet.size <= 1 && !folded.some(({ source }) => /\\[1-9]|\\k<|\(\?<(?![=!])/.test(source));
   const branches = new Set<string>();
-  const guard = `(?!.*${sep}node_modules${sep})`;
+  // Checked on the path (before a query).
+  const guard = `(?![^?]*${sep}node_modules${sep})`;
   for (const { moduleTypes, include, exclude, nodeModules } of plugins) {
     const extensions = moduleTypes
       ? moduleTypes.flatMap((type) => BUN_EXTENSIONS[type] ?? [])
@@ -534,10 +571,13 @@ export function createBunFilter(
     } else if (!nodeModules) {
       lookaheads = guard + lookaheads;
     }
-    branches.add(`${lookaheads}.*(?:${[...new Set(extensions)].map(escape).join("|")})$`);
+    const exts = [...new Set(extensions)].map(escape).join("|");
+    branches.add(`${lookaheads}[^?]*(?:${exts})(?:\\?.*)?$`);
   }
+  // Paths under a Bun marker have their own `onLoad` (or load from disk).
+  const marker = String.raw`\?__env_runner_(?:virtual|disk|plugin)(?:&|$)`;
   return new RegExp(
-    `^(?:${[...branches].join("|") || "(?!)"})`,
+    `^(?![^?]*${marker})(?:${[...branches].join("|") || "(?!)"})`,
     foldIds ? ([...flagSet][0] ?? "") : "",
   );
 }

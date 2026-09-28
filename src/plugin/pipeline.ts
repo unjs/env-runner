@@ -35,7 +35,9 @@ export type PluginStringFilter =
 
 /**
  * `transform` hook filter (all given properties must match; empty ones are
- * ignored). Ids are matched `/`-separated and without their query string.
+ * ignored). Ids are matched `/`-separated and with their query string: the
+ * glob `**\/*.svg` and the RegExp `/\.svg$/` don't match `/app/a.svg?raw`, but
+ * `/\.svg(?:\?.*)?$/` does (or add a `query` filter expression).
  * - `id`: RegExps are tested, strings are globs: `*` (within a path segment),
  *   `?`, `**` (any number of segments), `[abc]`/`[!abc]`, `{a,b}` and `\`
  *   escapes, case-sensitive; `*` and `**` also match dot files and
@@ -57,7 +59,7 @@ export interface PluginTransformFilter {
 /**
  * `resolveId` and `load` hook filter: `id` only, matched like
  * {@link PluginTransformFilter} `id`. For `resolveId` it is the import
- * specifier (without its query) and globs match it as written (not resolved
+ * specifier (with its query) and globs match it as written (not resolved
  * from the working directory).
  */
 export interface PluginHookFilter {
@@ -66,9 +68,11 @@ export interface PluginHookFilter {
 
 /**
  * A filter expression, matched like the {@link PluginTransformFilter}
- * properties. `query` sees no query (only `pattern: false` matches), and
- * `importerId` is rejected. `resolveId` and `load` filters take no `code` or
- * `moduleType` expressions.
+ * properties. `query` parses the id's query with `URLSearchParams`: `true`
+ * matches when `key` is present (`?raw`), `false` when it's absent, a string
+ * equals its value, a RegExp tests it (`""` when absent). `importerId` is
+ * rejected. `resolveId` and `load` filters take no `code` or `moduleType`
+ * expressions.
  */
 export type PluginFilterExpression =
   | { kind: "and" | "or"; args: PluginFilterExpression[] }
@@ -122,7 +126,11 @@ export interface PluginContext {
   meta: { watchMode: boolean };
 }
 
-/** Runs on the host and may be async. Return nullish to keep the code. */
+/**
+ * Runs on the host and may be async. Return nullish to keep the code. `id` is
+ * the module's path with the import's query (`/app/a.ts?raw`), or an id a
+ * `resolveId` hook returned.
+ */
 export type PluginTransformHandler = (
   this: PluginContext,
   code: string,
@@ -157,9 +165,9 @@ export interface PluginResolveIdOptions {
 
 /**
  * Runs on the host for the imports its filter matches (the import specifier
- * as written, `file:` URLs as paths) and may be async. `importer` is the
- * importing module's id (a path, or an id a `resolveId` returned), `undefined`
- * for the entry.
+ * as written, with its query, `file:` URLs as paths) and may be async.
+ * `importer` is the importing module's id (a path with its query, or an id a
+ * `resolveId` returned), `undefined` for the entry.
  */
 export type PluginResolveIdHandler = (
   this: PluginContext,
@@ -186,7 +194,8 @@ export type PluginResolveIdResult =
 /**
  * Runs on the host for the modules its filter matches and may be async:
  * return the module's code, or nullish to try the next plugin (then the file
- * is read from disk). `transform` hooks run on the result.
+ * is read from disk, without the id's query). `transform` hooks run on the
+ * result. `id` is like the {@link PluginTransformHandler} one.
  */
 export type PluginLoadHandler = (
   this: PluginContext,
@@ -395,8 +404,12 @@ export function createPluginPipeline(
   const resolvePrefilter = createPrefilter(resolvePrefilters);
 
   const filter = (id: string, moduleType?: PluginModuleType, resolved?: boolean) => {
-    const path = normalizeFilterId(id);
-    return prefilter(path, moduleType ?? moduleTypeOf(path), resolved || moduleType !== undefined);
+    const matchId = normalizeFilterId(id);
+    return prefilter(
+      matchId,
+      moduleType ?? moduleTypeOf(matchId),
+      resolved || moduleType !== undefined,
+    );
   };
 
   const resolveId = async (
@@ -549,18 +562,17 @@ export function createPluginPipeline(
       );
     }
     if (map) {
-      const source = isAbsolute(id) ? pathToFileURL(id).href : id;
+      const file = stripQuery(id);
+      const source = isAbsolute(file) ? pathToFileURL(file).href : file;
       const json = JSON.stringify({ ...map, sources: [source], file: undefined });
       code += `\n//# sourceMappingURL=data:application/json;base64,${Buffer.from(json).toString("base64")}\n`;
     }
     return { code, moduleType: moduleType as "js" | "ts" };
   };
 
-  const transform = (id: string, code: string, sourceType?: PluginModuleType) => {
-    id = stripQuery(id);
-    // Virtual modules, and modules the caller already sent here.
-    return _transform(id, code, sourceType ?? moduleTypeOf(id), { resolved: true, changed: false });
-  };
+  // Virtual modules, and modules the caller already sent here.
+  const transform = (id: string, code: string, sourceType?: PluginModuleType) =>
+    _transform(id, code, sourceType ?? moduleTypeOf(id), { resolved: true, changed: false });
 
   return {
     names: normalized.map((plugin) => plugin.name),

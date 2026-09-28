@@ -24,7 +24,12 @@ import { EnvServer } from "../src/server.ts";
 import * as miniflare from "miniflare";
 import { MiniflareEnvRunner } from "../src/runners/miniflare/runner.ts";
 import { createPluginPipeline, transformVirtualModules } from "../src/plugin/pipeline.ts";
-import { createPrefilter, moduleTypeOf } from "../src/plugin/filter.ts";
+import {
+  createPrefilter,
+  moduleTypeOf,
+  restoreInternalQuery,
+  stripInternalQuery,
+} from "../src/plugin/filter.ts";
 import { globToRegExp, resolveGlob } from "../src/plugin/glob.ts";
 import { openTransformSocket } from "../src/plugin/channel.ts";
 import { connect } from "node:net";
@@ -145,6 +150,39 @@ function resolvers(seen: [string, string | undefined][]): EnvRunnerPlugin[] {
   ];
 }
 
+// Query plugins, recording `[hook, id]` pairs: `?raw` imports loaded as their
+// source by a `load` hook, `?lines` modules (read from disk without the query)
+// transformed into their line count.
+function queries(seen: [string, string][]): EnvRunnerPlugin[] {
+  const has = (key: string) => [
+    { kind: "include" as const, expr: { kind: "query" as const, key, pattern: true } },
+  ];
+  return [
+    {
+      name: "raw",
+      load: {
+        filter: has("raw"),
+        handler(id) {
+          seen.push(["load", id]);
+          const code = readFileSync(id.slice(0, id.indexOf("?")), "utf8");
+          return { code: `export default ${JSON.stringify(code)};`, moduleType: "js" };
+        },
+      },
+    },
+    {
+      name: "lines",
+      transform: {
+        order: "pre",
+        filter: has("lines"),
+        handler(code, id) {
+          seen.push(["transform", id]);
+          return { code: `export default ${code.trim().split("\n").length};`, moduleType: "js" };
+        },
+      },
+    },
+  ];
+}
+
 const runners = [
   { name: "NodeWorkerEnvRunner", create: (opts: any) => new NodeWorkerEnvRunner(opts) },
   { name: "NodeProcessEnvRunner", create: (opts: any) => new NodeProcessEnvRunner(opts) },
@@ -237,6 +275,58 @@ for (const { name, create, skip, cjsOptions } of runners) {
         expect(seen).toEqual(expect.arrayContaining(["app-files.ts", "note.txt", "logo.svg"]));
       },
     );
+
+    it("passes ids with their import query, without env-runner's own params", async () => {
+      const seen: [string, string][] = [];
+      // Every script module the plugins see (before the others change it).
+      const ids: string[] = [];
+      const record: EnvRunnerPlugin = {
+        name: "record",
+        transform: { order: "pre", handler: (_code, id) => void ids.push(id) },
+      };
+      runner = create({
+        name: "plugins-query",
+        plugins: [record, oxc(), queries(seen)],
+        data: {
+          entry: fixture("app-query.ts"),
+          virtual: { "#stamp": "export default 1;" },
+        },
+      });
+      await runner.waitForReady();
+      const source = readFileSync(fixture("dep.ts"), "utf8");
+      const body = {
+        note: "hello",
+        depSource: true,
+        depLines: source.trim().split("\n").length,
+        label: "Ok",
+        separate: true,
+        dynamic: true,
+        // CommonJS output with a query (miniflare: behind its ESM shim).
+        cjs: "lib",
+        stamp: 1,
+      };
+      expect(await (await runner.fetch("http://localhost/")).json()).toEqual(body);
+      const note = fixture("note.txt?raw");
+      const depRaw = fixture("dep.ts?raw");
+      expect(seen).toEqual([
+        ["load", note],
+        ["load", depRaw],
+        ["transform", fixture("dep.ts?lines")],
+      ]);
+      // The importer (with its version and a reload's param) is re-served
+      // under its own id.
+      await runner.updateVirtualModules!({ "#stamp": "export default 2;" });
+      await runner.reloadModule!();
+      expect(await (await runner.fetch("http://localhost/")).json()).toEqual({
+        ...body,
+        stamp: 2,
+      });
+      const entry = fixture("app-query.ts");
+      expect(ids.filter((id) => id.startsWith(entry))).toEqual([entry, entry]);
+      const internal = /__env|__cjs|[?&][tv]=/;
+      expect(ids.filter((id) => internal.test(id))).toEqual([]);
+      expect(seen.filter(([, id]) => internal.test(id))).toEqual([]);
+    });
 
     it('runs `order: "pre"` handlers first', async () => {
       const pre: EnvRunnerPlugin = {
@@ -706,6 +796,14 @@ describe("plugins", () => {
     expect(all.test("/app/a.cts")).toBe(false);
     expect(all.test("/app/node_modules/x/a.ts")).toBe(false);
     expect(all.test(String.raw`C:\app\node_modules\x\a.ts`)).toBe(false);
+    // With the import's query, but not under a Bun marker (their own `onLoad`).
+    expect(all.test("/app/a.ts?raw")).toBe(true);
+    expect(all.test("/app/a.ts?x=/node_modules/")).toBe(true);
+    expect(all.test("/app/a.txt?x.ts")).toBe(false);
+    expect(all.test("/app/a.ts?__env_runner_virtual")).toBe(false);
+    expect(all.test("/app/a.ts?__env_runner_disk&raw&v=2")).toBe(false);
+    expect(all.test("/app/a.ts?__env_runner_plugin&raw")).toBe(false);
+    expect(all.test("/app/a.ts?raw&__env_runner_plugin")).toBe(true);
     const typed = filter([{ moduleTypes: ["tsx"] }]);
     expect(typed.test("/app/a.tsx")).toBe(true);
     expect(typed.test("/app/a.ts")).toBe(false);
@@ -848,13 +946,24 @@ describe("plugin filters", () => {
     expect(await matching({ id: "/r/{a.ts" }, ["/r/{a.ts", "/r/a.ts"])).toEqual(["/r/{a.ts"]);
   });
 
-  it("matches ids without their query, `/`-separated, and RegExps without `g`/`y`", async () => {
+  it("matches ids with their query, `/`-separated, and RegExps without `g`/`y`", async () => {
     const seen = await matching({ id: /\/src\//y }, [
       "/app/src/a.ts?v=1",
-      String.raw`C:\app\src\b.ts`,
+      String.raw`C:\app\src\b.ts?x=\y`,
     ]);
-    expect(seen).toEqual(["/app/src/a.ts", String.raw`C:\app\src\b.ts`]);
-    expect(await matching({ id: /a\.ts\?v/ }, ["/app/a.ts?v=1"])).toEqual([]);
+    // Handlers get the ids as they are.
+    expect(seen).toEqual(["/app/src/a.ts?v=1", String.raw`C:\app\src\b.ts?x=\y`]);
+    // Globs and RegExps both see the query (only the path is `/`-separated).
+    const ids = ["/app/a.ts", "/app/a.ts?raw", String.raw`C:\app\a.ts?x=\y`];
+    expect(await matching({ id: /a\.ts\?raw$/ }, ids)).toEqual(["/app/a.ts?raw"]);
+    expect(await matching({ id: /a\.ts$/ }, ids)).toEqual(["/app/a.ts"]);
+    expect(await matching({ id: "/app/*.ts" }, ids)).toEqual(["/app/a.ts"]);
+    expect(await matching({ id: "/app/*.ts{?*,}" }, ids)).toEqual(ids.slice(0, 2));
+    expect(await matching({ id: /^C:\/app\/a\.ts\?x=\\y$/ }, ids)).toEqual([ids[2]]);
+    expect(await matching({ id: { exclude: /\?raw$/ } }, ids)).toEqual([ids[0], ids[2]]);
+    // The module type comes from the path.
+    expect(moduleTypeOf("/app/a.svg?raw")).toBe("svg");
+    expect(moduleTypeOf("/app/a.ts?x.json")).toBe("ts");
     const global = /a/g;
     expect(await matching({ id: global, code: global }, ["/a1.ts", "/a2.ts"], "a")).toEqual([
       "/a1.ts",
@@ -917,12 +1026,77 @@ describe("plugin filters", () => {
     ).toEqual(ids);
     expect(await matching([include(moduleType("tsx"))], ids)).toEqual([]);
     expect(await matching([], ids)).toEqual(ids);
-    // Ids have no query: only "absent" matches.
-    const query = (pattern: any) => [include({ kind: "query", key: "raw", pattern })];
-    expect(await matching(query(false), ["/a.ts?raw"])).toEqual(["/a.ts"]);
-    for (const pattern of [true, "", /x/]) {
-      expect(await matching(query(pattern), ["/a.ts?raw"])).toEqual([]);
-    }
+  });
+
+  it("matches `query` expressions against the id's query", async () => {
+    const query = (key: string, pattern: any) => [include({ kind: "query", key, pattern })];
+    const ids = ["/a.ts", "/a.ts?raw", "/a.ts?url=1&raw", "/a.ts?type=style&lang.css", "/a.ts#raw"];
+    // A boolean: whether the key is present (with or without a value).
+    expect(await matching(query("raw", true), ids)).toEqual(["/a.ts?raw", "/a.ts?url=1&raw"]);
+    expect(await matching(query("raw", false), ids)).toEqual([
+      "/a.ts",
+      "/a.ts?type=style&lang.css",
+      "/a.ts#raw",
+    ]);
+    // A string equals the value (`?raw` has `""`), a RegExp tests it (`""` when absent).
+    expect(await matching(query("raw", ""), ids)).toEqual(["/a.ts?raw", "/a.ts?url=1&raw"]);
+    expect(await matching(query("url", "1"), ids)).toEqual(["/a.ts?url=1&raw"]);
+    expect(await matching(query("type", /^sty/), ids)).toEqual(["/a.ts?type=style&lang.css"]);
+    expect(await matching(query("type", /^$/), ids)).toEqual([
+      "/a.ts",
+      "/a.ts?raw",
+      "/a.ts?url=1&raw",
+      "/a.ts#raw",
+    ]);
+    // Parsed like `URLSearchParams` (decoded), without the fragment.
+    expect(await matching(query("q", "a b"), ["/a.ts?q=a%20b", "/a.ts?q=a+b#x"])).toEqual([
+      "/a.ts?q=a%20b",
+      "/a.ts?q=a+b#x",
+    ]);
+    expect(await matching(query("x", true), ["/a.ts?raw#x", "/a.ts?raw&x#y"])).toEqual([
+      "/a.ts?raw&x#y",
+    ]);
+    // Combined with `id`, in the worker's prefilter too.
+    const filter = [
+      include({
+        kind: "and",
+        args: [id(/\.svg(?:\?.*)?$/), { kind: "query", key: "raw", pattern: true }],
+      }),
+    ];
+    expect(await matching(filter, ["/a.svg", "/a.svg?raw", "/a.ts?raw"])).toEqual(["/a.svg?raw"]);
+    const [prefilter] = createPluginPipeline([{ load: { filter, handler() {} } }])!.prefilters;
+    const test = createPrefilter([prefilter!]);
+    expect(test("/a.svg?raw", "svg")).toBe(true);
+    expect(test("/a.svg", "svg")).toBe(false);
+    expect(test("/a.svg?raw=0", "svg")).toBe(true);
+  });
+
+  it("strips env-runner's own query params, keeping the import's", () => {
+    expect(stripInternalQuery("/a.ts")).toBe("/a.ts");
+    expect(stripInternalQuery("/a.ts?raw")).toBe("/a.ts?raw");
+    expect(stripInternalQuery("/a.ts?__envRunnerReload=3")).toBe("/a.ts");
+    expect(stripInternalQuery("/a.ts?raw&__envRunnerReload=3")).toBe("/a.ts?raw");
+    // Bun markers lead the query, miniflare's CommonJS shim param ends it.
+    expect(stripInternalQuery("/a.ts?__env_runner_virtual&raw")).toBe("/a.ts?raw");
+    expect(stripInternalQuery("/a.ts?__env_runner_disk&x=1&v=2", 2)).toBe("/a.ts?x=1");
+    expect(stripInternalQuery("/a.txt?__env_runner_plugin&raw")).toBe("/a.txt?raw");
+    expect(stripInternalQuery("/a.cjs?raw&__cjs")).toBe("/a.cjs?raw");
+    // A virtual module version only when given (and last): `v` may be the import's.
+    expect(stripInternalQuery("/a.ts?v=2")).toBe("/a.ts?v=2");
+    expect(stripInternalQuery("/a.ts?v=2", 3)).toBe("/a.ts?v=2");
+    expect(stripInternalQuery("/a.ts?v=2&v=3", 3)).toBe("/a.ts?v=2");
+    expect(stripInternalQuery("/a.ts?raw&v=3", 3)).toBe("/a.ts?raw");
+    expect(stripInternalQuery("/a.ts?v=3&raw", 3)).toBe("/a.ts?v=3&raw");
+    // Names only: other params are kept as written.
+    expect(stripInternalQuery("/a.ts?__cjsx&a=%20&__envRunnerReload")).toBe("/a.ts?__cjsx&a=%20");
+    // A resolved id gets a reload's param back.
+    expect(restoreInternalQuery("/b.ts", "/a.ts?raw&__envRunnerReload=3")).toBe(
+      "/b.ts?__envRunnerReload=3",
+    );
+    expect(restoreInternalQuery("file:///b.ts?x", "/a.ts?__envRunnerReload=3")).toBe(
+      "file:///b.ts?x&__envRunnerReload=3",
+    );
+    expect(restoreInternalQuery("/b.ts", "/a.ts?raw")).toBe("/b.ts");
   });
 
   it("validates filter expressions", () => {

@@ -11,6 +11,7 @@ import { proxyUpgrade } from "httpxy";
 import { BaseEnvRunner } from "../../common/base-runner.ts";
 import type { EnvRunnerData, EnvRunnerPluginOption } from "../../common/base-runner.ts";
 import { resolveRuntimeDep } from "../../common/runtime-deps.ts";
+import { queryOf, stripInternalQuery, stripQuery } from "../../plugin/filter.ts";
 import { jsonModuleCode, transformedFormat } from "../../plugin/hooks.ts";
 import type { PluginTransformOutput } from "../../plugin/pipeline.ts";
 import type { RuntimeDep } from "../../common/runtime-deps.ts";
@@ -664,8 +665,8 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
         // Read from the live runner: a persistent instance is adopted by later
         // runners, which bring their own plugins.
         const _livePlugins = () => ipc.runner._plugins;
-        // Plugin output of CommonJS modules, from the shim request until its
-        // `?__cjs` request (so they are transformed once).
+        // Plugin output of CommonJS modules by id, from the shim request until
+        // its `__cjs` request (so they are transformed once).
         const _cjsOutput = new Map<string, string>();
         const _exportConditions = this.#exportConditions;
         // `modulePath`: the served module's path, which its relative imports join onto.
@@ -729,7 +730,8 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
             namedExports: commonJSExports(code).filter((e) => e !== "default"),
           };
         };
-        // Plugin ids served (by workerd module name), the importers of their imports.
+        // Ids of served modules that aren't their path (by workerd module
+        // name): plugin ids and files with a query, the importers of their imports.
         const _pluginModuleIds = new Map<string, string>();
         // A named import of this module fails at link time before the throw
         // runs (hiding it), so also report it on the host.
@@ -758,7 +760,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
           const cleanSpecifier = specifier.split("?")[0] || specifier;
           const cleanRaw = rawSpecifier?.split("?")[0];
 
-          // Virtual modules override real files. Keep the `?t=` query in the name
+          // Virtual modules override real files. Keep the query (a reload's too) in the name
           // so reloads get a fresh workerd module identity.
           const bareSpecifier = cleanSpecifier.startsWith("/")
             ? cleanSpecifier.slice(1)
@@ -811,24 +813,39 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
           const name =
             (cleanSpecifier.startsWith("/") ? cleanSpecifier.slice(1) : cleanSpecifier) + rawQuery;
 
+          // The import's own query, as plugins see it: without a reload's
+          // param, the CommonJS shim's, or a (removed) virtual key's version.
+          const versionedKey = _virtual.versionedKeyOf(cleanRaw || cleanSpecifier, referrerPath);
+          const version =
+            versionedKey === undefined ? undefined : _virtual.versions.get(versionedKey);
+          const query = queryOf(stripInternalQuery(specifier, version));
+
           let resolvedPath: string | undefined;
+          // Module id when it isn't `resolvedPath` + `query` (a plugin resolved it).
+          let resolvedId: string | undefined;
           // Returned by a `resolveId` hook (may be under node_modules).
           let pluginResolved = false;
 
           // The plugins' `resolveId` hooks, after virtual modules (as in workers).
           const _resolvePlugins = _livePlugins();
-          const source = cleanRaw || bareSpecifier;
+          const rawSource = rawSpecifier
+            ? stripInternalQuery(rawSpecifier, version)
+            : bareSpecifier + query;
+          const source = rawSource.startsWith("file:")
+            ? fileURLToPath(stripQuery(rawSource)) + queryOf(rawSource)
+            : rawSource;
           if (_resolvePlugins?.resolveFilter(source)) {
             try {
               const resolved = await _resolvePlugins.resolveId(
-                source.startsWith("file:") ? fileURLToPath(source) : source,
-                referrerPath ?? _pluginModuleIds.get(referrerKey),
+                source,
+                _pluginModuleIds.get(referrerKey) ?? referrerPath,
               );
               if (resolved && !resolved.external) {
                 const id = resolved.id;
-                const idPath = id.split("?")[0]!;
+                const idPath = stripQuery(id);
                 if (isAbsolute(idPath)) {
                   resolvedPath = idPath;
+                  resolvedId = id;
                   pluginResolved = true;
                 } else {
                   // Not a file: a `load` hook serves it.
@@ -940,25 +957,29 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
             // Missing: maybe a plugin loads it.
           }
           const _plugins = _livePlugins();
-          const cjsSuffix = "?__cjs";
-          const cachedCJS = specifier.endsWith(cjsSuffix) && _cjsOutput.has(resolvedPath);
-          const pluginFile =
-            !cachedCJS && _plugins?.filter(resolvedPath, undefined, pluginResolved);
+          // The shim's request for the CommonJS module (the param goes last).
+          const cjsRequest = /[?&]__cjs$/.test(specifier);
+          const id = resolvedId ?? resolvedPath + query;
+          const cachedCJS = cjsRequest && _cjsOutput.has(id);
+          const pluginFile = !cachedCJS && _plugins?.filter(id, undefined, pluginResolved);
           if (contents === undefined && !cachedCJS && !pluginFile) {
             return new Response(null, { status: 404 });
           }
           // Track the real path so relative imports from this module resolve correctly
           modulePathMap.set(name, resolvedPath);
+          if (id !== resolvedPath) {
+            _pluginModuleIds.set(name, id);
+          }
 
           let transformed: string | undefined;
           if (cachedCJS) {
-            transformed = _cjsOutput.get(resolvedPath);
-            _cjsOutput.delete(resolvedPath);
+            transformed = _cjsOutput.get(id);
+            _cjsOutput.delete(id);
           } else if (pluginFile) {
             try {
               const file = resolvedPath;
               const result = await _plugins!.load(
-                file,
+                id,
                 () => {
                   if (contents === undefined) {
                     throw new Error(`Cannot find module "${file}"`);
@@ -970,7 +991,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
               if (result?.moduleType === "json") {
                 return Response.json({ name, esModule: jsonModuleCode(file, result.code) });
               }
-              transformed = result && (await _pluginCode(resolvedPath, result));
+              transformed = result && (await _pluginCode(id, result));
             } catch (error: any) {
               return _pluginErrorModule(name, error);
             }
@@ -998,13 +1019,14 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
             });
           }
           // Importers expect ESM: serve raw CJS under a suffixed name behind an ESM shim.
-          if (specifier.endsWith(cjsSuffix)) {
+          if (cjsRequest) {
             return Response.json({ name, commonJsModule: contents });
           }
           if (transformed !== undefined) {
-            _cjsOutput.set(resolvedPath, transformed);
+            _cjsOutput.set(id, transformed);
           }
-          const shimSpecifier = "./" + basename(resolvedPath) + cjsSuffix;
+          const shimSpecifier =
+            "./" + basename(resolvedPath) + (query ? `${query}&` : "?") + "__cjs";
           const esModule = createCjsEsmShim(shimSpecifier, contents);
           return Response.json({ name, esModule });
         };
