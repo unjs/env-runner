@@ -29,6 +29,7 @@
     "./runners/vercel/queue-dev": "./dist/runners/vercel/queue-dev.mjs",
     "./runners/netlify": "./dist/runners/netlify/runner.mjs",
     "./runners/netlify/worker": "./dist/runners/netlify/worker.mjs",
+    "./transformers/oxc": "./dist/transformers/oxc.mjs",
     "./vite": "./dist/vite.mjs"
   },
   "scripts": {

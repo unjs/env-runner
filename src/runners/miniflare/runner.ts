@@ -880,10 +880,10 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
           // Track the real path so relative imports from this module resolve correctly
           modulePathMap.set(name, resolvedPath);
 
-          let isESM: boolean;
+          let transformed: string | undefined;
           if (_transformer?.filter(resolvedPath)) {
             try {
-              contents = _transformer.transform(resolvedPath, contents);
+              transformed = _transformer.transform(resolvedPath, contents);
             } catch (error: any) {
               // A named import of this module fails at link time before the
               // throw runs (hiding it), so also report it on the host.
@@ -894,6 +894,10 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
                 esModule: `throw new SyntaxError(${JSON.stringify(message)});`,
               });
             }
+          }
+          let isESM: boolean;
+          if (transformed !== undefined) {
+            contents = transformed;
             isESM = transformedFormat(resolvedPath, contents) === "module";
           } else {
             // Detect module type: .mjs is always ESM, .cjs is always CJS,

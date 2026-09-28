@@ -23,10 +23,13 @@ export {
   type SerializedRegExp,
   type SourceTransformer,
   type TransformHandler,
+  type TransformHandlerMeta,
   type TransformHandlerResult,
   type TransformHookFilter,
   type TransformModuleType,
   type TransformPlugin,
+  type TransformPluginFactory,
+  type TransformerEntry,
   type TransformStringFilter,
   BaseEnvRunner,
 } from "./common/base-runner.ts";

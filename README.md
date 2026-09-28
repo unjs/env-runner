@@ -435,7 +435,9 @@ On `MiniflareEnvRunner` there is no in-worker registration: the runner's module 
 
 #### Transforms (`data.transform`)
 
-Pass `data.transform` to transform the entry, its imports and matching virtual modules with [`oxc-transform`](https://oxc.rs/docs/guide/usage/transformer) — beyond native type stripping: TypeScript `enum`s/namespaces/parameter properties, JSX/TSX, `define`, `target` lowering, ... It works on every runner except `SelfEnvRunner` (which warns and ignores it). `oxc-transform` is not a dependency: install it in your app (`npm i -D oxc-transform`).
+Pass `data.transform` to run **transformers** on the entry, its imports and matching virtual modules. It works on every runner except `SelfEnvRunner` (which warns and ignores it). A transformer is a module, given by specifier and resolved from the working directory, optionally with options: `[specifier, options]`. The options must be JSON-serializable, because they cross into the worker.
+
+env-runner ships `env-runner/transformers/oxc`, which compiles TypeScript (including `enum`s, namespaces and parameter properties) and JSX with [`oxc-transform`](https://oxc.rs/docs/guide/usage/transformer). Its options go to `transformSync()` as-is. `oxc-transform` is not a dependency: install it in your app (`npm i -D oxc-transform`).
 
 ```js
 import { NodeProcessEnvRunner } from "env-runner";
@@ -445,50 +447,59 @@ const runner = new NodeProcessEnvRunner({
   data: {
     entry: "./src/server.tsx",
     transform: {
-      // oxc-transform `TransformOptions` (`true` or omitted: defaults, `false`: skip oxc)
-      oxc: { jsx: { runtime: "automatic", importSource: "preact" } },
-      // Custom transforms: specifiers whose default export is a function or a plugin object (see below)
-      transformers: ["./build/inline-env.mjs"],
+      transformers: [
+        ["env-runner/transformers/oxc", { jsx: { runtime: "automatic", importSource: "preact" } }],
+        ["./build/inline-env.mjs", { prefix: "APP_" }],
+      ],
       // extensions: [".ts", ".mts", ".cts", ".tsx", ".jsx"], // default
       // include: /\/src\//,                                  // only matching paths / virtual keys
       // exclude: ["/node_modules/"],                          // default (path substrings)
       // sourcemap: true,                                       // inline source maps (default)
-      // oxcTransform: "oxc-transform",                         // package specifier (resolved from cwd)
     },
   },
 });
 ```
 
-`data.transform: true` enables oxc with its defaults. A file is transformed when its extension is in `extensions`, it contains no `exclude` substring, and it matches `include` (if set). `include` is a single RegExp, tested against `/`-separated paths and virtual keys. It is sent to the worker as `{ source, flags }`, with the stateful `g`/`y` flags dropped. On Bun it is folded into the plugin's filter RegExp, which sees native separators, so on Windows match `[\\/]`. The options must stay JSON-serializable (they cross into the worker), so custom transformers are **module specifiers**, resolved from the working directory, rather than functions. A transformer module has a single default export:
+A file is transformed when its extension is in `extensions`, it contains no `exclude` substring, and it matches `include` (if set). `include` is a single RegExp, tested against `/`-separated paths and virtual keys. It is sent to the worker as `{ source, flags }`, with the stateful `g`/`y` flags dropped. On Bun it is folded into the plugin's filter RegExp, which sees native separators, so on Windows match `[\\/]`.
+
+A transformer module has a single default export, either a **plugin factory** or a **plugin object**. Only the plugin's `transform` hook is used.
 
 ```js
-// A function: runs after oxc, on plain JavaScript
-export default (code, id, meta) => code.replaceAll("__VERSION__", '"1.0.0"');
+// A plugin factory: called once per worker with the entry's options (may be async)
+export default (options = {}) => ({
+  name: "inline-env",
+  transform: {
+    filter: { id: "src/**", code: "import.meta.env" }, // only matching modules
+    handler(code, id, meta) {
+      return code.replaceAll("import.meta.env", `process.env /* ${options.prefix} */`);
+    },
+  },
+});
 ```
 
 ```js
-// A plugin object (only the `transform` hook is used)
+// A plugin object: the entry's options arrive as `meta.options`
 export default {
-  name: "inline-env",
+  name: "version",
   transform: {
-    order: "pre", // before oxc, on the TS/JSX source (default: after oxc; "post": last)
-    filter: { id: "src/**", code: "import.meta.env" }, // only matching modules
+    order: "pre", // "pre" | "post" (default: unordered)
     handler(code, id, meta) {
-      // meta.moduleType: "ts" | "tsx" | "jsx" | "js" ("js" once oxc ran)
-      return { code: code.replaceAll("import.meta.env", "process.env") };
+      // meta.moduleType: "ts" | "tsx" | "jsx" | "js"
+      return code.replaceAll("__VERSION__", JSON.stringify(meta.options?.version ?? "dev"));
     },
   },
 };
 ```
 
-`transform` can also be a plain function. Handlers return a string, `{ code, map }`, or nothing to keep the code.
+`transform` can also be a plain function. Handlers return a string, `{ code, map, moduleType }`, or nothing to keep the code.
 
 **Rules:**
 
-- **Sync only:** handlers must be synchronous (Node.js module hooks are), and returning a Promise throws.
+- **Order:** `pre` handlers, then unordered ones, then `post` ones. Within each group, `transformers` order is kept, so list the oxc transformer before plugins that expect JavaScript.
+- **Module type:** `meta.moduleType` starts as the file's language (from its extension, or a virtual module's format). A handler that compiles to JavaScript returns `moduleType: "js"`, as the oxc transformer does, and later handlers see that.
+- **Output must be JavaScript:** if no handler changed a module, it loads as if unmatched. If one changed it but it is still TypeScript/JSX (no handler returned `moduleType: "js"`), loading it fails with an error.
+- **Sync only:** handlers must be synchronous (Node.js module hooks are), and returning a Promise throws. Factories may be async.
 - **No plugin context:** `this` is not bound to one.
-- **Pass the plugin object, not a factory:** a function default export is treated as the handler.
-- **Order:** `pre` handlers → oxc → functions and default-order plugins → `post` handlers. Within each group, list order is kept.
 
 **Filters**: all given properties must match.
 
@@ -497,7 +508,7 @@ export default {
 - `moduleType`: a list, or `{ include }`.
 - Values can be arrays or `{ include, exclude }`, and exclude wins.
 
-**Source maps are not composed.** The first returned `map` (oxc's, or a `pre` handler's) is used, and a second one drops both. Code-only results keep the current map, so keep such changes line-preserving. Stack traces use the inline source maps with `--enable-source-maps`.
+**Source maps are not composed.** The first returned `map` is used, and a second one drops both. Code-only results keep the current map, so keep such changes line-preserving. Stack traces use the inline source maps with `--enable-source-maps`.
 
 How transforms are applied:
 

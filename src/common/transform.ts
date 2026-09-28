@@ -2,9 +2,9 @@ import { readFileSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { init as initEsmLexer, parse as parseEsm } from "es-module-lexer";
-import { resolveRuntimeDep, resolveSpecifier } from "./runtime-deps.ts";
+import { resolveSpecifier } from "./runtime-deps.ts";
 import { virtualModuleFormat } from "../virtual-loader.ts";
-import { normalizeTransformer } from "./transform-plugin.ts";
+import { resolveTransformPlugin } from "./transform-plugin.ts";
 import type {
   NormalizedTransformer,
   SourceMapLike,
@@ -14,44 +14,34 @@ import type {
 export type {
   SourceTransformer,
   TransformHandler,
+  TransformHandlerMeta,
   TransformHandlerResult,
   TransformHookFilter,
   TransformModuleType,
   TransformPlugin,
+  TransformPluginFactory,
   TransformStringFilter,
 } from "./transform-plugin.ts";
 
-interface OxcTransformResult {
-  code: string;
-  map?: SourceMapLike;
-  errors: { severity: string; message: string; codeframe: string | null }[];
-}
-
-interface OxcTransformModule {
-  transformSync(filename: string, code: string, options?: object): OxcTransformResult;
-}
+/**
+ * A transformer module specifier (resolved from cwd), optionally with
+ * JSON-serializable options: `[specifier, options]`.
+ */
+export type TransformerEntry = string | URL | [specifier: string | URL, options?: unknown];
 
 /**
  * Source transforms (TypeScript, JSX, ...) applied to the entry, its imports
  * and matching virtual modules. Passed as `data.transform`, so it must stay
- * JSON-serializable: custom transforms are module specifiers.
+ * JSON-serializable: transformers are module specifiers with options.
  */
 export interface TransformOptions {
   /**
-   * Options passed as-is to `oxc-transform`'s `transformSync()` (`true` for
-   * defaults), or `false` to only run `transformers`. `sourcemap` follows
-   * {@link TransformOptions.sourcemap}.
-   * @default true
+   * Transformer modules, whose default export is a {@link SourceTransformer}
+   * (a plugin factory or a plugin object). Handlers run in this order within
+   * their `order` group (`"pre"`, unordered, `"post"`). Built in:
+   * `env-runner/transformers/oxc` (TypeScript/JSX with `oxc-transform`).
    */
-  oxc?: object | boolean;
-
-  /**
-   * Module specifiers (resolved from cwd) whose default export is a sync
-   * {@link SourceTransformer}: a function or a `{ transform }` plugin object.
-   * They run in order after oxc, on plain JS; plugins with `order: "pre"`
-   * run before it (on the TS/JSX source), `"post"` ones last.
-   */
-  transformers?: (string | URL)[];
+  transformers: TransformerEntry[];
 
   /**
    * File extensions to transform.
@@ -77,12 +67,6 @@ export interface TransformOptions {
    * @default true
    */
   sourcemap?: boolean;
-
-  /**
-   * The `oxc-transform` package specifier (resolved from cwd). Omitted:
-   * imported from the app.
-   */
-  oxcTransform?: string | URL;
 }
 
 /** A RegExp as `{ source, flags }`, the form `include` crosses into the worker in. */
@@ -103,8 +87,13 @@ export interface Transformer {
   filter(id: string): boolean;
   /** `include`/`exclude` only (no extension check), for formats known otherwise. */
   matchesPath(id: string): boolean;
-  /** Transform matched code to JS; throws on oxc errors. */
-  transform(id: string, code: string, moduleType?: TransformModuleType): string;
+  /**
+   * Run the transformers on matched code: JavaScript, or `undefined` when none
+   * changed it (serve it as if unmatched). Throws their errors, and when the
+   * code changed but is still not JavaScript (no transformer returned
+   * `moduleType: "js"`).
+   */
+  transform(id: string, code: string, moduleType?: TransformModuleType): string | undefined;
 }
 
 const DEFAULT_EXTENSIONS = [".ts", ".mts", ".cts", ".tsx", ".jsx"];
@@ -115,29 +104,52 @@ const DEFAULT_EXCLUDE = ["/node_modules/"];
  * so the worker imports the app's copies.
  */
 export function normalizeTransformOptions(
-  opts: TransformOptions | boolean | undefined,
+  opts: TransformOptions | undefined,
 ): TransformOptions | undefined {
   if (!opts) {
     return undefined;
   }
-  if (opts === true) {
-    return {};
+  if (!Array.isArray(opts.transformers)) {
+    throw new TypeError("[env-runner] `transform.transformers` must be an array.");
   }
-  const transformers = opts.transformers?.map((transformer) => {
-    if (typeof transformer !== "string" && !(transformer instanceof URL)) {
+  const transformers = opts.transformers.map((entry, index): TransformerEntry => {
+    const [specifier, options] = Array.isArray(entry) ? entry : [entry];
+    if (typeof specifier !== "string" && !(specifier instanceof URL)) {
       throw new TypeError(
-        "[env-runner] `transform.transformers` entries must be module specifiers (string or URL): " +
-          "they are imported inside the worker, so functions cannot be passed.",
+        `[env-runner] \`transform.transformers[${index}]\` must be a module specifier (string or URL) or \`[specifier, options]\`: ` +
+          "transformers are imported inside the worker, so functions cannot be passed.",
       );
     }
-    return resolveSpecifier(transformer);
+    _assertSerializable(options, `transform.transformers[${index}] options`);
+    const resolved = resolveSpecifier(specifier);
+    return options === undefined ? resolved : [resolved, options];
   });
   return {
     ...opts,
     include: opts.include === undefined ? undefined : _serializeRegExp(opts.include),
     transformers,
-    oxcTransform: opts.oxcTransform ? resolveSpecifier(opts.oxcTransform) : undefined,
   };
+}
+
+// Options cross into workers as JSON (process runners): only plain data
+// round-trips (a RegExp or Date would arrive as `{}` or a string).
+function _assertSerializable(value: unknown, path: string): void {
+  if (value === null || ["string", "number", "boolean", "undefined"].includes(typeof value)) {
+    return;
+  }
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => _assertSerializable(item, `${path}[${index}]`));
+    return;
+  }
+  const proto = typeof value === "object" ? Object.getPrototypeOf(value) : undefined;
+  if (proto !== Object.prototype && proto !== null) {
+    throw new TypeError(
+      `[env-runner] \`${path}\` must be JSON-serializable (plain objects, arrays and primitives): it is sent to the worker.`,
+    );
+  }
+  for (const [key, item] of Object.entries(value as object)) {
+    _assertSerializable(item, `${path}.${key}`);
+  }
 }
 
 // Neither JSON nor `workerData` round-trips a RegExp uniformly: send its parts.
@@ -151,15 +163,12 @@ function _serializeRegExp(value: RegExp | SerializedRegExp): SerializedRegExp {
   return { source, flags: new RegExp(source, flags.replace(/[gy]/g, "")).flags };
 }
 
-/** Load the pipeline (imports `oxc-transform` and custom transformers). */
+/** Load the pipeline (imports the transformers, calling plugin factories). */
 export async function loadTransformer(
-  opts: TransformOptions | boolean | undefined,
+  opts: TransformOptions | undefined,
 ): Promise<Transformer | undefined> {
-  if (!opts) {
+  if (!opts || !opts.transformers?.length) {
     return undefined;
-  }
-  if (opts === true) {
-    opts = {};
   }
   const extensions = opts.extensions ?? DEFAULT_EXTENSIONS;
   const exclude = opts.exclude ?? DEFAULT_EXCLUDE;
@@ -168,28 +177,9 @@ export async function loadTransformer(
     : undefined;
   const sourcemap = opts.sourcemap ?? true;
 
-  let oxcTransform:
-    | ((id: string, code: string, lang: TransformModuleType) => OxcTransformResult)
-    | undefined;
-  if (opts.oxc !== false) {
-    const oxc = await resolveRuntimeDep<OxcTransformModule>({
-      name: "oxc-transform",
-      option: "transform.oxcTransform",
-      value: opts.oxcTransform,
-      expect: "transformSync",
-      required: true,
-      hint: "Or set `transform.oxc: false` to only run custom `transformers`.",
-    });
-    const oxcOptions = {
-      ...(typeof opts.oxc === "object" ? opts.oxc : undefined),
-      sourcemap,
-    };
-    // `lang` covers ids without a telling extension (virtual keys by format).
-    oxcTransform = (id, code, lang) => oxc!.transformSync(id, code, { ...oxcOptions, lang });
-  }
-
   const transformers: NormalizedTransformer[] = [];
-  for (const specifier of opts.transformers ?? []) {
+  for (const entry of opts.transformers) {
+    const [specifier, options] = Array.isArray(entry) ? entry : [entry];
     let mod: any;
     try {
       mod = await import(resolveSpecifier(specifier));
@@ -198,7 +188,7 @@ export async function loadTransformer(
         cause: error,
       });
     }
-    transformers.push(normalizeTransformer(mod?.default, String(specifier)));
+    transformers.push(await resolveTransformPlugin(mod?.default, String(specifier), options));
   }
   const byOrder = (order: NormalizedTransformer["order"]) =>
     transformers.filter((transformer) => transformer.order === order);
@@ -222,11 +212,13 @@ export async function loadTransformer(
     // keep the current map (they should preserve lines).
     let map: SourceMapLike | null | undefined;
     let mapped = false;
+    let changed = false;
     const apply = (next: string, nextMap: SourceMapLike | null | undefined) => {
       if (next === code) {
         return;
       }
       code = next;
+      changed = true;
       if (nextMap) {
         map = mapped ? undefined : nextMap;
         mapped = true;
@@ -237,7 +229,7 @@ export async function loadTransformer(
         if (!transformer.matches(matchId, code, moduleType)) {
           continue;
         }
-        const result = transformer.handler(code, id, { moduleType });
+        const result = transformer.handler(code, id, moduleType);
         if (typeof (result as any)?.then === "function") {
           throw new TypeError(
             `[env-runner] transformer "${transformer.name}" returned a Promise for "${id}"; transforms must be synchronous.`,
@@ -247,26 +239,23 @@ export async function loadTransformer(
           apply(result, undefined);
         } else if (result) {
           apply(result.code ?? code, result.map);
+          moduleType = result.moduleType ?? moduleType;
         }
       }
     };
 
     run(pre);
-    if (oxcTransform) {
-      const result = oxcTransform(id, code, moduleType);
-      const errors = result.errors.filter((error) => error.severity === "Error");
-      if (errors.length > 0) {
-        throw new SyntaxError(
-          `[env-runner] failed to transform "${id}":\n` +
-            errors.map((error) => error.codeframe || error.message).join("\n"),
-        );
-      }
-      apply(result.code, result.map);
-      moduleType = "js";
-    }
     run(normal);
     run(post);
 
+    if (!changed) {
+      return undefined;
+    }
+    if (moduleType !== "js") {
+      throw new TypeError(
+        `[env-runner] "${id}" is still ${moduleType} after its transformers: add one that compiles it to JavaScript (returning \`moduleType: "js"\`, like \`env-runner/transformers/oxc\`) or narrow \`transform.extensions\`/\`include\`.`,
+      );
+    }
     if (sourcemap && map) {
       const source = isAbsolute(id) ? pathToFileURL(id).href : id;
       const json = JSON.stringify({ ...map, sources: [source], file: undefined });
@@ -292,7 +281,7 @@ const VIRTUAL_MODULE_TYPES: Partial<Record<string, TransformModuleType>> = {
  * Transform a matching virtual module (resolved `data.virtual` entry) to plain
  * JS in its format's module system: virtual `.ts`/`.tsx` stay ESM, like
  * untransformed ones. A key without a matching extension qualifies by a
- * TypeScript/JSX format (oxc gets its `lang`). Others are returned as is.
+ * TypeScript/JSX format (the initial `moduleType`). Others are returned as is.
  */
 export function transformVirtualModule<
   T extends string | { source: string | Uint8Array; format: string },
@@ -311,10 +300,11 @@ export function transformVirtualModule<
     return module;
   }
   const source = typeof module === "string" ? module : (module.source as string);
-  return {
-    source: transformer.transform(key, source, moduleType),
-    format: format.startsWith("commonjs") ? "commonjs" : "module",
-  };
+  const code = transformer.transform(key, source, moduleType);
+  if (code === undefined) {
+    return module;
+  }
+  return { source: code, format: format.startsWith("commonjs") ? "commonjs" : "module" };
 }
 
 let _active: Transformer | undefined;
@@ -382,8 +372,9 @@ export async function registerTransformHooks(transformer?: Transformer): Promise
           const path = fileURLToPath(_stripQuery(url));
           if (transformer.filter(path)) {
             const source = transformer.transform(path, readFileSync(path, "utf8"));
-            const format = transformedFormat(path, source, context.format);
-            if (!(isDeno && format === "commonjs")) {
+            const format =
+              source === undefined ? undefined : transformedFormat(path, source, context.format);
+            if (format && !(isDeno && format === "commonjs")) {
               return { format, source, shortCircuit: true };
             }
           }
@@ -406,10 +397,11 @@ export async function registerTransformHooks(transformer?: Transformer): Promise
       setup(build: any) {
         build.onLoad({ filter: _bunFilter(transformer) }, ({ path }: { path: string }) => {
           const contents = readFileSync(path, "utf8");
-          return {
-            contents: _active === transformer ? transformer.transform(path, contents) : contents,
-            loader: _active === transformer ? "js" : _bunLoader(path),
-          };
+          const code = _active === transformer ? transformer.transform(path, contents) : undefined;
+          // `onLoad` can't decline: untouched code goes to Bun's native loader.
+          return code === undefined
+            ? { contents, loader: _bunLoader(path) }
+            : { contents: code, loader: "js" };
         });
       },
     });
@@ -447,7 +439,7 @@ function _bunFilter(transformer: Transformer): RegExp {
   return new RegExp(`^${lookaheads}.*(?:${extensions.join("|") || "(?!)"})$`, include?.flags);
 }
 
-// Bun's native loader, for loads after the transformer is unregistered.
+// Bun's native loader, for untouched code and loads after unregistering.
 function _bunLoader(path: string): string {
   const ext = path.slice(path.lastIndexOf(".") + 1);
   switch (ext) {
@@ -465,7 +457,7 @@ function _bunLoader(path: string): string {
   }
 }
 
-// Module type before oxc, from the extension.
+// Initial module type, from the extension.
 function _moduleType(id: string): TransformModuleType {
   const ext = id.slice(id.lastIndexOf(".") + 1);
   if (ext === "tsx" || ext === "jsx") {

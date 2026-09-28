@@ -34,10 +34,13 @@ export type {
   SerializedRegExp,
   SourceTransformer,
   TransformHandler,
+  TransformHandlerMeta,
   TransformHandlerResult,
   TransformHookFilter,
   TransformModuleType,
   TransformPlugin,
+  TransformPluginFactory,
+  TransformerEntry,
   TransformStringFilter,
 } from "./transform.ts";
 
@@ -55,11 +58,11 @@ export interface EnvRunnerData {
   virtual?: VirtualModules;
 
   /**
-   * Transform the entry, its imports and matching virtual modules (TypeScript
-   * enums, JSX, custom transforms) with `oxc-transform` (installed by the app).
-   * `true` uses the defaults. Not supported by the `self` runner.
+   * Transform the entry, its imports and matching virtual modules with
+   * transformer modules (e.g. `env-runner/transformers/oxc` for TypeScript
+   * enums and JSX). Not supported by the `self` runner.
    */
-  transform?: TransformOptions | boolean;
+  transform?: TransformOptions;
 
   [key: string]: unknown;
 }

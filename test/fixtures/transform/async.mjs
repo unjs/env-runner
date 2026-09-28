@@ -1,1 +1,1 @@
-export default async (code) => code;
+export default { transform: async (code) => code };

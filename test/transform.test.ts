@@ -26,10 +26,11 @@ function hasRuntime(cmd: string): boolean {
 const _dir = dirname(fileURLToPath(import.meta.url));
 const fixture = (name: string) => resolve(_dir, "fixtures/transform", name);
 
-const transform = {
-  oxc: { jsx: { runtime: "classic", pragma: "h" } },
-  transformers: [fixture("greeting.mjs")],
-} as const;
+// The built-in transformer, resolved like an app would (package self-reference).
+const oxc = "env-runner/transformers/oxc";
+const oxcEntry = [oxc, { jsx: { runtime: "classic", pragma: "h" } }] as [string, unknown];
+
+const transform = { transformers: [oxcEntry, fixture("greeting.mjs")] };
 
 const expected = { tag: "div", props: { kind: "page" }, children: ["Ok", "hi"] };
 
@@ -76,12 +77,15 @@ for (const { name, create, skip, bun, miniflare, cjsOptions } of runners) {
         name: "transform-plugin",
         data: {
           entry: fixture("app.tsx"),
-          transform: { ...transform, transformers: [fixture("greeting-plugin.mjs")] },
+          transform: {
+            transformers: [oxcEntry, [fixture("greeting-plugin.mjs"), { greeting: "hey" }]],
+          },
         },
       });
       await runner.waitForReady();
       const res = await runner.fetch("http://localhost/");
-      expect(await res.json()).toEqual({ ...expected, children: ["Ok", "hi from tsx"] });
+      // `pre` ran on the TSX source although listed after oxc; options reached the hook.
+      expect(await res.json()).toEqual({ ...expected, children: ["Ok", "hey from tsx"] });
     });
 
     it("re-transforms the entry on reloadModule()", async () => {
@@ -181,7 +185,7 @@ for (const { name, create, skip, bun, miniflare, cjsOptions } of runners) {
         data: {
           // Untransformed entry (no extension), so only `#count.ts` is counted.
           entry: "#entry",
-          transform: { transformers: [fixture("count.mjs")] },
+          transform: { transformers: [oxc, fixture("count.mjs")] },
           virtual: {
             "#entry": `import { count } from "#count.ts";
               export default { fetch: () => new Response(String(count)) };`,
@@ -243,31 +247,47 @@ for (const { name, create, skip, bun, miniflare, cjsOptions } of runners) {
 }
 
 describe("transform options", () => {
-  it("rejects non-specifier transformers", () => {
+  it("rejects non-specifier transformers and non-serializable options", () => {
     expect(() =>
       normalizeTransformOptions({ transformers: [(() => "") as unknown as string] }),
-    ).toThrow(/module specifiers/);
+    ).toThrow(/module specifier/);
     expect(
       () =>
         new NodeWorkerEnvRunner({
           name: "bad",
           data: { entry: fixture("app.tsx"), transform: { transformers: [{} as any] } },
         }),
-    ).toThrow(/module specifiers/);
+    ).toThrow(/module specifier/);
+    expect(() => normalizeTransformOptions({ transformers: [[oxc, { re: /x/ }]] })).toThrow(
+      /transformers\[0\] options\.re` must be JSON-serializable/,
+    );
+    expect(() => normalizeTransformOptions({ transformers: [[oxc, { fn() {} }]] })).toThrow(
+      /JSON-serializable/,
+    );
+    expect(
+      normalizeTransformOptions({ transformers: [[oxc, { a: [1, { b: null }] }]] }),
+    ).toBeTruthy();
+  });
+
+  it("does nothing without transformers", async () => {
+    expect(await loadTransformer({ transformers: [] })).toBeUndefined();
   });
 
   it("serializes `include` as `{ source, flags }` without stateful flags", () => {
-    expect(normalizeTransformOptions({ include: /\/src\//giu })!.include).toEqual({
-      source: String.raw`\/src\/`,
-      flags: "iu",
-    });
-    expect(() => normalizeTransformOptions({ include: "/src/" as any })).toThrow(/RegExp/);
-    expect(() => normalizeTransformOptions({ include: { source: "(" } })).toThrow();
+    expect(normalizeTransformOptions({ transformers: [], include: /\/src\//giu })!.include).toEqual(
+      { source: String.raw`\/src\/`, flags: "iu" },
+    );
+    expect(() => normalizeTransformOptions({ transformers: [], include: "/src/" as any })).toThrow(
+      /RegExp/,
+    );
+    expect(() =>
+      normalizeTransformOptions({ transformers: [], include: { source: "(" } }),
+    ).toThrow();
   });
 
   it("filters by `include` (tested against `/`-separated paths)", async () => {
     const transformer = (await loadTransformer(
-      normalizeTransformOptions({ include: /\/src\//g }),
+      normalizeTransformOptions({ transformers: [oxc], include: /\/src\//g }),
     ))!;
     // A `g` flag would alternate results through `lastIndex`.
     expect(transformer.filter("/app/src/a.ts")).toBe(true);
@@ -278,7 +298,7 @@ describe("transform options", () => {
   });
 
   it("filters by extension and excludes node_modules", async () => {
-    const transformer = (await loadTransformer(true))!;
+    const transformer = (await loadTransformer({ transformers: [oxc] }))!;
     expect(transformer.filter("/app/src/index.tsx")).toBe(true);
     expect(transformer.filter("/app/src/index.ts?v=1")).toBe(true);
     expect(transformer.filter("/app/src/index.mjs")).toBe(false);
@@ -287,7 +307,7 @@ describe("transform options", () => {
   });
 
   it("reports oxc errors with the file id", async () => {
-    const transformer = (await loadTransformer({ sourcemap: false }))!;
+    const transformer = (await loadTransformer({ transformers: [oxc], sourcemap: false }))!;
     expect(transformer.transform("/app/a.ts", "enum A { B }")).not.toContain("sourceMappingURL");
     expect(() => transformer.transform("/app/bad.tsx", "const a = <div>;")).toThrow(
       /failed to transform "\/app\/bad.tsx"/,
@@ -295,84 +315,125 @@ describe("transform options", () => {
   });
 
   it("inlines a source map for the original file", async () => {
-    const transformer = (await loadTransformer({}))!;
-    const map = decodeMap(transformer.transform("/app/a.ts", "enum A { B }"));
+    const transformer = (await loadTransformer({ transformers: [oxc] }))!;
+    const map = decodeMap(transformer.transform("/app/a.ts", "enum A { B }")!);
     expect(map.sources).toEqual(["file:///app/a.ts"]);
   });
 
-  it("drops a transformer map that can't be composed with oxc's", async () => {
-    const transformer = (await loadTransformer({ transformers: [fixture("mapped.mjs")] }))!;
+  it("drops a second source map (maps aren't composed)", async () => {
+    const transformer = (await loadTransformer({ transformers: [oxc, fixture("mapped.mjs")] }))!;
     expect(transformer.transform("/app/a.ts", "enum A { B }")).not.toContain("sourceMappingURL");
-    // Without oxc, the transformer's map is relative to the original source.
-    const own = (await loadTransformer({ oxc: false, transformers: [fixture("mapped.mjs")] }))!;
-    expect(decodeMap(own.transform("/app/a.js", "a()")).mappings).toBe("AAAA");
+    // Alone, the plugin's map is relative to the original source.
+    const own = (await loadTransformer({
+      transformers: [fixture("mapped.mjs")],
+      extensions: [".js"],
+    }))!;
+    expect(decodeMap(own.transform("/app/a.js", "a()")!).mappings).toBe("AAAA");
   });
 
-  it("orders plugins: pre (source) → oxc → normal/functions (js) → post", async () => {
+  it("orders plugins: pre → unordered (list order) → post", async () => {
     const calls: string[] = [];
     (globalThis as any).__transformCalls = calls;
     const transformer = (await loadTransformer({
-      transformers: [fixture("order-post.mjs"), fixture("order-fn.mjs"), fixture("order-pre.mjs")],
+      transformers: [
+        fixture("order-post.mjs"),
+        oxc,
+        fixture("order-fn.mjs"),
+        fixture("order-pre.mjs"),
+      ],
     }))!;
     transformer.transform("/app/a.ts", "const a: number = 1;");
-    expect(calls).toEqual(["pre:ts:typed", "fn:js:untyped", "post:js:untyped"]);
+    // oxc (unordered, listed first) returned `moduleType: "js"`.
+    expect(calls).toEqual(["pre:ts:typed", "normal:js:untyped", "post:js:untyped"]);
+  });
+
+  it("passes untouched code through and rejects code left non-JS", async () => {
+    const transformer = (await loadTransformer({ transformers: [fixture("greeting.mjs")] }))!;
+    // No transformer changed it: served as if unmatched.
+    expect(transformer.transform("/app/a.ts", "const a: string = 1;")).toBeUndefined();
+    // Changed but still TypeScript (nothing compiled it).
+    expect(() => transformer.transform("/app/a.ts", "const a: string = __GREETING__;")).toThrow(
+      /still ts after its transformers/,
+    );
+    const js = (await loadTransformer({
+      transformers: [[fixture("greeting.mjs"), { greeting: "yo" }]],
+      extensions: [".js"],
+    }))!;
+    expect(js.transform("/app/a.js", "const a = __GREETING__;")).toBe('const a = "yo";');
   });
 
   it("applies hook filters (id, code, moduleType, include/exclude)", async () => {
-    const { normalizeTransformer } = await import("../src/common/transform-plugin.ts");
-    const matches = (filter: any, id: string, code = "", moduleType = "ts") =>
-      normalizeTransformer({ transform: { filter, handler: () => {} } }, "t").matches(
-        id,
-        code,
-        moduleType,
-      );
+    const { resolveTransformPlugin } = await import("../src/common/transform-plugin.ts");
+    const matches = async (filter: any, id: string, code = "", moduleType = "ts") =>
+      (
+        await resolveTransformPlugin({ transform: { filter, handler: () => {} } }, "t", undefined)
+      ).matches(id, code, moduleType);
     // Plain values include; exclude wins over include.
-    expect(matches({ id: /\.ts$/ }, "/app/a.ts")).toBe(true);
-    expect(matches({ id: [/\.tsx$/, "**/*.ts"] }, "/app/a.ts")).toBe(true);
-    expect(matches({ id: { include: "**/src/**", exclude: /skip/ } }, "/app/src/skip.ts")).toBe(
-      false,
-    );
-    expect(matches({ id: { exclude: "**/vendor/**" } }, "/app/src/a.ts")).toBe(true);
+    expect(await matches({ id: /\.ts$/ }, "/app/a.ts")).toBe(true);
+    expect(await matches({ id: [/\.tsx$/, "**/*.ts"] }, "/app/a.ts")).toBe(true);
+    expect(
+      await matches({ id: { include: "**/src/**", exclude: /skip/ } }, "/app/src/skip.ts"),
+    ).toBe(false);
+    expect(await matches({ id: { exclude: "**/vendor/**" } }, "/app/src/a.ts")).toBe(true);
     // Relative globs resolve from cwd.
-    expect(matches({ id: "src/**" }, `${process.cwd()}/src/a.ts`)).toBe(true);
-    expect(matches({ id: "src/**" }, "/elsewhere/src/a.ts")).toBe(false);
+    expect(await matches({ id: "src/**" }, `${process.cwd()}/src/a.ts`)).toBe(true);
+    expect(await matches({ id: "src/**" }, "/elsewhere/src/a.ts")).toBe(false);
     // `code` strings are substrings; all properties must match.
-    expect(matches({ code: "import.meta.env" }, "/a.ts", "x(import.meta.env.X)")).toBe(true);
-    expect(matches({ code: "import.meta.env", id: /\.tsx$/ }, "/a.ts", "import.meta.env")).toBe(
-      false,
-    );
-    expect(matches({ moduleType: ["tsx"] }, "/a.tsx", "", "tsx")).toBe(true);
-    expect(matches({ moduleType: { include: ["ts"] } }, "/a.tsx", "", "tsx")).toBe(false);
+    expect(await matches({ code: "import.meta.env" }, "/a.ts", "x(import.meta.env.X)")).toBe(true);
+    expect(
+      await matches({ code: "import.meta.env", id: /\.tsx$/ }, "/a.ts", "import.meta.env"),
+    ).toBe(false);
+    expect(await matches({ moduleType: ["tsx"] }, "/a.tsx", "", "tsx")).toBe(true);
+    expect(await matches({ moduleType: { include: ["ts"] } }, "/a.tsx", "", "tsx")).toBe(false);
     // Stateful RegExps don't alternate.
     const g = /a/g;
-    expect([matches({ code: g }, "/a.ts", "a"), matches({ code: g }, "/a.ts", "a")]).toEqual([
-      true,
-      true,
-    ]);
+    expect([
+      await matches({ code: g }, "/a.ts", "a"),
+      await matches({ code: g }, "/a.ts", "a"),
+    ]).toEqual([true, true]);
+  });
+
+  it("calls factories with the options and passes them to hooks", async () => {
+    const { resolveTransformPlugin } = await import("../src/common/transform-plugin.ts");
+    const factory = await resolveTransformPlugin(
+      async (options: any) => ({ transform: (code: string) => code + options.suffix }),
+      "f",
+      { suffix: "!" },
+    );
+    expect(factory.handler("a", "/a.js", "js")).toBe("a!");
+    const object = await resolveTransformPlugin(
+      { transform: (code: string, _id: string, meta: any) => code + meta.options.suffix },
+      "o",
+      { suffix: "?" },
+    );
+    expect(object.handler("a", "/a.js", "js")).toBe("a?");
   });
 
   it("rejects invalid transformer exports and async handlers", async () => {
-    const { normalizeTransformer } = await import("../src/common/transform-plugin.ts");
-    expect(() => normalizeTransformer(undefined, "x")).toThrow(/no usable default export/);
-    expect(() => normalizeTransformer({ name: "x" }, "x")).toThrow(/transform/);
-    expect(() =>
-      normalizeTransformer({ transform: { order: "early", handler() {} } }, "x"),
-    ).toThrow(/order/);
-    const transformer = (await loadTransformer({
-      oxc: false,
-      transformers: [fixture("async.mjs")],
-    }))!;
-    expect(() => transformer.transform("/app/a.ts", "a")).toThrow(/synchronous/);
-  });
-
-  it("only runs custom transformers with `oxc: false`", async () => {
-    const transformer = (await loadTransformer({
-      oxc: false,
-      transformers: [fixture("greeting.mjs")],
-    }))!;
-    expect(transformer.transform("/app/a.ts", "const a: string = __GREETING__;")).toBe(
-      'const a: string = "hi";',
+    const { resolveTransformPlugin } = await import("../src/common/transform-plugin.ts");
+    await expect(resolveTransformPlugin(undefined, "x", undefined)).rejects.toThrow(
+      /no usable default export/,
     );
+    await expect(resolveTransformPlugin({ name: "x" }, "x", undefined)).rejects.toThrow(
+      /transform/,
+    );
+    await expect(
+      resolveTransformPlugin({ transform: { order: "early", handler() {} } }, "x", undefined),
+    ).rejects.toThrow(/order/);
+    await expect(resolveTransformPlugin(() => "nope", "x", undefined)).rejects.toThrow(
+      /factory that didn't return a plugin object/,
+    );
+    await expect(
+      resolveTransformPlugin(
+        () => {
+          throw new Error("boom");
+        },
+        "x",
+        undefined,
+      ),
+    ).rejects.toThrow(/"x" failed to initialize: boom/);
+    const transformer = (await loadTransformer({ transformers: [fixture("async.mjs")] }))!;
+    expect(() => transformer.transform("/app/a.ts", "a")).toThrow(/synchronous/);
   });
 });
 

@@ -7,7 +7,7 @@ export type TransformStringFilter =
   | MaybeArray<string | RegExp>
   | { include?: MaybeArray<string | RegExp>; exclude?: MaybeArray<string | RegExp> };
 
-/** Module type of the code a handler receives (`js` once oxc ran). */
+/** Module type of the code a handler receives (`js` once a transformer returned JS). */
 export type TransformModuleType = "js" | "jsx" | "ts" | "tsx" | (string & {});
 
 /**
@@ -23,16 +23,28 @@ export interface TransformHookFilter {
   moduleType?: TransformModuleType[] | { include?: TransformModuleType[] };
 }
 
+/** Passed to every handler. */
+export interface TransformHandlerMeta {
+  /** Language of `code` (updated by results returning a `moduleType`). */
+  moduleType: TransformModuleType;
+  /** The options of this transformer's `transformers` entry. */
+  options: unknown;
+}
+
 /** Must be sync (Node.js module hooks are). Return nullish to keep the code. */
 export type TransformHandler = (
   code: string,
   id: string,
-  meta: { moduleType: TransformModuleType },
+  meta: TransformHandlerMeta,
 ) => TransformHandlerResult;
 
+/**
+ * New code, or `{ code, map, moduleType }`: a `moduleType` tells later
+ * handlers the new language (e.g. `js` after compiling TypeScript).
+ */
 export type TransformHandlerResult =
   | string
-  | { code?: string; map?: SourceMapLike | null }
+  | { code?: string; map?: SourceMapLike | null; moduleType?: TransformModuleType }
   | null
   | undefined;
 
@@ -45,8 +57,8 @@ export interface SourceMapLike {
 }
 
 /**
- * Plugin object (only `transform` is used). `order: "pre"` runs
- * before oxc (on the TS/JSX source), otherwise after it; `"post"` last.
+ * Plugin object (only `transform` is used). Handlers run in `transformers`
+ * order within their `order` group: `"pre"`, then unordered, then `"post"`.
  */
 export interface TransformPlugin {
   name?: string;
@@ -59,11 +71,15 @@ export interface TransformPlugin {
       };
 }
 
+/** Called once per worker with the entry's options. May be async. */
+export type TransformPluginFactory = (options: any) => TransformPlugin | Promise<TransformPlugin>;
+
 /**
- * Default export of a `transformers` module: a {@link TransformHandler} or a
- * {@link TransformPlugin}.
+ * Default export of a `transformers` module: a {@link TransformPluginFactory}
+ * (called with the entry's options) or a {@link TransformPlugin} (its handler
+ * gets them as `meta.options`).
  */
-export type SourceTransformer = TransformHandler | TransformPlugin;
+export type SourceTransformer = TransformPlugin | TransformPluginFactory;
 
 /** A validated transformer, ready to run. */
 export interface NormalizedTransformer {
@@ -71,46 +87,62 @@ export interface NormalizedTransformer {
   order: "pre" | "normal" | "post";
   /** Whether the handler runs for this code (`id` is `/`-separated). */
   matches(id: string, code: string, moduleType: TransformModuleType): boolean;
-  handler: TransformHandler;
+  handler(code: string, id: string, moduleType: TransformModuleType): TransformHandlerResult;
 }
 
-/** Validate a module's default export; throws a descriptive `TypeError`. */
-export function normalizeTransformer(value: unknown, specifier: string): NormalizedTransformer {
+/**
+ * Resolve a module's default export (calling a factory with `options`) and
+ * validate it; throws a descriptive `TypeError`.
+ */
+export async function resolveTransformPlugin(
+  value: unknown,
+  specifier: string,
+  options: unknown,
+): Promise<NormalizedTransformer> {
   const fail = (reason: string): never => {
     throw new TypeError(
-      `[env-runner] transformer "${specifier}" ${reason}: default-export a function ` +
-        "`(code, id, meta) => string | { code, map } | undefined` or a " +
-        "`{ name?, transform }` object (not a plugin factory).",
+      `[env-runner] transformer "${specifier}" ${reason}: default-export a plugin factory ` +
+        "`(options) => ({ name?, transform })` or a `{ name?, transform }` plugin object.",
     );
   };
+  let plugin = value;
   if (typeof value === "function") {
-    return {
-      name: value.name || specifier,
-      order: "normal",
-      matches: () => true,
-      handler: value as TransformHandler,
-    };
-  }
-  if (!value || typeof value !== "object") {
+    try {
+      plugin = await value(options);
+    } catch (error: any) {
+      throw new TypeError(
+        `[env-runner] transformer "${specifier}" failed to initialize: ${error?.message || error}`,
+        { cause: error },
+      );
+    }
+    if (!plugin || typeof plugin !== "object") {
+      return fail("has a factory that didn't return a plugin object");
+    }
+  } else if (!plugin || typeof plugin !== "object") {
     return fail("has no usable default export");
   }
-  const plugin = value as Partial<TransformPlugin>;
-  const name = typeof plugin.name === "string" ? plugin.name : specifier;
-  const hook = plugin.transform;
+  const { name: pluginName, transform: hook } = plugin as Partial<TransformPlugin>;
+  const name = typeof pluginName === "string" ? pluginName : specifier;
+  let order: NormalizedTransformer["order"] = "normal";
+  let matches: NormalizedTransformer["matches"] = () => true;
+  let handler: TransformHandler;
   if (typeof hook === "function") {
-    return { name, order: "normal", matches: () => true, handler: hook };
-  }
-  if (!hook || typeof hook !== "object" || typeof hook.handler !== "function") {
-    return fail("is an object without a `transform` function or `transform.handler`");
-  }
-  if (hook.order != null && hook.order !== "pre" && hook.order !== "post") {
-    return fail(`has an invalid \`transform.order\` (${JSON.stringify(hook.order)})`);
+    handler = hook;
+  } else if (hook && typeof hook === "object" && typeof hook.handler === "function") {
+    if (hook.order != null && hook.order !== "pre" && hook.order !== "post") {
+      return fail(`has an invalid \`transform.order\` (${JSON.stringify(hook.order)})`);
+    }
+    order = hook.order ?? "normal";
+    matches = hook.filter ? _compileHookFilter(hook.filter) : matches;
+    handler = hook.handler;
+  } else {
+    return fail("has no `transform` function or `transform.handler`");
   }
   return {
     name,
-    order: hook.order ?? "normal",
-    matches: hook.filter ? _compileHookFilter(hook.filter) : () => true,
-    handler: hook.handler,
+    order,
+    matches,
+    handler: (code, id, moduleType) => handler.call(undefined, code, id, { moduleType, options }),
   };
 }
 
