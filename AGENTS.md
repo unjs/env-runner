@@ -29,7 +29,6 @@ src/
 │   ├── miniflare/           # MiniflareEnvRunner + wrapper.ts (in-memory workerd wrapper) + wrangler.ts (config → Miniflare options) + dotenv.ts (minimal-reader dev vars)
 │   ├── vercel/              # VercelEnvRunner (extends node-worker) + worker, oidc.ts, queue-dev.ts
 │   └── netlify/             # NetlifyEnvRunner (extends node-worker) + worker
-├── plugins/oxc.ts           # Built-in `data.plugins` plugin (TypeScript/JSX via oxc-transform)
 ├── types.ts                 # Core interfaces
 ├── virtual-loader.ts        # Virtual module formats/validation/JSON transport + createVirtualHooks() — ESM resolve/load hooks
 ├── index.ts                 # Public API exports
@@ -39,7 +38,7 @@ src/
 └── cli.ts                   # CLI entry point
 ```
 
-Exports: see `package.json` `exports` (`.`, `./runners/<name>`, `./runners/<name>/worker`, `./plugins/oxc`, `./vite`).
+Exports: see `package.json` `exports` (`.`, `./runners/<name>`, `./runners/<name>/worker`, `./vite`).
 
 ## Built-in Workers
 
@@ -75,7 +74,7 @@ Details in [`.agents/MINIFLARE.md`](.agents/MINIFLARE.md). In short: the wrapper
 - [`VERCEL.md`](.agents/VERCEL.md) — `VercelEnvRunner` (env vars, headers, OIDC, Queues) + tests
 - [`NETLIFY.md`](.agents/NETLIFY.md) — `NetlifyEnvRunner` + tests
 - [`VIRTUAL-MODULES.md`](.agents/VIRTUAL-MODULES.md) — virtual modules across Node/Bun/Deno/Miniflare + tests
-- [`PLUGINS.md`](.agents/PLUGINS.md) — `data.plugins` (plugin `transform` hooks, filter-based gating, Bun filter, built-in oxc plugin) across runners + tests
+- [`PLUGINS.md`](.agents/PLUGINS.md) — `data.plugins` (plugin `transform` hooks, filter-based gating, Bun filter) across runners + tests
 
 ## Testing
 
@@ -95,8 +94,9 @@ Details in [`.agents/MINIFLARE.md`](.agents/MINIFLARE.md). In short: the wrapper
 ## Dependencies
 
 - `crossws`, `httpxy`, `srvx` — WebSocket hooks, HTTP/WS proxy, server framework
-- `cjs-module-lexer` / `es-module-lexer` — devDependencies inlined into `dist` (miniflare module fallback service)
-- **No peer dependencies.** `miniflare`, `wrangler`, `@netlify/runtime`, `@vercel/queue`, `oxc-transform` are installed by the app and passed as runner options (`miniflare`, `wranglerModule`, `netlifyRuntime`, queue `sdk`), resolved via `resolveRuntimeDep()`: imported module | specifier (resolved from cwd) | `false` (opt out) | omitted (optional import). If nothing resolves: miniflare throws; wrangler → minimal JSON/JSONC reader; netlify → shim; queue → warn-once no-op; `oxc-transform` is required by the `env-runner/plugins/oxc` plugin (imported from cwd). `netlifyRuntime` must be a specifier (imported inside the worker, via `resolveRuntimeDepSpecifier()`). These packages must stay listed as external in `build.config.mjs`.
+- `cjs-module-lexer` / `es-module-lexer` — devDependencies inlined into `dist` (miniflare module fallback service, `data.plugins` format detection)
+- `oxc-transform` — devDependency for the test oxc plugin fixture only (`test/fixtures/plugins/oxc.mjs`); env-runner ships no plugins
+- **No peer dependencies.** `miniflare`, `wrangler`, `@netlify/runtime`, `@vercel/queue` are installed by the app and passed as runner options (`miniflare`, `wranglerModule`, `netlifyRuntime`, queue `sdk`), resolved via `resolveRuntimeDep()`: imported module | specifier (resolved from cwd) | `false` (opt out) | omitted (optional import). If nothing resolves: miniflare throws; wrangler → minimal JSON/JSONC reader; netlify → shim; queue → warn-once no-op. `netlifyRuntime` must be a specifier (imported inside the worker, via `resolveRuntimeDepSpecifier()`). These packages must stay listed as external in `build.config.mjs`.
 
 ## Key patterns
 

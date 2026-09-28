@@ -1,4 +1,4 @@
-// `greeting.mjs` with a case-insensitive `id` filter leaving out `cjs/vendor/plain.ts`.
+// The greeting plugin with a case-insensitive `id` RegExp leaving out `vendor/plain.ts`.
 export default {
   name: "greeting-include",
   transform: {

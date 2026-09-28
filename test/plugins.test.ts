@@ -32,8 +32,8 @@ function hasRuntime(cmd: string): boolean {
 const _dir = dirname(fileURLToPath(import.meta.url));
 const fixture = (name: string) => resolve(_dir, "fixtures/plugins", name);
 
-// The built-in plugin, resolved like an app would (package self-reference).
-const oxc = "env-runner/plugins/oxc";
+// A TypeScript/JSX plugin with `oxc-transform`, as an app would write it.
+const oxc = fixture("oxc.mjs");
 const oxcEntry = [oxc, { jsx: { runtime: "classic", pragma: "h" } }] as [string, unknown];
 
 const plugins = [oxcEntry, fixture("greeting.mjs")];
@@ -217,15 +217,14 @@ for (const { name, create, skip, bun, cjsOptions } of runners) {
       expect(await res.json()).toEqual(["lib", "cts"]);
     });
 
-    // `cjs/vendor/plain.ts` is CommonJS `.ts` (see above for Bun). On Deno, CommonJS
-    // falls back to the native loader, so only the other runners prove the filter.
-    it.skipIf(bun)("skips paths a plugin's `id` filter excludes", async () => {
+    // `vendor/plain.ts` would become "hi" if the greeting plugin ran on it.
+    it("scopes a plugin with an `id` filter from its options (glob exclude)", async () => {
       runner = create({
         ...cjsOptions,
         name: "plugins-exclude",
         data: {
           entry: fixture("app-vendor.ts"),
-          plugins: [oxcEntry, fixture("greeting-exclude.mjs")],
+          plugins: [oxcEntry, [fixture("greeting.mjs"), { id: { exclude: "**/vendor/**" } }]],
         },
       });
       await runner.waitForReady();
@@ -233,7 +232,7 @@ for (const { name, create, skip, bun, cjsOptions } of runners) {
       expect(await res.json()).toEqual(["cts", "vendor"]);
     });
 
-    it.skipIf(bun)("only runs a plugin on paths its `id` RegExp includes", async () => {
+    it("scopes a plugin with an `id` RegExp include", async () => {
       runner = create({
         ...cjsOptions,
         name: "plugins-include",
@@ -251,9 +250,12 @@ for (const { name, create, skip, bun, cjsOptions } of runners) {
 
 describe("plugins options", () => {
   it("rejects non-specifier plugins and non-serializable options", () => {
-    expect(() => normalizePluginEntries([(() => "") as unknown as string])).toThrow(
-      /`plugins\[0\]` must be a module specifier/,
-    );
+    // Server plugins (functions/objects) are a likely mix-up with the app entry's `plugins`.
+    for (const plugin of [() => "", { name: "srvx-plugin", request() {} }]) {
+      expect(() => normalizePluginEntries([plugin as any])).toThrow(
+        /`data\.plugins\[0\]` must be a module specifier .* srvx server plugins belong on the app entry's `plugins`/,
+      );
+    }
     expect(
       () =>
         new NodeWorkerEnvRunner({
@@ -261,7 +263,7 @@ describe("plugins options", () => {
           data: { entry: fixture("app.tsx"), plugins: [{} as any] },
         }),
     ).toThrow(/module specifier/);
-    expect(() => normalizePluginEntries("oxc" as any)).toThrow(/`plugins` must be an array/);
+    expect(() => normalizePluginEntries("oxc" as any)).toThrow(/`data\.plugins` must be an array/);
     expect(() => normalizePluginEntries([[oxc, { re: /x/ }]])).toThrow(
       /`plugins\[0\] options\.re` must be JSON-serializable/,
     );
@@ -297,7 +299,7 @@ describe("plugins options", () => {
     // greeting-include: its `id` RegExp (case-insensitive), any module type.
     expect(pipeline.filter("/app/plugins/app-vendor.ts")).toBe(true);
     expect(pipeline.filter("/app/Plugins/cjs/dep.cts")).toBe(true);
-    expect(pipeline.filter("/app/plugins/cjs/vendor/plain.js")).toBe(false);
+    expect(pipeline.filter("/app/plugins/vendor/plain.js")).toBe(false);
     expect(pipeline.filter(String.raw`C:\app\plugins\app-vendor.ts`)).toBe(true);
     expect(pipeline.filter("#view", "tsx")).toBe(true);
     expect(pipeline.filter("#view", "js")).toBe(false);
@@ -311,7 +313,9 @@ describe("plugins options", () => {
     expect(typed.filter("/app/a.mjs")).toBe(false);
     const module = { source: "export default 1;", format: "module" };
     expect(transformVirtualModule(typed, "#a", module)).toBe(module);
-    const excluded = (await loadPlugins([fixture("greeting-exclude.mjs")]))!;
+    const excluded = (await loadPlugins([
+      [fixture("greeting.mjs"), { id: { exclude: "**/vendor/**" } }],
+    ]))!;
     expect(excluded.filter("/app/vendor/a.ts")).toBe(false);
     expect(transformVirtualModule(excluded, "/app/vendor/a.js", "__GREETING__")).toBe(
       "__GREETING__",
@@ -323,6 +327,13 @@ describe("plugins options", () => {
     const counted = (await loadPlugins([oxc, fixture("order-pre.mjs")]))!;
     expect(transformVirtualModule(counted, "/app/node_modules/a.ts", "a")).toBe("a");
     expect(calls).toEqual([]);
+  });
+
+  it("keeps a plugin off paths its `id` option excludes", async () => {
+    const pipeline = (await loadPlugins([[oxc, { id: { exclude: "**/vendor/**" } }]]))!;
+    expect(pipeline.filter("/app/src/a.ts")).toBe(true);
+    expect(pipeline.filter("/app/vendor/a.ts")).toBe(false);
+    expect(pipeline.transform("/app/vendor/a.ts", "enum A { B }")).toBeUndefined();
   });
 
   it("leaves plain JavaScript to oxc's `moduleType` filter", async () => {
@@ -492,25 +503,52 @@ describe("plugins options", () => {
       "/app/a.mjs",
     ]);
 
-    // Every plugin including only RegExps (same flags): folded in as a lookahead.
-    const folded = createBunFilter([
+    // One alternative per plugin: its extensions, RegExp excludes and includes.
+    const exact = createBunFilter([
       await plugin({ id: /\/SRC\//i, moduleType: ["ts"] }),
-      await plugin({ id: { include: [/\/lib\//gi], exclude: /x/ }, moduleType: ["tsx"] }),
+      await plugin({ id: { include: [/\/lib\//gi], exclude: /skip/i }, moduleType: ["tsx"] }),
     ]);
-    expect(folded.flags).toBe("i");
-    expect(test(folded, ["/app/src/a.ts", "/app/lib/a.tsx", "/app/lib/a.ts", "/app/a.ts"])).toEqual(
-      ["/app/src/a.ts", "/app/lib/a.tsx", "/app/lib/a.ts"],
+    expect(exact.flags).toBe("i");
+    expect(
+      test(exact, [
+        "/app/src/a.ts",
+        "/app/lib/a.tsx",
+        "/app/lib/a.ts",
+        "/app/src/a.tsx",
+        "/app/lib/skip.tsx",
+        "/app/a.ts",
+        "/app/node_modules/src/a.ts",
+      ]),
+    ).toEqual(["/app/src/a.ts", "/app/lib/a.tsx"]);
+    const bun = async (...filters: any[]) =>
+      createBunFilter(await Promise.all(filters.map((filter) => plugin(filter))));
+    // Exclude-only `id` filter.
+    expect(
+      test(await bun({ id: { exclude: /\/vendor\// } }), ["/app/vendor/a.ts", "/app/a.ts"]),
+    ).toEqual(["/app/a.ts"]);
+    // A glob include can't be folded: that plugin's alternative takes any path.
+    const glob = await bun(
+      { id: /\/src\//, moduleType: ["ts"] },
+      { id: "**/lib/**", moduleType: ["tsx"] },
     );
-    // Not folded: differing flags, a glob, an `id` filter without include, or no `id` filter.
-    for (const filters of [
-      [{ id: /\/src\//i }, { id: /\/lib\// }],
-      [{ id: /\/src\// }, { id: "**/lib/**" }],
-      [{ id: /\/src\// }, { id: { exclude: /\/lib\// } }],
-      [{ id: /\/src\// }, { moduleType: ["ts"] }],
-    ]) {
-      const re = createBunFilter(await Promise.all(filters.map((filter) => plugin(filter))));
-      expect(re.test("/app/other/a.ts")).toBe(true);
-    }
+    expect(test(glob, ["/app/src/a.ts", "/app/other/a.ts", "/app/other/a.tsx"])).toEqual([
+      "/app/src/a.ts",
+      "/app/other/a.tsx",
+    ]);
+    // A glob exclude is left to the JS filter; RegExp includes still apply.
+    const globExclude = await bun({ id: { include: /\/src\//, exclude: "**/skip/**" } });
+    expect(test(globExclude, ["/app/src/skip/a.ts", "/app/lib/a.ts"])).toEqual([
+      "/app/src/skip/a.ts",
+    ]);
+    // No `id` filter: that plugin's alternative takes any path.
+    const noId = await bun({ id: /\/src\//, moduleType: ["ts"] }, { moduleType: ["tsx"] });
+    expect(test(noId, ["/app/other/a.ts", "/app/other/a.tsx"])).toEqual(["/app/other/a.tsx"]);
+    // Differing flags: no `id` filter is folded in.
+    const mixed = await bun({ id: /\/src\//i }, { id: /\/lib\// });
+    expect(mixed.flags).toBe("");
+    expect(mixed.test("/app/other/a.ts")).toBe(true);
+    // A custom module type implies no extension.
+    expect(test(await bun({ moduleType: ["svelte"] }), paths)).toEqual([]);
   });
 
   it("rejects invalid plugin exports and async handlers", async () => {

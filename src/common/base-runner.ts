@@ -56,7 +56,7 @@ export interface EnvRunnerData {
 
   /**
    * Plugin modules whose `transform` hooks run on the entry, its imports and
-   * virtual modules their filters match (e.g. `env-runner/plugins/oxc` for
+   * virtual modules their filters match (e.g. an `oxc-transform` plugin for
    * TypeScript enums and JSX). Not supported by the `self` runner.
    */
   plugins?: EnvRunnerPluginEntry[];

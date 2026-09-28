@@ -59,14 +59,15 @@ export function normalizePluginEntries(
     return undefined;
   }
   if (!Array.isArray(entries)) {
-    throw new TypeError("[env-runner] `plugins` must be an array.");
+    throw new TypeError("[env-runner] `data.plugins` must be an array.");
   }
   return entries.map((entry, index): EnvRunnerPluginEntry => {
     const [specifier, options] = Array.isArray(entry) ? entry : [entry];
     if (typeof specifier !== "string" && !(specifier instanceof URL)) {
       throw new TypeError(
-        `[env-runner] \`plugins[${index}]\` must be a module specifier (string or URL) or \`[specifier, options]\`: ` +
-          "plugins are imported inside the worker, so functions and objects cannot be passed.",
+        `[env-runner] \`data.plugins[${index}]\` must be a module specifier (string or URL) or \`[specifier, options]\`: ` +
+          "`data.plugins` takes plugin modules, loaded inside the worker, so functions and objects cannot be passed. " +
+          "srvx server plugins belong on the app entry's `plugins` (`export default { fetch, plugins }`).",
       );
     }
     _assertSerializable(options, `plugins[${index}] options`);
@@ -184,7 +185,7 @@ export async function loadPlugins(
     }
     if (moduleType !== "js") {
       throw new TypeError(
-        `[env-runner] "${id}" is still ${moduleType} after its plugins: add one that compiles it to JavaScript (returning \`moduleType: "js"\`, like \`env-runner/plugins/oxc\`) or narrow the plugins' filters.`,
+        `[env-runner] "${id}" is still ${moduleType} after its plugins: add one that compiles it to JavaScript (returning \`moduleType: "js"\`) or narrow the plugins' filters.`,
       );
     }
     if (map) {
@@ -369,47 +370,57 @@ const BUN_EXTENSIONS: Record<string, string[]> = {
 
 /**
  * Bun's `onLoad` filter (a single RegExp) for these plugins. Bun evaluates
- * plugin output as ESM and `onLoad` can't decline, so it is kept narrow:
+ * plugin output as ESM and `onLoad` can't decline, so it follows the plugins'
+ * prefilters as closely as a RegExp can: no `/node_modules/` (either
+ * separator), then one alternative per plugin with
  *
- * - the extensions the plugins' `moduleType` filters imply (all non-CommonJS
- *   script extensions for a plugin without one), never `.cjs`/`.cts`;
- * - no `/node_modules/` (either separator);
- * - when every plugin has an `id` filter including only RegExps (with the same
- *   flags), those as a lookahead. Bun paths keep native separators.
+ * - the extensions its `moduleType` filter implies (all non-CommonJS script
+ *   extensions without one), never `.cjs`/`.cts`;
+ * - its `id` filter: RegExp excludes as a negative lookahead, and includes as
+ *   a lookahead when they are all RegExps (otherwise any path).
  *
- * The plugins' filters still decide per module; paths the RegExp lets through
- * but no plugin matches load with Bun's native loader.
+ * The RegExp takes the `id` RegExps' flags; if they differ, no `id` filter is
+ * folded in. Bun paths keep native separators. The plugins' filters still
+ * decide per module; paths the RegExp lets through but no plugin matches load
+ * with Bun's native loader.
  */
 export function createBunFilter(plugins: NormalizedPlugin[]): RegExp {
   const escape = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const extensions = new Set<string>();
-  for (const { moduleTypes } of plugins) {
-    const implied = moduleTypes
+  const sep = String.raw`(?:\\|\/)`;
+  const isRegExp = (pattern: string | RegExp): pattern is RegExp => pattern instanceof RegExp;
+  // Stateful flags don't change what matches.
+  const flagSet = new Set(
+    plugins.flatMap(({ id }) =>
+      id
+        ? [...id.include, ...id.exclude].filter(isRegExp).map((re) => re.flags.replace(/[gy]/g, ""))
+        : [],
+    ),
+  );
+  const foldIds = flagSet.size <= 1;
+  const branches = new Set<string>();
+  for (const { moduleTypes, id } of plugins) {
+    const extensions = moduleTypes
       ? moduleTypes.flatMap((type) => BUN_EXTENSIONS[type] ?? [])
       : Object.values(BUN_EXTENSIONS).flat();
-    for (const ext of implied) {
-      extensions.add(escape(ext));
+    if (extensions.length === 0) {
+      continue;
     }
-  }
-  const sep = String.raw`(?:\\|\/)`;
-  let lookaheads = `(?!.*${sep}node_modules${sep})`;
-  let flags = "";
-  const includes = plugins.map((plugin) => plugin.idInclude);
-  if (
-    plugins.length > 0 &&
-    includes.every(
-      (include) => include?.length && include.every((pattern) => pattern instanceof RegExp),
-    )
-  ) {
-    const patterns = includes.flat() as RegExp[];
-    // Stateful flags don't change what matches.
-    const flagSet = new Set(patterns.map((pattern) => pattern.flags.replace(/[gy]/g, "")));
-    if (flagSet.size === 1) {
-      flags = [...flagSet][0]!;
-      lookaheads += `(?=.*?(?:${patterns.map((pattern) => pattern.source).join("|")}))`;
+    let lookaheads = "";
+    if (id && foldIds) {
+      const exclude = id.exclude.filter(isRegExp);
+      if (exclude.length > 0) {
+        lookaheads += `(?!.*?(?:${exclude.map((re) => re.source).join("|")}))`;
+      }
+      if (id.include.length > 0 && id.include.every(isRegExp)) {
+        lookaheads += `(?=.*?(?:${id.include.map((re) => (re as RegExp).source).join("|")}))`;
+      }
     }
+    branches.add(`${lookaheads}.*(?:${[...new Set(extensions)].map(escape).join("|")})$`);
   }
-  return new RegExp(`^${lookaheads}.*(?:${[...extensions].join("|") || "(?!)"})$`, flags);
+  return new RegExp(
+    `^(?!.*${sep}node_modules${sep})(?:${[...branches].join("|") || "(?!)"})`,
+    foldIds ? ([...flagSet][0] ?? "") : "",
+  );
 }
 
 // Bun's native loader, for untouched code and loads after unregistering.

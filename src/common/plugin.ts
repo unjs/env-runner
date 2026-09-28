@@ -83,8 +83,8 @@ export type EnvRunnerPluginFactory = (options: any) => EnvRunnerPlugin | Promise
 export interface NormalizedPlugin {
   name: string;
   order: "pre" | "normal" | "post";
-  /** `filter.id` include patterns (`undefined` without an `id` filter; empty = all). */
-  idInclude?: (string | RegExp)[];
+  /** `filter.id` patterns (`undefined` without an `id` filter; no includes = all). */
+  id?: { include: (string | RegExp)[]; exclude: (string | RegExp)[] };
   /** `filter.moduleType` (`undefined` without one). */
   moduleTypes?: TransformModuleType[];
   /**
@@ -160,7 +160,7 @@ export async function resolvePlugin(
   return {
     name,
     order,
-    idInclude: id?.include,
+    id: id && { include: id.include, exclude: id.exclude },
     moduleTypes,
     prefilter,
     matches: (idValue, codeValue, moduleType) =>
@@ -191,7 +191,11 @@ function _warnUnsupportedHooks(name: string, plugin: Record<string, unknown>): v
 function _compileStringFilter(
   filter: TransformStringFilter,
   match: (pattern: string | RegExp, value: string) => boolean,
-): { include: (string | RegExp)[]; test: (value: string) => boolean } {
+): {
+  include: (string | RegExp)[];
+  exclude: (string | RegExp)[];
+  test: (value: string) => boolean;
+} {
   const formal =
     filter && typeof filter === "object" && !Array.isArray(filter) && !(filter instanceof RegExp);
   const toList = (value: MaybeArray<string | RegExp> | undefined) =>
@@ -200,6 +204,7 @@ function _compileStringFilter(
   const exclude = formal ? toList(filter.exclude) : [];
   return {
     include,
+    exclude,
     test: (value) =>
       !exclude.some((pattern) => match(pattern, value)) &&
       (include.length === 0 || include.some((pattern) => match(pattern, value))),

@@ -427,7 +427,7 @@ The code formats are named like Node's [load formats](https://nodejs.org/api/mod
   - On Node.js, after a module re-exported by CommonJS (`module.exports = require("./dep.cjs")`) changes, Node reads it as an empty, circular module (this happens with real files too after deleting them from `require.cache`). Assign it first (`const dep = require("./dep.cjs"); module.exports = dep;`).
 - **Text and bytes** can't be imported from memory natively on every runtime, so they are served as ES modules where needed. `bytes` gives each module instance its own `Uint8Array`. Bytes survive every transport, including the process runners' JSON IPC (as base64) and `updateVirtualModules()`.
 - **WebAssembly** default-exports a compiled [`WebAssembly.Module`](https://developer.mozilla.org/docs/WebAssembly/Reference/JavaScript_interface/Module) on every runtime, so instantiate it yourself with `WebAssembly.instantiate(module, imports)`. This follows workerd, which compiles `.wasm` modules ahead of time and disallows compiling Wasm at runtime. Node.js and Deno's own `.wasm` imports instantiate the module instead ([Wasm ESM integration](https://github.com/WebAssembly/esm-integration)), and Bun's give a file path, so those aren't used.
-- **JSX** is only supported on Bun, by its `jsx`/`tsx` loaders (configure the JSX runtime with `tsconfig.json` or pragma comments like `/** @jsxImportSource preact */`). Node.js, Deno and miniflare can't load JSX from memory and fail with an error naming the key. Add the oxc plugin to [`data.plugins`](#plugins-dataplugins) to transform it, or pre-transpile it to JavaScript and pass `{ source, format: "module" }` to keep a `.jsx`/`.tsx` key.
+- **JSX** is only supported on Bun, by its `jsx`/`tsx` loaders (configure the JSX runtime with `tsconfig.json` or pragma comments like `/** @jsxImportSource preact */`). Node.js, Deno and miniflare can't load JSX from memory and fail with an error naming the key. Add a compiling plugin to [`data.plugins`](#plugins-dataplugins) to transform it, or pre-transpile it to JavaScript and pass `{ source, format: "module" }` to keep a `.jsx`/`.tsx` key.
 
 Virtual modules are registered inside the worker, before the entry is imported. On Node.js (>= 22.15 / 23.5) and Deno (>= 2.8) this uses [ESM customization hooks](https://nodejs.org/api/module.html#moduleregisterhooksoptions) (`module.registerHooks`); on Bun (which does not implement `registerHooks`) it uses a [`Bun.plugin()`](https://bun.com/docs/runtime/plugins) runtime plugin instead, also for the Node.js runners when the host runtime is Bun. Each source is served in its format, and virtual specifiers (including a virtual entry) resolve across `reloadModule()`. On runtimes supporting neither mechanism, a warning is logged and registration is skipped. When the worker shuts down gracefully the registration is unregistered again (the `registerHooks` registration is deregistered; on Bun, which has no plugin-removal API, the registration is detached so fresh loads and reloads stop resolving, and an overridden real file loads from disk again).
 
@@ -437,7 +437,7 @@ On `MiniflareEnvRunner` there is no in-worker registration: the runner's module 
 
 Pass `data.plugins` to run **plugins** on the entry, its imports and virtual modules. It works on every runner except `SelfEnvRunner` (which warns and ignores it). A plugin is a module, given by specifier and resolved from the working directory, optionally with options: `[specifier, options]`. The options must be JSON-serializable, because they cross into the worker.
 
-env-runner ships `env-runner/plugins/oxc`, which compiles TypeScript (including `enum`s, namespaces and parameter properties) and JSX with [`oxc-transform`](https://oxc.rs/docs/guide/usage/transformer). Its options go to `transformSync()` as-is. It only handles TypeScript/JSX modules (plain JavaScript is left alone). `oxc-transform` is not a dependency: install it in your app (`npm i -D oxc-transform`).
+> `data.plugins` is unrelated to the srvx server `plugins` of your [app entry](#app-entry): those stay on the entry's default export.
 
 ```js
 import { NodeProcessEnvRunner } from "env-runner";
@@ -447,8 +447,8 @@ const runner = new NodeProcessEnvRunner({
   data: {
     entry: "./src/server.tsx",
     plugins: [
-      ["env-runner/plugins/oxc", { jsx: { runtime: "automatic", importSource: "preact" } }],
-      ["./build/inline-env.mjs", { prefix: "APP_" }],
+      ["./build/oxc.mjs", { jsx: { runtime: "automatic" }, id: { exclude: "**/generated/**" } }],
+      ["./build/version.mjs", { version: "1.2.3" }],
     ],
   },
 });
@@ -456,26 +456,35 @@ const runner = new NodeProcessEnvRunner({
 
 A plugin module has a single default export, either a **plugin factory** or a **plugin object**. Only the plugin's `transform` hook is used; other hooks are ignored with a warning.
 
+TypeScript enums, namespaces and JSX need a compiler. A small plugin with [`oxc-transform`](https://oxc.rs/docs/guide/usage/transformer) (`npm i -D oxc-transform`) covers them:
+
 ```js
-// A plugin factory: called once per worker with the entry's options (may be async)
-export default (options = {}) => ({
-  name: "inline-env",
+// build/oxc.mjs: a plugin factory, called once per worker with the entry's options (may be async)
+import { transformSync } from "oxc-transform";
+
+export default ({ id, ...options } = {}) => ({
+  name: "oxc",
   transform: {
-    filter: { id: /\/src\//, code: "import.meta.env" }, // only matching modules
-    handler(code, id, meta) {
-      return code.replaceAll("import.meta.env", `process.env /* ${options.prefix} */`);
+    // Only TypeScript/JSX, optionally scoped by an `id` filter from the options.
+    filter: { moduleType: ["ts", "tsx", "jsx"], ...(id && { id }) },
+    handler(code, path, { moduleType }) {
+      const result = transformSync(path, code, { sourcemap: true, lang: moduleType, ...options });
+      const errors = result.errors.filter((error) => error.severity === "Error");
+      if (errors.length > 0)
+        throw new SyntaxError(errors.map((error) => error.codeframe).join("\n"));
+      return { code: result.code, map: result.map, moduleType: "js" };
     },
   },
 });
 ```
 
 ```js
-// A plugin object: the entry's options arrive as `meta.options`
+// build/version.mjs: a plugin object, the entry's options arrive as `meta.options`
 export default {
   name: "version",
   transform: {
     order: "pre", // "pre" | "post" (default: unordered)
-    filter: { moduleType: ["ts", "tsx"] },
+    filter: { id: "src/**", moduleType: ["ts", "tsx"], code: "__VERSION__" },
     handler(code, id, meta) {
       // meta.moduleType: "ts" | "tsx" | "jsx" | "js"
       return code.replaceAll("__VERSION__", JSON.stringify(meta.options?.version ?? "dev"));
@@ -486,7 +495,7 @@ export default {
 
 `transform` can also be a plain function. Handlers return a string, `{ code, map, moduleType }`, or nothing to keep the code.
 
-**Which modules are transformed:** the plugins' filters decide; there is no separate include/exclude setting.
+**Which modules are transformed:** the plugins' filters decide, so each plugin scopes itself (there is no global include/exclude setting). Filters can't be RegExps when they come from options (JSON), so pass globs, as `id` in the oxc example does.
 
 - Candidates are files with a script extension (`.js`, `.mjs`, `.cjs`, `.ts`, `.mts`, `.cts`, `.jsx`, `.tsx`) and virtual modules with a code format. Paths containing `/node_modules/` are never transformed.
 - A candidate is read and run through the plugins only when at least one plugin's `id` and `moduleType` filters match it (a plugin without them matches every candidate). The initial module type comes from the extension, or a virtual module's format. Anything else loads as if there were no plugins.
@@ -494,8 +503,9 @@ export default {
 
 **Rules:**
 
-- **Order:** `pre` handlers, then unordered ones, then `post` ones. Within each group, `plugins` order is kept, so list the oxc plugin before plugins that expect JavaScript.
-- **Module type:** `meta.moduleType` starts as the module's language. A handler that compiles to JavaScript returns `moduleType: "js"`, as the oxc plugin does, and later handlers see that.
+- **Filter every plugin:** give each plugin a `moduleType` filter, and an `id` filter where you can. Unfiltered plugins read every script module (outside `node_modules`), and on Bun they break CommonJS files (see below).
+- **Order:** `pre` handlers, then unordered ones, then `post` ones. Within each group, `plugins` order is kept, so list a compiling plugin (like oxc above) before plugins that expect JavaScript.
+- **Module type:** `meta.moduleType` starts as the module's language. A handler that compiles to JavaScript returns `moduleType: "js"`, as the oxc plugin above does, and later handlers see that.
 - **Output must be JavaScript:** if no handler changed a module, it loads as if unmatched. If one changed it but it is still TypeScript/JSX (no handler returned `moduleType: "js"`), loading it fails with an error.
 - **Sync only:** handlers must be synchronous (Node.js module hooks are), and returning a Promise throws. Factories may be async.
 - **No plugin context:** `this` is not bound to one.
@@ -512,7 +522,7 @@ export default {
 How plugins are applied:
 
 - **Node.js** runners (and runners built on them) and **Deno**: a `module.registerHooks` load hook (Node.js >= 22.15 / 23.5). The output is served as ESM or CommonJS: by the package `"type"` when Node.js reports it, else `.mts`/`.cts`, else CommonJS only for output with CommonJS markers (`require()`, `module.exports`) and no ESM syntax. Deno evaluates hook output as ESM, so CommonJS files fall back to its native loader (which needs `--unstable-detect-cjs` in the runner's `execArgv` for CommonJS `.ts`).
-- **Bun**: a `Bun.plugin()` `onLoad` with one filter RegExp built from the plugins: the extensions their `moduleType` filters imply (`ts` → `.ts`/`.mts`, `tsx` → `.tsx`, `jsx` → `.jsx`, `js` → `.js`/`.mjs`; every one of them for a plugin without a `moduleType` filter), without `/node_modules/`. When every plugin has an `id` filter that includes only RegExps (with the same flags), those narrow it too; Bun matches them against native paths, so on Windows match `[\\/]`. Bun evaluates plugin output as ESM and a plugin can't decline a load, so `.cjs`/`.cts` never reach it, and **CommonJS in other files the filter covers is not supported** (e.g. a CommonJS `.js` file next to a plugin without a `moduleType` filter). Files the RegExp lets through but no plugin matches are handed back to Bun's native loader.
+- **Bun**: a `Bun.plugin()` `onLoad` with one filter RegExp built from the plugins, one alternative per plugin: the extensions its `moduleType` filter implies (`ts` → `.ts`/`.mts`, `tsx` → `.tsx`, `jsx` → `.jsx`, `js` → `.js`/`.mjs`; every one of them without a `moduleType` filter), plus its `id` RegExps (RegExp excludes always; includes when they are all RegExps). Globs are left to the plugin's own filter, and `id` RegExps with differing flags aren't folded in. `/node_modules/` is always left out. Bun matches against native paths, so on Windows `id` RegExps should match `[\\/]`. Bun evaluates plugin output as ESM and a plugin can't decline a load, so `.cjs`/`.cts` never reach it, and **CommonJS in other files the RegExp covers is not supported** (e.g. a CommonJS `.js` file next to a plugin without a `moduleType` filter). Files the RegExp lets through but no plugin matches are handed back to Bun's native loader.
 - **Miniflare**: on the host, in the module fallback service (after `transformRequest`), with CommonJS output served behind the same ESM shim as untransformed files. A transform error is logged on the host and thrown from the failing module inside workerd.
 - **Virtual modules** go through the plugins instead of type-stripping when a plugin matches them, which also makes JSX work on every runner (e.g. `#entry.tsx`, or `{ source, format: "tsx" }` without an extension). The output stays in its format's module system: CommonJS formats stay CommonJS, and the rest become ESM. Sources added or replaced by `updateVirtualModules()`/`invalidateModule()` are transformed too. A source that fails to transform rejects the update and changes nothing.
 - `reloadModule()` re-transforms the entry from disk; already-imported modules stay cached.

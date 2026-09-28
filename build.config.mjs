@@ -29,7 +29,7 @@ export default defineBuildConfig({
       // resolved from the user's project. Keep them external so they are never
       // inlined into `dist`.
       rolldown: {
-        external: ["miniflare", "wrangler", "@netlify/runtime", "@vercel/queue", "oxc-transform"],
+        external: ["miniflare", "wrangler", "@netlify/runtime", "@vercel/queue"],
       },
     },
   ],

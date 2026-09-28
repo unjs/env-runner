@@ -1,6 +1,6 @@
 # Plugins (`data.plugins`)
 
-Plugin `transform` hooks applied to the entry, its disk imports and virtual modules. Implemented in **`src/common/plugins.ts`** (entry normalization, pipeline, runtime hooks, virtual module transform, Bun filter) and **`src/common/plugin.ts`** (resolving a plugin, hook filters); wired into workers by `registerWorkerHooks()` (`worker-utils.ts`) and host-side by miniflare. TypeScript/JSX compilation is not built into the pipeline: it's the `env-runner/plugins/oxc` plugin (`src/plugins/oxc.ts`), used like any other. There is no settings object: plugins alone decide what they touch, through their hook filters.
+Plugin `transform` hooks applied to the entry, its disk imports and virtual modules. Implemented in **`src/common/plugins.ts`** (entry normalization, pipeline, runtime hooks, virtual module transform, Bun filter) and **`src/common/plugin.ts`** (resolving a plugin, hook filters); wired into workers by `registerWorkerHooks()` (`worker-utils.ts`) and host-side by miniflare. env-runner ships no plugins: TypeScript/JSX compilation is a user-land plugin (the README shows a small `oxc-transform` one; tests use `test/fixtures/plugins/oxc.mjs`). There is no settings object: plugins alone decide what they touch, through their hook filters, so scoping is each plugin's job (globs via options, since options are JSON).
 
 ## Options and data flow
 
@@ -8,9 +8,9 @@ Plugin `transform` hooks applied to the entry, its disk imports and virtual modu
 - `BaseEnvRunner` calls `normalizePluginEntries()` in its constructor. It:
   - resolves specifiers from the host cwd to `file:` URLs, so workers import the app's copies (`env-runner/...` resolves through the package's self-reference);
   - checks options with `_assertSerializable()`: plain objects, arrays and primitives only, since a RegExp/Date/class instance would arrive as `{}`/a string over JSON, and functions not at all;
-  - throws a `TypeError` naming the entry (`plugins[0]`, `plugins[0] options.re`) for a non-specifier or bad options.
+  - throws a `TypeError` naming the entry (`data.plugins[0]`, `plugins[0] options.re`) for a non-specifier or bad options. A function/object entry's message points srvx server plugins to the app entry's `plugins` (same name, unrelated option).
 - `loadPlugins()` (in the worker; on the host for miniflare) returns `undefined` for no entries (no hooks registered). Otherwise it imports each module and calls `resolvePlugin(default, specifier, options)`:
-  - A **function** default export is a **plugin factory**, called once with the options. It may be async (the oxc plugin awaits its `oxc-transform` import). A throw becomes `plugin "<specifier>" failed to initialize: ...`; a non-object result fails.
+  - A **function** default export is a **plugin factory**, called once with the options. It may be async. A throw becomes `plugin "<specifier>" failed to initialize: ...`; a non-object result fails.
   - An **object** is the plugin itself; its handler gets the options as `meta.options` (factory plugins get them too).
   - A plugin has `{ name?, transform }`, where `transform` is a function or `{ order?, filter?, handler }`. Bad shapes throw a `TypeError` naming the specifier. A handler returning a thenable throws, since hooks are sync. Handlers get `(code, id, { moduleType, options })` with no plugin context (`this`).
   - Other function-valued hooks (or `{ handler }` objects), e.g. `load`/`resolveId`, are ignored with one `console.warn` per plugin name.
@@ -30,18 +30,17 @@ Plugin `transform` hooks applied to the entry, its disk imports and virtual modu
 
 Callers only read a file when `filter()` passes: Node/Deno otherwise `nextLoad()`, miniflare otherwise serves the raw file. Inside the pipeline each handler still checks its full filter (`matches()`) against the current code and module type.
 
-The built-in oxc plugin filters on `moduleType: ["ts", "tsx", "jsx"]`, so plain JS isn't compiled (or even read) with oxc alone.
+The README recommends a `moduleType` (and, where possible, `id`) filter on every plugin: unfiltered plugins read every script module, and on Bun make CommonJS files break (below). The test oxc plugin filters on `moduleType: ["ts", "tsx", "jsx"]`, so plain JS isn't read with it alone.
 
 ## Pipeline
 
 - `pre` handlers, then unordered ones, then `post` ones, each group in `plugins` order.
-- `moduleType` starts from the extension (or a virtual module's format), and a result's `moduleType` updates it for later handlers and filters. The oxc plugin returns `js`.
+- `moduleType` starts from the extension (or a virtual module's format), and a result's `moduleType` updates it for later handlers and filters. A compiling plugin returns `js`.
 - **Untouched** code (no handler changed it) returns `undefined`, and callers serve the module as if unmatched: Node/Deno `nextLoad()`, Bun's native loader, miniflare's raw path, the virtual module unchanged.
-- Code that **changed but isn't `js`** at the end throws a `TypeError` naming the id and module type. Serving leftover TypeScript/JSX would need per-backend stripping, and it's almost always a missing oxc entry.
+- Code that **changed but isn't `js`** at the end throws a `TypeError` naming the id and module type. Serving leftover TypeScript/JSX would need per-backend stripping, and it's almost always a missing compiling plugin.
 - An inline `sourceMappingURL` is appended whenever the pipeline ends with a map; `sources` is the file URL for absolute ids.
-- The oxc plugin: `transformSync(id, code, { sourcemap: true, lang: moduleType, ...options })`. `lang` covers virtual keys without a telling extension. Diagnostics with severity `Error` throw a `SyntaxError` with codeframes and the id.
 - Maps are never composed. The first map-producing step that changes the code sets the map. A second one would be relative to already-mapped code, so it drops the map, because a wrong map is worse than none. Code-only results keep the current map, and a step returning unchanged code is a no-op.
-- `oxc-transform` is a devDependency, external in `build.config.mjs`, and only imported by the oxc plugin, by name (`resolveRuntimeDep()` from cwd). Its options are untyped (`unknown` entry options), since env-runner doesn't own their shape.
+- `oxc-transform` is only a devDependency, for the test fixture plugin; `dist` never imports it.
 
 ## Runtimes
 
@@ -51,10 +50,11 @@ The built-in oxc plugin filters on `moduleType: ["ts", "tsx", "jsx"]`, so plain 
   - `nextLoad()` can't be used for detection: it throws `ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX` on enums.
   - Deno ignores the format and evaluates hook output as ESM, so CommonJS output falls back to `nextLoad` (Deno's native loader; CommonJS `.ts` needs `--unstable-detect-cjs`). Deno does call load hooks for disk files.
 - **Bun** (`Bun.plugin` `onLoad`): plugin output is always evaluated as ESM, regardless of `loader`, and `onLoad` can't decline a load. So `createBunFilter()` (built in the worker after loading plugins, since RegExps aren't serializable) keeps the one native filter RegExp narrow:
-  - extensions: the union over plugins of those their `filter.moduleType` implies (`ts` → `.ts .mts`, `tsx` → `.tsx`, `jsx` → `.jsx`, `js` → `.js .mjs`; unknown types none); a plugin without a moduleType filter adds all of them. Never `.cjs`/`.cts`.
-  - `/node_modules/` as a negative lookahead, with either separator (`(?:\\|\/)` rather than a character class, so it stays valid in `u`/`v` mode).
-  - if **every** plugin has an `id` filter whose include list is non-empty and all RegExps, and their flags (minus `g`/`y`) agree, their sources are folded in as `(?=.*?(?:a|b))` with those flags. Otherwise no id fold. Bun paths keep native separators, so on Windows folded RegExps must match `\` themselves.
-  - The fold is an over-approximation (union of all includes and extensions, no excludes), so `onLoad` still runs `filter()` and returns untouched or unmatched files with Bun's native loader (`_bunLoader()`). Consequence: CommonJS in any file the RegExp covers breaks (a transformed CommonJS `.ts`, or a CommonJS `.js` when a plugin has no `moduleType` filter). Documented as a limitation.
+  - `^(?!.*SEP node_modules SEP)` (either separator, `(?:\\|\/)` rather than a character class, so it stays valid in `u`/`v` mode), then **one alternative per plugin** (deduplicated), each ending in `.*(?:<exts>)$`:
+    - exts: those its `filter.moduleType` implies (`ts` → `.ts .mts`, `tsx` → `.tsx`, `jsx` → `.jsx`, `js` → `.js .mjs`; unknown types none, so the plugin gets no alternative); without a moduleType filter all of them. Never `.cjs`/`.cts`.
+    - its `id` RegExp excludes as `(?!.*?(?:a|b))` (glob excludes dropped: over-approximation is safe), and its includes as `(?=.*?(?:a|b))` when all of them are RegExps (a glob anywhere in the include list drops the include lookahead, since dropping only the glob would under-approximate).
+    - The RegExp takes the `id` RegExps' flags (minus `g`/`y`); if flags differ across plugins, no `id` lookaheads at all (extensions only).
+  - So with RegExp-only filters it's exact for `id`/`moduleType` (modulo native separators: on Windows `id` RegExps must match `\` themselves). `onLoad` still runs `filter()` and returns untouched or unmatched files with Bun's native loader (`_bunLoader()`). Consequence: CommonJS in any file the RegExp covers breaks (a transformed CommonJS `.ts`, or a CommonJS `.js` when a plugin has no `moduleType` filter). Documented as a limitation, with the advice to filter every plugin.
   - Plugins can't be removed; unregister only detaches the active pipeline.
 - `_active` is set only after a backend registered, so reload never takes the plugin path without a hook behind it.
 - **Virtual modules**: `transformVirtualModule()` runs before each backend's own preparation.
@@ -83,13 +83,13 @@ Both keep relative imports working, unlike the untransformed `data:` URL path. A
 `test/plugins.test.ts` runs every IPC runner plus miniflare against `test/fixtures/plugins/`:
 
 - `app.tsx` uses an enum and classic JSX with pragma `h`, and imports `dep.ts` (enum) and `h.ts`. It has `// @ts-nocheck` because tsconfig has no `--jsx`.
-- Plugins are configured as `["env-runner/plugins/oxc", { jsx: classic, pragma h }]` (resolved through the package self-reference to `dist`, so run `pnpm build` first), followed by `greeting.mjs`, a plugin factory with a `greeting` option.
+- Plugins are configured as `[oxc.mjs, { jsx: classic, pragma h }]` (a fixture plugin with `oxc-transform`: `moduleType` filter plus an optional `id` filter from its options), followed by `greeting.mjs`, a plugin factory with `greeting` and `id` (filter) options. Workers are spawned from `dist`, so run `pnpm build` first.
 
 Further fixtures:
 
-- `cjs/` has a package.json without `"type"`: `lib.ts` (CommonJS with an enum), `dep.cts`, and `vendor/plain.ts` (CommonJS; becomes `"hi"` instead of `"vendor"` if a greeting plugin runs on it).
-- `app-cjs.ts` and `app-vendor.ts` import them.
-- `greeting-exclude.mjs` (`id: { exclude: /\/vendor\// }`) and `greeting-include.mjs` (case-insensitive `id` RegExp leaving out `vendor/plain.ts`) exercise `id` filters; both tests fail without the filters (except on Deno, where CommonJS output falls back to the native loader anyway).
+- `cjs/` has a package.json without `"type"`: `lib.ts` (CommonJS with an enum) and `dep.cts`; `app-cjs.ts` imports them.
+- `vendor/plain.ts` is an ES module whose `value` becomes `"hi"` instead of `"vendor"` if a greeting plugin runs on it; `app-vendor.ts` imports it and `cjs/dep.cts`. ESM so the filter tests run (and prove the filter) on every runner, Bun and Deno included.
+- `greeting.mjs` with `{ id: { exclude: "**/vendor/**" } }` (glob through options) and `greeting-include.mjs` (case-insensitive `id` RegExp leaving out `vendor/plain.ts`) exercise `id` filters; both tests fail on every runner without the filters.
 - `mapped.mjs` is a plugin returning its own map.
 - `greeting-plugin.mjs` is a plugin object: `pre` order, with a glob `id` filter and a `code` filter, reading `meta.options.greeting`.
 - `order-*.mjs` and `async.mjs` exercise ordering and the async error.
@@ -103,7 +103,7 @@ Runner cases:
 - a transform error closing the runner (virtual source, since invalid syntax on disk breaks `tsc`)
 - invalidation with a failing transform (rejects, worker survives)
 - CommonJS `.ts` + `.cts` (not Bun; Deno passes `--unstable-detect-cjs`)
-- `id` exclude / include filters (not Bun: `vendor/plain.ts` is CommonJS)
+- `id` exclude (glob from options) / include (RegExp) filters, on every runner
 - a plugin object listed after oxc (`"hey from tsx"` proves `pre` ran on the source and the entry's options reached the hook)
 
-Unit cases cover entry normalization, candidates (script extensions, `/node_modules/`), prefiltering by `id`/`moduleType` (nothing read or run when no plugin matches), oxc's `moduleType` filter, oxc errors, source maps, plugin ordering, untouched/non-JS output, hook filters, factories and options, the unsupported-hook warning, `createBunFilter()` (extensions, node_modules, id folding and when it's skipped), and invalid exports.
+Unit cases cover entry normalization (including the srvx-plugin mix-up message), candidates (script extensions, `/node_modules/`), prefiltering by `id`/`moduleType` (nothing read or run when no plugin matches), the oxc fixture's `moduleType` filter and `id` option, oxc errors, source maps, plugin ordering, untouched/non-JS output, hook filters, factories and options, the unsupported-hook warning, `createBunFilter()` (extensions, node_modules, per-plugin alternatives with RegExp includes/excludes, globs, missing `id`, mixed flags, custom module types), and invalid exports.

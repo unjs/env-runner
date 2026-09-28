@@ -1,7 +1,7 @@
-// @ts-nocheck -- CommonJS default imports
+// @ts-nocheck -- CommonJS default import
 import dep from "./cjs/dep.cts";
-import vendor from "./cjs/vendor/plain.ts";
+import { value } from "./vendor/plain.ts";
 
 export default {
-  fetch: () => Response.json([dep.value, vendor.value]),
+  fetch: () => Response.json([dep.value, value]),
 };
