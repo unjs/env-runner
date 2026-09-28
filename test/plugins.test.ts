@@ -635,10 +635,14 @@ describe("plugins", () => {
       createPluginPipeline([{ transform: { filter: { moduleType: "ts" as any }, handler() {} } }]),
     ).toThrow(/invalid `transform\.filter\.moduleType`/);
     expect(() => createPluginPipeline("oxc" as any)).toThrow(/must be an array/);
-    // Other hooks are ignored: a plugin may have none of these.
-    expect(createPluginPipeline([{ name: "other", buildStart() {} } as any])!.names).toEqual([
-      "other",
-    ]);
+    // Other hooks are ignored: a plugin may have none of these. Without any
+    // supported hook, as without `plugins`.
+    expect(createPluginPipeline([{ name: "other", buildStart() {} } as any])).toBeUndefined();
+    expect(createPluginPipeline([])).toBeUndefined();
+    expect(createPluginPipeline([false, null, [[]]])).toBeUndefined();
+    expect(() => createPluginPipeline([false, [{ transform: 1 } as any]])).toThrow(
+      /`plugins\[1\]\[0\]` has an invalid `transform` hook/,
+    );
     expect(() => createPluginPipeline([{ transform: 1 } as any])).toThrow(
       /`plugins\[0\]` has an invalid `transform` hook \(got 1\)/,
     );
@@ -1042,6 +1046,12 @@ describe("plugin filters", () => {
     expect(await matching(query("raw", ""), ids)).toEqual(["/a.ts?raw", "/a.ts?url=1&raw"]);
     expect(await matching(query("url", "1"), ids)).toEqual(["/a.ts?url=1&raw"]);
     expect(await matching(query("type", /^sty/), ids)).toEqual(["/a.ts?type=style&lang.css"]);
+    // `g`/`y` flags are dropped: every test matches.
+    expect(await matching(query("v", /a/gy), ["/a.ts?v=a", "/b.ts?v=a", "/c.ts?v=a"])).toEqual([
+      "/a.ts?v=a",
+      "/b.ts?v=a",
+      "/c.ts?v=a",
+    ]);
     expect(await matching(query("type", /^$/), ids)).toEqual([
       "/a.ts",
       "/a.ts?raw",
@@ -1145,6 +1155,53 @@ describe("plugin filters", () => {
     // The host's `filter()` doesn't know the code either.
     expect(pipeline.filter("/app/src/a.ts")).toBe(true);
     expect(pipeline.filter("/app/lib/a.js")).toBe(true);
+  });
+
+  it("names other file types by the `id`/`moduleType` a filter expression matches", async () => {
+    const run = async (filter: any, id: string, code = "__V__") => {
+      const pipeline = createPluginPipeline([
+        { transform: { filter, handler: (code) => code.replace("__V__", "1") } },
+      ])!;
+      const test = createPrefilter(JSON.parse(JSON.stringify(pipeline.prefilters)));
+      const moduleType = moduleTypeOf(id);
+      const sent = test(id, moduleType);
+      expect(pipeline.filter(id), id).toBe(sent);
+      return { sent, code: (await pipeline.transform(id, code, moduleType))?.code };
+    };
+    // A `moduleType` include types `json`, like `{ moduleType: ["json"] }`.
+    expect(await run([include(moduleType("json"))], "/app/data.json", '"__V__"')).toEqual({
+      sent: true,
+      code: '"1"',
+    });
+    expect(await run([include(id(/\.json$/))], "/app/data.json")).toEqual({
+      sent: false,
+      code: undefined,
+    });
+    // A `code`-only include names no file: other types stay untouched.
+    const version = [include(code("__V__"))];
+    expect(await run(version, "/app/a.ts")).toEqual({ sent: true, code: "1" });
+    expect(await run(version, "/app/a.yaml")).toEqual({ sent: false, code: undefined });
+    expect(await run([include({ kind: "not", expr: id(/x/) })], "/app/a.yaml")).toMatchObject({
+      sent: false,
+    });
+    // An `id` in the include that may decide: named, unless only `code` matched.
+    const either = [include({ kind: "or", args: [id(/src\//), code("__V__")] })];
+    expect(await run(either, "/app/src/a.yaml")).toEqual({ sent: true, code: "1" });
+    expect(await run(either, "/app/lib/a.yaml")).toEqual({ sent: false, code: undefined });
+    expect(
+      await run([include({ kind: "and", args: [id(/\.yaml$/), code("__V__")] })], "/app/a.yaml"),
+    ).toEqual({ sent: true, code: "1" });
+    // An exclude that depends on the code doesn't hide a later include.
+    const skip = [exclude(code("SKIP")), include(id(/\.yaml$/))];
+    expect(await run(skip, "/app/a.yaml")).toEqual({ sent: true, code: "1" });
+    expect(await run(skip, "/app/a.yaml", "SKIP __V__")).toEqual({ sent: true, code: undefined });
+    // A present `query` param names it; an absent one doesn't.
+    expect(
+      await run([include({ kind: "query", key: "raw", pattern: true })], "/app/a.txt?raw"),
+    ).toMatchObject({ sent: true, code: "1" });
+    expect(
+      await run([include({ kind: "query", key: "raw", pattern: false })], "/app/a.txt"),
+    ).toMatchObject({ sent: false });
   });
 
   it("gives handlers `this.info`/`this.debug` and log positions", async () => {

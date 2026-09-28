@@ -369,7 +369,10 @@ interface NormalizedPlugin {
 // Module types a result may leave without a `moduleType` (others become `js`).
 const KNOWN_MODULE_TYPES: readonly string[] = ["js", "jsx", "ts", "tsx", "json"];
 
-/** Validate the `plugins` option (throws a descriptive `TypeError`). */
+/**
+ * Validate the `plugins` option (throws a descriptive `TypeError`):
+ * `undefined` when it has no `resolveId`, `load` or `transform` hook.
+ */
 export function createPluginPipeline(
   plugins: EnvRunnerPluginOption[] | undefined,
 ): PluginPipeline | undefined {
@@ -396,6 +399,11 @@ export function createPluginPipeline(
   const resolveHooks = ordered("resolveId");
   const loadHooks = ordered("load");
   const transformHooks = ordered("transform");
+  // No hook to run (`plugins: []`, only falsy entries or unsupported hooks):
+  // as without `plugins`.
+  if (resolveHooks.length + loadHooks.length + transformHooks.length === 0) {
+    return undefined;
+  }
   const prefilters = normalized.flatMap((plugin) =>
     [plugin.load, plugin.transform].flatMap((hook) => (hook ? [hook.prefilter] : [])),
   );
@@ -720,7 +728,7 @@ function _normalizeHook(
       prefilter,
       // Without code (prefilter), a `code` expression may match.
       match: (id, moduleType, code, resolved) =>
-        test(id, moduleType, code) !== false && level(id, moduleType, resolved),
+        test(id, moduleType, code) !== false && level(id, moduleType, resolved, code),
       handler,
     };
   }
@@ -932,7 +940,8 @@ function _normalizeNode(
       return {
         kind: "query",
         key: node.key,
-        pattern: value instanceof RegExp ? { source: value.source, flags: value.flags } : value,
+        pattern:
+          value instanceof RegExp ? { source: value.source, flags: _statelessFlags(value) } : value,
       };
     }
     case "importerId": {

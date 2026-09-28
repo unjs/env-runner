@@ -112,7 +112,8 @@ expose WebSocket hooks via the `websocket` field (see [Workers](#workers)).
 Proxy manager for hot-reload with message queueing and listener forwarding:
 
 ```ts
-import { RunnerManager, NodeProcessEnvRunner } from "env-runner";
+import { RunnerManager } from "env-runner";
+import { NodeProcessEnvRunner } from "env-runner/runners/node-process";
 
 await using manager = new RunnerManager();
 
@@ -435,7 +436,7 @@ On `MiniflareEnvRunner` there is no in-worker registration: the runner's module 
 
 #### Plugins (`plugins`)
 
-Pass the `plugins` runner option to resolve, load and transform the entry, its imports and virtual modules with **plugins that run on the host**. While resolving an import or loading a module, the worker sends it to the runner, the runner runs the plugins' `resolveId`, `load` and `transform` handlers and sends the result back, and the worker uses that result. Plugins are plain objects in the host process, so handlers can be async, close over host state and share work with the rest of your tooling. It works on every runner except `SelfEnvRunner`, which closes with an error. `loadRunner()` and `EnvServer` take the same `plugins` option (`EnvServer` passes it to every runner it creates).
+Pass the `plugins` runner option to resolve, load and transform the entry, its imports and virtual modules with **plugins that run on the host**. While resolving an import or loading a module, the worker sends it to the runner, the runner runs the plugins' `resolveId`, `load` and `transform` handlers and sends the result back, and the worker uses that result. Plugins are plain objects in the host process, so handlers can be async, close over host state and share work with the rest of your tooling. It works on every runner except `SelfEnvRunner`, which closes with an error (an empty list, or plugins without these hooks, count as no `plugins`). `loadRunner()` and `EnvServer` take the same `plugins` option (`EnvServer` passes it to every runner it creates).
 
 > The runner `plugins` option is unrelated to the srvx server `plugins` of your [app entry](#app-entry): those stay on the entry's default export.
 
@@ -443,7 +444,7 @@ TypeScript enums, namespaces and JSX need a compiler. A plugin with [`oxc-transf
 
 ```js
 import { transformSync } from "oxc-transform";
-import { NodeProcessEnvRunner } from "env-runner";
+import { NodeProcessEnvRunner } from "env-runner/runners/node-process";
 
 const oxc = {
   name: "oxc",
@@ -542,8 +543,8 @@ const raw = {
 - Files under `/node_modules/` only go to hooks with a matching `id` include that names `node_modules` (like `**/node_modules/my-pkg/**`, or an include filter expression with such an `id`), or to every matching hook when a `resolveId` hook returned their path.
 - The worker gets each `load` and `transform` hook's `id` and `moduleType` filters (or its filter expressions). It only sends a candidate that one of them may match. A hook without these filters matches every script. The code isn't known in the worker, so `code` filters are checked on the host. Anything else loads without a round trip, so **give every plugin a `moduleType` filter, and an `id` filter where you can**.
 - Scripts (module types `js`, `jsx`, `ts`, `tsx`) go to every hook whose filter matches. Other files only go to hooks whose filter names them:
-  - an `id` include that matches (like `/\.ya?ml$/`, or `src/**`), or an include filter expression that may match;
-  - for `.json`, `.node` and `.wasm`, which runtimes load themselves, a `moduleType` filter listing the type (`["json"]`) or a `load` hook's `id` include.
+  - an `id` include that matches (like `/\.ya?ml$/`, or `src/**`), or, in filter expressions, an include that matches through an `id` (or a present `query` param), not only through `code` or `not`;
+  - for `.json`, `.node` and `.wasm`, which runtimes load themselves, a `moduleType` filter listing the type (`["json"]`, or a `moduleType` expression in the matching include) or a `load` hook's `id` include.
 - Only imports that some `resolveId` filter matches are sent, so give `resolveId` hooks an `id` filter: without one, every import goes to the runner.
 - On the host, each handler runs only when its whole filter matches the current code.
 

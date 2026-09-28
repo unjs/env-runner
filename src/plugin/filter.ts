@@ -42,8 +42,9 @@ export interface SerializedPrefilter {
   moduleTypes?: PluginModuleType[];
   expr?: SerializedFilterExpression[];
   /**
-   * A `load` filter: it can't name module types, so a matching `id` include
-   * (or include expression) counts as `"typed"` ({@link PrefilterMatch}).
+   * A `load` filter: it can't name module types, so a module its `id`
+   * include (or include expression) names counts as `"typed"`
+   * ({@link PrefilterMatch}).
    */
   load?: true;
 }
@@ -260,8 +261,10 @@ function _compileNode(node: SerializedFilterNode): FilterExpressionTest {
 
 /**
  * How a filter matches a module without its code: `false`, `true`, `"named"`
- * when an `id` include (or, for filter expressions, an include) matches it,
- * or `"typed"` when its `moduleType` filter lists the module's type.
+ * when an `id` include matches it, or `"typed"` when its `moduleType` filter
+ * lists the module's type. For filter expressions, the include that matches
+ * names it with a matching `id` (or a present `query` param) and types it
+ * with a matching `moduleType`.
  */
 export type PrefilterMatch = boolean | "named" | "typed";
 
@@ -282,11 +285,13 @@ export function requiredMatch(moduleType: PluginModuleType): "named" | "typed" |
 /**
  * `resolved`: a path a `resolveId` hook returned, which may be under
  * `/node_modules/` without a filter naming it ({@link isNodeModulesId}).
+ * `code` (host only) makes the level of filter expressions exact.
  */
 export type PrefilterTest = (
   id: string,
   moduleType: PluginModuleType,
   resolved?: boolean,
+  code?: string,
 ) => PrefilterMatch;
 
 export function compilePrefilter(filter: SerializedPrefilter): PrefilterTest {
@@ -296,10 +301,10 @@ export function compilePrefilter(filter: SerializedPrefilter): PrefilterTest {
   const excluded = (id: string, resolved?: boolean) =>
     !resolved && isNodeModulesId(id) && !nodeModules.some((pattern) => pattern.test(id));
   if (filter.expr) {
-    const test = compileFilterExpressions(filter.expr);
-    const named = filter.expr.some((expr) => expr.kind === "include") && namedLevel;
-    return (id, moduleType, resolved) =>
-      !excluded(id, resolved) && test(id, moduleType) !== false && (named || true);
+    const level = _compileExpressionsLevel(filter.expr);
+    const levels = [false, true, namedLevel, "typed"] as const;
+    return (id, moduleType, resolved, code) =>
+      !excluded(id, resolved) && levels[level(id, moduleType, code)];
   }
   const idFilter =
     filter.id &&
@@ -314,6 +319,80 @@ export function compilePrefilter(filter: SerializedPrefilter): PrefilterTest {
     (!filter.moduleTypes || filter.moduleTypes.includes(moduleType)) &&
     (!idFilter || idFilter.test(id)) &&
     (filter.moduleTypes ? "typed" : named ? namedLevel : true);
+}
+
+// How filter expressions may match a module: 0 not at all, 1 without naming
+// it (`code`, `not`, `query(key, false)`), 2 named by an `id` or a present
+// `query` param, 3 typed by a `moduleType`. Without the code, the highest
+// level any possible outcome has (the host then checks with the code).
+type ExpressionLevel = 0 | 1 | 2 | 3;
+type ExpressionLevelTest = (
+  id: string,
+  moduleType: PluginModuleType,
+  code?: string,
+) => ExpressionLevel;
+
+// The deciding expression, as in `compileFilterExpressions()`: the first one
+// that matches, or any unknown one before it.
+function _compileExpressionsLevel(expressions: SerializedFilterExpression[]): ExpressionLevelTest {
+  const compiled = expressions.map(({ kind, expr }) => ({
+    include: kind === "include",
+    test: _compileNode(expr),
+    level: _compileNodeLevel(expr),
+  }));
+  const hasInclude = compiled.some((expr) => expr.include);
+  return (id, moduleType, code) => {
+    let level: ExpressionLevel = 0;
+    for (const expr of compiled) {
+      const result = expr.test(id, moduleType, code);
+      if (result === false) {
+        continue;
+      }
+      if (expr.include) {
+        level = Math.max(level, expr.level(id, moduleType, code)) as ExpressionLevel;
+      }
+      if (result) {
+        return level;
+      }
+    }
+    return hasInclude ? level : (Math.max(level, 1) as ExpressionLevel);
+  };
+}
+
+function _compileNodeLevel(node: SerializedFilterNode): ExpressionLevelTest {
+  const test = _compileNode(node);
+  const matched = (level: ExpressionLevel): ExpressionLevelTest => {
+    return (id, moduleType, code) => (test(id, moduleType, code) === false ? 0 : level);
+  };
+  switch (node.kind) {
+    case "and":
+    case "or": {
+      // `and`: every argument holds, `or`: any that may hold.
+      const args = node.args.map(_compileNodeLevel);
+      return (id, moduleType, code) =>
+        test(id, moduleType, code) === false
+          ? 0
+          : (Math.max(...args.map((arg) => arg(id, moduleType, code))) as ExpressionLevel);
+    }
+    case "id": {
+      return matched(2);
+    }
+    case "moduleType": {
+      return matched(3);
+    }
+    case "query": {
+      const { key } = node;
+      return (id, moduleType, code) =>
+        test(id, moduleType, code) === false
+          ? 0
+          : new URLSearchParams(queryOf(id)).has(key)
+            ? 2
+            : 1;
+    }
+    default: {
+      return matched(1);
+    }
+  }
 }
 
 /** Whether a {@link PrefilterMatch} is at least `required`. */
