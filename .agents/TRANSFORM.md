@@ -7,16 +7,28 @@ Source transforms (TypeScript beyond erasable syntax, JSX, custom) for the entry
 - Lives in `data` (not a runner option), so it reaches every runner the same way `data.virtual` does, and must stay **JSON-serializable**: custom transformers are module specifiers, never functions.
 - `BaseEnvRunner` calls `normalizeTransformOptions()` in its constructor: `true` → `{}`, specifiers (`transformers`, `oxcTransform`) resolved from the host cwd to `file:` URLs. Function transformers throw a `TypeError` at construction.
 - `loadTransformer()` (in the worker; on the host for miniflare) imports `oxc-transform` via `resolveRuntimeDep({ required: true })` unless `oxc: false`, then imports each transformer (default export, sync `(code, id) => string | { code, map } | nullish`).
-- Pipeline: oxc (`sourcemap` forced from `transform.sourcemap`, default `true`) → custom transformers in order → inline `sourceMappingURL`. oxc diagnostics with severity `Error` throw a `SyntaxError` with codeframes and the id. A transformer `map` replaces the previous one; code-only results keep it.
+- Pipeline: oxc (`sourcemap` forced from `transform.sourcemap`, default `true`) → custom transformers in order → inline `sourceMappingURL` (`sources` is the file URL for absolute ids). oxc diagnostics with severity `Error` throw a `SyntaxError` with codeframes and the id.
+- Maps are never composed. A transformer `map` is kept only when no earlier step changed the code, since it is relative to the transformer's input; otherwise it is dropped, because a wrong map is worse than none. Code-only results keep the previous map.
 - `filter(id)`: query stripped, `\` normalized to `/`; extension in `extensions` (default `.ts .mts .cts .tsx .jsx`) and no `exclude` substring (default `/node_modules/`). Applies to virtual keys too.
-- `oxc-transform` is a devDependency, external in `build.config.mjs`; its types are inlined into `dist` by the dts bundler.
+- `oxc-transform` is a devDependency, external in `build.config.mjs`, and never imported statically.
+- `OxcTransformOptions`/`OxcJsxOptions` are declared locally and structurally, with nested groups typed as `object`. Inlining oxc's own declarations breaks assignability: its `const enum`s such as `HelperMode` are nominal, so objects typed with the real package would no longer be assignable.
 
 ## Runtimes
 
-- **Node / Deno** (`registerHooks`): a load hook for matching `file:` URLs reads the file itself (so `.tsx`/`.jsx` never hit `ERR_UNKNOWN_FILE_EXTENSION`) and short-circuits. Format is `commonjs` when resolution hinted it (`context.format` `commonjs*`) or for `.cts`, else `module`. Deno ignores the format (output is JS anyway) and does call load hooks for disk files.
-- **Bun** (`Bun.plugin` `onLoad`): the filter RegExp is built from `extensions` inside the worker (RegExps aren't serializable). Excluded paths matching an extension return the source with Bun's native loader. Plugins can't be removed; unregister only detaches the active transformer.
+- **Node / Deno** (`registerHooks`): a load hook for matching `file:` URLs, filtered on the decoded path. It reads the file itself, so `.tsx`/`.jsx` never hit `ERR_UNKNOWN_FILE_EXTENSION`, and short-circuits.
+  - Format comes from `transformedFormat()`. A `module*`/`commonjs*` hint wins. Otherwise `.m*`/`.c*` extensions decide. Otherwise output is CommonJS only with CommonJS markers and no ESM syntax (checked with `es-module-lexer`'s `hasModuleSyntax`, which misses top-level `await`, hence the markers).
+  - Node's hint is `null` in packages without `"type"`, `"typescript"` for `require()`, and `undefined` for `.tsx`/`.jsx`.
+  - `nextLoad()` can't be used for detection: it throws `ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX` on enums.
+  - Deno ignores the format and evaluates hook output as ESM, so CommonJS output falls back to `nextLoad` (Deno's native loader; CommonJS `.ts` needs `--unstable-detect-cjs`). Deno does call load hooks for disk files.
+- **Bun** (`Bun.plugin` `onLoad`): plugin output is always evaluated as ESM, regardless of `loader`.
+  - `_bunFilter()` therefore drops `.c*` extensions and encodes `exclude` as a negative lookahead (either path separator), so those paths never reach the plugin and load natively. A transformed CommonJS `.ts` is unsupported.
+  - The RegExp is built inside the worker because RegExps aren't serializable.
+  - Plugins can't be removed; unregister only detaches the active transformer.
+- `_active` is set only after a backend registered, so reload never takes the transform path without a hook behind it.
+- **Invalidation**: `handleInvalidateModule()` catches transform errors and acks with `error`, so the worker survives and keeps the previous source. Bun validates the transform eagerly on invalidation, since it otherwise transforms lazily on load.
 - **Virtual modules**: `registerVirtualModules(virtual, transformer)` transforms matching keys at registration and on invalidation (via `transformSource`) and forces the `module` format for them. On Bun, the `build.module` callback transforms lazily. Miniflare's `#prepareVirtualSource` transforms instead of type-stripping.
-- **Miniflare**: host-side in `unsafeModuleFallbackService`, after `transformRequest` and before the raw disk read. Transform errors are served as a module that throws the message, since a 500 from the fallback would only surface as "module not found". v4 `modulesRules` include the transform extensions. `data.transform` is part of the persistent cache key.
+- **Miniflare**: host-side in `unsafeModuleFallbackService`, after `transformRequest`. Transformed code goes through the same ESM/CommonJS split as raw files, with CommonJS behind `createCjsEsmShim`; `transformedFormat()` decides for transformed code, the existing regex for raw files.
+  - Transform errors are `console.error`ed on the host and served as a module that throws the message. The host log matters because a named import of it fails at link time first, and a 500 from the fallback would only surface as "module not found". v4 `modulesRules` include the transform extensions. `data.transform` is part of the persistent cache key.
 - **Self**: unsupported (hooks would affect the host process); warns and ignores.
 
 ## Reload
@@ -35,4 +47,20 @@ Both keep relative imports working, unlike the untransformed `data:` URL path. A
 - `app.tsx` uses an enum and classic JSX with pragma `h`, and imports `dep.ts` (enum) and `h.ts`. It has `// @ts-nocheck` because tsconfig has no `--jsx`.
 - `greeting.mjs` is a custom transformer.
 
-Cases: disk entry, reload after editing a temp copy, virtual `.tsx`/`.ts`, and a transform error closing the runner (virtual source, since invalid syntax on disk breaks `tsc`). Option-level tests cover normalization, filtering, errors and `oxc: false`.
+Further fixtures:
+
+- `cjs/` has a package.json without `"type"`: `lib.ts` (CommonJS with an enum), `dep.cts`, and `vendor/plain.ts` (CommonJS, excluded).
+- `app-cjs.ts` and `app-vendor.ts` import them.
+- `mapped.mjs` is a transformer returning its own map.
+
+Cases:
+
+- disk entry
+- reload after editing a temp copy
+- virtual `.tsx`/`.ts`
+- a transform error closing the runner (virtual source, since invalid syntax on disk breaks `tsc`)
+- invalidation with a failing transform (rejects, worker survives)
+- CommonJS `.ts` + `.cts` (not Bun; Deno passes `--unstable-detect-cjs`)
+- `exclude` to the native loader (not miniflare: workerd can't parse TS)
+
+Option-level tests cover normalization, filtering, errors, source maps and `oxc: false`.

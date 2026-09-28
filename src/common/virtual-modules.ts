@@ -119,6 +119,11 @@ export function invalidateVirtualModule(specifier: string, source?: string): boo
   }
   if (_bunVirtual && Object.hasOwn(_bunVirtual, specifier)) {
     if (source !== undefined) {
+      // Bun transforms lazily on load; validate now so a broken source is
+      // rejected here like on the other backends.
+      if (_bunTransformer?.filter(specifier)) {
+        _bunTransformer.transform(specifier, source);
+      }
       _bunVirtual[specifier] = source;
     }
     _registerBunModules(expandVirtualInvalidation(_bunVirtual, specifier));
@@ -132,14 +137,17 @@ export function handleInvalidateModule(
   message: { specifier: string; source?: string },
   sendMessage: (message: unknown) => void,
 ): void {
-  const ok = invalidateVirtualModule(message.specifier, message.source);
-  sendMessage({
-    event: "module-invalidated",
-    specifier: message.specifier,
-    error: ok
-      ? undefined
-      : `Cannot invalidate "${message.specifier}" (not a registered virtual module)`,
-  });
+  let error: string | undefined;
+  try {
+    if (!invalidateVirtualModule(message.specifier, message.source)) {
+      error = `Cannot invalidate "${message.specifier}" (not a registered virtual module)`;
+    }
+  } catch (cause: any) {
+    // A failing transform (e.g. a syntax error while editing) must not kill the
+    // worker: reject the invalidation and keep serving the previous source.
+    error = cause?.message || String(cause);
+  }
+  sendMessage({ event: "module-invalidated", specifier: message.specifier, error });
 }
 
 interface HooksRegistration {

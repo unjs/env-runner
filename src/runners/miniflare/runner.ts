@@ -12,7 +12,7 @@ import { BaseEnvRunner } from "../../common/base-runner.ts";
 import type { EnvRunnerData } from "../../common/base-runner.ts";
 import { isVirtualSpecifier } from "../../common/worker-utils.ts";
 import { resolveRuntimeDep } from "../../common/runtime-deps.ts";
-import { loadTransformer } from "../../common/transform.ts";
+import { loadTransformer, transformedFormat } from "../../common/transform.ts";
 import type { Transformer, TransformOptions } from "../../common/transform.ts";
 import type { RuntimeDep } from "../../common/runtime-deps.ts";
 import {
@@ -719,48 +719,49 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
             }
           }
 
-          if (_transformer?.filter(resolvedPath)) {
-            let contents: string;
-            try {
-              contents = readFileSync(resolvedPath, "utf8");
-            } catch {
-              return new Response(null, { status: 404 });
-            }
-            modulePathMap.set(name, resolvedPath);
-            let esModule: string;
-            try {
-              esModule = _applyVirtualVersions(_transformer.transform(resolvedPath, contents));
-            } catch (error: any) {
-              // Surface the transform error at the import site inside workerd.
-              esModule = `throw new SyntaxError(${JSON.stringify(error?.message || String(error))});`;
-            }
-            return Response.json({ name, esModule });
-          }
-
+          let contents: string;
           try {
-            const contents = readFileSync(resolvedPath, "utf8");
-            // Track the real path so relative imports from this module resolve correctly
-            modulePathMap.set(name, resolvedPath);
-            // Detect module type: .mjs is always ESM, .cjs is always CJS,
-            // otherwise check for ESM syntax indicators
-            const isESM =
-              resolvedPath.endsWith(".mjs") ||
-              (!resolvedPath.endsWith(".cjs") &&
-                /\b(import\s|import\(|export\s|export\{|import\.meta\b)/.test(contents));
-            if (isESM) {
-              return Response.json({ name, esModule: _applyVirtualVersions(contents) });
-            }
-            // Importers expect ESM: serve raw CJS under a suffixed name behind an ESM shim.
-            const cjsSuffix = "?__cjs";
-            if (specifier.endsWith(cjsSuffix)) {
-              return Response.json({ name, commonJsModule: contents });
-            }
-            const shimSpecifier = "./" + basename(resolvedPath) + cjsSuffix;
-            const esModule = createCjsEsmShim(shimSpecifier, contents);
-            return Response.json({ name, esModule });
+            contents = readFileSync(resolvedPath, "utf8");
           } catch {
             return new Response(null, { status: 404 });
           }
+          // Track the real path so relative imports from this module resolve correctly
+          modulePathMap.set(name, resolvedPath);
+
+          let isESM: boolean;
+          if (_transformer?.filter(resolvedPath)) {
+            try {
+              contents = _transformer.transform(resolvedPath, contents);
+            } catch (error: any) {
+              // A named import of this module fails at link time before the
+              // throw runs (hiding it), so also report it on the host.
+              const message = error?.message || String(error);
+              console.error(message);
+              return Response.json({
+                name,
+                esModule: `throw new SyntaxError(${JSON.stringify(message)});`,
+              });
+            }
+            isESM = transformedFormat(resolvedPath, contents) === "module";
+          } else {
+            // Detect module type: .mjs is always ESM, .cjs is always CJS,
+            // otherwise check for ESM syntax indicators
+            isESM =
+              resolvedPath.endsWith(".mjs") ||
+              (!resolvedPath.endsWith(".cjs") &&
+                /\b(import\s|import\(|export\s|export\{|import\.meta\b)/.test(contents));
+          }
+          if (isESM) {
+            return Response.json({ name, esModule: _applyVirtualVersions(contents) });
+          }
+          // Importers expect ESM: serve raw CJS under a suffixed name behind an ESM shim.
+          const cjsSuffix = "?__cjs";
+          if (specifier.endsWith(cjsSuffix)) {
+            return Response.json({ name, commonJsModule: contents });
+          }
+          const shimSpecifier = "./" + basename(resolvedPath) + cjsSuffix;
+          const esModule = createCjsEsmShim(shimSpecifier, contents);
+          return Response.json({ name, esModule });
         };
       }
     }

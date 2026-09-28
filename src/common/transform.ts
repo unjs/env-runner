@@ -1,12 +1,52 @@
-import type {
-  TransformOptions as OxcTransformOptions,
-  TransformResult as OxcTransformResult,
-} from "oxc-transform";
 import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
+import { isAbsolute } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { init as initEsmLexer, parse as parseEsm } from "es-module-lexer";
 import { resolveRuntimeDep, resolveSpecifier } from "./runtime-deps.ts";
 
-export type { OxcTransformOptions };
+/**
+ * [`oxc-transform`](https://oxc.rs/docs/guide/usage/transformer)
+ * `TransformOptions`, declared structurally so `env-runner` types don't depend
+ * on the package: nested groups are loosely typed, so an object typed with
+ * `oxc-transform`'s own `TransformOptions` is assignable. `sourcemap` follows
+ * {@link TransformOptions.sourcemap}.
+ */
+export interface OxcTransformOptions {
+  lang?: "js" | "jsx" | "ts" | "tsx" | "dts";
+  sourceType?: "script" | "module" | "commonjs" | "unambiguous";
+  cwd?: string;
+  assumptions?: object;
+  typescript?: object;
+  decorator?: object;
+  plugins?: object;
+  jsx?: "preserve" | OxcJsxOptions;
+  target?: string | string[];
+  helpers?: object;
+  inject?: Record<string, string | [string, string]>;
+  define?: Record<string, string>;
+}
+
+/** `oxc-transform` `JsxOptions`. */
+export interface OxcJsxOptions {
+  runtime?: "classic" | "automatic";
+  development?: boolean;
+  throwIfNamespace?: boolean;
+  pure?: boolean;
+  importSource?: string;
+  pragma?: string;
+  pragmaFrag?: string;
+  refresh?: boolean | object;
+}
+
+interface OxcTransformResult {
+  code: string;
+  map?: SourceMapLike;
+  errors: { severity: string; message: string; codeframe: string | null }[];
+}
+
+interface OxcTransformModule {
+  transformSync(filename: string, code: string, options?: object): OxcTransformResult;
+}
 
 /**
  * Source transforms (TypeScript, JSX, ...) applied to the entry, its imports
@@ -54,8 +94,10 @@ export interface TransformOptions {
 
 /**
  * Custom transform, the default export of a `transformers` module. Must be
- * sync (Node.js module hooks are). Return nullish to keep the code; return a
- * `map` when the change shifts lines (it replaces the previous one).
+ * sync (Node.js module hooks are). Return nullish to keep the code. A returned
+ * `map` is only used when no earlier step (oxc included) changed the code, as
+ * maps aren't composed; code-only results keep the previous map (so they
+ * should preserve lines).
  */
 export type SourceTransformer = (
   code: string,
@@ -74,6 +116,8 @@ interface SourceMapLike {
 export interface Transformer {
   /** Transformed file extensions. */
   extensions: string[];
+  /** Excluded path substrings (`/`-separated). */
+  exclude: string[];
   /** Whether a path (or virtual key) is transformed. Queries are ignored. */
   filter(id: string): boolean;
   /** Transform matched code to JS; throws on oxc errors. */
@@ -128,7 +172,7 @@ export async function loadTransformer(
 
   let oxcTransform: ((id: string, code: string) => OxcTransformResult) | undefined;
   if (opts.oxc !== false) {
-    const oxc = await resolveRuntimeDep<typeof import("oxc-transform")>({
+    const oxc = await resolveRuntimeDep<OxcTransformModule>({
       name: "oxc-transform",
       option: "transform.oxcTransform",
       value: opts.oxcTransform,
@@ -136,7 +180,7 @@ export async function loadTransformer(
       required: true,
       hint: "Or set `transform.oxc: false` to only run custom `transformers`.",
     });
-    const oxcOptions: OxcTransformOptions = {
+    const oxcOptions = {
       ...(typeof opts.oxc === "object" ? opts.oxc : undefined),
       sourcemap,
     };
@@ -172,6 +216,7 @@ export async function loadTransformer(
   const transform = (id: string, code: string) => {
     id = _stripQuery(id);
     let map: SourceMapLike | null | undefined;
+    let changed = false;
     if (oxcTransform) {
       const result = oxcTransform(id, code);
       const errors = result.errors.filter((error) => error.severity === "Error");
@@ -183,6 +228,7 @@ export async function loadTransformer(
       }
       code = result.code;
       map = result.map;
+      changed = true;
     }
     for (const transformer of transformers) {
       const result = transformer(code, id);
@@ -190,17 +236,23 @@ export async function loadTransformer(
         code = result;
       } else if (result) {
         code = result.code;
-        map = result.map ?? map;
+        // A map is relative to this transformer's input: only valid when that
+        // input is the original source (no composition). Else drop it.
+        map = result.map ? (changed ? undefined : result.map) : map;
+      } else {
+        continue;
       }
+      changed = true;
     }
     if (sourcemap && map) {
-      const json = JSON.stringify({ ...map, sources: [id], file: undefined });
+      const source = isAbsolute(id) ? pathToFileURL(id).href : id;
+      const json = JSON.stringify({ ...map, sources: [source], file: undefined });
       code += `\n//# sourceMappingURL=data:application/json;base64,${Buffer.from(json).toString("base64")}\n`;
     }
     return code;
   };
 
-  return { extensions, filter, transform };
+  return { extensions, exclude, filter, transform };
 }
 
 let _active: Transformer | undefined;
@@ -210,34 +262,74 @@ export function getActiveTransformer(): Transformer | undefined {
   return _active;
 }
 
+const CJS_MARKERS = /\b(?:module\.exports\b|exports\.\w|require\s*\()/;
+
+/**
+ * Module format of transformed code: the resolution hint when definite, then
+ * the extension, then syntax. Node's hint is missing for `.tsx`/`.jsx` and in
+ * packages without `"type"`, so CommonJS needs CommonJS markers and no ESM
+ * syntax (a marker-free file, e.g. only top-level `await`, stays ESM).
+ */
+export function transformedFormat(
+  path: string,
+  code: string,
+  hint?: string | null,
+): "module" | "commonjs" {
+  if (hint?.startsWith("module")) {
+    return "module";
+  }
+  if (hint?.startsWith("commonjs")) {
+    return "commonjs";
+  }
+  if (/\.m[jt]sx?$/.test(path)) {
+    return "module";
+  }
+  if (/\.c[jt]sx?$/.test(path)) {
+    return "commonjs";
+  }
+  if (!CJS_MARKERS.test(code)) {
+    return "module";
+  }
+  try {
+    return parseEsm(code)[3] ? "module" : "commonjs";
+  } catch {
+    return "module";
+  }
+}
+
 /**
  * Transform matching disk modules in this worker; await before importing the
- * entry. Node.js/Deno: a `module.registerHooks` load hook. Bun: `Bun.plugin`
- * `onLoad` (can't be removed). Warns once and skips elsewhere.
+ * entry. Warns once and skips on runtimes without either backend:
+ *
+ * - Node.js/Deno: a `module.registerHooks` load hook. Deno evaluates hook
+ *   output as ESM, so CommonJS files fall back to its native loader.
+ * - Bun: a `Bun.plugin` `onLoad` (can't be removed). Its output is always
+ *   evaluated as ESM, so `exclude`d paths and `.cts`/`.cjs` never reach it.
  */
 export async function registerTransformHooks(transformer?: Transformer): Promise<() => void> {
   if (!transformer) {
     return _noop;
   }
-  _active = transformer;
+  await initEsmLexer();
   const { registerHooks } = await import("node:module");
   if (typeof registerHooks === "function") {
+    const isDeno = "Deno" in globalThis;
     const hooks = registerHooks({
       load(url, context, nextLoad) {
-        if (url.startsWith("file:") && transformer.filter(url)) {
+        if (url.startsWith("file:")) {
           const path = fileURLToPath(_stripQuery(url));
-          // Keep CommonJS where resolution detected it (`.cts`, `"type": "commonjs"`).
-          const format =
-            context.format?.startsWith("commonjs") || path.endsWith(".cts") ? "commonjs" : "module";
-          return {
-            format,
-            source: transformer.transform(path, readFileSync(path, "utf8")),
-            shortCircuit: true,
-          };
+          if (transformer.filter(path)) {
+            const source = transformer.transform(path, readFileSync(path, "utf8"));
+            const format = transformedFormat(path, source, context.format);
+            if (!(isDeno && format === "commonjs")) {
+              return { format, source, shortCircuit: true };
+            }
+          }
         }
         return nextLoad(url, context);
       },
     });
+    _active = transformer;
     return () => {
       if (_active === transformer) {
         _active = undefined;
@@ -250,18 +342,16 @@ export async function registerTransformHooks(transformer?: Transformer): Promise
     bunPlugin({
       name: "env-runner-transform",
       setup(build: any) {
-        const filter = new RegExp(
-          `(?:${transformer.extensions.map((ext) => ext.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})$`,
-        );
-        build.onLoad({ filter }, ({ path }: { path: string }) => {
+        build.onLoad({ filter: _bunFilter(transformer) }, ({ path }: { path: string }) => {
           const contents = readFileSync(path, "utf8");
-          if (_active === transformer && transformer.filter(path)) {
-            return { contents: transformer.transform(path, contents), loader: "js" };
-          }
-          return { contents, loader: _bunLoader(path) };
+          return {
+            contents: _active === transformer ? transformer.transform(path, contents) : contents,
+            loader: _active === transformer ? "js" : _bunLoader(path),
+          };
         });
       },
     });
+    _active = transformer;
     return () => {
       if (_active === transformer) {
         _active = undefined;
@@ -274,19 +364,29 @@ export async function registerTransformHooks(transformer?: Transformer): Promise
   return _noop;
 }
 
-// Bun's native loader for excluded paths (e.g. `node_modules`) matching an extension.
+/** Extensions minus CommonJS ones, with `exclude` as a negative lookahead (either separator). */
+function _bunFilter(transformer: Transformer): RegExp {
+  const escape = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const extensions = transformer.extensions
+    .filter((ext) => !/^\.c[jt]sx?$/.test(ext))
+    .map((ext) => escape(ext));
+  const exclude = transformer.exclude.map((part) =>
+    escape(part).replaceAll("/", String.raw`[\\/]`),
+  );
+  const lookahead = exclude.length > 0 ? `(?!.*(?:${exclude.join("|")}))` : "";
+  return new RegExp(`^${lookahead}.*(?:${extensions.join("|") || "(?!)"})$`);
+}
+
+// Bun's native loader, for loads after the transformer is unregistered.
 function _bunLoader(path: string): string {
   const ext = path.slice(path.lastIndexOf(".") + 1);
   switch (ext) {
     case "ts":
-    case "mts":
-    case "cts": {
+    case "mts": {
       return "ts";
     }
     case "tsx":
-    case "jsx":
-    case "json":
-    case "toml": {
+    case "jsx": {
       return ext;
     }
     default: {

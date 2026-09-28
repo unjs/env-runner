@@ -17,6 +17,7 @@ export {
   type VirtualModuleSource,
   type TransformOptions,
   type OxcTransformOptions,
+  type OxcJsxOptions,
   type SourceTransformer,
   BaseEnvRunner,
 } from "./common/base-runner.ts";

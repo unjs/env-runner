@@ -40,19 +40,23 @@ const runners = [
     name: "BunProcessEnvRunner",
     create: (opts: any) => new BunProcessEnvRunner(opts),
     skip: !hasRuntime("bun"),
+    bun: true,
   },
   {
     name: "DenoProcessEnvRunner",
     create: (opts: any) => new DenoProcessEnvRunner(opts),
     skip: !hasRuntime("deno"),
+    // CommonJS falls back to Deno's native loader, which needs this for `.ts`.
+    cjsOptions: { execArgv: ["--unstable-detect-cjs"] },
   },
   {
     name: "MiniflareEnvRunner",
     create: (opts: any) => new MiniflareEnvRunner({ miniflare, ...opts }),
+    miniflare: true,
   },
 ];
 
-for (const { name, create, skip } of runners) {
+for (const { name, create, skip, bun, miniflare, cjsOptions } of runners) {
   describe.skipIf(skip ?? false)(`${name} transform`, () => {
     let runner: EnvRunner;
 
@@ -102,15 +106,63 @@ for (const { name, create, skip } of runners) {
       expect(await res.json()).toEqual({ tag: "b", children: ["dev", "hi"] });
     });
 
-    // Miniflare transforms per request in its fallback service and serves a
-    // module that throws, so the error surfaces from the entry import instead.
-    it.skipIf(name === "MiniflareEnvRunner")("closes with the transform error", async () => {
+    it("closes with the transform error", async () => {
       runner = create({
         name: "transform-error",
         data: { entry: "#bad.tsx", transform, virtual: { "#bad.tsx": "const a = <div>;" } },
       });
       await expect(runner.waitForReady()).rejects.toThrow();
       expect(runner.closed).toBe(true);
+    });
+
+    it("rejects invalidating a virtual module whose new source fails to transform", async () => {
+      let source = `export const value: string = "ok";`;
+      runner = create({
+        name: "transform-invalidate",
+        data: {
+          entry: "#entry.ts",
+          transform,
+          virtual: {
+            "#entry.ts": `import { value } from "#value.tsx";
+              export default { fetch: () => new Response(value) };`,
+            "#value.tsx": () => source,
+          },
+        },
+      });
+      await runner.waitForReady();
+      source = `export const value = <div>;`;
+      await expect(runner.invalidateModule!("#value.tsx")).rejects.toThrow(/#value\.tsx/);
+      // The worker survives and keeps serving the previous source.
+      expect(runner.ready).toBe(true);
+      const res = await runner.fetch("http://localhost/");
+      expect(await res.text()).toBe("ok");
+    });
+
+    // Bun evaluates plugin output as ESM, so CommonJS `.ts` can't be transformed there.
+    it.skipIf(bun)("serves CommonJS `.ts` (package without `type`) and `.cts`", async () => {
+      runner = create({
+        ...cjsOptions,
+        name: "transform-cjs",
+        data: { entry: fixture("app-cjs.ts"), transform },
+      });
+      await runner.waitForReady();
+      const res = await runner.fetch("http://localhost/");
+      expect(await res.json()).toEqual(["lib", "cts"]);
+    });
+
+    // workerd can't parse the untransformed TypeScript of an excluded file.
+    it.skipIf(miniflare)("leaves excluded paths to the runtime's native loader", async () => {
+      runner = create({
+        ...cjsOptions,
+        name: "transform-exclude",
+        data: {
+          entry: fixture("app-vendor.ts"),
+          transform: { ...transform, exclude: ["/vendor/"] },
+        },
+      });
+      await runner.waitForReady();
+      const res = await runner.fetch("http://localhost/");
+      expect(await res.json()).toEqual(["cts", "vendor"]);
     });
   });
 }
@@ -146,6 +198,20 @@ describe("transform options", () => {
     );
   });
 
+  it("inlines a source map for the original file", async () => {
+    const transformer = (await loadTransformer({}))!;
+    const map = decodeMap(transformer.transform("/app/a.ts", "enum A { B }"));
+    expect(map.sources).toEqual(["file:///app/a.ts"]);
+  });
+
+  it("drops a transformer map that can't be composed with oxc's", async () => {
+    const transformer = (await loadTransformer({ transformers: [fixture("mapped.mjs")] }))!;
+    expect(transformer.transform("/app/a.ts", "enum A { B }")).not.toContain("sourceMappingURL");
+    // Without oxc, the transformer's map is relative to the original source.
+    const own = (await loadTransformer({ oxc: false, transformers: [fixture("mapped.mjs")] }))!;
+    expect(decodeMap(own.transform("/app/a.js", "a()")).mappings).toBe("AAAA");
+  });
+
   it("only runs custom transformers with `oxc: false`", async () => {
     const transformer = (await loadTransformer({
       oxc: false,
@@ -156,3 +222,9 @@ describe("transform options", () => {
     );
   });
 });
+
+function decodeMap(code: string) {
+  const match = /sourceMappingURL=data:application\/json;base64,(\S+)/.exec(code);
+  expect(match).toBeTruthy();
+  return JSON.parse(Buffer.from(match![1]!, "base64").toString());
+}

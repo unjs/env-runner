@@ -365,14 +365,14 @@ const runner = new NodeProcessEnvRunner({
 });
 ```
 
-`data.transform: true` enables oxc with its defaults. The options must stay JSON-serializable (they cross into the worker), so custom transformers are **module specifiers** (resolved from the working directory) rather than functions. They run after oxc, in order, on plain JavaScript, and must be **synchronous** (Node.js module hooks are). A transformer returning a `map` replaces the previous source map; returning only code keeps it (fine for line-preserving changes). Stack traces use the inline source maps with `--enable-source-maps`.
+`data.transform: true` enables oxc with its defaults. The options must stay JSON-serializable (they cross into the worker), so custom transformers are **module specifiers** (resolved from the working directory) rather than functions. They run after oxc, in order, on plain JavaScript, and must be **synchronous** (Node.js module hooks are). Source maps are not composed: a transformer's returned `map` is only used when nothing earlier (oxc included) changed the code, and a code-only result keeps the previous map (so keep such changes line-preserving). Stack traces use the inline source maps with `--enable-source-maps`.
 
 How transforms are applied:
 
-- **Node.js** runners (and runners built on them) and **Deno**: a `module.registerHooks` load hook (Node.js >= 22.15 / 23.5). The output is served as ESM, or CommonJS for `.cts` and files resolved as CommonJS.
-- **Bun**: a `Bun.plugin()` `onLoad` for the configured extensions (excluded paths use Bun's native loader).
-- **Miniflare**: on the host, in the module fallback service (after `transformRequest`). A transform error is thrown from the failing module inside workerd.
-- **Virtual modules** whose key matches (e.g. `#entry.tsx`) are transformed instead of type-stripped.
+- **Node.js** runners (and runners built on them) and **Deno**: a `module.registerHooks` load hook (Node.js >= 22.15 / 23.5). The output is served as ESM or CommonJS: by the package `"type"` when Node.js reports it, else `.mts`/`.cts`, else CommonJS only for output with CommonJS markers (`require()`, `module.exports`) and no ESM syntax. Deno evaluates hook output as ESM, so CommonJS files fall back to its native loader (which needs `--unstable-detect-cjs` in the runner's `execArgv` for CommonJS `.ts`).
+- **Bun**: a `Bun.plugin()` `onLoad` for the configured extensions. Bun evaluates plugin output as ESM, so `exclude`d paths and `.cts` never reach it (Bun's native loader handles them); a CommonJS `.ts` file that is transformed is not supported.
+- **Miniflare**: on the host, in the module fallback service (after `transformRequest`), with CommonJS output served behind the same ESM shim as untransformed files. A transform error is logged on the host and thrown from the failing module inside workerd.
+- **Virtual modules** whose key matches (e.g. `#entry.tsx`) are transformed instead of type-stripped. If a new source fails to transform, `invalidateModule()` rejects with the error and the worker keeps serving the previous one.
 - `reloadModule()` re-transforms the entry from disk; already-imported modules stay cached.
 
 #### Miniflare Runner

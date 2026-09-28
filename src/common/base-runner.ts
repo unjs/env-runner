@@ -10,7 +10,12 @@ import { normalizeTransformOptions } from "./transform.ts";
 import type { TransformOptions } from "./transform.ts";
 
 export type { VirtualModules, VirtualModuleSource } from "../virtual-loader.ts";
-export type { TransformOptions, OxcTransformOptions, SourceTransformer } from "./transform.ts";
+export type {
+  TransformOptions,
+  OxcTransformOptions,
+  OxcJsxOptions,
+  SourceTransformer,
+} from "./transform.ts";
 
 export interface EnvRunnerData {
   name?: string;
