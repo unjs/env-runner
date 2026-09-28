@@ -132,6 +132,10 @@ export class SelfEnvRunner extends BaseEnvRunner {
       this.close("self runner requires data.entry");
       return;
     }
+    if (this._data?.transform) {
+      // Module hooks would apply to the whole host process.
+      console.warn("[env-runner] the self runner does not support `data.transform`; ignoring.");
+    }
     this.#active = true;
     resolveEntry(entryPath)
       .then(async (entry) => {

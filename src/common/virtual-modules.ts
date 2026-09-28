@@ -4,6 +4,7 @@ import {
   stripVirtualTypeScript,
   virtualModuleFormat,
 } from "../virtual-loader.ts";
+import type { Transformer } from "./transform.ts";
 
 /**
  * Serve virtual modules; await before importing the entry. Format follows the
@@ -14,11 +15,14 @@ import {
  * or `Bun.plugin` (Bun's `module.register` is a silent no-op). Warns once and
  * skips when neither exists.
  *
+ * Keys matching `transformer` (see `data.transform`) are served as its JS output.
+ *
  * Resolves to an idempotent unregister function. Bun can't remove plugins, so
  * there it detaches the source map (cached modules survive, fresh loads fail).
  */
 export async function registerVirtualModules(
   virtual?: Record<string, string>,
+  transformer?: Transformer,
 ): Promise<() => void> {
   if (!virtual || Object.keys(virtual).length === 0) {
     return _noop;
@@ -27,9 +31,13 @@ export async function registerVirtualModules(
   if (typeof registerHooks === "function") {
     const isDeno = "Deno" in globalThis;
     let transformSource: ((specifier: string, source: string) => string) | undefined;
-    if (isDeno) {
+    if (isDeno || transformer) {
       transformSource = (specifier, source) =>
-        _transformSourceForDeno(specifier, source, stripTypeScriptTypes);
+        transformer?.filter(specifier)
+          ? transformer.transform(specifier, source)
+          : isDeno
+            ? _transformSourceForDeno(specifier, source, stripTypeScriptTypes)
+            : source;
       const transformed: Record<string, string> = {};
       for (const [specifier, source] of Object.entries(virtual)) {
         transformed[specifier] = transformSource(specifier, source);
@@ -42,9 +50,14 @@ export async function registerVirtualModules(
       transformSource,
     };
     // Track only after registerHooks succeeds (a throw returns no unregister).
-    // Deno sources are already plain JS, so force the `module` format.
+    // Deno and transformed sources are already plain JS: force the `module` format.
     const hooks = registerHooks(
-      createVirtualHooks(virtual, registration.versions, undefined, isDeno),
+      createVirtualHooks(
+        virtual,
+        registration.versions,
+        undefined,
+        isDeno || ((specifier) => Boolean(transformer?.filter(specifier))),
+      ),
     );
     _hooksRegistrations.unshift(registration);
     return _once(() => {
@@ -58,6 +71,7 @@ export async function registerVirtualModules(
   const bunPlugin = (globalThis as any).Bun?.plugin;
   if (typeof bunPlugin === "function") {
     _bunVirtual = virtual;
+    _bunTransformer = transformer;
     _registerBunModules(Object.keys(virtual));
     return _once(() => {
       if (_bunVirtual === virtual) {
@@ -139,6 +153,7 @@ interface HooksRegistration {
 const _hooksRegistrations: HooksRegistration[] = [];
 
 let _bunVirtual: Record<string, string> | undefined;
+let _bunTransformer: Transformer | undefined;
 
 // Read the live map so unregistering (detaching it) disables fresh loads;
 // Bun can't remove a `build.module` registration.
@@ -151,6 +166,9 @@ function _registerBunModules(specifiers: string[]): void {
           const source = _bunVirtual?.[specifier];
           if (source === undefined) {
             throw new Error(`Cannot find virtual module "${specifier}" (unregistered)`);
+          }
+          if (_bunTransformer?.filter(specifier)) {
+            return { contents: _bunTransformer.transform(specifier, source), loader: "js" };
           }
           const format = virtualModuleFormat(specifier);
           if (format === "json") {

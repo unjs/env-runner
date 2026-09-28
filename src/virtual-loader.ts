@@ -30,9 +30,9 @@ export function createVirtualHooks(
   versions?: ReadonlyMap<string, number>,
   // Resolution base for a virtual module's own non-virtual imports.
   parentURL: string = _defaultParentURL(),
-  // For backends that pre-transform sources to JS (Deno >= 2.9 honors the
-  // format and would re-parse them as JSON/TS).
-  forcePlainModule = false,
+  // For sources pre-transformed to JS (Deno >= 2.9 honors the format and would
+  // re-parse them as JSON/TS), for all keys or per key.
+  forcePlainModule: boolean | ((specifier: string) => boolean) = false,
 ): {
   resolve: ResolveHookSync;
   load: LoadHookSync;
@@ -62,7 +62,11 @@ export function createVirtualHooks(
       const key = _stripQuery(decodeURIComponent(url.slice(VIRTUAL_SCHEME.length)));
       if (Object.hasOwn(virtual, key)) {
         return {
-          format: forcePlainModule ? "module" : virtualModuleFormat(key),
+          format: (
+            typeof forcePlainModule === "function" ? forcePlainModule(key) : forcePlainModule
+          )
+            ? "module"
+            : virtualModuleFormat(key),
           source: virtual[key],
           shortCircuit: true,
         };

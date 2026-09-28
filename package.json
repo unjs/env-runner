@@ -60,6 +60,7 @@
     "es-module-lexer": "^3.0.2",
     "miniflare": "^5.20260921.1-alpha",
     "obuild": "^0.4.40",
+    "oxc-transform": "^0.151.0",
     "oxfmt": ">=0.70.0",
     "oxlint": "^1.85.0",
     "typescript": "^7.0.2",

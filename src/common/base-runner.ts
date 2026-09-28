@@ -6,8 +6,11 @@ import { rm } from "node:fs/promises";
 import { proxyFetch, proxyUpgrade } from "httpxy";
 import { resolveVirtualModules } from "../virtual-loader.ts";
 import type { VirtualModules } from "../virtual-loader.ts";
+import { normalizeTransformOptions } from "./transform.ts";
+import type { TransformOptions } from "./transform.ts";
 
 export type { VirtualModules, VirtualModuleSource } from "../virtual-loader.ts";
+export type { TransformOptions, OxcTransformOptions, SourceTransformer } from "./transform.ts";
 
 export interface EnvRunnerData {
   name?: string;
@@ -18,6 +21,13 @@ export interface EnvRunnerData {
    * on the host before spawn. Not supported by the `self` runner.
    */
   virtual?: VirtualModules;
+
+  /**
+   * Transform the entry, its imports and matching virtual modules (TypeScript
+   * enums, JSX, custom transforms) with `oxc-transform` (installed by the app).
+   * `true` uses the defaults. Not supported by the `self` runner.
+   */
+  transform?: TransformOptions | boolean;
 
   [key: string]: unknown;
 }
@@ -43,7 +53,10 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
   }) {
     this._name = opts.name;
     this._workerEntry = opts.workerEntry;
-    this._data = opts.data;
+    // Resolve specifiers from the host cwd; throws early for non-serializable options.
+    this._data = opts.data?.transform
+      ? { ...opts.data, transform: normalizeTransformOptions(opts.data.transform) }
+      : opts.data;
     this._hooks = opts.hooks || {};
     this._messageListeners = new Set();
     this._pendingRequests = new Set();

@@ -15,6 +15,7 @@ src/
 │   ├── worker-utils.ts      # AppEntry interface, resolveEntry(), parseServerAddress(), toServerOptions()
 │   ├── runtime-deps.ts      # resolveRuntimeDep()/resolveRuntimeDepSpecifier() — "module | specifier | false" resolver
 │   ├── host-env.ts          # hostEnv() — worker/child env: host env + FORCE_COLOR/COLUMNS from the host TTY
+│   ├── transform.ts         # data.transform: loadTransformer() (oxc-transform + custom transformers), registerTransformHooks()
 │   ├── ws-proxy.ts          # createRunnerWSProxyPlugin() — runtime-native WS upgrade proxy
 │   └── virtual-modules.ts   # registerVirtualModules() — registerHooks()/Bun.plugin wiring for node/bun/deno workers
 ├── runners/
@@ -71,6 +72,7 @@ Details in [`.agents/MINIFLARE.md`](.agents/MINIFLARE.md). In short: the wrapper
 - [`VERCEL.md`](.agents/VERCEL.md) — `VercelEnvRunner` (env vars, headers, OIDC, Queues) + tests
 - [`NETLIFY.md`](.agents/NETLIFY.md) — `NetlifyEnvRunner` + tests
 - [`VIRTUAL-MODULES.md`](.agents/VIRTUAL-MODULES.md) — virtual modules across Node/Bun/Deno/Miniflare + tests
+- [`TRANSFORM.md`](.agents/TRANSFORM.md) — `data.transform` (oxc-transform + custom transformers) across runners + tests
 
 ## Testing
 
@@ -91,7 +93,7 @@ Details in [`.agents/MINIFLARE.md`](.agents/MINIFLARE.md). In short: the wrapper
 
 - `crossws`, `httpxy`, `srvx` — WebSocket hooks, HTTP/WS proxy, server framework
 - `cjs-module-lexer` / `es-module-lexer` — devDependencies inlined into `dist` (miniflare module fallback service)
-- **No peer dependencies.** `miniflare`, `wrangler`, `@netlify/runtime`, `@vercel/queue` are installed by the app and passed as runner options (`miniflare`, `wranglerModule`, `netlifyRuntime`, queue `sdk`), resolved via `resolveRuntimeDep()`: imported module | specifier (resolved from cwd) | `false` (opt out) | omitted (optional import). If nothing resolves: miniflare throws; wrangler → minimal JSON/JSONC reader; netlify → shim; queue → warn-once no-op. `netlifyRuntime` must be a specifier (imported inside the worker, via `resolveRuntimeDepSpecifier()`). These packages must stay listed as external in `build.config.mjs`.
+- **No peer dependencies.** `miniflare`, `wrangler`, `@netlify/runtime`, `@vercel/queue`, `oxc-transform` are installed by the app and passed as runner options (`miniflare`, `wranglerModule`, `netlifyRuntime`, queue `sdk`), resolved via `resolveRuntimeDep()`: imported module | specifier (resolved from cwd) | `false` (opt out) | omitted (optional import). If nothing resolves: miniflare throws; wrangler → minimal JSON/JSONC reader; netlify → shim; queue → warn-once no-op; `oxc-transform` is required once `data.transform` enables oxc (`transform.oxcTransform` specifier). `netlifyRuntime` must be a specifier (imported inside the worker, via `resolveRuntimeDepSpecifier()`). These packages must stay listed as external in `build.config.mjs`.
 
 ## Key patterns
 

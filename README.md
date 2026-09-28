@@ -340,6 +340,41 @@ Virtual modules are registered inside the worker, before the entry is imported. 
 
 On `MiniflareEnvRunner` there is no in-worker registration: the runner's module fallback service serves virtual specifiers to workerd directly (taking precedence over disk files and the `transformRequest` pipeline, so a virtual key overrides a real file with the same path). Named `exports` (Durable Objects / WorkerEntrypoints) also work with virtual entries.
 
+#### Transforms (`data.transform`)
+
+Pass `data.transform` to transform the entry, its imports and matching virtual modules with [`oxc-transform`](https://oxc.rs/docs/guide/usage/transformer) — beyond native type stripping: TypeScript `enum`s/namespaces/parameter properties, JSX/TSX, `define`, `target` lowering, ... It works on every runner except `SelfEnvRunner` (which warns and ignores it). `oxc-transform` is not a dependency: install it in your app (`npm i -D oxc-transform`).
+
+```js
+import { NodeProcessEnvRunner } from "env-runner";
+
+const runner = new NodeProcessEnvRunner({
+  name: "my-app",
+  data: {
+    entry: "./src/server.tsx",
+    transform: {
+      // oxc-transform `TransformOptions` (`true` or omitted: defaults, `false`: skip oxc)
+      oxc: { jsx: { runtime: "automatic", importSource: "preact" } },
+      // Custom transforms: specifiers whose default export is `(code, id) => string | { code, map } | undefined`
+      transformers: ["./build/inline-env.mjs"],
+      // extensions: [".ts", ".mts", ".cts", ".tsx", ".jsx"], // default
+      // exclude: ["/node_modules/"],                          // default (path substrings)
+      // sourcemap: true,                                       // inline source maps (default)
+      // oxcTransform: "oxc-transform",                         // package specifier (resolved from cwd)
+    },
+  },
+});
+```
+
+`data.transform: true` enables oxc with its defaults. The options must stay JSON-serializable (they cross into the worker), so custom transformers are **module specifiers** (resolved from the working directory) rather than functions. They run after oxc, in order, on plain JavaScript, and must be **synchronous** (Node.js module hooks are). A transformer returning a `map` replaces the previous source map; returning only code keeps it (fine for line-preserving changes). Stack traces use the inline source maps with `--enable-source-maps`.
+
+How transforms are applied:
+
+- **Node.js** runners (and runners built on them) and **Deno**: a `module.registerHooks` load hook (Node.js >= 22.15 / 23.5). The output is served as ESM, or CommonJS for `.cts` and files resolved as CommonJS.
+- **Bun**: a `Bun.plugin()` `onLoad` for the configured extensions (excluded paths use Bun's native loader).
+- **Miniflare**: on the host, in the module fallback service (after `transformRequest`). A transform error is thrown from the failing module inside workerd.
+- **Virtual modules** whose key matches (e.g. `#entry.tsx`) are transformed instead of type-stripped.
+- `reloadModule()` re-transforms the entry from disk; already-imported modules stay cached.
+
 #### Miniflare Runner
 
 Run your app in the Cloudflare Workers runtime using [miniflare](https://github.com/cloudflare/workers-sdk/tree/main/packages/miniflare).

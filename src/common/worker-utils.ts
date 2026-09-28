@@ -4,7 +4,13 @@ import type { UpgradeContext } from "../types.ts";
 import { pathToFileURL } from "node:url";
 import { isAbsolute } from "node:path";
 import { readFileSync, existsSync } from "node:fs";
-import { refreshVirtualModule } from "./virtual-modules.ts";
+import { refreshVirtualModule, registerVirtualModules } from "./virtual-modules.ts";
+import {
+  getActiveTransformer,
+  loadTransformer,
+  registerTransformHooks,
+  type TransformOptions,
+} from "./transform.ts";
 
 export interface AppEntryIPCContext {
   sendMessage: (message: unknown) => void;
@@ -82,6 +88,23 @@ export function isVirtualSpecifier(
   return Boolean(specifier && virtual && Object.hasOwn(virtual, specifier));
 }
 
+/**
+ * Register `data.transform` and `data.virtual` hooks; await before importing
+ * the entry. Resolves to an idempotent unregister function.
+ */
+export async function registerWorkerHooks(data: {
+  transform?: TransformOptions;
+  virtual?: Record<string, string>;
+}): Promise<() => void> {
+  const transformer = await loadTransformer(data.transform);
+  const unregisterTransform = await registerTransformHooks(transformer);
+  const unregisterVirtual = await registerVirtualModules(data.virtual, transformer);
+  return () => {
+    unregisterVirtual();
+    unregisterTransform();
+  };
+}
+
 export async function resolveEntry(entryPath: string, virtual?: boolean): Promise<AppEntry> {
   // Virtual specifiers are matched verbatim by the registered resolve hook —
   // don't convert path-shaped ones to file:// URLs.
@@ -137,7 +160,18 @@ async function _importFresh(entryPath: string, virtual?: boolean): Promise<AppEn
   const filePath = qIndex === -1 ? entryPath : entryPath.slice(0, qIndex);
 
   let mod: any;
-  if (!virtual && existsSync(filePath)) {
+  const transformer = getActiveTransformer();
+  if (!virtual && transformer?.filter(filePath) && existsSync(filePath)) {
+    if ((globalThis as any).Bun) {
+      // Bun's `require.cache` also holds ESM; evicting it re-runs the plugin.
+      delete require.cache[filePath];
+      mod = await import(filePath);
+    } else {
+      // Through the transform load hook, which ignores the cache-busting query.
+      const url = pathToFileURL(filePath).href;
+      mod = await import(url + "?__envRunnerReload=" + _reloadCounter++);
+    }
+  } else if (!virtual && existsSync(filePath)) {
     // Real file: re-read latest content via data: URL to bypass the module cache.
     const code = readFileSync(filePath, "utf8");
     const dataUrl = "data:text/javascript;base64," + Buffer.from(code).toString("base64");

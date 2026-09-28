@@ -15,6 +15,9 @@ export {
   type EnvRunnerData,
   type VirtualModules,
   type VirtualModuleSource,
+  type TransformOptions,
+  type OxcTransformOptions,
+  type SourceTransformer,
   BaseEnvRunner,
 } from "./common/base-runner.ts";
 export { RunnerManager } from "./manager.ts";
