@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve, dirname, join } from "node:path";
@@ -406,7 +406,7 @@ describe("plugins", () => {
     expect(code).toBe("export const x = 1;//a//b");
     expect(JSON.parse(Buffer.from(map!, "base64").toString())).toEqual({
       mappings: "AAAA",
-      sources: ["file:///app/a.ts"],
+      sources: [pathToFileURL("/app/a.ts").href],
     });
     // Unchanged code, changed code that is still TypeScript (left to the
     // runtime), and still JSX.
