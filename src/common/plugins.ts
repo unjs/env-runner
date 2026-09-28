@@ -5,17 +5,18 @@ import { init as initEsmLexer, parse as parseEsm } from "es-module-lexer";
 import { resolveSpecifier } from "./runtime-deps.ts";
 import { virtualModuleFormat } from "../virtual-loader.ts";
 import { resolvePlugin } from "./plugin.ts";
-import type { NormalizedPlugin, SourceMapLike, TransformModuleType } from "./plugin.ts";
+import type { NormalizedPlugin, SourceMapLike, PluginModuleType } from "./plugin.ts";
 
 export type {
   EnvRunnerPlugin,
   EnvRunnerPluginFactory,
-  TransformHandler,
-  TransformHandlerMeta,
-  TransformHandlerResult,
-  TransformHookFilter,
-  TransformModuleType,
-  TransformStringFilter,
+  PluginContext,
+  PluginModuleType,
+  PluginStringFilter,
+  PluginTransformFilter,
+  PluginTransformHandler,
+  PluginTransformMeta,
+  PluginTransformResult,
 } from "./plugin.ts";
 
 /**
@@ -35,14 +36,14 @@ export interface PluginPipeline {
    * is a file that also needs a script extension (its initial module type).
    * Queries are ignored.
    */
-  filter(id: string, moduleType?: TransformModuleType): boolean;
+  filter(id: string, moduleType?: PluginModuleType): boolean;
   /**
    * Run the plugins on matched code: JavaScript, or `undefined` when none
    * changed it (serve it as if unmatched). Throws their errors, and when the
    * code changed but is still not JavaScript (no plugin returned
    * `moduleType: "js"`).
    */
-  transform(id: string, code: string, moduleType?: TransformModuleType): string | undefined;
+  transform(id: string, code: string, moduleType?: PluginModuleType): string | undefined;
 }
 
 /** File extensions of modules plugins can transform. */
@@ -72,6 +73,13 @@ export function normalizePluginEntries(
     }
     _assertSerializable(options, `plugins[${index}] options`);
     const resolved = resolveSpecifier(specifier);
+    // A path that doesn't resolve here won't in the worker either (same cwd):
+    // fail with the path instead of an import error from inside the worker.
+    if (resolved === specifier && (/^\.\.?(?:[/\\]|$)/.test(specifier) || isAbsolute(specifier))) {
+      throw new TypeError(
+        `[env-runner] \`data.plugins[${index}]\` "${specifier}" does not resolve from ${process.cwd()}.`,
+      );
+    }
     return options === undefined ? resolved : [resolved, options];
   });
 }
@@ -121,7 +129,7 @@ export async function loadPlugins(
     plugins.filter((plugin) => plugin.order === order);
   const [pre, normal, post] = [byOrder("pre"), byOrder("normal"), byOrder("post")];
 
-  const filter = (id: string, moduleType?: TransformModuleType) => {
+  const filter = (id: string, moduleType?: PluginModuleType) => {
     const path = _stripQuery(id).replaceAll("\\", "/");
     if (path.includes("/node_modules/")) {
       return false;
@@ -135,7 +143,7 @@ export async function loadPlugins(
     return plugins.some((plugin) => plugin.prefilter(path, moduleType));
   };
 
-  const transform = (id: string, code: string, sourceType?: TransformModuleType) => {
+  const transform = (id: string, code: string, sourceType?: PluginModuleType) => {
     id = _stripQuery(id);
     const matchId = id.replaceAll("\\", "/");
     let moduleType = sourceType ?? _moduleType(id);
@@ -143,17 +151,27 @@ export async function loadPlugins(
     // relative to already-mapped code, so both are dropped. Code-only steps
     // keep the current map (they should preserve lines).
     let map: SourceMapLike | null | undefined;
-    let mapped = false;
+    // Name of the plugin whose map was kept first.
+    let mappedBy: string | undefined;
     let changed = false;
-    const apply = (next: string, nextMap: SourceMapLike | null | undefined) => {
+    const apply = (
+      next: string,
+      nextMap: SourceMapLike | null | undefined,
+      plugin: NormalizedPlugin,
+    ) => {
       if (next === code) {
         return;
       }
       code = next;
       changed = true;
       if (nextMap) {
-        map = mapped ? undefined : nextMap;
-        mapped = true;
+        if (mappedBy === undefined) {
+          map = nextMap;
+          mappedBy = plugin.name;
+        } else {
+          map = undefined;
+          _warnDroppedMap(mappedBy, plugin.name);
+        }
       }
     };
     const run = (group: NormalizedPlugin[]) => {
@@ -168,9 +186,9 @@ export async function loadPlugins(
           );
         }
         if (typeof result === "string") {
-          apply(result, undefined);
+          apply(result, undefined, plugin);
         } else if (result) {
-          apply(result.code ?? code, result.map);
+          apply(result.code ?? code, result.map, plugin);
           moduleType = result.moduleType ?? moduleType;
         }
       }
@@ -199,8 +217,21 @@ export async function loadPlugins(
   return { plugins, filter, transform };
 }
 
+const _warnedMaps = new Set<string>();
+
+// Maps aren't composed: say so once per pair of plugins returning one.
+function _warnDroppedMap(first: string, second: string): void {
+  const key = `${first}\0${second}`;
+  if (!_warnedMaps.has(key)) {
+    _warnedMaps.add(key);
+    console.warn(
+      `[env-runner] plugins "${first}" and "${second}" both returned a source map; maps are not combined, so modules both change have none.`,
+    );
+  }
+}
+
 // Initial module type of each virtual module code format.
-const VIRTUAL_MODULE_TYPES: Partial<Record<string, TransformModuleType>> = {
+const VIRTUAL_MODULE_TYPES: Partial<Record<string, PluginModuleType>> = {
   module: "js",
   commonjs: "js",
   "module-typescript": "ts",
@@ -379,8 +410,9 @@ const BUN_EXTENSIONS: Record<string, string[]> = {
  * - its `id` filter: RegExp excludes as a negative lookahead, and includes as
  *   a lookahead when they are all RegExps (otherwise any path).
  *
- * The RegExp takes the `id` RegExps' flags; if they differ, no `id` filter is
- * folded in. Bun paths keep native separators. The plugins' filters still
+ * The RegExp takes the `id` RegExps' flags; if they differ, or one has
+ * backreferences or named groups (which don't survive being spliced together),
+ * no `id` filter is folded in. Bun paths keep native separators. The plugins' filters still
  * decide per module; paths the RegExp lets through but no plugin matches load
  * with Bun's native loader.
  */
@@ -388,15 +420,14 @@ export function createBunFilter(plugins: NormalizedPlugin[]): RegExp {
   const escape = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const sep = String.raw`(?:\\|\/)`;
   const isRegExp = (pattern: string | RegExp): pattern is RegExp => pattern instanceof RegExp;
-  // Stateful flags don't change what matches.
-  const flagSet = new Set(
-    plugins.flatMap(({ id }) =>
-      id
-        ? [...id.include, ...id.exclude].filter(isRegExp).map((re) => re.flags.replace(/[gy]/g, ""))
-        : [],
-    ),
+  const idRegExps = plugins.flatMap(({ id }) =>
+    id ? [...id.include, ...id.exclude].filter(isRegExp) : [],
   );
-  const foldIds = flagSet.size <= 1;
+  // Stateful flags don't change what matches.
+  const flagSet = new Set(idRegExps.map((re) => re.flags.replace(/[gy]/g, "")));
+  // Group numbers shift and group names may repeat once sources are joined.
+  const foldIds =
+    flagSet.size <= 1 && !idRegExps.some((re) => /\\[1-9]|\\k<|\(\?<(?![=!])/.test(re.source));
   const branches = new Set<string>();
   for (const { moduleTypes, id } of plugins) {
     const extensions = moduleTypes
@@ -442,7 +473,7 @@ function _bunLoader(path: string): string {
 }
 
 // Initial module type, from the extension.
-function _moduleType(id: string): TransformModuleType {
+function _moduleType(id: string): PluginModuleType {
   const ext = id.slice(id.lastIndexOf(".") + 1);
   if (ext === "tsx" || ext === "jsx") {
     return ext;

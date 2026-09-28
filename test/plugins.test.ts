@@ -269,6 +269,10 @@ describe("plugins options", () => {
     );
     expect(() => normalizePluginEntries([[oxc, { fn() {} }]])).toThrow(/JSON-serializable/);
     expect(normalizePluginEntries([[oxc, { a: [1, { b: null }] }]])).toBeTruthy();
+    // Paths fail on the host, not as an import error inside the worker.
+    expect(() => normalizePluginEntries(["./missing-plugin.mjs"])).toThrow(
+      /`data\.plugins\[0\]` "\.\/missing-plugin\.mjs" does not resolve from /,
+    );
   });
 
   it("does nothing without plugins", async () => {
@@ -357,8 +361,16 @@ describe("plugins options", () => {
   });
 
   it("drops a second source map (maps aren't composed)", async () => {
-    const pipeline = (await loadPlugins([oxc, fixture("mapped.mjs")]))!;
-    expect(pipeline.transform("/app/a.ts", "enum A { B }")).not.toContain("sourceMappingURL");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const pipeline = (await loadPlugins([oxc, fixture("mapped.mjs")]))!;
+      expect(pipeline.transform("/app/a.ts", "enum A { B }")).not.toContain("sourceMappingURL");
+      pipeline.transform("/app/b.ts", "enum B { C }");
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls[0]![0]).toMatch(/plugins "oxc" and ".+" both returned a source map/);
+    } finally {
+      warn.mockRestore();
+    }
     // Alone, the plugin's map is relative to the original source.
     const own = (await loadPlugins([fixture("mapped.mjs")]))!;
     expect(decodeMap(own.transform("/app/a.js", "a()")!).mappings).toBe("AAAA");
@@ -547,8 +559,44 @@ describe("plugins options", () => {
     const mixed = await bun({ id: /\/src\//i }, { id: /\/lib\// });
     expect(mixed.flags).toBe("");
     expect(mixed.test("/app/other/a.ts")).toBe(true);
+    // Group names and numbers don't survive joining sources: no `id` folding.
+    const grouped = await bun({ id: /(?<dir>src)\// }, { id: /(?<dir>lib)\// });
+    expect(grouped.test("/app/other/a.ts")).toBe(true);
+    const backref = await bun({ id: /(a)\1/ }, { id: /\/(src)\// });
+    expect(backref.test("/app/other/a.ts")).toBe(true);
     // A custom module type implies no extension.
     expect(test(await bun({ moduleType: ["svelte"] }), paths)).toEqual([]);
+  });
+
+  it("gives handlers a context to warn and throw with", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const plugin = await resolvePlugin(
+        {
+          name: "ctx",
+          transform(this: any, code: string) {
+            if (code === "throw") {
+              this.error(new Error("bad code"));
+            }
+            this.warn("careful");
+          },
+        },
+        "x",
+        undefined,
+      );
+      plugin.handler("ok", "/app/a.ts", "ts");
+      expect(warn).toHaveBeenCalledWith('[env-runner] plugin "ctx" (/app/a.ts): careful');
+      let error: any;
+      try {
+        plugin.handler("throw", "/app/a.ts", "ts");
+      } catch (error_) {
+        error = error_;
+      }
+      expect(error.message).toBe('[env-runner] plugin "ctx" (/app/a.ts): bad code');
+      expect(error.cause.message).toBe("bad code");
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("rejects invalid plugin exports and async handlers", async () => {

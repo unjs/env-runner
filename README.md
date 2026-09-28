@@ -435,7 +435,7 @@ On `MiniflareEnvRunner` there is no in-worker registration: the runner's module 
 
 #### Plugins (`data.plugins`)
 
-Pass `data.plugins` to run **plugins** on the entry, its imports and virtual modules. It works on every runner except `SelfEnvRunner` (which warns and ignores it). A plugin is a module, given by specifier and resolved from the working directory, optionally with options: `[specifier, options]`. The options must be JSON-serializable, because they cross into the worker.
+Pass `data.plugins` to run **plugins** on the entry, its imports and virtual modules. It works on every runner except `SelfEnvRunner` (which warns and ignores it). A plugin is a module, given by specifier and resolved from the working directory, optionally with options: `[specifier, options]`. A relative or absolute path that doesn't resolve throws when the runner is created. The options must be JSON-serializable, because they cross into the worker.
 
 > `data.plugins` is unrelated to the srvx server `plugins` of your [app entry](#app-entry): those stay on the entry's default export.
 
@@ -497,7 +497,8 @@ export default {
 
 **Which modules are transformed:** the plugins' filters decide, so each plugin scopes itself (there is no global include/exclude setting). Filters can't be RegExps when they come from options (JSON), so pass globs, as `id` in the oxc example does.
 
-- Candidates are files with a script extension (`.js`, `.mjs`, `.cjs`, `.ts`, `.mts`, `.cts`, `.jsx`, `.tsx`) and virtual modules with a code format. Paths containing `/node_modules/` are never transformed.
+- Candidates are files with a script extension (`.js`, `.mjs`, `.cjs`, `.ts`, `.mts`, `.cts`, `.jsx`, `.tsx`) and virtual modules with a code format. Paths containing `/node_modules/` are never transformed. Linked workspace packages resolve to their real paths, outside `node_modules`, so they are candidates too.
+- Module types other than `js`, `jsx`, `ts` and `tsx` (and matching candidates) may be added later, so don't assume a handler only ever sees these four.
 - A candidate is read and run through the plugins only when at least one plugin's `id` and `moduleType` filters match it (a plugin without them matches every candidate). The initial module type comes from the extension, or a virtual module's format. Anything else loads as if there were no plugins.
 - Inside the pipeline, each handler still runs only when its whole filter (`id`, `code`, `moduleType`) matches the current code.
 
@@ -508,7 +509,7 @@ export default {
 - **Module type:** `meta.moduleType` starts as the module's language. A handler that compiles to JavaScript returns `moduleType: "js"`, as the oxc plugin above does, and later handlers see that.
 - **Output must be JavaScript:** if no handler changed a module, it loads as if unmatched. If one changed it but it is still TypeScript/JSX (no handler returned `moduleType: "js"`), loading it fails with an error.
 - **Sync only:** handlers must be synchronous (Node.js module hooks are), and returning a Promise throws. Factories may be async.
-- **No plugin context:** `this` is not bound to one.
+- **Plugin context:** `this.warn(message)` logs a warning and `this.error(message)` throws, both prefixed with the plugin name and module id (an `Error` passed to `this.error()` becomes the `cause`). No other context methods are available.
 
 **Filters**: all given properties must match.
 
@@ -517,13 +518,15 @@ export default {
 - `moduleType`: a list, or `{ include }`.
 - Values can be arrays or `{ include, exclude }`, and exclude wins.
 
-**Source maps are not composed.** The first returned `map` is appended inline, and a second one drops both. Code-only results keep the current map, so keep such changes line-preserving. Stack traces use the inline source maps with `--enable-source-maps`.
+**Source maps are not composed.** The first returned `map` is appended inline, and a second one drops both (with a warning, once per pair of plugins). Code-only results keep the current map, so keep such changes line-preserving. Stack traces use the inline source maps with `--enable-source-maps`.
 
 How plugins are applied:
 
 - **Node.js** runners (and runners built on them) and **Deno**: a `module.registerHooks` load hook (Node.js >= 22.15 / 23.5). The output is served as ESM or CommonJS: by the package `"type"` when Node.js reports it, else `.mts`/`.cts`, else CommonJS only for output with CommonJS markers (`require()`, `module.exports`) and no ESM syntax. Deno evaluates hook output as ESM, so CommonJS files fall back to its native loader (which needs `--unstable-detect-cjs` in the runner's `execArgv` for CommonJS `.ts`).
-- **Bun**: a `Bun.plugin()` `onLoad` with one filter RegExp built from the plugins, one alternative per plugin: the extensions its `moduleType` filter implies (`ts` → `.ts`/`.mts`, `tsx` → `.tsx`, `jsx` → `.jsx`, `js` → `.js`/`.mjs`; every one of them without a `moduleType` filter), plus its `id` RegExps (RegExp excludes always; includes when they are all RegExps). Globs are left to the plugin's own filter, and `id` RegExps with differing flags aren't folded in. `/node_modules/` is always left out. Bun matches against native paths, so on Windows `id` RegExps should match `[\\/]`. Bun evaluates plugin output as ESM and a plugin can't decline a load, so `.cjs`/`.cts` never reach it, and **CommonJS in other files the RegExp covers is not supported** (e.g. a CommonJS `.js` file next to a plugin without a `moduleType` filter). Files the RegExp lets through but no plugin matches are handed back to Bun's native loader.
-- **Miniflare**: on the host, in the module fallback service (after `transformRequest`), with CommonJS output served behind the same ESM shim as untransformed files. A transform error is logged on the host and thrown from the failing module inside workerd.
+- **Bun**: a `Bun.plugin()` `onLoad` with one filter RegExp built from the plugins, one alternative per plugin: the extensions its `moduleType` filter implies (`ts` → `.ts`/`.mts`, `tsx` → `.tsx`, `jsx` → `.jsx`, `js` → `.js`/`.mjs`; every one of them without a `moduleType` filter), plus its `id` RegExps (RegExp excludes always; includes when they are all RegExps). Globs are left to the plugin's own filter, and `id` RegExps aren't folded in when their flags differ or one has backreferences or named groups. `/node_modules/` is always left out. Bun matches against native paths, so on Windows `id` RegExps should match `[\\/]`. Bun evaluates plugin output as ESM and a plugin can't decline a load, so `.cjs`/`.cts` never reach it, and **CommonJS in other files the RegExp covers is not supported** (e.g. a CommonJS `.js` file next to a plugin without a `moduleType` filter). Files the RegExp lets through but no plugin matches are handed back to Bun's native loader.
+- **Miniflare**: on the host, in the module fallback service, with CommonJS output served behind the same ESM shim as untransformed files. A transform error is logged on the host and thrown from the failing module inside workerd.
+  - With a `transformRequest` option, disk modules it returns code for are served as is: plugins only run on disk modules it leaves alone (and on virtual modules).
+  - Plugins are imported into the host process, not a worker, so an edited plugin module takes effect only after the host process restarts (other runners pick it up with the next worker).
 - **Virtual modules** go through the plugins instead of type-stripping when a plugin matches them, which also makes JSX work on every runner (e.g. `#entry.tsx`, or `{ source, format: "tsx" }` without an extension). The output stays in its format's module system: CommonJS formats stay CommonJS, and the rest become ESM. Sources added or replaced by `updateVirtualModules()`/`invalidateModule()` are transformed too. A source that fails to transform rejects the update and changes nothing.
 - `reloadModule()` re-transforms the entry from disk; already-imported modules stay cached.
 

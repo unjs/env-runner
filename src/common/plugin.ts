@@ -3,52 +3,61 @@ import * as nodePath from "node:path";
 type MaybeArray<T> = T | T[];
 
 /** Include values, or `{ include, exclude }` (exclude wins). */
-export type TransformStringFilter =
+export type PluginStringFilter =
   | MaybeArray<string | RegExp>
   | { include?: MaybeArray<string | RegExp>; exclude?: MaybeArray<string | RegExp> };
 
 /** Module type of the code a handler receives (`js` once a plugin returned JS). */
-export type TransformModuleType = "js" | "jsx" | "ts" | "tsx" | (string & {});
+export type PluginModuleType = "js" | "jsx" | "ts" | "tsx" | (string & {});
 
 /**
  * `transform` hook filter (all given properties must match).
  * - `id`: strings are globs (`path.matchesGlob`; relative ones resolve from
  *   cwd), RegExps are tested; both against the `/`-separated id.
  * - `code`: strings are substrings, RegExps are tested.
- * - `moduleType`: see {@link TransformModuleType}.
+ * - `moduleType`: see {@link PluginModuleType}.
  *
  * `id` and `moduleType` also decide which modules are read and run through
  * the plugins at all: a module no plugin's `id`/`moduleType` filter matches
  * (with its initial module type) is left to the runtime.
  */
-export interface TransformHookFilter {
-  id?: TransformStringFilter;
-  code?: TransformStringFilter;
-  moduleType?: TransformModuleType[] | { include?: TransformModuleType[] };
+export interface PluginTransformFilter {
+  id?: PluginStringFilter;
+  code?: PluginStringFilter;
+  moduleType?: PluginModuleType[] | { include?: PluginModuleType[] };
 }
 
 /** Passed to every handler. */
-export interface TransformHandlerMeta {
+export interface PluginTransformMeta {
   /** Language of `code` (updated by results returning a `moduleType`). */
-  moduleType: TransformModuleType;
+  moduleType: PluginModuleType;
   /** The options of this plugin's `plugins` entry. */
   options: unknown;
 }
 
+/** `this` in handlers. Messages are prefixed with the plugin name and module id. */
+export interface PluginContext {
+  /** Log a warning. */
+  warn(message: string | { message: string }): void;
+  /** Throw an error (an `Error` given is kept as its `cause`). */
+  error(message: string | { message: string }): never;
+}
+
 /** Must be sync (Node.js module hooks are). Return nullish to keep the code. */
-export type TransformHandler = (
+export type PluginTransformHandler = (
+  this: PluginContext,
   code: string,
   id: string,
-  meta: TransformHandlerMeta,
-) => TransformHandlerResult;
+  meta: PluginTransformMeta,
+) => PluginTransformResult;
 
 /**
  * New code, or `{ code, map, moduleType }`: a `moduleType` tells later
  * handlers the new language (e.g. `js` after compiling TypeScript).
  */
-export type TransformHandlerResult =
+export type PluginTransformResult =
   | string
-  | { code?: string; map?: SourceMapLike | null; moduleType?: TransformModuleType }
+  | { code?: string; map?: SourceMapLike | null; moduleType?: PluginModuleType }
   | null
   | undefined;
 
@@ -68,11 +77,11 @@ export interface SourceMapLike {
 export interface EnvRunnerPlugin {
   name?: string;
   transform:
-    | TransformHandler
+    | PluginTransformHandler
     | {
         order?: "pre" | "post" | null;
-        filter?: TransformHookFilter;
-        handler: TransformHandler;
+        filter?: PluginTransformFilter;
+        handler: PluginTransformHandler;
       };
 }
 
@@ -86,15 +95,15 @@ export interface NormalizedPlugin {
   /** `filter.id` patterns (`undefined` without an `id` filter; no includes = all). */
   id?: { include: (string | RegExp)[]; exclude: (string | RegExp)[] };
   /** `filter.moduleType` (`undefined` without one). */
-  moduleTypes?: TransformModuleType[];
+  moduleTypes?: PluginModuleType[];
   /**
    * Whether a module can reach this plugin: its `id` and `moduleType` filters
    * (`id` is `/`-separated, `moduleType` the initial one).
    */
-  prefilter(id: string, moduleType: TransformModuleType): boolean;
+  prefilter(id: string, moduleType: PluginModuleType): boolean;
   /** Whether the handler runs for this code (`id` is `/`-separated). */
-  matches(id: string, code: string, moduleType: TransformModuleType): boolean;
-  handler(code: string, id: string, moduleType: TransformModuleType): TransformHandlerResult;
+  matches(id: string, code: string, moduleType: PluginModuleType): boolean;
+  handler(code: string, id: string, moduleType: PluginModuleType): PluginTransformResult;
 }
 
 const _warnedHooks = new Set<string>();
@@ -133,8 +142,8 @@ export async function resolvePlugin(
   const { name: pluginName, transform: hook } = plugin as Partial<EnvRunnerPlugin>;
   const name = typeof pluginName === "string" ? pluginName : specifier;
   let order: NormalizedPlugin["order"] = "normal";
-  let filter: TransformHookFilter | undefined;
-  let handler: TransformHandler;
+  let filter: PluginTransformFilter | undefined;
+  let handler: PluginTransformHandler;
   if (typeof hook === "function") {
     handler = hook;
   } else if (hook && typeof hook === "object" && typeof hook.handler === "function") {
@@ -150,13 +159,23 @@ export async function resolvePlugin(
   _warnUnsupportedHooks(name, plugin as Record<string, unknown>);
 
   const id = filter?.id === undefined ? undefined : _compileStringFilter(filter.id, _matchId);
+  // Each load tests the same id more than once, and globs aren't precompiled.
+  const idResults = new Map<string, boolean>();
+  const testId = (value: string) => {
+    let result = idResults.get(value);
+    if (result === undefined) {
+      result = id!.test(value);
+      idResults.set(value, result);
+    }
+    return result;
+  };
   const code =
     filter?.code === undefined ? undefined : _compileStringFilter(filter.code, _matchCode);
   const moduleTypes = Array.isArray(filter?.moduleType)
     ? filter.moduleType
     : filter?.moduleType?.include;
-  const prefilter = (idValue: string, moduleType: TransformModuleType) =>
-    (!id || id.test(idValue)) && (!moduleTypes || moduleTypes.includes(moduleType));
+  const prefilter = (idValue: string, moduleType: PluginModuleType) =>
+    (!id || testId(idValue)) && (!moduleTypes || moduleTypes.includes(moduleType));
   return {
     name,
     order,
@@ -166,7 +185,21 @@ export async function resolvePlugin(
     matches: (idValue, codeValue, moduleType) =>
       prefilter(idValue, moduleType) && (!code || code.test(codeValue)),
     handler: (codeValue, idValue, moduleType) =>
-      handler.call(undefined, codeValue, idValue, { moduleType, options }),
+      handler.call(_createContext(name, idValue), codeValue, idValue, { moduleType, options }),
+  };
+}
+
+function _createContext(name: string, id: string): PluginContext {
+  const format = (message: string | { message: string }) =>
+    `[env-runner] plugin "${name}" (${id}): ${typeof message === "string" ? message : message?.message}`;
+  return {
+    warn: (message) => console.warn(format(message)),
+    error: (message) => {
+      throw new Error(
+        format(message),
+        typeof message === "string" ? undefined : { cause: message },
+      );
+    },
   };
 }
 
@@ -189,7 +222,7 @@ function _warnUnsupportedHooks(name: string, plugin: Record<string, unknown>): v
 }
 
 function _compileStringFilter(
-  filter: TransformStringFilter,
+  filter: PluginStringFilter,
   match: (pattern: string | RegExp, value: string) => boolean,
 ): {
   include: (string | RegExp)[];

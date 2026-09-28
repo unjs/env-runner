@@ -6,16 +6,16 @@ Plugin `transform` hooks applied to the entry, its disk imports and virtual modu
 
 - Lives in `data` (not a runner option), so it reaches every runner the same way `data.virtual` does, and must stay **JSON-serializable**. Entries are `string | URL | [specifier, options]`, never functions.
 - `BaseEnvRunner` calls `normalizePluginEntries()` in its constructor. It:
-  - resolves specifiers from the host cwd to `file:` URLs, so workers import the app's copies (`env-runner/...` resolves through the package's self-reference);
+  - resolves specifiers from the host cwd to `file:` URLs, so workers import the app's copies (`env-runner/...` resolves through the package's self-reference). A relative/absolute path that doesn't resolve throws there (the worker shares the cwd, so it would only fail later as an import error); bare specifiers that don't resolve pass through (e.g. Deno's `npm:`);
   - checks options with `_assertSerializable()`: plain objects, arrays and primitives only, since a RegExp/Date/class instance would arrive as `{}`/a string over JSON, and functions not at all;
   - throws a `TypeError` naming the entry (`data.plugins[0]`, `plugins[0] options.re`) for a non-specifier or bad options. A function/object entry's message points srvx server plugins to the app entry's `plugins` (same name, unrelated option).
 - `loadPlugins()` (in the worker; on the host for miniflare) returns `undefined` for no entries (no hooks registered). Otherwise it imports each module and calls `resolvePlugin(default, specifier, options)`:
   - A **function** default export is a **plugin factory**, called once with the options. It may be async. A throw becomes `plugin "<specifier>" failed to initialize: ...`; a non-object result fails.
   - An **object** is the plugin itself; its handler gets the options as `meta.options` (factory plugins get them too).
-  - A plugin has `{ name?, transform }`, where `transform` is a function or `{ order?, filter?, handler }`. Bad shapes throw a `TypeError` naming the specifier. A handler returning a thenable throws, since hooks are sync. Handlers get `(code, id, { moduleType, options })` with no plugin context (`this`).
+  - A plugin has `{ name?, transform }`, where `transform` is a function or `{ order?, filter?, handler }`. Bad shapes throw a `TypeError` naming the specifier. A handler returning a thenable throws, since hooks are sync. Handlers get `(code, id, { moduleType, options })`, with `this` a `PluginContext` built per call (`_createContext()`): `warn()` logs and `error()` throws, both prefixed `[env-runner] plugin "<name>" (<id>):`, an object argument kept as `cause`.
   - Other function-valued hooks (or `{ handler }` objects), e.g. `load`/`resolveId`, are ignored with one `console.warn` per plugin name.
 - Hook filters:
-  - `id`: glob strings go through `path.matchesGlob` (namespace access, since a named import fails to link before Node 22.5). Relative globs resolve from cwd. RegExps are tested against the `/`-separated id.
+  - `id`: glob strings go through `path.matchesGlob` (namespace access, since a named import fails to link before Node 22.5). Relative globs resolve from cwd. RegExps are tested against the `/`-separated id. Results are memoized per plugin and id: every load tests the id at least twice (prefilter, then `matches()`), and globs aren't precompiled.
   - `code`: strings are substrings.
   - `moduleType`: a list or `{ include }`.
   - Any value can be `{ include, exclude }`, and exclude wins. All given properties must match. `lastIndex` is reset for `g`/`y` RegExps.
@@ -39,7 +39,7 @@ The README recommends a `moduleType` (and, where possible, `id`) filter on every
 - **Untouched** code (no handler changed it) returns `undefined`, and callers serve the module as if unmatched: Node/Deno `nextLoad()`, Bun's native loader, miniflare's raw path, the virtual module unchanged.
 - Code that **changed but isn't `js`** at the end throws a `TypeError` naming the id and module type. Serving leftover TypeScript/JSX would need per-backend stripping, and it's almost always a missing compiling plugin.
 - An inline `sourceMappingURL` is appended whenever the pipeline ends with a map; `sources` is the file URL for absolute ids.
-- Maps are never composed. The first map-producing step that changes the code sets the map. A second one would be relative to already-mapped code, so it drops the map, because a wrong map is worse than none. Code-only results keep the current map, and a step returning unchanged code is a no-op.
+- Maps are never composed. The first map-producing step that changes the code sets the map. A second one would be relative to already-mapped code, so it drops the map, because a wrong map is worse than none, and `console.warn`s once per pair of plugin names (`_warnDroppedMap()`). Code-only results keep the current map, and a step returning unchanged code is a no-op.
 - `oxc-transform` is only a devDependency, for the test fixture plugin; `dist` never imports it.
 
 ## Runtimes
@@ -53,7 +53,7 @@ The README recommends a `moduleType` (and, where possible, `id`) filter on every
   - `^(?!.*SEP node_modules SEP)` (either separator, `(?:\\|\/)` rather than a character class, so it stays valid in `u`/`v` mode), then **one alternative per plugin** (deduplicated), each ending in `.*(?:<exts>)$`:
     - exts: those its `filter.moduleType` implies (`ts` → `.ts .mts`, `tsx` → `.tsx`, `jsx` → `.jsx`, `js` → `.js .mjs`; unknown types none, so the plugin gets no alternative); without a moduleType filter all of them. Never `.cjs`/`.cts`.
     - its `id` RegExp excludes as `(?!.*?(?:a|b))` (glob excludes dropped: over-approximation is safe), and its includes as `(?=.*?(?:a|b))` when all of them are RegExps (a glob anywhere in the include list drops the include lookahead, since dropping only the glob would under-approximate).
-    - The RegExp takes the `id` RegExps' flags (minus `g`/`y`); if flags differ across plugins, no `id` lookaheads at all (extensions only).
+    - The RegExp takes the `id` RegExps' flags (minus `g`/`y`); if flags differ across plugins, or any `id` RegExp has a backreference (`\1`, `\k<>`) or named group, no `id` lookaheads at all (extensions only). Joined sources renumber groups, and repeated names are a SyntaxError (before ES2025 even across alternatives).
   - So with RegExp-only filters it's exact for `id`/`moduleType` (modulo native separators: on Windows `id` RegExps must match `\` themselves). `onLoad` still runs `filter()` and returns untouched or unmatched files with Bun's native loader (`_bunLoader()`). Consequence: CommonJS in any file the RegExp covers breaks (a transformed CommonJS `.ts`, or a CommonJS `.js` when a plugin has no `moduleType` filter). Documented as a limitation, with the advice to filter every plugin.
   - Plugins can't be removed; unregister only detaches the active pipeline.
 - `_active` is set only after a backend registered, so reload never takes the plugin path without a hook behind it.
@@ -65,7 +65,7 @@ The README recommends a `moduleType` (and, where possible, `id`) filter on every
   - Candidates are the code formats (`module`, `commonjs`, `module-typescript`, `commonjs-typescript`, `jsx`, `tsx`); the format gives the initial `moduleType` (`js`/`ts`/`jsx`/`tsx`), then `filter(key, moduleType)` applies. An untouched module is returned as is.
   - The output is `{ source, format }` with `format` `commonjs` for `commonjs*`, else `module`. It follows virtual-module rules (no syntax detection; `.ts` is always ESM). The backend preparers then handle it like any JS module: Node natively, Deno/Bun wrapping CommonJS, miniflare as `esModule`/`commonJsModule`.
 
-- **Miniflare**: host-side in `unsafeModuleFallbackService`, after `transformRequest`. Transformed code goes through the same ESM/CommonJS split as raw files, with CommonJS behind `createCjsEsmShim`; `transformedFormat()` decides for transformed code, the existing regex for raw files.
+- **Miniflare**: host-side in `unsafeModuleFallbackService`, only for disk modules `transformRequest` returned no code for (its output is served as is and never reaches the plugins). Plugins are imported into the host process, so the ESM cache keeps an edited plugin module until the host restarts; worker runners re-import it with each new worker. Transformed code goes through the same ESM/CommonJS split as raw files, with CommonJS behind `createCjsEsmShim`; `transformedFormat()` decides for transformed code, the existing regex for raw files.
   - Transform errors are `console.error`ed on the host and served as a module that throws the message. The host log matters because a named import of it fails at link time first, and a 500 from the fallback would only surface as "module not found". v4 `modulesRules` add `.cts` when plugins are set. `data.plugins` is part of the persistent cache key (`_plugins`).
 - **Self**: unsupported (hooks would affect the host process); warns and ignores.
 

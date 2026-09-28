@@ -33,12 +33,13 @@ export type {
   EnvRunnerPlugin,
   EnvRunnerPluginEntry,
   EnvRunnerPluginFactory,
-  TransformHandler,
-  TransformHandlerMeta,
-  TransformHandlerResult,
-  TransformHookFilter,
-  TransformModuleType,
-  TransformStringFilter,
+  PluginContext,
+  PluginModuleType,
+  PluginStringFilter,
+  PluginTransformFilter,
+  PluginTransformHandler,
+  PluginTransformMeta,
+  PluginTransformResult,
 } from "./plugins.ts";
 
 export interface EnvRunnerData {
