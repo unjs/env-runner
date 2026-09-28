@@ -1,6 +1,6 @@
 import type { WorkerHooks } from "../../types.ts";
 
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -11,7 +11,12 @@ import { proxyUpgrade } from "httpxy";
 import { BaseEnvRunner } from "../../common/base-runner.ts";
 import type { EnvRunnerData, EnvRunnerPluginOption } from "../../common/base-runner.ts";
 import { resolveRuntimeDep } from "../../common/runtime-deps.ts";
-import { queryOf, stripInternalQuery, stripQuery } from "../../plugin/filter.ts";
+import {
+  queryOf,
+  restoreInternalQuery,
+  stripInternalQuery,
+  stripQuery,
+} from "../../plugin/filter.ts";
 import { jsonModuleCode, transformedFormat } from "../../plugin/hooks.ts";
 import type { PluginTransformOutput } from "../../plugin/pipeline.ts";
 import type { RuntimeDep } from "../../common/runtime-deps.ts";
@@ -365,6 +370,10 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
 
   protected _runtimeType() {
     return "miniflare";
+  }
+
+  protected override _resolveConditions() {
+    return this.#exportConditions;
   }
 
   protected async _closeRuntime() {
@@ -826,38 +835,69 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
           // Returned by a `resolveId` hook (may be under node_modules).
           let pluginResolved = false;
 
-          // The plugins' `resolveId` hooks, after virtual modules (as in workers).
+          // The plugins' `resolveId` hooks, after virtual modules (as in workers),
+          // and the `fallback` ones where resolving it here fails.
           const _resolvePlugins = _livePlugins();
           const rawSource = rawSpecifier
             ? stripInternalQuery(rawSpecifier, version)
             : bareSpecifier + query;
-          const source = rawSource.startsWith("file:")
-            ? fileURLToPath(stripQuery(rawSource)) + queryOf(rawSource)
-            : rawSource;
-          if (_resolvePlugins?.resolveFilter(source)) {
+          // A path a plugin resolved it to, or its response (a plugin module,
+          // a virtual path key's redirect, an error).
+          const _pluginResolve = async (
+            fallback: boolean,
+          ): Promise<Response | string | undefined> => {
+            if (!_resolvePlugins) {
+              return undefined;
+            }
             try {
+              const source = rawSource.startsWith("file:")
+                ? fileURLToPath(stripQuery(rawSource)) + queryOf(rawSource)
+                : rawSource;
+              if (!_resolvePlugins.resolveFilter(source, fallback)) {
+                return undefined;
+              }
               const resolved = await _resolvePlugins.resolveId(
                 source,
                 _pluginModuleIds.get(referrerKey) ?? referrerPath,
+                { fallback },
               );
-              if (resolved && !resolved.external) {
-                const id = resolved.id;
-                const idPath = stripQuery(id);
-                if (isAbsolute(idPath)) {
-                  resolvedPath = idPath;
-                  resolvedId = id;
-                  pluginResolved = true;
-                } else {
-                  // Not a file: a `load` hook serves it.
-                  const result = (await _resolvePlugins.load(id))!;
-                  _pluginModuleIds.set(name, id);
-                  return Response.json({ name, ...(await _servePluginModule(id, result)) });
-                }
+              if (!resolved || resolved.external) {
+                return undefined;
               }
+              const id = resolved.id;
+              const idPath = stripQuery(id);
+              const pathKey = isAbsolute(idPath) ? _virtual.keyOf(idPath) : undefined;
+              const keyPath = pathKey === undefined ? undefined : virtualKeyPath(pathKey);
+              if (keyPath) {
+                // A virtual path key (maybe without a file): served under
+                // its path, like a `file:` import of it above.
+                const location = restoreInternalQuery(
+                  toWorkerdPath(keyPath) + queryOf(id),
+                  specifier,
+                );
+                return new Response(null, {
+                  status: 301,
+                  headers: { location: Buffer.from(location, "utf8").toString("latin1") },
+                });
+              }
+              if (isAbsolute(idPath)) {
+                resolvedId = id;
+                pluginResolved = true;
+                return idPath;
+              }
+              // Not a file: a `load` hook serves it.
+              const result = (await _resolvePlugins.load(id))!;
+              _pluginModuleIds.set(name, id);
+              return Response.json({ name, ...(await _servePluginModule(id, result)) });
             } catch (error: any) {
               return _pluginErrorModule(name, error);
             }
+          };
+          const pluginPath = await _pluginResolve(false);
+          if (pluginPath instanceof Response) {
+            return pluginPath;
           }
+          resolvedPath = pluginPath;
 
           // file:// URL specifier — convert to filesystem path
           const fileUrlRaw = cleanRaw || cleanSpecifier;
@@ -904,11 +944,18 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
                 });
                 resolvedPath = resolved || contextRequire.resolve(cleanRaw);
               } catch {
-                // Return an empty stub for unresolvable bare specifiers (e.g. optional native addons like bufferutil)
-                const name = cleanSpecifier.startsWith("/")
-                  ? cleanSpecifier.slice(1)
-                  : cleanSpecifier;
-                return Response.json({ name, esModule: "export default undefined;" });
+                const failed = await _pluginResolve(true);
+                if (failed instanceof Response) {
+                  return failed;
+                }
+                if (failed === undefined) {
+                  // Return an empty stub for unresolvable bare specifiers (e.g. optional native addons like bufferutil)
+                  const name = cleanSpecifier.startsWith("/")
+                    ? cleanSpecifier.slice(1)
+                    : cleanSpecifier;
+                  return Response.json({ name, esModule: "export default undefined;" });
+                }
+                resolvedPath = failed;
               }
             }
           } else {
@@ -929,9 +976,24 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
               try {
                 resolvedPath = _require.resolve(raw);
               } catch {
-                return new Response(null, { status: 404 });
+                const failed = await _pluginResolve(true);
+                if (failed === undefined) {
+                  return new Response(null, { status: 404 });
+                }
+                if (failed instanceof Response) {
+                  return failed;
+                }
+                resolvedPath = failed;
               }
             }
+          }
+          // A path without a file: the `fallback` hooks may resolve it.
+          if (!pluginResolved && _resolvePlugins && !existsSync(resolvedPath)) {
+            const failed = await _pluginResolve(true);
+            if (failed instanceof Response) {
+              return failed;
+            }
+            resolvedPath = failed ?? resolvedPath;
           }
 
           // Try Vite transform pipeline first (TS/JSX → JS, etc.)
@@ -998,6 +1060,10 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
             if (transformed === undefined && contents === undefined) {
               return new Response(null, { status: 404 });
             }
+          }
+          // workerd compiles WebAssembly modules only (never bytes at runtime).
+          if (transformed === undefined && resolvedPath.endsWith(".wasm")) {
+            return Response.json({ name, wasm: Array.from(readFileSync(resolvedPath)) });
           }
           let isESM: boolean;
           if (transformed === undefined) {

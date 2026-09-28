@@ -37,6 +37,7 @@ export type {
   EnvRunnerPlugin,
   EnvRunnerPluginOption,
   PluginContext,
+  PluginContextResolveOptions,
   PluginFilterExpression,
   PluginHook,
   PluginHookFilter,
@@ -46,6 +47,8 @@ export type {
   PluginLogPosition,
   PluginModuleType,
   PluginResolveIdHandler,
+  PluginResolveIdHook,
+  PluginResolvedId,
   PluginResolveIdOptions,
   PluginResolveIdResult,
   PluginStringFilter,
@@ -114,7 +117,9 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
     this._workerEntry = opts.workerEntry;
     this._data = opts.data;
     // Throws for invalid plugins.
-    this._plugins = createPluginPipeline(opts.plugins);
+    this._plugins = createPluginPipeline(opts.plugins, {
+      resolveConditions: () => this._resolveConditions(),
+    });
     this._hooks = opts.hooks || {};
     this._messageListeners = new Set();
     this._pendingRequests = new Set();
@@ -337,6 +342,15 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
       });
     }
     return hostEnv({ ENV_RUNNER_NAME: this._name });
+  }
+
+  /**
+   * Export conditions the runtime resolves packages with, for the plugins'
+   * `this.resolve()` (`undefined`: Node.js's). Called lazily, after the
+   * subclass constructor.
+   */
+  protected _resolveConditions(): string[] | undefined {
+    return undefined;
   }
 
   /**

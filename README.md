@@ -479,7 +479,15 @@ const runner = new NodeProcessEnvRunner({
 });
 ```
 
-`transform` can also be a plain function. Handlers get `(code, id, { moduleType })` and return a string, `{ code, map, moduleType }`, or nothing to keep the code (`moduleSideEffects` and `meta` in a result are ignored). `this.warn(message)` and `this.info(message)` log, and `this.error(message)` throws, all prefixed with the plugin name and module id; `message` can also be a `{ message }` log object, and a second argument (an offset in the code, or `{ line, column }`) is appended to the id as `:line:column`. `this.debug()` is ignored. `this.addWatchFile()` is accepted and ignored (`this.getWatchFiles()` is empty), and `this.meta.watchMode` is `false`. Other errors are wrapped the same way (`[env-runner] plugin "version" failed on "/app/src/index.ts": ...`). Nested arrays in `plugins` are flattened and falsy entries skipped, so a plugin can be added conditionally (`isDev && plugin`).
+`transform` can also be a plain function. Handlers get `(code, id, { moduleType })` and return a string, `{ code, map, moduleType }`, or nothing to keep the code (`moduleSideEffects` and `meta` in a result are ignored). Nested arrays in `plugins` are flattened and falsy entries skipped, so a plugin can be added conditionally (`isDev && plugin`).
+
+In every handler, `this` has:
+
+- `this.warn(message)` and `this.info(message)` log, and `this.error(message)` throws, all prefixed with the plugin name and module id. `message` can also be a log object, `{ message, loc?, pos?, frame? }`. A position (a second argument, else the log's `loc` `{ line, column }` or `pos` offset) is appended to the id as `:line:column`, and a `frame` goes below the message. `this.debug()` is ignored.
+- `this.resolve(source, importer?, { skipSelf?, isEntry?, attributes? })` resolves an import on the host as the runner would. It runs the `resolveId` hooks, then Node.js ESM resolution from `importer` (or the working directory) with the runner's export conditions, then the `fallback` hooks (below). It returns `{ id, external }`, with builtins (`node:fs`) as external, or `null` when nothing resolves it; like Node.js, it tries no extensions or directory indexes. Called from a `resolveId` handler, it skips that plugin's own hook (`skipSelf: false` keeps it), also when another plugin asks again for the same source and importer.
+- `this.addWatchFile()` is accepted and ignored (`this.getWatchFiles()` is empty), and `this.meta.watchMode` is `false`.
+
+Errors a handler throws are reported the same way, with the plugin name and module id, and a `loc`/`pos` and `frame` of the error: `[env-runner] plugin "version" failed on "/app/src/index.ts:3:10": ...`. Positions are in the code the hook got (after earlier hooks changed it). Other hooks (`buildStart`, `renderChunk`, ...) are ignored, and handlers find no other context methods (`this.emitFile`, `this.parse`, ...): calling one fails with a `TypeError`.
 
 **Resolving and loading modules:** `resolveId` and `load` hooks serve modules that aren't files, redirect imports, or load files the runtime can't:
 
@@ -531,11 +539,50 @@ const raw = {
 ```
 
 - `resolveId(source, importer, { isEntry, attributes })` runs for the imports its filter matches, with the specifier as written, query included (`file:` URLs as paths). `importer` is the importing module's id (a path with its query, or an id a `resolveId` hook returned), and `undefined` for the entry. The first handler returning a result wins. Returning nothing leaves the import to the next plugin, then to the runtime.
-- A resolved absolute path (a query is kept) loads that file, through `load` hooks and then from disk. Any other id, like `\0virtual:routes`, must be returned by a `load` hook, and relative imports inside such a module resolve from the working directory. `false` or `{ id, external: true }` leaves the import (or the returned id) to the runtime. Only Node.js and Deno import a different non-path id returned with `external`; Bun and miniflare keep the original specifier, so return an unchanged id or a path for portable externals.
+- A resolved absolute path (a query is kept) loads that file, through `load` hooks and then from disk. A path that is a key of `data.virtual` loads that virtual module, also without a file on disk. Any other id, like `\0virtual:routes`, must be returned by a `load` hook, and relative imports inside such a module resolve from the working directory.
+- **`fallback: true`** makes a `resolveId` hook run only for imports the runtime fails to resolve, after the runtime tried. The worker tries first, so imports it resolves take no round trip, unlike other `resolveId` hooks, which run before the runtime for every import their filter matches. Use it for imports the runtime can't resolve itself, like extensionless relative imports (`./utils`), which Bun resolves itself:
+
+  ```js
+  const extensionless = {
+    name: "extensionless",
+    resolveId: {
+      fallback: true,
+      filter: { id: /^\.\.?\// },
+      handler: (source, importer) =>
+        [".ts", ".mts", "/index.ts"]
+          .map((ext) => join(dirname(importer), source + ext))
+          .find((path) => existsSync(path)),
+    },
+  };
+  ```
+
+`false` or `{ id, external: true }` leaves the import (or the returned id) to the runtime. Only Node.js and Deno import a different non-path id returned with `external`; Bun and miniflare keep the original specifier, so return an unchanged id or a path for portable externals.
+
 - `load(id)` returns the module's code, or `{ code, map, moduleType }`. The first handler returning code wins, and `transform` hooks run on the result. Without a `moduleType`, it is the id's type (`js` for other extensions). When no `load` hook returns code, the file is read from disk (without the id's query).
 - **Queries:** ids keep the import's query (`/app/logo.svg?raw`), in `load`, `transform` and filters, and the query is part of the module's identity: `./dep.ts` and `./dep.ts?raw` are separate modules on every runner. The module type comes from the path (`svg` there). Query params env-runner adds itself (reload cache-busting, virtual module versions, Bun and miniflare markers) are removed from the ids plugins see, and the import's own params are kept as written.
 - `resolveId` and `load` filters take only `id` (or filter expressions without `code` and `moduleType`). For `resolveId`, `id` matches the specifier with its query, and globs aren't resolved from the working directory (`virtual:*`, `@/**`).
 - Error messages name the hook: `[env-runner] plugin "virtual" failed to load "\0virtual:routes": ...`.
+- **`.wasm`**: a `load` hook (an `id` filter like `/\.wasm$/` names the type) returns an ES module wrapper around the file. On Node.js, Deno and Bun it can inline the bytes and compile them. workerd can't compile bytes at runtime, so on miniflare the wrapper imports the file as a compiled module (with a query the hook's filter leaves out, served by the runner as a WebAssembly module) and instantiates it:
+
+  ```js
+  const wasm = (workerd = false) => ({
+    name: "wasm",
+    load: {
+      filter: { id: /\.wasm$/ },
+      handler(id) {
+        const bytes = readFileSync(id);
+        const names = WebAssembly.Module.exports(new WebAssembly.Module(bytes)).map((e) => e.name);
+        return [
+          workerd
+            ? `import module from ${JSON.stringify(`${id}?module`)};`
+            : `const module = new WebAssembly.Module(Uint8Array.from(atob("${bytes.toString("base64")}"), (c) => c.charCodeAt(0)));`,
+          "const { exports } = new WebAssembly.Instance(module);",
+          ...names.map((name) => `export const ${name} = exports.${name};`),
+        ].join("\n");
+      },
+    },
+  });
+  ```
 
 **Which modules are sent:**
 
@@ -585,16 +632,18 @@ const filter = [
 - **Output:** a compiling handler returns `moduleType: "js"`, and later handlers see it. If no handler changed a module, it loads as if unmatched. Output still typed as `ts` is left to the runtime's type stripping, like an untransformed file (on miniflare, the host strips it), so a code-only plugin doesn't need a compiler before it. Output still typed as `jsx`/`tsx` fails to load.
 - **Other file types:** a handler that turns another file type (`yaml`) into code without returning a `moduleType` makes it `js`. JSON stays JSON while it parses as JSON, and is served as a JSON module: with `with { type: "json" }` (or `require()`) where the runtime expects one, else as an ES module with the value as default export and its top-level keys as named exports.
 - **Source maps are not composed:** the first returned `map` is appended inline, and a second one drops both (with a warning, once per pair of plugins). Code-only results keep the current map, so keep such changes line-preserving.
-- **Errors** from a handler fail the import of that module in the worker (and the worker's startup for the entry's imports).
+- **Errors** from a handler fail the import of that module in the worker, as the error message (with its position and frame). At startup, the runner closes with it as the cause (`waitForReady()` rejects, and `RunnerManager.onClose()` listeners get it). On `reloadModule()`, the reload rejects with it and the previous entry keeps serving. On miniflare, a named import of the failing module can fail to link first, so the error is also logged on the host.
+- **Order with virtual modules and other hooks:** virtual modules come first. An import of a `data.virtual` key never reaches `resolveId` hooks (virtual modules are transformed on the host before they are sent), and a path a `resolveId` hook returns that is a virtual key loads that virtual module. On Node.js and Deno, a `module.registerHooks()` call in the entry registers hooks that run before env-runner's, for imports after it (hooks registered later run first; their `nextResolve()`/`nextLoad()` reach env-runner's). On Bun, env-runner's callbacks run before those of a `Bun.plugin()` in the entry, which only get what env-runner's leave. On miniflare, the order is virtual modules, `resolveId` hooks, resolution on the host, `fallback` hooks, `transformRequest`, then `load` and `transform` hooks.
+- **Cost:** each module sent is one blocking round trip. Measured on an app of 400 small modules (Node.js 24, Bun 1.4, Deno 2.9, one desktop machine): about 50 µs per module with `NodeWorkerEnvRunner`, and 150 to 330 µs per module with the process runners, which also pay a fixed 10 to 30 ms at startup. A `resolveId` hook costs about the same per import it matches. A plugin whose filters match no module still runs the load hook for every module: about 20 µs per module with `NodeWorkerEnvRunner`, 50 µs on Bun and 115 µs on Deno. Nothing is cached on the host: `reloadModule()` sends only the entry again, since the runtime keeps its imports cached.
 - **Don't wait on the same runner** in a handler (`runner.fetch()`, `rpc()`, ...): its worker is blocked until the handler returns. A transform taking over 10 seconds logs a warning in the worker.
 
 How it works:
 
-- **Transport:** module loader hooks are synchronous, so the worker blocks until the runner replies. `NodeWorkerEnvRunner` (and the Vercel and Netlify runners) pass the worker a `MessagePort`. The process runners listen on a local socket (a unix socket in a private temporary directory, or a named pipe on Windows), which a helper thread in the worker connects to. If the runner goes away, a pending load throws instead of hanging.
+- **Transport:** module loader hooks are synchronous, so the worker blocks until the runner replies. `NodeWorkerEnvRunner` (and the Vercel and Netlify runners) pass the worker a `MessagePort`. The process runners listen on a local socket (a unix socket in a private temporary directory, or a named pipe on Windows), which a helper thread in the worker connects to. CI runs the `NodeProcessEnvRunner` plugin tests on Windows, over the named pipe; Bun and Deno plugins on Windows are untested. If the runner goes away, a pending load throws instead of hanging.
 - **Node.js** and **Deno**: a `module.registerHooks` load hook. The output is ESM or CommonJS: by the package `"type"` when Node.js reports it, else `.mts`/`.cts`, else CommonJS only for output with CommonJS markers (`require()`, `module.exports`) and no ESM syntax. Deno evaluates hook output as plain ESM, so it gets TypeScript stripped and CommonJS wrapped as an ES module. Deno reads `require()`d files from disk, untransformed, and untouched CommonJS files load natively (CommonJS `.ts`/`.js` there needs `--unstable-detect-cjs` in the runner's `execArgv`). With that flag, Deno skips load hooks for `.ts` files in packages without `"type": "module"`, so plugins don't see them: add `"type": "module"` to that `package.json`, or use `.mts`.
-- **Node.js** and **Deno** resolve imports with a `module.registerHooks` resolve hook, which sees every import.
+- **Node.js** and **Deno** resolve imports with a `module.registerHooks` resolve hook, which sees every import. `fallback` hooks get an import when the default resolution throws, or (Deno) resolves to a path without a file.
 - **Bun**: a `Bun.plugin()` `onLoad` with one filter RegExp built from the plugins' `moduleType` filters (implied extensions) and `id` filters (globs match either path separator; on Windows, `id` RegExps are left to the per-module check), not from filter expressions. Bun evaluates plugin output as ESM and can't decline a load, so CommonJS is wrapped as an ES module, also in files the RegExp covers but no plugin matches. `.cjs`/`.cts` never reach it. Other file types are sent while their import is resolved, so a file no plugin changes still loads with Bun's own loader (`.txt`, `.toml`, a path for unknown extensions). Virtual modules are registered first, so a virtual key overriding a file wins, like on Node.js.
-- **Bun imports** go through `onResolve`, which Bun only calls for some specifiers. Bare specifiers without an extension (`~icons/home`, `@/utils`) never reach it, while `@/utils.ts` does. A `scheme:rest` specifier only reaches the callbacks of its scheme, so the runner adds one for each scheme its `resolveId` filters start with (`/^virtual:/`, `"virtual:*"`).
+- **Bun imports** go through `onResolve`, which Bun only calls for some specifiers. Bare specifiers without an extension (`~icons/home`, `@/utils`) never reach it, while `@/utils.ts` does. A `scheme:rest` specifier only reaches the callbacks of its scheme, so the runner adds one for each scheme its `resolveId` filters start with (`/^virtual:/`, `"virtual:*"`). `onResolve` runs before Bun resolves, so for `fallback` hooks the runner asks `Bun.resolveSync()` first.
 - **Miniflare**: no worker round trip. Imports workerd can't resolve itself, and disk modules, go through the plugins in the module fallback service. Modules that `transformRequest` returns code for are served as is. A plugin error is logged on the host and thrown from the failing module. A persistent instance runs the plugins of the runner currently using it.
 - **Virtual modules** are transformed on the host before they are sent, also on `updateVirtualModules()`/`invalidateModule()` (a source that fails to transform rejects the update and changes nothing). This makes JSX work on every runner (e.g. `#entry.tsx`, or `{ source, format: "tsx" }`). The output stays in its format's module system.
 - `reloadModule()` sends the entry again; already-imported modules stay cached.

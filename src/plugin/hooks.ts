@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { init as initEsmLexer, parse as parseEsm } from "es-module-lexer";
@@ -98,9 +98,14 @@ export async function registerPluginHooks(
   // Paths `resolveId` hooks returned (Node.js/Deno).
   const pluginResolved = new Set<string>();
   const resolvePrefilters = config.resolvePrefilters ?? [];
-  const resolvePrefilter = createPrefilter(resolvePrefilters);
-  const resolves = (source: string) =>
-    resolvePrefilters.length > 0 && resolvePrefilter(normalizeFilterId(source), "js", true);
+  // Hooks before the runtime resolves an import, and for failures (`fallback`).
+  const resolveTest = (fallback: boolean) => {
+    const prefilters = resolvePrefilters.filter((prefilter) => !prefilter.fallback === !fallback);
+    const test = createPrefilter(prefilters);
+    return (source: string) => prefilters.length > 0 && test(normalizeFilterId(source), "js", true);
+  };
+  const resolves = resolveTest(false);
+  const resolvesFailed = resolveTest(true);
   const entryId = entry && (entry.startsWith("file:") ? _urlPath(entry) : stripQuery(entry));
   const client = createTransformClient(config);
   await initEsmLexer;
@@ -152,13 +157,17 @@ export async function registerPluginHooks(
           // A reload's cache-busting param stays out of the plugins' view, and
           // goes back on the result.
           const source = stripInternalQuery(raw);
-          if (resolves(source)) {
+          const ask = (fallback: boolean) => {
             const isEntry = entryId !== undefined && stripQuery(source) === entryId;
-            const importer = isEntry ? undefined : _importerId(context.parentURL);
-            const resolved = client.resolve(source, importer, {
-              isEntry,
-              attributes: context.importAttributes as Record<string, string> | undefined,
-            });
+            const resolved = client.resolve(
+              source,
+              isEntry ? undefined : _importerId(context.parentURL),
+              {
+                isEntry,
+                attributes: context.importAttributes as Record<string, string> | undefined,
+                fallback,
+              },
+            );
             if (resolved && !resolved.external) {
               if (_idPath(resolved.id)) {
                 pluginResolved.add(stripQuery(resolved.id));
@@ -171,12 +180,41 @@ export async function registerPluginHooks(
                 raw,
               );
             }
+            return resolved;
+          };
+          const before = resolves(source) ? ask(false) : undefined;
+          if (before && "url" in before) {
+            return before;
           }
           // Plugin ids aren't hierarchical: their imports resolve from cwd.
-          if (context.parentURL?.startsWith(PLUGIN_SCHEME)) {
-            return nextResolve(specifier, { ...context, parentURL: cwdURL });
+          const parent = context.parentURL?.startsWith(PLUGIN_SCHEME)
+            ? { ...context, parentURL: cwdURL }
+            : context;
+          if (!resolvesFailed(source)) {
+            return nextResolve(specifier, parent);
           }
-          return nextResolve(specifier, context);
+          let result: ReturnType<typeof nextResolve> | undefined;
+          let failure: unknown;
+          try {
+            result = nextResolve(specifier, parent);
+          } catch (error) {
+            failure = error;
+          }
+          // Deno resolves paths without a file (loading them fails).
+          if (result && !(result.url.startsWith("file:") && !existsSync(_urlPath(result.url)))) {
+            return result;
+          }
+          const resolved = ask(true);
+          if (resolved && "url" in resolved) {
+            return resolved;
+          }
+          if (resolved) {
+            return nextResolve(specifier, parent);
+          }
+          if (failure !== undefined) {
+            throw failure;
+          }
+          return result!;
         },
       }),
       load(url, context, nextLoad) {
@@ -242,18 +280,22 @@ export async function registerPluginHooks(
     const onResolve =
       (namespace?: string) =>
       ({ path, importer }: BunResolveArgs) => {
-        if (_active !== served || (!namespace && importer === "")) {
+        if (_bunResolving || _active !== served || (!namespace && importer === "")) {
           return undefined;
         }
         const raw = namespace ? `${namespace}:${path}` : path;
         const source = stripInternalQuery(raw);
-        if (!resolves(source)) {
+        const before = resolves(source);
+        if (!before && !resolvesFailed(source)) {
           return undefined;
         }
         const isEntry = entryId !== undefined && stripQuery(source) === entryId;
-        const resolved = client.resolve(source, isEntry ? undefined : _bunImporterId(importer), {
-          isEntry,
-        });
+        const importerId = isEntry ? undefined : _bunImporterId(importer);
+        let resolved = before ? client.resolve(source, importerId, { isEntry }) : undefined;
+        // `onResolve` runs before Bun resolves: ask Bun first.
+        if (!resolved && resolvesFailed(source) && !_bunResolves(raw, importer)) {
+          resolved = client.resolve(source, importerId, { isEntry, fallback: true });
+        }
         if (!resolved || (resolved.external && resolved.id === source)) {
           return undefined;
         }
@@ -331,6 +373,27 @@ export async function registerPluginHooks(
     "[env-runner] `plugins` requires `module.registerHooks` (Node.js >= 22.15 / Deno >= 2.8) or `Bun.plugin`; skipping.",
   );
   return _noop;
+}
+
+// Set while `_bunResolves()` runs: `Bun.resolveSync()` calls the plugins'
+// `onResolve` callbacks again.
+let _bunResolving = false;
+
+// Whether Bun resolves a specifier from `importer` (a path, or a plugin id).
+function _bunResolves(specifier: string, importer: string): boolean {
+  const from = stripQuery(importer);
+  _bunResolving = true;
+  try {
+    (globalThis as any).Bun.resolveSync(
+      stripQuery(specifier),
+      isAbsolute(from) ? dirname(from) : process.cwd(),
+    );
+    return true;
+  } catch {
+    return false;
+  } finally {
+    _bunResolving = false;
+  }
 }
 
 // Whether a resolved id is a file path (else a plugin id, like `\0virtual:foo`).

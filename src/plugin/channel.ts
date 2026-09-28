@@ -22,8 +22,9 @@ import type { PluginPipeline, PluginResolvedId } from "./pipeline.ts";
 //
 // Messages (`{ id, error }` on failure; the socket carries them as
 // newline-delimited JSON):
-// - `{ id, type: "resolve", source, importer?, isEntry, attributes? }` →
-//   `{ id, resolved? }` (none: the runtime resolves it).
+// - `{ id, type: "resolve", source, importer?, isEntry, attributes?, fallback? }`
+//   → `{ id, resolved? }` (none: the runtime resolves it, or, with
+//   `fallback`, fails as it did).
 // - `{ id, type: "load", path, virtual? }` → `{ id, code?, moduleType? }` (no
 //   `code`: load the file as usual). The runner reads the file itself (the
 //   path without its query);
@@ -37,6 +38,8 @@ export type TransformRequest =
       importer?: string;
       isEntry: boolean;
       attributes?: Record<string, string>;
+      /** The runtime failed to resolve it: the `fallback` hooks. */
+      fallback?: boolean;
     }
   | {
       id: number;
@@ -203,7 +206,7 @@ export interface TransformClient {
   resolve(
     source: string,
     importer: string | undefined,
-    options: { isEntry: boolean; attributes?: Record<string, string> },
+    options: { isEntry: boolean; attributes?: Record<string, string>; fallback?: boolean },
   ): PluginResolvedId | undefined;
   /**
    * The module from the `load` and `transform` hooks, `undefined` when no

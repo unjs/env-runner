@@ -1,5 +1,7 @@
+import { isBuiltin } from "node:module";
 import { isAbsolute } from "node:path";
 import { pathToFileURL } from "node:url";
+import { resolveModulePath } from "exsolve";
 import { virtualModuleFormat } from "../virtual-loader.ts";
 import type { ResolvedVirtualModule } from "../virtual-loader.ts";
 import {
@@ -9,6 +11,7 @@ import {
   createPrefilter,
   moduleTypeOf,
   normalizeFilterId,
+  queryOf,
   requiredMatch,
   satisfiesMatch,
   stripQuery,
@@ -99,8 +102,19 @@ export interface PluginTransformMeta {
   moduleType: PluginModuleType;
 }
 
-/** A message for {@link PluginContext}: a string, or a log object. */
-export type PluginLog = string | { message: string };
+/**
+ * A message for {@link PluginContext}: a string, or a log object. A log's
+ * `loc` (1-based line, 0-based column) or `pos` (an offset) is used when no
+ * position is given, and its `frame` is shown below the message.
+ */
+export type PluginLog =
+  | string
+  | {
+      message: string;
+      loc?: { line: number; column: number; file?: string };
+      pos?: number;
+      frame?: string;
+    };
 
 /** An offset in the code, or a 1-based line and 0-based column. */
 export type PluginLogPosition = number | { line: number; column: number };
@@ -116,8 +130,25 @@ export interface PluginContext {
   info(log: PluginLog, pos?: PluginLogPosition): void;
   /** Ignored (debug messages aren't shown). */
   debug(log: PluginLog, pos?: PluginLogPosition): void;
-  /** Throw an error (an `Error` or log object given is kept as its `cause`). */
+  /**
+   * Throw an error (an `Error` or log object given is kept as its `cause`).
+   * Errors a handler throws are reported the same way, with their `loc`,
+   * `pos` and `frame`.
+   */
   error(log: PluginLog, pos?: PluginLogPosition): never;
+  /**
+   * Resolve an import like the runner would, on the host: the `resolveId`
+   * hooks (with `skipSelf`, the default, without the calling plugin's), then
+   * Node.js ESM resolution from `importer` (or the working directory) with
+   * the runner's export conditions: a file path, a builtin (`external`), or
+   * `null` when it doesn't resolve. No extensions or directory indexes are
+   * tried, as in Node.js.
+   */
+  resolve(
+    source: string,
+    importer?: string,
+    options?: PluginContextResolveOptions,
+  ): Promise<PluginResolvedId | null>;
   /** Ignored: the runner doesn't watch files (nothing is ever returned). */
   addWatchFile(id: string): void;
   /** Always empty (see `addWatchFile`). */
@@ -154,6 +185,18 @@ export type PluginTransformResult =
     }
   | null
   | undefined;
+
+/** Options of {@link PluginContext.resolve}. */
+export interface PluginContextResolveOptions {
+  /**
+   * Skip the calling plugin's `resolveId` hook, also when other plugins call
+   * `this.resolve()` with the same source and importer meanwhile (default
+   * `true`; only for calls from `resolveId`).
+   */
+  skipSelf?: boolean;
+  isEntry?: boolean;
+  attributes?: Record<string, string>;
+}
 
 /** Passed to `resolveId` handlers. */
 export interface PluginResolveIdOptions {
@@ -255,10 +298,25 @@ export interface EnvRunnerPlugin {
    * applies on top of that.
    */
   enforce?: "pre" | "post";
-  resolveId?: PluginHook<PluginResolveIdHandler, PluginHookFilter>;
+  resolveId?: PluginResolveIdHook;
   load?: PluginHook<PluginLoadHandler, PluginHookFilter>;
   transform?: PluginHook<PluginTransformHandler, PluginTransformFilter>;
 }
+
+/**
+ * A `resolveId` hook. With `fallback: true`, it only runs for imports the
+ * runtime fails to resolve (the worker tries first, so imports it resolves
+ * take no round trip), after the other `resolveId` hooks, which run before
+ * the runtime.
+ */
+export type PluginResolveIdHook =
+  | PluginResolveIdHandler
+  | {
+      order?: "pre" | "post" | null;
+      filter?: PluginHookFilter | PluginTopLevelFilterExpression[];
+      fallback?: boolean;
+      handler: PluginResolveIdHandler;
+    };
 
 /** `plugins` option entries: nested arrays are flattened, falsy ones skipped. */
 export type EnvRunnerPluginOption =
@@ -280,12 +338,19 @@ export interface PluginTransformOutput {
   moduleType: "js" | "ts" | "json";
 }
 
+/** Options of {@link PluginPipeline.resolveId}. */
+export interface PluginResolveIdCallOptions extends Partial<PluginResolveIdOptions> {
+  /** Run the `fallback` hooks: the runtime failed to resolve the import. */
+  fallback?: boolean;
+}
+
 /** Result of {@link PluginPipeline.resolveId}. */
-export interface PluginResolvedId {
+// A type (not an interface): `resolveId` handlers can return it as it is.
+export type PluginResolvedId = {
   id: string;
   /** Leave the import (as `id`) to the runtime. */
   external: boolean;
-}
+};
 
 /** The `plugins` option of a runner, ready to run on the host. */
 export interface PluginPipeline {
@@ -304,16 +369,20 @@ export interface PluginPipeline {
    * `moduleType` (virtual modules) is given.
    */
   filter(id: string, moduleType?: PluginModuleType, resolved?: boolean): boolean;
-  /** Whether some `resolveId` filter matches an import specifier. */
-  resolveFilter(source: string): boolean;
   /**
-   * Run the `resolveId` hooks: the first result, or `undefined` when none
-   * resolved it (the runtime resolves it). Rejects with their errors.
+   * Whether some `resolveId` filter matches an import specifier (`fallback`:
+   * of the hooks for imports the runtime can't resolve).
+   */
+  resolveFilter(source: string, fallback?: boolean): boolean;
+  /**
+   * Run the `resolveId` hooks (`fallback`: those for imports the runtime
+   * failed to resolve): the first result, or `undefined` when none resolved
+   * it (the runtime resolves it, or fails). Rejects with their errors.
    */
   resolveId(
     source: string,
     importer?: string,
-    options?: Partial<PluginResolveIdOptions>,
+    options?: PluginResolveIdCallOptions,
   ): Promise<PluginResolvedId | undefined>;
   /**
    * Run the `load` hooks, then the `transform` hooks on the loaded code. When
@@ -345,6 +414,8 @@ interface NormalizedHook<Handler> {
   name: string;
   order: "pre" | "normal" | "post";
   prefilter: SerializedPrefilter;
+  /** A `resolveId` hook for imports the runtime can't resolve. */
+  fallback?: boolean;
   /**
    * The full filter (code-aware for `transform`), see {@link PrefilterMatch}
    * (`resolved`: see {@link PrefilterTest}).
@@ -356,6 +427,13 @@ interface NormalizedHook<Handler> {
     resolved?: boolean,
   ): PrefilterMatch;
   handler: Handler;
+}
+
+// A `resolveId` hook `this.resolve()` skips (see `skipSelf`).
+interface ResolveSkip {
+  hook: NormalizedHook<unknown>;
+  source: string;
+  importer: string | undefined;
 }
 
 interface NormalizedPlugin {
@@ -375,7 +453,12 @@ const KNOWN_MODULE_TYPES: readonly string[] = ["js", "jsx", "ts", "tsx", "json"]
  */
 export function createPluginPipeline(
   plugins: EnvRunnerPluginOption[] | undefined,
+  options: {
+    /** Export conditions of `this.resolve()` without a plugin result (Node.js's by default). */
+    resolveConditions?: () => string[] | undefined;
+  } = {},
 ): PluginPipeline | undefined {
+  const { resolveConditions } = options;
   if (plugins == null) {
     return undefined;
   }
@@ -408,8 +491,13 @@ export function createPluginPipeline(
     [plugin.load, plugin.transform].flatMap((hook) => (hook ? [hook.prefilter] : [])),
   );
   const resolvePrefilters = resolveHooks.map((hook) => hook.prefilter);
+  const fallbackPrefilter = createPrefilter(
+    resolvePrefilters.filter((prefilter) => prefilter.fallback),
+  );
   const prefilter = createPrefilter(prefilters);
-  const resolvePrefilter = createPrefilter(resolvePrefilters);
+  const resolvePrefilter = createPrefilter(
+    resolvePrefilters.filter((prefilter) => !prefilter.fallback),
+  );
 
   const filter = (id: string, moduleType?: PluginModuleType, resolved?: boolean) => {
     const matchId = normalizeFilterId(id);
@@ -420,10 +508,42 @@ export function createPluginPipeline(
     );
   };
 
-  const resolveId = async (
+  // `this.resolve()` of a handler (`caller`: a `resolveId` hook, skipped with
+  // `skipSelf`, also in nested calls for the same source and importer).
+  const contextResolve =
+    (caller: NormalizedHook<unknown> | undefined, skip: readonly ResolveSkip[]) =>
+    async (
+      source: string,
+      importer?: string,
+      options: PluginContextResolveOptions = {},
+    ): Promise<PluginResolvedId | null> => {
+      if (typeof source !== "string") {
+        throw new TypeError(
+          `[env-runner] \`this.resolve()\` needs a string (got ${_describe(source)}).`,
+        );
+      }
+      const skipping =
+        caller && options.skipSelf !== false ? [...skip, { hook: caller, source, importer }] : skip;
+      const skipped = new Set(
+        skipping
+          .filter((entry) => entry.source === source && entry.importer === importer)
+          .map((entry) => entry.hook),
+      );
+      const { skipSelf: _, ...rest } = options;
+      return (
+        (await _resolveId(source, importer, rest, skipped, skipping)) ??
+        _resolveLikeRuntime(source, importer, resolveConditions?.()) ??
+        (await _resolveId(source, importer, { ...rest, fallback: true }, skipped, skipping)) ??
+        null
+      );
+    };
+
+  const _resolveId = async (
     source: string,
-    importer?: string,
-    options?: Partial<PluginResolveIdOptions>,
+    importer: string | undefined,
+    options: PluginResolveIdCallOptions | undefined,
+    skipped: ReadonlySet<NormalizedHook<unknown>>,
+    skip: readonly ResolveSkip[],
   ): Promise<PluginResolvedId | undefined> => {
     const matchId = normalizeFilterId(source);
     const extra: PluginResolveIdOptions = {
@@ -432,11 +552,16 @@ export function createPluginPipeline(
     };
     for (const hook of resolveHooks) {
       // The `node_modules` rule is for modules, not specifiers.
-      if (!hook.match(matchId, "js", undefined, true)) {
+      if (
+        Boolean(hook.fallback) !== Boolean(options?.fallback) ||
+        skipped.has(hook) ||
+        !hook.match(matchId, "js", undefined, true)
+      ) {
         continue;
       }
-      const result = await _callHook(hook.name, `failed to resolve "${source}"`, () =>
-        hook.handler.call(_createContext(hook.name, source, ""), source, importer, extra),
+      const context = _createContext(hook.name, source, "", contextResolve(hook, skip));
+      const result = await _callHook(hook.name, "failed to resolve", source, "", () =>
+        hook.handler.call(context, source, importer, extra),
       );
       if (result == null) {
         continue;
@@ -455,6 +580,12 @@ export function createPluginPipeline(
     return undefined;
   };
 
+  const resolveId = (
+    source: string,
+    importer?: string,
+    options?: PluginResolveIdCallOptions,
+  ): Promise<PluginResolvedId | undefined> => _resolveId(source, importer, options, new Set(), []);
+
   const load = async (id: string, read?: () => string, options?: { resolved?: boolean }) => {
     const matchId = normalizeFilterId(id);
     let moduleType = moduleTypeOf(id);
@@ -466,8 +597,8 @@ export function createPluginPipeline(
       if (!satisfiesMatch(hook.match(matchId, moduleType, undefined, resolved), required)) {
         continue;
       }
-      const result = await _callHook(hook.name, `failed to load "${id}"`, () =>
-        hook.handler.call(_createContext(hook.name, id, ""), id),
+      const result = await _callHook(hook.name, "failed to load", id, "", () =>
+        hook.handler.call(_createContext(hook.name, id, "", contextResolve(undefined, [])), id),
       );
       if (result == null) {
         continue;
@@ -519,8 +650,13 @@ export function createPluginPipeline(
       if (!satisfiesMatch(match, requiredMatch(moduleType))) {
         continue;
       }
-      const result = await _callHook(hook.name, `failed on "${id}"`, () =>
-        hook.handler.call(_createContext(hook.name, id, code), code, id, { moduleType }),
+      const result = await _callHook(hook.name, "failed on", id, code, () =>
+        hook.handler.call(
+          _createContext(hook.name, id, code, contextResolve(undefined, [])),
+          code,
+          id,
+          { moduleType },
+        ),
       );
       const next = typeof result === "string" ? result : (result?.code ?? code);
       if (typeof next !== "string") {
@@ -587,23 +723,67 @@ export function createPluginPipeline(
     prefilters,
     resolvePrefilters,
     filter,
-    resolveFilter: (source) => resolvePrefilter(normalizeFilterId(source), "js", true),
+    resolveFilter: (source, fallback) =>
+      (fallback ? fallbackPrefilter : resolvePrefilter)(normalizeFilterId(source), "js", true),
     resolveId,
     load,
     transform,
   };
 }
 
-// Run a handler; errors name the plugin (`this.error()` messages already do).
-async function _callHook<T>(name: string, what: string, call: () => T | Promise<T>): Promise<T> {
+// `this.resolve()` without a plugin result: Node.js ESM resolution on the host.
+function _resolveLikeRuntime(
+  source: string,
+  importer: string | undefined,
+  conditions: string[] | undefined,
+): PluginResolvedId | null {
+  if (isBuiltin(source)) {
+    return { id: source, external: true };
+  }
+  const from =
+    importer && isAbsolute(stripQuery(importer)) ? stripQuery(importer) : `${process.cwd()}/`;
+  const path = resolveModulePath(stripQuery(source), { from, conditions, try: true, cache: false });
+  return path ? { id: path + queryOf(source), external: false } : null;
+}
+
+// Run a handler; errors name the plugin and id (`this.error()` messages
+// already do), with the position (`id:line:column`) and code frame of
+// errors with a `loc`, `pos` or `frame`, in `code`.
+async function _callHook<T>(
+  name: string,
+  what: string,
+  id: string,
+  code: string,
+  call: () => T | Promise<T>,
+): Promise<T> {
   try {
     return await call();
   } catch (error: any) {
     const message = error?.message || String(error);
-    throw message.startsWith("[env-runner]")
-      ? error
-      : new Error(`[env-runner] plugin "${name}" ${what}: ${message}`, { cause: error });
+    if (message.startsWith("[env-runner]")) {
+      throw error;
+    }
+    const at = `${id}${_formatPosition(code, _logPosition(error))}`;
+    throw new Error(`[env-runner] plugin "${name}" ${what} "${at}": ${message}${_frame(error)}`, {
+      cause: error,
+    });
   }
+}
+
+// Position of a log or error: `loc` (1-based line, 0-based
+// column), else a `pos` offset.
+function _logPosition(log: unknown): PluginLogPosition | undefined {
+  const { loc, pos } = (log ?? {}) as { loc?: { line?: unknown; column?: unknown }; pos?: unknown };
+  if (typeof loc?.line === "number" && typeof loc.column === "number") {
+    return { line: loc.line, column: loc.column };
+  }
+  return typeof pos === "number" ? pos : undefined;
+}
+
+// A log's code frame, on lines of its own.
+function _frame(log: unknown): string {
+  const frame = (log as { frame?: unknown } | null)?.frame;
+  return typeof frame === "string" && frame.trim() ? `\n\n${frame.replace(/\n+$/, "")}` : "";
 }
 
 // Initial module type of each virtual module code format.
@@ -700,13 +880,28 @@ function _normalizeHook(
   };
   let order: NormalizedHook<unknown>["order"] = "normal";
   let filter: unknown;
+  let fallback = false;
   let handler: (...args: any[]) => unknown;
   if (typeof hook === "function") {
     handler = hook as typeof handler;
   } else if (hook && typeof hook === "object" && typeof (hook as any).handler === "function") {
-    const object = hook as { order?: unknown; filter?: unknown; handler: typeof handler };
+    const object = hook as {
+      order?: unknown;
+      filter?: unknown;
+      fallback?: unknown;
+      handler: typeof handler;
+    };
     if (object.order != null && object.order !== "pre" && object.order !== "post") {
       return fail(`has an invalid \`${kind}.order\` (${JSON.stringify(object.order)})`);
+    }
+    if (object.fallback != null && object.fallback !== false) {
+      if (kind !== "resolveId") {
+        return fail(`has a \`${kind}.fallback\` (only \`resolveId\` hooks take one)`);
+      }
+      if (object.fallback !== true) {
+        return fail(`has an invalid \`${kind}.fallback\` (${_describe(object.fallback)})`);
+      }
+      fallback = true;
     }
     order = (object.order as "pre" | "post" | undefined) ?? "normal";
     filter = object.filter;
@@ -716,16 +911,19 @@ function _normalizeHook(
   }
   // `load` filters can't name module types: a matching `id` include does.
   const load = kind === "load" ? { load: true as const } : {};
+  // Sent with the prefilter: the worker asks only when resolving failed.
+  const flags = { ...load, ...(fallback && { fallback: true as const }) };
 
   if (Array.isArray(filter)) {
     const expr = _normalizeExpressions(filter, kind, failFilter);
     const test = compileFilterExpressions(expr);
-    const prefilter: SerializedPrefilter = { expr, ...load };
+    const prefilter: SerializedPrefilter = { expr, ...flags };
     const level = compilePrefilter(prefilter);
     return {
       name,
       order,
       prefilter,
+      fallback,
       // Without code (prefilter), a `code` expression may match.
       match: (id, moduleType, code, resolved) =>
         test(id, moduleType, code) !== false && level(id, moduleType, resolved, code),
@@ -771,12 +969,13 @@ function _normalizeHook(
       _matchCode,
     );
   const moduleTypes = _moduleTypes(moduleTypeValue, failFilter);
-  const prefilter: SerializedPrefilter = { id, moduleTypes, ...load };
+  const prefilter: SerializedPrefilter = { id, moduleTypes, ...flags };
   const level = compilePrefilter(prefilter);
   return {
     name,
     order,
     prefilter,
+    fallback,
     match: (idValue, moduleType, codeValue, resolved) =>
       (codeValue === undefined || !code || code.test(codeValue)) &&
       level(idValue, moduleType, resolved),
@@ -968,9 +1167,17 @@ function _describe(value: unknown): string {
   return typeof value === "string" ? JSON.stringify(value) : String(value);
 }
 
-function _createContext(name: string, id: string, code: string): PluginContext {
+function _createContext(
+  name: string,
+  id: string,
+  code: string,
+  resolve: PluginContext["resolve"],
+): PluginContext {
+  // A log object's own position (`loc`, `pos`) and `frame` count too.
   const format = (log: PluginLog, pos?: PluginLogPosition) =>
-    `[env-runner] plugin "${name}" (${id}${_formatPosition(code, pos)}): ${typeof log === "string" ? log : log?.message}`;
+    typeof log === "string"
+      ? `[env-runner] plugin "${name}" (${id}${_formatPosition(code, pos)}): ${log}`
+      : `[env-runner] plugin "${name}" (${id}${_formatPosition(code, pos ?? _logPosition(log))}): ${log?.message}${_frame(log)}`;
   return {
     warn: (log, pos) => console.warn(format(log, pos)),
     info: (log, pos) => console.info(format(log, pos)),
@@ -978,6 +1185,7 @@ function _createContext(name: string, id: string, code: string): PluginContext {
     error: (log, pos) => {
       throw new Error(format(log, pos), typeof log === "string" ? undefined : { cause: log });
     },
+    resolve,
     addWatchFile: () => {},
     getWatchFiles: () => [],
     meta: { watchMode: false },

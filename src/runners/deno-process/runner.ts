@@ -48,6 +48,10 @@ export class DenoProcessEnvRunner extends BaseEnvRunner {
     return "process";
   }
 
+  protected override _resolveConditions() {
+    return ["deno", "node", "import"];
+  }
+
   protected async _closeRuntime() {
     if (!this.#process) {
       return;

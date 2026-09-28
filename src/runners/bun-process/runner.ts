@@ -92,6 +92,10 @@ export class BunProcessEnvRunner extends BaseEnvRunner {
     return "process";
   }
 
+  protected override _resolveConditions() {
+    return ["bun", "node", "import"];
+  }
+
   protected async _closeRuntime() {
     if (!this.#process) {
       return;

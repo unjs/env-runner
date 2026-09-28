@@ -14,13 +14,19 @@ import { resolve, dirname, join } from "node:path";
 import { describe, expect, it, afterEach, vi } from "vitest";
 import { transformSync } from "oxc-transform";
 
-import type { EnvRunner, EnvRunnerPlugin, PluginTransformHandler } from "../src/index.ts";
+import type {
+  EnvRunner,
+  EnvRunnerPlugin,
+  PluginContext,
+  PluginTransformHandler,
+} from "../src/index.ts";
 import { NodeWorkerEnvRunner } from "../src/runners/node-worker/runner.ts";
 import { NodeProcessEnvRunner } from "../src/runners/node-process/runner.ts";
 import { BunProcessEnvRunner } from "../src/runners/bun-process/runner.ts";
 import { DenoProcessEnvRunner } from "../src/runners/deno-process/runner.ts";
 import { SelfEnvRunner } from "../src/runners/self/runner.ts";
 import { EnvServer } from "../src/server.ts";
+import { RunnerManager } from "../src/manager.ts";
 import * as miniflare from "miniflare";
 import { MiniflareEnvRunner } from "../src/runners/miniflare/runner.ts";
 import { createPluginPipeline, transformVirtualModules } from "../src/plugin/pipeline.ts";
@@ -181,6 +187,32 @@ function queries(seen: [string, string][]): EnvRunnerPlugin[] {
       },
     },
   ];
+}
+
+// `.wasm` as an ES module instantiating it, with its exports as named
+// exports. The bytes are inlined, or (`native`, for workerd, which can't
+// compile bytes) the file is imported as a compiled module (`?module`, which
+// the filter leaves out).
+function wasm(options: { native?: boolean } = {}): EnvRunnerPlugin {
+  return {
+    name: "wasm",
+    load: {
+      filter: { id: /\.wasm$/ },
+      handler(id) {
+        const bytes = readFileSync(id);
+        const names = WebAssembly.Module.exports(new WebAssembly.Module(bytes)).map(
+          (entry) => entry.name,
+        );
+        return [
+          options.native
+            ? `import module from ${JSON.stringify(`${id}?module`)};`
+            : `const module = new WebAssembly.Module(Uint8Array.from(atob(${JSON.stringify(bytes.toString("base64"))}), (c) => c.charCodeAt(0)));`,
+          "const { exports } = new WebAssembly.Instance(module);",
+          ...names.map((name) => `export const ${name} = exports.${name};`),
+        ].join("\n");
+      },
+    },
+  };
 }
 
 const runners = [
@@ -349,7 +381,7 @@ for (const { name, create, skip, cjsOptions } of runners) {
       expect(await res.json()).toEqual({ ...expected, children: ["Ok", "hey from tsx"] });
     });
 
-    it("sends node_modules files only to filters naming them, or paths `resolveId` returned", async () => {
+    it("sends node_modules files only to filters naming them (with `code`), or paths `resolveId` returned", async () => {
       const dir = mkdtempSync(join(tmpdir(), "env-runner-plugins-"));
       const write = (path: string, code: string) => {
         mkdirSync(dirname(join(dir, path)), { recursive: true });
@@ -358,12 +390,20 @@ for (const { name, create, skip, cjsOptions } of runners) {
       for (const pkg of ["named", "other", "resolved"]) {
         write(`node_modules/${pkg}/index.mjs`, 'export const value = "__V__";');
       }
+      // `import.meta` replaced in a package's runtime files only.
+      const meta = 'export const dev = import.meta.dev ?? "unset";';
+      write("node_modules/nitro/dist/runtime/meta.mjs", meta);
+      write("node_modules/nitro/dist/other/meta.mjs", meta);
       write(
         "app.mjs",
         `import { value as named } from "./node_modules/named/index.mjs";
         import { value as other } from "./node_modules/other/index.mjs";
         import { value as resolved } from "#resolved.mjs";
-        export default { fetch: () => Response.json({ named, other, resolved }) };`,
+        import { dev as runtimeDev } from "./node_modules/nitro/dist/runtime/meta.mjs";
+        import { dev as otherDev } from "./node_modules/nitro/dist/other/meta.mjs";
+        export default {
+          fetch: () => Response.json({ named, other, resolved, runtimeDev, otherDev }),
+        };`,
       );
       runner = create({
         name: "plugins-node-modules",
@@ -384,13 +424,26 @@ for (const { name, create, skip, cjsOptions } of runners) {
           },
           // Unfiltered: only gets the resolved path.
           { name: "any", transform: (code: string) => code.replace("__V__", "any") },
+          {
+            name: "import-meta",
+            transform: {
+              filter: { id: "**/node_modules/nitro/dist/runtime/**", code: "import.meta." },
+              handler: (code: string) => code.replaceAll("import.meta.dev", "true"),
+            },
+          },
         ],
         data: { entry: join(dir, "app.mjs") },
       });
       try {
         await runner.waitForReady();
         const res = await runner.fetch("http://localhost/");
-        expect(await res.json()).toEqual({ named: "named", other: "__V__", resolved: "any" });
+        expect(await res.json()).toEqual({
+          named: "named",
+          other: "__V__",
+          resolved: "any",
+          runtimeDev: true,
+          otherDev: "unset",
+        });
       } finally {
         rmSync(dir, { recursive: true, force: true });
       }
@@ -531,6 +584,69 @@ for (const { name, create, skip, cjsOptions } of runners) {
       await runner.waitForReady();
       const res = await runner.fetch("http://localhost/");
       expect(await res.json()).toEqual(["cts", "virtual"]);
+    });
+
+    it("serves a virtual path key without a file that `resolveId` resolved to", async () => {
+      // No file on disk: only the virtual module (transformed on the host).
+      const key = fixture("virtual-key/value.mjs");
+      runner = create({
+        name: "plugins-virtual-key",
+        plugins: [
+          {
+            name: "alias",
+            resolveId: {
+              filter: { id: /^#virtual-key\// },
+              handler: (source: string) => fixture(`virtual-key/${source.slice(13)}`),
+            },
+          },
+          greeting(),
+        ],
+        data: {
+          entry: fixture("app-virtual-key.ts"),
+          virtual: { [key]: `export default __GREETING__;` },
+        },
+      });
+      await runner.waitForReady();
+      const res = await runner.fetch("http://localhost/");
+      expect(await res.text()).toBe("hi");
+    });
+
+    it("resolves only imports the runtime can't with `fallback` hooks", async () => {
+      const seen: string[] = [];
+      runner = create({
+        name: "plugins-fallback",
+        plugins: [
+          {
+            name: "extensionless",
+            resolveId: {
+              fallback: true,
+              filter: { id: /^\.\.?\// },
+              handler(source: string, importer: string | undefined) {
+                seen.push(source);
+                const path = join(dirname(importer!), `${source}.mjs`);
+                return existsSync(path) ? path : null;
+              },
+            },
+          },
+        ],
+        data: { entry: fixture("app-fallback.mjs") },
+      });
+      await runner.waitForReady();
+      const res = await runner.fetch("http://localhost/");
+      expect(await res.json()).toEqual(["utils", "native"]);
+      // Bun resolves extensionless imports itself.
+      expect(seen).toEqual(name === "BunProcessEnvRunner" ? [] : ["./fallback/utils"]);
+    });
+
+    it("loads `.wasm` as an ES module wrapper from a `load` hook", async () => {
+      runner = create({
+        name: "plugins-wasm",
+        plugins: [wasm({ native: miniflareRunner })],
+        data: { entry: fixture("app-wasm.ts") },
+      });
+      await runner.waitForReady();
+      const res = await runner.fetch("http://localhost/");
+      expect(await res.text()).toBe("5");
     });
 
     // `vendor/plain.ts` would become "hi" if the greeting plugin ran on it.
@@ -1204,6 +1320,68 @@ describe("plugin filters", () => {
     ).toMatchObject({ sent: false });
   });
 
+  it("keeps the position and code frame of errors (`loc`, `pos`, `frame`)", async () => {
+    const frame = "1: a\n2: b\n   ^";
+    const pipeline = createPluginPipeline([
+      {
+        name: "parse",
+        transform: {
+          filter: { id: /thrown/ },
+          handler() {
+            throw Object.assign(new SyntaxError("Unexpected token"), {
+              loc: { line: 2, column: 0, file: "/a.js" },
+              frame: `${frame}\n`,
+            });
+          },
+        },
+      },
+      {
+        name: "log",
+        transform: {
+          filter: { id: /logged/ },
+          handler(code) {
+            this.error({ message: "bad", pos: code.indexOf("b") });
+          },
+        },
+      },
+    ])!;
+    await expect(pipeline.transform("/thrown.js", "a\nb")).rejects.toThrow(
+      `[env-runner] plugin "parse" failed on "/thrown.js:2:0": Unexpected token\n\n${frame}`,
+    );
+    await expect(pipeline.transform("/logged.js", "a\nb")).rejects.toThrow(
+      /^\[env-runner\] plugin "log" \(\/logged\.js:2:0\): bad$/,
+    );
+  });
+
+  it("reports plugin errors to `RunnerManager.onClose`, with their position", async () => {
+    const manager = new RunnerManager();
+    const closed = new Promise<unknown>((resolve) =>
+      manager.onClose((_runner, cause) => resolve(cause)),
+    );
+    const runner = new NodeWorkerEnvRunner({
+      name: "plugins-manager-error",
+      plugins: [
+        {
+          name: "failing",
+          transform: {
+            filter: { id: /dep\.ts$/ },
+            handler(code) {
+              this.error("no dep here", code.indexOf("export"));
+            },
+          },
+        },
+        oxc(),
+      ],
+      data: { entry: fixture("app.tsx") },
+    });
+    await manager.reload(runner).catch(() => {});
+    const cause: any = await closed;
+    expect(String(cause?.message ?? cause)).toMatch(
+      /\[env-runner\] plugin "failing" \(.*dep\.ts:\d+:\d+\): no dep here/,
+    );
+    await manager.close();
+  });
+
   it("gives handlers `this.info`/`this.debug` and log positions", async () => {
     const info = vi.spyOn(console, "info").mockImplementation(() => {});
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -1303,6 +1481,180 @@ describe("plugin `resolveId`/`load` hooks", () => {
     ])!;
     await expect(failing.resolveId("x")).rejects.toThrow(
       '[env-runner] plugin "failing" failed to resolve "x": nope',
+    );
+  });
+
+  it("resolves with `this.resolve()`: other plugins, then like the runtime", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "env-runner-plugins-"));
+    const write = (path: string, code: string) => {
+      mkdirSync(dirname(join(dir, path)), { recursive: true });
+      writeFileSync(join(dir, path), code);
+    };
+    write("src/a.mjs", "");
+    write("src/utils.ts", "");
+    write(
+      "node_modules/pkg/package.json",
+      JSON.stringify({ exports: { workerd: "./workerd.mjs", default: "./node.mjs" } }),
+    );
+    write("node_modules/pkg/node.mjs", "");
+    write("node_modules/pkg/workerd.mjs", "");
+    const importer = join(dir, "src/a.mjs");
+    try {
+      const calls: string[] = [];
+      let resolve!: PluginContext["resolve"];
+      const pipeline = createPluginPipeline([
+        {
+          // Wraps what the others resolve (skipping itself by default).
+          name: "wrap",
+          resolveId: {
+            filter: { id: /^#/ },
+            async handler(source, importer) {
+              calls.push(`wrap:${source}`);
+              const resolved = await this.resolve(source, importer);
+              return resolved && { id: `${resolved.id}?wrapped`, external: resolved.external };
+            },
+          },
+        },
+        {
+          // Asks again for the same import: the first plugin stays skipped.
+          name: "alias",
+          resolveId: {
+            filter: { id: /^#/ },
+            async handler(source, importer) {
+              calls.push(`alias:${source}`);
+              return source === "#utils"
+                ? await this.resolve("./utils.ts", importer)
+                : ((await this.resolve(source, importer)) ?? join(dir, "src/a.mjs"));
+            },
+          },
+        },
+        {
+          transform(code) {
+            resolve = this.resolve;
+            return code;
+          },
+        },
+      ])!;
+      expect(await pipeline.resolveId("#utils", importer)).toEqual({
+        id: `${join(dir, "src/utils.ts")}?wrapped`,
+        external: false,
+      });
+      expect(await pipeline.resolveId("#other", importer)).toEqual({
+        id: `${importer}?wrapped`,
+        external: false,
+      });
+      expect(calls).toEqual(["wrap:#utils", "alias:#utils", "wrap:#other", "alias:#other"]);
+
+      // From other hooks: every `resolveId` hook, then like the runtime.
+      await pipeline.transform(importer, "x");
+      expect(await resolve("#utils", importer)).toEqual({
+        id: `${join(dir, "src/utils.ts")}?wrapped`,
+        external: false,
+      });
+      expect(await resolve("./utils.ts?raw", importer)).toEqual({
+        id: `${join(dir, "src/utils.ts")}?raw`,
+        external: false,
+      });
+      // No extensions or indexes, as in Node.js; builtins are external.
+      expect(await resolve("./utils", importer)).toBeNull();
+      expect(await resolve("./missing.ts", importer)).toBeNull();
+      expect(await resolve("node:fs")).toEqual({ id: "node:fs", external: true });
+      expect(await resolve("pkg", importer)).toEqual({
+        id: join(dir, "node_modules/pkg/node.mjs"),
+        external: false,
+      });
+      // The runner's export conditions.
+      const workerd = createPluginPipeline(
+        [
+          {
+            transform(code) {
+              resolve = this.resolve;
+              return code;
+            },
+          },
+        ],
+        { resolveConditions: () => ["workerd", "worker"] },
+      )!;
+      await workerd.transform(importer, "x");
+      expect(await resolve("pkg", importer)).toEqual({
+        id: join(dir, "node_modules/pkg/workerd.mjs"),
+        external: false,
+      });
+      // Without `skipSelf`, a plugin sees its own call.
+      let depth = 0;
+      const self = createPluginPipeline([
+        {
+          resolveId: {
+            filter: { id: /^#/ },
+            async handler(source, importer) {
+              if (depth++ > 0) {
+                return `\0${source}`;
+              }
+              return this.resolve(source, importer, { skipSelf: false });
+            },
+          },
+        },
+      ])!;
+      expect(await self.resolveId("#x")).toEqual({ id: "\0#x", external: false });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("runs `fallback` resolveId hooks only for imports the runtime failed to resolve", async () => {
+    const calls: string[] = [];
+    const hook = (name: string, fallback?: boolean): EnvRunnerPlugin => ({
+      name,
+      resolveId: {
+        fallback,
+        filter: { id: fallback ? /^\./ : /^#/ },
+        handler(source) {
+          calls.push(`${name}:${source}`);
+          return `/${name}${source.slice(1)}`;
+        },
+      },
+    });
+    const pipeline = createPluginPipeline([hook("late", true), hook("early")])!;
+    // Sent before the runtime resolves, or after it failed.
+    expect(pipeline.resolveFilter("#a")).toBe(true);
+    expect(pipeline.resolveFilter("./a")).toBe(false);
+    expect(pipeline.resolveFilter("./a", true)).toBe(true);
+    expect(pipeline.resolveFilter("#a", true)).toBe(false);
+    expect(JSON.parse(JSON.stringify(pipeline.resolvePrefilters))[0]).toMatchObject({
+      fallback: true,
+    });
+    expect(await pipeline.resolveId("./a")).toBeUndefined();
+    expect(await pipeline.resolveId("./a", undefined, { fallback: true })).toEqual({
+      id: "/late/a",
+      external: false,
+    });
+    expect(calls).toEqual(["late:./a"]);
+    // `this.resolve()`: the other hooks, the runtime, then the `fallback` ones.
+    let resolve!: PluginContext["resolve"];
+    const context = createPluginPipeline([
+      hook("late", true),
+      {
+        transform(code) {
+          resolve = this.resolve;
+          return code;
+        },
+      },
+    ])!;
+    await context.transform("/app/a.ts", "x");
+    expect(await resolve("./missing", "/app/a.ts")).toEqual({
+      id: "/late/missing",
+      external: false,
+    });
+    expect(await resolve(fixture("dep.ts"), "/app/a.ts")).toEqual({
+      id: fixture("dep.ts"),
+      external: false,
+    });
+    const create = (hook: unknown) => () => createPluginPipeline([hook as EnvRunnerPlugin]);
+    expect(create({ transform: { fallback: true, handler() {} } })).toThrow(
+      /`transform\.fallback` \(only `resolveId` hooks take one\)/,
+    );
+    expect(create({ resolveId: { fallback: 1, handler() {} } })).toThrow(
+      /invalid `resolveId\.fallback` \(1\)/,
     );
   });
 

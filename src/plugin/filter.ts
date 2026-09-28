@@ -47,6 +47,8 @@ export interface SerializedPrefilter {
    * ({@link PrefilterMatch}).
    */
   load?: true;
+  /** A `resolveId` hook for imports the runtime fails to resolve. */
+  fallback?: true;
 }
 
 /**
