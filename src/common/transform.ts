@@ -3,6 +3,7 @@ import { isAbsolute } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { init as initEsmLexer, parse as parseEsm } from "es-module-lexer";
 import { resolveRuntimeDep, resolveSpecifier } from "./runtime-deps.ts";
+import { virtualModuleFormat } from "../virtual-loader.ts";
 import { normalizeTransformer } from "./transform-plugin.ts";
 import type {
   NormalizedTransformer,
@@ -133,8 +134,10 @@ export interface Transformer {
   exclude: string[];
   /** Whether a path (or virtual key) is transformed. Queries are ignored. */
   filter(id: string): boolean;
+  /** `include`/`exclude` only (no extension check), for formats known otherwise. */
+  matchesPath(id: string): boolean;
   /** Transform matched code to JS; throws on oxc errors. */
-  transform(id: string, code: string): string;
+  transform(id: string, code: string, moduleType?: TransformModuleType): string;
 }
 
 const DEFAULT_EXTENSIONS = [".ts", ".mts", ".cts", ".tsx", ".jsx"];
@@ -198,7 +201,9 @@ export async function loadTransformer(
     : undefined;
   const sourcemap = opts.sourcemap ?? true;
 
-  let oxcTransform: ((id: string, code: string) => OxcTransformResult) | undefined;
+  let oxcTransform:
+    | ((id: string, code: string, lang: TransformModuleType) => OxcTransformResult)
+    | undefined;
   if (opts.oxc !== false) {
     const oxc = await resolveRuntimeDep<OxcTransformModule>({
       name: "oxc-transform",
@@ -212,7 +217,8 @@ export async function loadTransformer(
       ...(typeof opts.oxc === "object" ? opts.oxc : undefined),
       sourcemap,
     };
-    oxcTransform = (id, code) => oxc!.transformSync(id, code, oxcOptions);
+    // `lang` covers ids without a telling extension (virtual keys by format).
+    oxcTransform = (id, code, lang) => oxc!.transformSync(id, code, { ...oxcOptions, lang });
   }
 
   const transformers: NormalizedTransformer[] = [];
@@ -231,19 +237,19 @@ export async function loadTransformer(
     transformers.filter((transformer) => transformer.order === order);
   const [pre, normal, post] = [byOrder("pre"), byOrder("normal"), byOrder("post")];
 
+  const matchesPath = (id: string) => {
+    const path = _stripQuery(id).replaceAll("\\", "/");
+    return !exclude.some((part) => path.includes(part)) && (!include || include.test(path));
+  };
   const filter = (id: string) => {
     const path = _stripQuery(id).replaceAll("\\", "/");
-    return (
-      extensions.some((ext) => path.endsWith(ext)) &&
-      !exclude.some((part) => path.includes(part)) &&
-      (!include || include.test(path))
-    );
+    return extensions.some((ext) => path.endsWith(ext)) && matchesPath(path);
   };
 
-  const transform = (id: string, code: string) => {
+  const transform = (id: string, code: string, sourceType?: TransformModuleType) => {
     id = _stripQuery(id);
     const matchId = id.replaceAll("\\", "/");
-    let moduleType = _moduleType(id);
+    let moduleType = sourceType ?? _moduleType(id);
     // Maps aren't composed: the first map is kept, a second one would be
     // relative to already-mapped code, so both are dropped. Code-only steps
     // keep the current map (they should preserve lines).
@@ -280,7 +286,7 @@ export async function loadTransformer(
 
     run(pre);
     if (oxcTransform) {
-      const result = oxcTransform(id, code);
+      const result = oxcTransform(id, code, moduleType);
       const errors = result.errors.filter((error) => error.severity === "Error");
       if (errors.length > 0) {
         throw new SyntaxError(
@@ -302,7 +308,46 @@ export async function loadTransformer(
     return code;
   };
 
-  return { extensions, include, exclude, filter, transform };
+  return { extensions, include, exclude, filter, matchesPath, transform };
+}
+
+// `data.transform` source language of each virtual module code format.
+const VIRTUAL_MODULE_TYPES: Partial<Record<string, TransformModuleType>> = {
+  module: "js",
+  commonjs: "js",
+  "module-typescript": "ts",
+  "commonjs-typescript": "ts",
+  jsx: "jsx",
+  tsx: "tsx",
+};
+
+/**
+ * Transform a matching virtual module (resolved `data.virtual` entry) to plain
+ * JS in its format's module system: virtual `.ts`/`.tsx` stay ESM, like
+ * untransformed ones. A key without a matching extension qualifies by a
+ * TypeScript/JSX format (oxc gets its `lang`). Others are returned as is.
+ */
+export function transformVirtualModule<
+  T extends string | { source: string | Uint8Array; format: string },
+>(
+  transformer: Transformer,
+  key: string,
+  module: T,
+): T | { source: string; format: "module" | "commonjs" } {
+  const format = virtualModuleFormat(key, module as any);
+  const moduleType = VIRTUAL_MODULE_TYPES[format];
+  if (
+    !moduleType ||
+    !transformer.matchesPath(key) ||
+    !(moduleType !== "js" || transformer.filter(key))
+  ) {
+    return module;
+  }
+  const source = typeof module === "string" ? module : (module.source as string);
+  return {
+    source: transformer.transform(key, source, moduleType),
+    format: format.startsWith("commonjs") ? "commonjs" : "module",
+  };
 }
 
 let _active: Transformer | undefined;

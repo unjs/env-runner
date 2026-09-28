@@ -13,8 +13,12 @@ export type {
 
 export {
   type EnvRunnerData,
+  type VirtualModule,
+  type VirtualModuleContent,
+  type VirtualModuleFormat,
   type VirtualModules,
   type VirtualModuleSource,
+  type VirtualModuleUpdates,
   type TransformOptions,
   type OxcTransformOptions,
   type OxcJsxOptions,

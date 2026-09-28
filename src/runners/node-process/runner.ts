@@ -6,7 +6,6 @@ import { fileURLToPath } from "node:url";
 import { fork } from "node:child_process";
 
 import { BaseEnvRunner } from "../../common/base-runner.ts";
-import { hostEnv } from "../../common/host-env.ts";
 import type { EnvRunnerData } from "../../common/base-runner.ts";
 
 export type { EnvRunnerData as ProcessEnvRunnerData } from "../../common/base-runner.ts";
@@ -67,10 +66,7 @@ export class NodeProcessEnvRunner extends BaseEnvRunner {
     }
 
     const child = fork(this._workerEntry, [], {
-      env: hostEnv({
-        ENV_RUNNER_NAME: this._name,
-        ENV_RUNNER_DATA: JSON.stringify(this._data || {}),
-      }),
+      env: this._processEnv(),
       stdio: ["pipe", "pipe", "pipe", "ipc"],
       execArgv: execArgv || [],
     }) as ChildProcess & { _exitCode?: number | null };
@@ -86,7 +82,7 @@ export class NodeProcessEnvRunner extends BaseEnvRunner {
     });
 
     child.on("message", (message: any) => {
-      this._handleMessage(message);
+      this._handleProcessMessage(message);
     });
 
     child.stdout?.pipe(process.stdout);

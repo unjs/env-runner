@@ -6,23 +6,24 @@ import {
   resolveEntry,
   reloadEntryModule,
   parseServerAddress,
-  isVirtualSpecifier,
+  isVirtualEntry,
   toServerOptions,
+  formatInitError,
   registerWorkerHooks,
   type AppEntry,
 } from "../../common/worker-utils.ts";
-import { handleInvalidateModule } from "../../common/virtual-modules.ts";
+import { handleUpdateVirtualModules } from "../../common/virtual-modules.ts";
 
 const data = workerData || {};
 const sendMessage = (message: unknown) => parentPort?.postMessage(message);
-const virtualEntry = isVirtualSpecifier(data.entry, data.virtual);
 
 let unregisterHooks: () => void;
 let entry: AppEntry;
 let server: Server;
 try {
   unregisterHooks = await registerWorkerHooks(data);
-  entry = await resolveEntry(data.entry, virtualEntry);
+  // After registering: entry detection follows the live registrations.
+  entry = await resolveEntry(data.entry, isVirtualEntry(data.entry));
   // The entry's own srvx options are forwarded, so `serve()` can throw on a
   // bad option — keep it inside the init-error path for an actionable message.
   server = serve({
@@ -34,7 +35,7 @@ try {
 } catch (error: any) {
   // Report a structured error before exiting so the runner closes with a
   // meaningful cause instead of an uncaught rejection + bare exit code.
-  const message = error?.message || String(error);
+  const message = formatInitError(error);
   sendMessage({ event: "init-error", error: message });
   console.error(`[env-runner] worker init failed: ${message}`);
   process.exit(1);
@@ -67,7 +68,7 @@ parentPort?.on("message", async (message) => {
 
   if (message?.event === "reload-module") {
     try {
-      entry = await reloadEntryModule(data.entry, entry, sendMessage, virtualEntry);
+      entry = await reloadEntryModule(data.entry, entry, sendMessage, isVirtualEntry(data.entry));
       parentPort?.postMessage({ event: "module-reloaded" });
     } catch (error: any) {
       parentPort?.postMessage({ event: "module-reloaded", error: error?.message || String(error) });
@@ -75,8 +76,8 @@ parentPort?.on("message", async (message) => {
     return;
   }
 
-  if (message?.event === "invalidate-module") {
-    handleInvalidateModule(message, sendMessage);
+  if (message?.event === "update-virtual-modules") {
+    handleUpdateVirtualModules(message, sendMessage);
     return;
   }
 

@@ -52,8 +52,14 @@ Source transforms (TypeScript beyond erasable syntax, JSX, custom) for the entry
   - The RegExp is built inside the worker because RegExps aren't serializable.
   - Plugins can't be removed; unregister only detaches the active transformer.
 - `_active` is set only after a backend registered, so reload never takes the transform path without a hook behind it.
-- **Invalidation**: `handleInvalidateModule()` catches transform errors and acks with `error`, so the worker survives and keeps the previous source. Bun validates the transform eagerly on invalidation, since it otherwise transforms lazily on load. `_bunTransformed` caches the output per specifier, keyed by the exact source, so validation, the next load and reload re-registrations share one transform. It is cleared when the Bun registration is replaced or removed.
-- **Virtual modules**: `registerVirtualModules(virtual, transformer)` transforms matching keys at registration and on invalidation (via `transformSource`) and forces the `module` format for them. On Bun, the `build.module` callback transforms lazily. Miniflare's `#prepareVirtualSource` transforms instead of type-stripping.
+- **Virtual modules**: `transformVirtualModule()` runs before each backend's own preparation.
+  - Workers: `_prepareVirtualModules()` in `virtual-modules.ts`, with the transformer set by `registerWorkerHooks()` through `setVirtualModulesTransformer()`.
+  - Miniflare: `#prepareVirtualModule()`.
+
+  So it applies at registration and to every update/invalidation, all eager on every backend (Bun included), and a transform error goes through the existing paths: it fails registration (`init-error`) or rejects the update before anything changes.
+  - A module qualifies when its key passes `filter()`, or when it passes `matchesPath()` (`include`/`exclude` only) and its format is TypeScript/JSX (`module-typescript`, `commonjs-typescript`, `jsx`, `tsx`). oxc then gets `lang` from the format.
+  - The output is `{ source, format }` with `format` `commonjs` for `commonjs*`, else `module`. It follows virtual-module rules (no syntax detection; `.ts` is always ESM). The backend preparers then handle it like any JS module: Node natively, Deno/Bun wrapping CommonJS, miniflare as `esModule`/`commonJsModule`.
+
 - **Miniflare**: host-side in `unsafeModuleFallbackService`, after `transformRequest`. Transformed code goes through the same ESM/CommonJS split as raw files, with CommonJS behind `createCjsEsmShim`; `transformedFormat()` decides for transformed code, the existing regex for raw files.
   - Transform errors are `console.error`ed on the host and served as a module that throws the message. The host log matters because a named import of it fails at link time first, and a 500 from the fallback would only surface as "module not found". v4 `modulesRules` include the transform extensions. `data.transform` is part of the persistent cache key.
 - **Self**: unsupported (hooks would affect the host process); warns and ignores.
@@ -81,13 +87,13 @@ Further fixtures:
 - `mapped.mjs` is a transformer returning its own map.
 - `greeting-plugin.mjs` is a rolldown-like object: `pre` order, with a glob `id` filter and a `code` filter.
 - `order-*.mjs` and `async.mjs` exercise ordering and the async error.
-- `count.mjs` counts its runs; it asserts an invalidated virtual source is transformed once (Bun previously transformed it twice).
+- `count.mjs` counts its runs; it asserts an invalidated virtual source is transformed once.
 
 Cases:
 
 - disk entry
 - reload after editing a temp copy
-- virtual `.tsx`/`.ts`
+- virtual `.tsx`/`.ts`, and an extensionless key with `format: "tsx"`
 - a transform error closing the runner (virtual source, since invalid syntax on disk breaks `tsc`)
 - invalidation with a failing transform (rejects, worker survives)
 - CommonJS `.ts` + `.cts` (not Bun; Deno passes `--unstable-detect-cjs`)

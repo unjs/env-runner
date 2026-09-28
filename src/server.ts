@@ -1,6 +1,7 @@
 import { type FSWatcher, watch as watchFile } from "node:fs";
 import type { EnvRunner, WorkerHooks } from "./types.ts";
 import type { RunnerName } from "./loader.ts";
+import type { VirtualModules, VirtualModuleUpdates } from "./virtual-loader.ts";
 
 import { loadRunner } from "./loader.ts";
 import { RunnerManager } from "./manager.ts";
@@ -32,6 +33,8 @@ export class EnvServer extends RunnerManager {
   private _reloadTimeout: ReturnType<typeof setTimeout> | undefined;
   private _reloadListeners = new Set<() => void>();
   private _startPromise: Promise<this> | undefined;
+  // `data.virtual` with updates applied (own copy, once updated).
+  private _virtual: VirtualModules | undefined;
 
   runner: Awaited<ReturnType<typeof loadRunner>> | null = null;
 
@@ -68,6 +71,30 @@ export class EnvServer extends RunnerManager {
     await super.reload(this.runner);
   }
 
+  /**
+   * Also kept in the server's own map, so runners it creates later (`reload()`,
+   * watch mode) start with the changes. Without an active runner (before the
+   * first start), the changes are only recorded.
+   */
+  override async updateVirtualModules(
+    changes: VirtualModuleUpdates,
+    timeout?: number,
+  ): Promise<void> {
+    const virtual = (this._virtual ??= {
+      ...(this._opts.data?.virtual as VirtualModules | undefined),
+    });
+    for (const [key, source] of Object.entries(changes)) {
+      if (source === null) {
+        delete virtual[key];
+      } else if (source !== undefined) {
+        virtual[key] = source;
+      }
+    }
+    if (await this._waitForRunner()) {
+      await super.updateVirtualModules(changes, timeout);
+    }
+  }
+
   override async close() {
     this._stopWatching();
     await super.close();
@@ -99,7 +126,11 @@ export class EnvServer extends RunnerManager {
       ...this._opts.runnerOptions,
       name: this._opts.name || this._opts.entry,
       hooks: this._opts.hooks,
-      data: { ...this._opts.data, entry: this._opts.entry },
+      data: {
+        ...this._opts.data,
+        ...(this._virtual && { virtual: { ...this._virtual } }),
+        entry: this._opts.entry,
+      },
       execArgv: this._opts.execArgv,
     });
   }

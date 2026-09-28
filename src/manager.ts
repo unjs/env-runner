@@ -6,6 +6,7 @@ import type {
   UpgradeHandler,
   WorkerAddress,
 } from "./types.ts";
+import type { VirtualModuleUpdates } from "./virtual-loader.ts";
 
 import { createRunnerWSProxyPlugin } from "./common/ws-proxy.ts";
 
@@ -193,12 +194,26 @@ export class RunnerManager implements EnvRunner, AsyncDisposable {
     this._moduleInvalidated = false;
   }
 
+  /**
+   * Set or remove (`null`) virtual modules of the active runner (waiting for it
+   * during a reload); the next `fetch()` reloads the entry automatically.
+   */
+  async updateVirtualModules(changes: VirtualModuleUpdates, timeout?: number): Promise<void> {
+    const runner = await this._waitForRunner();
+    if (!runner?.updateVirtualModules) {
+      throw new Error("Active runner does not support updateVirtualModules()");
+    }
+    await runner.updateVirtualModules(changes, timeout);
+    this._moduleInvalidated = true;
+  }
+
   /** Invalidate a virtual module; the next `fetch()` reloads the entry automatically. */
   async invalidateModule(specifier: string, timeout?: number): Promise<void> {
-    if (!this._runner?.invalidateModule) {
+    const runner = await this._waitForRunner();
+    if (!runner?.invalidateModule) {
       throw new Error("Active runner does not support invalidateModule()");
     }
-    await this._runner.invalidateModule(specifier, timeout);
+    await runner.invalidateModule(specifier, timeout);
     this._moduleInvalidated = true;
   }
 
@@ -262,13 +277,15 @@ export class RunnerManager implements EnvRunner, AsyncDisposable {
       runner.onMessage(listener);
     }
 
-    // Wrap close() to detect when runner exits (works with BaseEnvRunner)
-    const originalClose = runner.close.bind(runner);
-    runner.close = async () => {
-      await originalClose();
+    // Wrap close() to detect when runner exits (works with BaseEnvRunner). Runners
+    // close themselves via this wrapper, so forward the cause (`hooks.onClose`,
+    // `waitForReady()` rejections).
+    const originalClose = runner.close.bind(runner) as (cause?: unknown) => Promise<void>;
+    runner.close = async (cause?: unknown) => {
+      await originalClose(cause);
       if (this._runner === runner) {
         this._runner = undefined;
-        for (const fn of this._closeListeners) fn(this);
+        for (const fn of this._closeListeners) fn(this, cause);
       }
     };
 
@@ -288,7 +305,8 @@ export class RunnerManager implements EnvRunner, AsyncDisposable {
     }
   }
 
-  private _waitForRunner(timeout = 3000): Promise<EnvRunner | undefined> {
+  /** The active runner, waiting for one during a reload. */
+  protected _waitForRunner(timeout = 3000): Promise<EnvRunner | undefined> {
     if (this._runner) {
       return Promise.resolve(this._runner);
     }

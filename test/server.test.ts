@@ -86,4 +86,34 @@ describe("EnvServer", () => {
     await server.invalidateModule("#config.json");
     expect(await (await server.fetch("http://localhost/")).text()).toBe("1");
   });
+
+  describe("updateVirtualModules", () => {
+    const virtual = {
+      "#entry": `import value from "#value";
+        export default { fetch: () => new Response(value) };`,
+      "#value": `export default "initial";`,
+    };
+
+    it("reloads on the next fetch, and starts later runners with the changes", async () => {
+      server = new EnvServer({ entry: "#entry", data: { virtual } });
+      expect(await (await server.fetch("http://localhost/")).text()).toBe("initial");
+
+      await server.updateVirtualModules({ "#value": `export default "updated";` });
+      expect(await (await server.fetch("http://localhost/")).text()).toBe("updated");
+
+      // A fresh runner (watch mode, `reload()`) starts from the updated map.
+      const runner = server.runner;
+      await server.reload();
+      expect(server.runner).not.toBe(runner);
+      expect(await (await server.fetch("http://localhost/")).text()).toBe("updated");
+      // The caller's options are left alone.
+      expect(virtual["#value"]).toBe(`export default "initial";`);
+    });
+
+    it("records changes made before the first start", async () => {
+      server = new EnvServer({ entry: "#entry", data: { virtual } });
+      await server.updateVirtualModules({ "#value": `export default "early";` });
+      expect(await (await server.fetch("http://localhost/")).text()).toBe("early");
+    });
+  });
 });

@@ -1,5 +1,6 @@
 import type { IncomingMessage } from "node:http";
 import type { Socket } from "node:net";
+import type { VirtualModuleUpdates } from "./virtual-loader.ts";
 
 /** Proxy a request to the worker; relative inputs resolve against `http://localhost`. */
 export type FetchHandler = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
@@ -79,6 +80,13 @@ export interface EnvRunner extends RunnerRPCHooks, AsyncDisposable {
 
   /** Re-import the entry module without restarting the worker/process. */
   reloadModule?(timeout?: number): Promise<void>;
+
+  /**
+   * Set (add or replace) and remove (`null`) virtual modules in one round trip.
+   * Changed and removed modules, and their importers, evaluate fresh on the
+   * next `reloadModule()`; a removed key falls through to normal resolution.
+   */
+  updateVirtualModules?(changes: VirtualModuleUpdates, timeout?: number): Promise<void>;
 
   /**
    * Invalidate a virtual module so the next `reloadModule()` re-evaluates it.

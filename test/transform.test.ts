@@ -119,6 +119,29 @@ for (const { name, create, skip, bun, miniflare, cjsOptions } of runners) {
       expect(await res.json()).toEqual({ tag: "b", children: ["dev", "hi"] });
     });
 
+    it("transforms a virtual module by its TypeScript/JSX format (no extension)", async () => {
+      runner = create({
+        name: "transform-virtual-format",
+        data: {
+          entry: "#entry",
+          transform,
+          virtual: {
+            "#entry": `import view from "#view";
+              export default { fetch: () => Response.json(view) };`,
+            "#view": {
+              source: `enum Tag { B = "b" }
+                const h = (tag: string, _props: unknown, ...children: unknown[]) => ({ tag, children });
+                export default <b>{Tag.B}</b>;`,
+              format: "tsx",
+            },
+          },
+        },
+      });
+      await runner.waitForReady();
+      const res = await runner.fetch("http://localhost/");
+      expect(await res.json()).toEqual({ tag: "b", children: ["b"] });
+    });
+
     it("closes with the transform error", async () => {
       runner = create({
         name: "transform-error",
