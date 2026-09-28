@@ -1,6 +1,6 @@
 import type { WorkerHooks } from "../../types.ts";
 
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -9,8 +9,16 @@ import { init as initCjsLexer, parse as parseCjs } from "cjs-module-lexer";
 import { init as initEsmLexer, parse as parseEsm } from "es-module-lexer";
 import { proxyUpgrade } from "httpxy";
 import { BaseEnvRunner } from "../../common/base-runner.ts";
-import type { EnvRunnerData } from "../../common/base-runner.ts";
+import type { EnvRunnerData, EnvRunnerPluginOption } from "../../common/base-runner.ts";
 import { resolveRuntimeDep } from "../../common/runtime-deps.ts";
+import {
+  queryOf,
+  restoreInternalQuery,
+  stripInternalQuery,
+  stripQuery,
+} from "../../plugin/filter.ts";
+import { jsonModuleCode, transformedFormat } from "../../plugin/hooks.ts";
+import type { PluginTransformOutput } from "../../plugin/pipeline.ts";
 import type { RuntimeDep } from "../../common/runtime-deps.ts";
 import {
   encodeVirtualModules,
@@ -56,6 +64,8 @@ export interface MiniflareEnvRunnerOptions {
   name: string;
   hooks?: WorkerHooks;
   data?: EnvRunnerData;
+  /** Host-side transform plugins (see `EnvRunnerPluginOption`). */
+  plugins?: EnvRunnerPluginOption[];
   /**
    * The `miniflare` package (`import * as miniflare from "miniflare"`) or a
    * specifier resolved from cwd. Omitted: imported optionally.
@@ -362,6 +372,10 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
     return "miniflare";
   }
 
+  protected override _resolveConditions() {
+    return this.#exportConditions;
+  }
+
   protected async _closeRuntime() {
     if (!this.#miniflare) {
       return;
@@ -633,18 +647,19 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
         },
       };
 
-      // When transformRequest is provided, add module rules so miniflare's
-      // ModuleLocator doesn't reject non-JS extensions (e.g. .ts, .tsx, .jsx).
-      // v5 has no ModuleLocator (and rejects `modulesRules`): imports all go
-      // through the fallback service.
+      // When transformRequest or `plugins` is provided, add module rules
+      // so miniflare's ModuleLocator doesn't reject non-JS extensions (e.g. .ts,
+      // .tsx, .jsx). v5 has no ModuleLocator (and rejects `modulesRules`):
+      // imports all go through the fallback service.
       if (
-        this.#transformRequest &&
+        (this.#transformRequest || this._plugins) &&
         !options.modulesRules &&
         !miniflare.convertV4MiniflareOptions &&
         !skipLocator
       ) {
+        const extensions = [".ts", ".tsx", ".jsx", ".mts", ...(this._plugins ? [".cts"] : [])];
         options.modulesRules = [
-          { type: "ESModule", include: ["**/*.ts", "**/*.tsx", "**/*.jsx", "**/*.mts"] },
+          { type: "ESModule", include: extensions.map((ext) => `**/*${ext}`) },
         ];
       }
 
@@ -655,6 +670,13 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
         // Read live: updates change it in place.
         const _virtual = virtual;
         const _transformRequest = this.#transformRequest;
+        // The `plugins` run here, on the host (workerd only parses JS).
+        // Read from the live runner: a persistent instance is adopted by later
+        // runners, which bring their own plugins.
+        const _livePlugins = () => ipc.runner._plugins;
+        // Plugin output of CommonJS modules by id, from the shim request until
+        // its `__cjs` request (so they are transformed once).
+        const _cjsOutput = new Map<string, string>();
         const _exportConditions = this.#exportConditions;
         // `modulePath`: the served module's path, which its relative imports join onto.
         const _applyVirtualVersions = (code: string, modulePath: string | undefined) =>
@@ -690,6 +712,46 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
             }
           }
         };
+        // Plugin output as workerd runs it: TypeScript stripped on the host.
+        const _pluginCode = async (id: string, result: PluginTransformOutput) => {
+          if (result.moduleType !== "ts") {
+            return result.code;
+          }
+          const strip = await _getStripTypeScriptTypes();
+          if (typeof strip !== "function") {
+            throw new TypeError(
+              `[env-runner] "${id}" is still TypeScript after its plugins, which needs \`module.stripTypeScriptTypes\` on the host: upgrade Node.js or compile it in a plugin.`,
+            );
+          }
+          return strip(result.code);
+        };
+        // A module a plugin loaded under an id that isn't a path.
+        const _servePluginModule = async (id: string, result: PluginTransformOutput) => {
+          if (result.moduleType === "json") {
+            return { esModule: jsonModuleCode(id, result.code) };
+          }
+          const code = await _pluginCode(id, result);
+          if (transformedFormat(id, code) === "module") {
+            return { esModule: _applyVirtualVersions(code, undefined) };
+          }
+          return {
+            commonJsModule: code,
+            namedExports: commonJSExports(code).filter((e) => e !== "default"),
+          };
+        };
+        // Ids of served modules that aren't their path (by workerd module
+        // name): plugin ids and files with a query, the importers of their imports.
+        const _pluginModuleIds = new Map<string, string>();
+        // A named import of this module fails at link time before the throw
+        // runs (hiding it), so also report it on the host.
+        const _pluginErrorModule = (name: string, error: any) => {
+          const message = error?.message || String(error);
+          console.error(message);
+          return Response.json({
+            name,
+            esModule: `throw new Error(${JSON.stringify(message)});`,
+          });
+        };
         options.unsafeUseModuleFallbackService = true;
         // Map workerd module names to real filesystem paths for correct
         // relative import resolution from bare-specifier modules.
@@ -707,7 +769,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
           const cleanSpecifier = specifier.split("?")[0] || specifier;
           const cleanRaw = rawSpecifier?.split("?")[0];
 
-          // Virtual modules override real files. Keep the `?t=` query in the name
+          // Virtual modules override real files. Keep the query (a reload's too) in the name
           // so reloads get a fresh workerd module identity.
           const bareSpecifier = cleanSpecifier.startsWith("/")
             ? cleanSpecifier.slice(1)
@@ -754,11 +816,94 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
             });
           }
 
-          let resolvedPath: string;
+          // workerd requires name to match specifier
+          // Preserve query string in name for cache-busting (workerd caches by name)
+          const rawQuery = specifier.includes("?") ? specifier.slice(specifier.indexOf("?")) : "";
+          const name =
+            (cleanSpecifier.startsWith("/") ? cleanSpecifier.slice(1) : cleanSpecifier) + rawQuery;
+
+          // The import's own query, as plugins see it: without a reload's
+          // param, the CommonJS shim's, or a (removed) virtual key's version.
+          const versionedKey = _virtual.versionedKeyOf(cleanRaw || cleanSpecifier, referrerPath);
+          const version =
+            versionedKey === undefined ? undefined : _virtual.versions.get(versionedKey);
+          const query = queryOf(stripInternalQuery(specifier, version));
+
+          let resolvedPath: string | undefined;
+          // Module id when it isn't `resolvedPath` + `query` (a plugin resolved it).
+          let resolvedId: string | undefined;
+          // Returned by a `resolveId` hook (may be under node_modules).
+          let pluginResolved = false;
+
+          // The plugins' `resolveId` hooks, after virtual modules (as in workers),
+          // and the `fallback` ones where resolving it here fails.
+          const _resolvePlugins = _livePlugins();
+          const rawSource = rawSpecifier
+            ? stripInternalQuery(rawSpecifier, version)
+            : bareSpecifier + query;
+          // A path a plugin resolved it to, or its response (a plugin module,
+          // a virtual path key's redirect, an error).
+          const _pluginResolve = async (
+            fallback: boolean,
+          ): Promise<Response | string | undefined> => {
+            if (!_resolvePlugins) {
+              return undefined;
+            }
+            try {
+              const source = rawSource.startsWith("file:")
+                ? fileURLToPath(stripQuery(rawSource)) + queryOf(rawSource)
+                : rawSource;
+              if (!_resolvePlugins.resolveFilter(source, fallback)) {
+                return undefined;
+              }
+              const resolved = await _resolvePlugins.resolveId(
+                source,
+                _pluginModuleIds.get(referrerKey) ?? referrerPath,
+                { fallback },
+              );
+              if (!resolved || resolved.external) {
+                return undefined;
+              }
+              const id = resolved.id;
+              const idPath = stripQuery(id);
+              const pathKey = isAbsolute(idPath) ? _virtual.keyOf(idPath) : undefined;
+              const keyPath = pathKey === undefined ? undefined : virtualKeyPath(pathKey);
+              if (keyPath) {
+                // A virtual path key (maybe without a file): served under
+                // its path, like a `file:` import of it above.
+                const location = restoreInternalQuery(
+                  toWorkerdPath(keyPath) + queryOf(id),
+                  specifier,
+                );
+                return new Response(null, {
+                  status: 301,
+                  headers: { location: Buffer.from(location, "utf8").toString("latin1") },
+                });
+              }
+              if (isAbsolute(idPath)) {
+                resolvedId = id;
+                pluginResolved = true;
+                return idPath;
+              }
+              // Not a file: a `load` hook serves it.
+              const result = (await _resolvePlugins.load(id))!;
+              _pluginModuleIds.set(name, id);
+              return Response.json({ name, ...(await _servePluginModule(id, result)) });
+            } catch (error: any) {
+              return _pluginErrorModule(name, error);
+            }
+          };
+          const pluginPath = await _pluginResolve(false);
+          if (pluginPath instanceof Response) {
+            return pluginPath;
+          }
+          resolvedPath = pluginPath;
 
           // file:// URL specifier — convert to filesystem path
           const fileUrlRaw = cleanRaw || cleanSpecifier;
-          if (fileUrlRaw.startsWith("file://")) {
+          if (resolvedPath !== undefined) {
+            // Resolved by a plugin.
+          } else if (fileUrlRaw.startsWith("file://")) {
             try {
               resolvedPath = fileURLToPath(fileUrlRaw);
             } catch {
@@ -799,11 +944,18 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
                 });
                 resolvedPath = resolved || contextRequire.resolve(cleanRaw);
               } catch {
-                // Return an empty stub for unresolvable bare specifiers (e.g. optional native addons like bufferutil)
-                const name = cleanSpecifier.startsWith("/")
-                  ? cleanSpecifier.slice(1)
-                  : cleanSpecifier;
-                return Response.json({ name, esModule: "export default undefined;" });
+                const failed = await _pluginResolve(true);
+                if (failed instanceof Response) {
+                  return failed;
+                }
+                if (failed === undefined) {
+                  // Return an empty stub for unresolvable bare specifiers (e.g. optional native addons like bufferutil)
+                  const name = cleanSpecifier.startsWith("/")
+                    ? cleanSpecifier.slice(1)
+                    : cleanSpecifier;
+                  return Response.json({ name, esModule: "export default undefined;" });
+                }
+                resolvedPath = failed;
               }
             }
           } else {
@@ -824,16 +976,25 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
               try {
                 resolvedPath = _require.resolve(raw);
               } catch {
-                return new Response(null, { status: 404 });
+                const failed = await _pluginResolve(true);
+                if (failed === undefined) {
+                  return new Response(null, { status: 404 });
+                }
+                if (failed instanceof Response) {
+                  return failed;
+                }
+                resolvedPath = failed;
               }
             }
           }
-
-          // workerd requires name to match specifier
-          // Preserve query string in name for cache-busting (workerd caches by name)
-          const rawQuery = specifier.includes("?") ? specifier.slice(specifier.indexOf("?")) : "";
-          const name =
-            (cleanSpecifier.startsWith("/") ? cleanSpecifier.slice(1) : cleanSpecifier) + rawQuery;
+          // A path without a file: the `fallback` hooks may resolve it.
+          if (!pluginResolved && _resolvePlugins && !existsSync(resolvedPath)) {
+            const failed = await _pluginResolve(true);
+            if (failed instanceof Response) {
+              return failed;
+            }
+            resolvedPath = failed ?? resolvedPath;
+          }
 
           // Try Vite transform pipeline first (TS/JSX → JS, etc.)
           if (_transformRequest) {
@@ -851,33 +1012,89 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
             }
           }
 
+          let contents: string | undefined;
           try {
-            const contents = readFileSync(resolvedPath, "utf8");
-            // Track the real path so relative imports from this module resolve correctly
-            modulePathMap.set(name, resolvedPath);
+            contents = readFileSync(resolvedPath, "utf8");
+          } catch {
+            // Missing: maybe a plugin loads it.
+          }
+          const _plugins = _livePlugins();
+          // The shim's request for the CommonJS module (the param goes last).
+          const cjsRequest = /[?&]__cjs$/.test(specifier);
+          const id = resolvedId ?? resolvedPath + query;
+          const cachedCJS = cjsRequest && _cjsOutput.has(id);
+          const pluginFile = !cachedCJS && _plugins?.filter(id, undefined, pluginResolved);
+          if (contents === undefined && !cachedCJS && !pluginFile) {
+            return new Response(null, { status: 404 });
+          }
+          // Track the real path so relative imports from this module resolve correctly
+          modulePathMap.set(name, resolvedPath);
+          if (id !== resolvedPath) {
+            _pluginModuleIds.set(name, id);
+          }
+
+          let transformed: string | undefined;
+          if (cachedCJS) {
+            transformed = _cjsOutput.get(id);
+            _cjsOutput.delete(id);
+          } else if (pluginFile) {
+            try {
+              const file = resolvedPath;
+              const result = await _plugins!.load(
+                id,
+                () => {
+                  if (contents === undefined) {
+                    throw new Error(`Cannot find module "${file}"`);
+                  }
+                  return contents;
+                },
+                { resolved: pluginResolved },
+              );
+              if (result?.moduleType === "json") {
+                return Response.json({ name, esModule: jsonModuleCode(file, result.code) });
+              }
+              transformed = result && (await _pluginCode(id, result));
+            } catch (error: any) {
+              return _pluginErrorModule(name, error);
+            }
+            if (transformed === undefined && contents === undefined) {
+              return new Response(null, { status: 404 });
+            }
+          }
+          // workerd compiles WebAssembly modules only (never bytes at runtime).
+          if (transformed === undefined && resolvedPath.endsWith(".wasm")) {
+            return Response.json({ name, wasm: Array.from(readFileSync(resolvedPath)) });
+          }
+          let isESM: boolean;
+          if (transformed === undefined) {
+            contents = contents!;
             // Detect module type: .mjs is always ESM, .cjs is always CJS,
             // otherwise check for ESM syntax indicators
-            const isESM =
+            isESM =
               resolvedPath.endsWith(".mjs") ||
               (!resolvedPath.endsWith(".cjs") &&
                 /\b(import\s|import\(|export\s|export\{|import\.meta\b)/.test(contents));
-            if (isESM) {
-              return Response.json({
-                name,
-                esModule: _applyVirtualVersions(contents, resolvedPath),
-              });
-            }
-            // Importers expect ESM: serve raw CJS under a suffixed name behind an ESM shim.
-            const cjsSuffix = "?__cjs";
-            if (specifier.endsWith(cjsSuffix)) {
-              return Response.json({ name, commonJsModule: contents });
-            }
-            const shimSpecifier = "./" + basename(resolvedPath) + cjsSuffix;
-            const esModule = createCjsEsmShim(shimSpecifier, contents);
-            return Response.json({ name, esModule });
-          } catch {
-            return new Response(null, { status: 404 });
+          } else {
+            contents = transformed;
+            isESM = transformedFormat(resolvedPath, contents) === "module";
           }
+          if (isESM) {
+            return Response.json({
+              name,
+              esModule: _applyVirtualVersions(contents, resolvedPath),
+            });
+          }
+          // Importers expect ESM: serve raw CJS under a suffixed name behind an ESM shim.
+          if (cjsRequest) {
+            return Response.json({ name, commonJsModule: contents });
+          }
+          if (transformed !== undefined) {
+            _cjsOutput.set(id, transformed);
+          }
+          const shimSpecifier =
+            "./" + basename(resolvedPath) + (query ? `${query}&` : "?") + "__cjs";
+          const esModule = createCjsEsmShim(shimSpecifier, contents);
+          return Response.json({ name, esModule });
         };
       }
     }
@@ -888,6 +1105,8 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
         ...this.#miniflareOptions,
         _exportConditions: this.#exportConditions,
         _exports: this.#exports,
+        // Plugins are read from the adopting runner, but change the module rules.
+        _plugins: Boolean(this._plugins),
         // The fallback service closure captures the virtual map, so instances
         // are only shareable when the resolved sources are identical (bytes
         // compared as base64, not as JSON objects of indices).

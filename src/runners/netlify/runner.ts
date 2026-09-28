@@ -3,7 +3,7 @@ import type { WorkerHooks } from "../../types.ts";
 import { fileURLToPath } from "node:url";
 import { resolveRuntimeDepSpecifier } from "../../common/runtime-deps.ts";
 
-import type { EnvRunnerData } from "../../common/base-runner.ts";
+import type { EnvRunnerData, EnvRunnerPluginOption } from "../../common/base-runner.ts";
 import { NodeWorkerEnvRunner } from "../node-worker/runner.ts";
 
 export type { EnvRunnerData };
@@ -15,6 +15,8 @@ export interface NetlifyEnvRunnerOptions {
   workerEntry?: string;
   hooks?: WorkerHooks;
   data?: EnvRunnerData;
+  /** Host-side transform plugins (see `EnvRunnerPluginOption`). */
+  plugins?: EnvRunnerPluginOption[];
   /**
    * `@netlify/runtime` specifier (resolved from cwd), imported inside the worker
    * since a module instance can't cross into it. Omitted: imported optionally,

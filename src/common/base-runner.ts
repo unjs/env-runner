@@ -18,6 +18,12 @@ import type {
   VirtualModuleUpdates,
 } from "../virtual-loader.ts";
 import { hostEnv } from "./host-env.ts";
+import { PLUGINS_DATA_KEY } from "../plugin/hooks.ts";
+import type { PluginWorkerData } from "../plugin/hooks.ts";
+import { createPluginPipeline, transformVirtualModules } from "../plugin/pipeline.ts";
+import type { EnvRunnerPluginOption, PluginPipeline } from "../plugin/pipeline.ts";
+import { openTransformPort, openTransformSocket } from "../plugin/channel.ts";
+import type { TransformChannelHost } from "../plugin/channel.ts";
 
 export type {
   VirtualModule,
@@ -27,6 +33,31 @@ export type {
   VirtualModuleSource,
   VirtualModuleUpdates,
 } from "../virtual-loader.ts";
+export type {
+  EnvRunnerPlugin,
+  EnvRunnerPluginOption,
+  PluginContext,
+  PluginContextResolveOptions,
+  PluginFilterExpression,
+  PluginHook,
+  PluginHookFilter,
+  PluginLoadHandler,
+  PluginLoadResult,
+  PluginLog,
+  PluginLogPosition,
+  PluginModuleType,
+  PluginResolveIdHandler,
+  PluginResolveIdHook,
+  PluginResolvedId,
+  PluginResolveIdOptions,
+  PluginResolveIdResult,
+  PluginStringFilter,
+  PluginTopLevelFilterExpression,
+  PluginTransformFilter,
+  PluginTransformHandler,
+  PluginTransformMeta,
+  PluginTransformResult,
+} from "../plugin/pipeline.ts";
 
 export interface EnvRunnerData {
   name?: string;
@@ -63,16 +94,32 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
   #virtualUpdateId = 0;
   // Runner data JSON for process workers, snapshotted at spawn (`_processEnv()`).
   protected _processData?: string;
+  // The `plugins` option, run on the host.
+  protected _plugins?: PluginPipeline;
+  protected _transformChannel?: TransformChannelHost;
 
   constructor(opts: {
     name: string;
     workerEntry: string;
     hooks?: WorkerHooks;
     data?: EnvRunnerData;
+    /**
+     * Plugins whose `resolveId`, `load` and `transform` hooks run on the host
+     * for the imports, disk modules and virtual modules their filters match
+     * (e.g. compiling TypeScript enums and JSX, or serving generated modules).
+     * The worker sends each matching import or module to the runner and uses
+     * the result. Nested arrays are flattened and falsy entries skipped. Not
+     * supported by the `self` runner.
+     */
+    plugins?: EnvRunnerPluginOption[];
   }) {
     this._name = opts.name;
     this._workerEntry = opts.workerEntry;
     this._data = opts.data;
+    // Throws for invalid plugins.
+    this._plugins = createPluginPipeline(opts.plugins, {
+      resolveConditions: () => this._resolveConditions(),
+    });
     this._hooks = opts.hooks || {};
     this._messageListeners = new Set();
     this._pendingRequests = new Set();
@@ -226,6 +273,8 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
     const onError = (error: unknown) => console.error(error);
     await this._closeRuntime().catch(onError);
     await this._closeSocket().catch(onError);
+    this._transformChannel?.close();
+    this._transformChannel = undefined;
   }
 
   async [Symbol.asyncDispose]() {
@@ -277,18 +326,51 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
    * base64; throws if not JSON-serializable.
    */
   protected _processEnv(): NodeJS.ProcessEnv {
-    const data = this._data || {};
+    let data = this._data || {};
     const virtual = data.virtual as Record<string, ResolvedVirtualModule> | undefined;
+    if (virtual) {
+      data = { ...data, virtual: encodeVirtualModules(virtual) };
+    }
+    if (this._plugins) {
+      data = { ...data, ...this._pluginWorkerData("socket") };
+    }
     try {
-      this._processData = JSON.stringify(
-        virtual ? { ...data, virtual: encodeVirtualModules(virtual) } : data,
-      );
+      this._processData = JSON.stringify(data);
     } catch (error: any) {
       throw new TypeError(`Runner data must be JSON-serializable: ${error?.message || error}`, {
         cause: error,
       });
     }
     return hostEnv({ ENV_RUNNER_NAME: this._name });
+  }
+
+  /**
+   * Export conditions the runtime resolves packages with, for the plugins'
+   * `this.resolve()` (`undefined`: Node.js's). Called lazily, after the
+   * subclass constructor.
+   */
+  protected _resolveConditions(): string[] | undefined {
+    return undefined;
+  }
+
+  /**
+   * Runner data entries for the `plugins` option (none without plugins): the
+   * plugins' prefilters and a transform channel, opened on the first call.
+   * A `port` channel's `MessagePort` must be transferred to the worker.
+   */
+  protected _pluginWorkerData(kind: "port" | "socket"): { [PLUGINS_DATA_KEY]?: PluginWorkerData } {
+    if (!this._plugins) {
+      return {};
+    }
+    this._transformChannel ??=
+      kind === "port" ? openTransformPort(this._plugins) : openTransformSocket(this._plugins);
+    return {
+      [PLUGINS_DATA_KEY]: {
+        prefilters: this._plugins.prefilters,
+        resolvePrefilters: this._plugins.resolvePrefilters,
+        ...this._transformChannel.channel,
+      },
+    };
   }
 
   /**
@@ -383,6 +465,16 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
     if (!virtual) {
       return undefined;
     }
+    const plugins = this._plugins;
+    if (plugins) {
+      // Plugins run on the host, asynchronously, before the modules are sent.
+      this._virtualResolved = resolveVirtualModules(virtual)
+        .then((resolved) => transformVirtualModules(plugins, resolved))
+        .then((transformed) => {
+          this._data = { ...this._data, virtual: transformed };
+        });
+      return this._virtualResolved;
+    }
     if (!Object.values(virtual).some((v) => typeof v === "function")) {
       try {
         this._data.virtual = normalizeVirtualModules(
@@ -420,13 +512,16 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
       if (entries.length === 0) {
         return;
       }
-      // Factories run on the host; one that throws, or an invalid module,
-      // rejects before any change.
+      // Factories and plugins run on the host; one that throws, or an invalid
+      // module, rejects before any change.
       const sets: VirtualModules = Object.fromEntries(
         entries.filter((entry): entry is [string, VirtualModuleSource] => entry[1] !== null),
       );
-      const resolved: Record<string, ResolvedVirtualModule | null> =
+      let resolved: Record<string, ResolvedVirtualModule | null> =
         await resolveVirtualModules(sets);
+      if (this._plugins) {
+        resolved = await transformVirtualModules(this._plugins, resolved);
+      }
       const sources = (this._virtualSources ??= {});
       const virtual = ((this._data ??= {}).virtual ??= {}) as Record<string, ResolvedVirtualModule>;
       let added = false;

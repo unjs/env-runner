@@ -18,6 +18,12 @@ src/
 │   ├── process-data.ts      # receiveProcessData() — runner data over IPC for process workers
 │   ├── ws-proxy.ts          # createRunnerWSProxyPlugin() — runtime-native WS upgrade proxy
 │   └── virtual-modules.ts   # registerVirtualModules() — registerHooks()/Bun.plugin wiring for node/bun/deno workers
+├── plugin/                  # host-side `plugins` runner option (see .agents/PLUGINS.md)
+│   ├── pipeline.ts          # public plugin types + createPluginPipeline() (host: filters, ordering, source maps, `this.resolve()`, `fallback` resolveId phase) + transformVirtualModules()
+│   ├── filter.ts            # filter matching shared by host and worker (candidates, serialized filters + expressions, prefilters)
+│   ├── glob.ts              # host: resolveGlob() + globToRegExp() — `id` globs compiled to RegExps for host and workers
+│   ├── hooks.ts             # worker: registerPluginHooks() — registerHooks/Bun.plugin resolve + load hooks that send imports/modules to the runner
+│   └── channel.ts           # sync resolve/load requests: MessagePort (node-worker) / local socket + helper thread (process workers)
 ├── runners/
 │   ├── node-worker/         # NodeWorkerEnvRunner + worker (parentPort)
 │   ├── node-process/        # NodeProcessEnvRunner + worker (process.send)
@@ -72,6 +78,7 @@ Details in [`.agents/MINIFLARE.md`](.agents/MINIFLARE.md). In short: the wrapper
 - [`VERCEL.md`](.agents/VERCEL.md) — `VercelEnvRunner` (env vars, headers, OIDC, Queues) + tests
 - [`NETLIFY.md`](.agents/NETLIFY.md) — `NetlifyEnvRunner` + tests
 - [`VIRTUAL-MODULES.md`](.agents/VIRTUAL-MODULES.md) — virtual modules across Node/Bun/Deno/Miniflare + tests
+- [`PLUGINS.md`](.agents/PLUGINS.md) — host-side `plugins` runner option, the sync transform channel, per-runtime load hooks + tests
 
 ## Testing
 
@@ -101,6 +108,7 @@ Details in [`.agents/MINIFLARE.md`](.agents/MINIFLARE.md). In short: the wrapper
 - **Immediate shutdown** — `close()` terminates the worker/process, no graceful handshake
 - **Orphan protection** — node-process/bun-process/deno-process workers call `process.on("disconnect", () => process.exit(0))` before the data handshake and entry import
 - **Data passing** — `workerData` (threads), IPC handshake (processes: worker listens, sends `request-init-data`, host replies `{ event: "init-data", data: "<JSON>" }`; env vars are size-limited, see [`NODE-RUNNERS.md`](.agents/NODE-RUNNERS.md)), direct in-process import (self), in-memory `script` + `unsafeModuleFallbackService` (miniflare)
+- **Host-side plugins** — the `plugins` runner option (not part of `data`) stays on the host (`resolveId`, `load`, `transform` hooks). Worker resolve/load hooks send matching imports and modules over a dedicated sync channel (`Atomics.wait` + `receiveMessageOnPort`, since the runner IPC listener can't run while the loader blocks); virtual modules are transformed on the host before they are sent. `resolveId` hooks with `fallback: true` only get imports the runtime failed to resolve; handlers get `this.resolve()`. See [`PLUGINS.md`](.agents/PLUGINS.md)
 - **Virtual module updates** — `updateVirtualModules()` sets/removes (`null`) keys in one `update-virtual-modules` round trip (miniflare: host-side); `invalidateModule()` is the same update with the current source. The host keeps its own map in sync, see [`VIRTUAL-MODULES.md`](.agents/VIRTUAL-MODULES.md#runtime-updates)
 - **Terminal capabilities** — spawned workers get piped stdout, so `hostEnv()` forwards `FORCE_COLOR`/`COLUMNS` from the host TTY
 - **Stdio forwarding** — all runners forward entry stdout/stderr to the host

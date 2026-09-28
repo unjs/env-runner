@@ -2,8 +2,14 @@ import type { ServerOptions, Server } from "srvx";
 import type { Hooks } from "crossws";
 import type { UpgradeContext } from "../types.ts";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { createRequire } from "node:module";
 import { isAbsolute } from "node:path";
-import { refreshVirtualModule, registeredVirtualModules } from "./virtual-modules.ts";
+import {
+  refreshVirtualModule,
+  registeredVirtualModules,
+  registerVirtualModules,
+} from "./virtual-modules.ts";
+import { PLUGINS_DATA_KEY, registerPluginHooks, servedByPluginHooks } from "../plugin/hooks.ts";
 import { findVirtualPathKey } from "../virtual-loader.ts";
 
 export interface AppEntryIPCContext {
@@ -108,6 +114,25 @@ export function isVirtualEntry(
   return isVirtualSpecifier(entry, virtual, typeof registerHooks === "function");
 }
 
+/**
+ * Register the loader hooks for the runner's `plugins` and `data.virtual`;
+ * await before importing the entry. Resolves to an idempotent unregister
+ * function.
+ */
+export async function registerWorkerHooks(data: Record<string, any>): Promise<() => void> {
+  // Virtual modules must win for keys overriding a file. The latest
+  // `registerHooks` registration runs first, but Bun asks the earliest
+  // `onLoad` whose filter matches.
+  const bun = "Bun" in globalThis;
+  const unregisterVirtualFirst = bun ? await registerVirtualModules(data.virtual) : undefined;
+  const unregisterPlugins = await registerPluginHooks(data[PLUGINS_DATA_KEY], data.entry);
+  const unregisterVirtual = unregisterVirtualFirst ?? (await registerVirtualModules(data.virtual));
+  return () => {
+    unregisterVirtual();
+    unregisterPlugins();
+  };
+}
+
 export async function resolveEntry(entryPath: string, virtual?: boolean): Promise<AppEntry> {
   // Import virtual keys verbatim: Bun matches extensionless keys as-is and drops
   // `file:` queries (`registerHooks` resolves path keys by URL either way).
@@ -128,7 +153,8 @@ export async function resolveEntry(entryPath: string, virtual?: boolean): Promis
  * messages mostly don't. env-runner's own errors are left as they are.
  */
 export function formatInitError(error: any): string {
-  const message = error?.message || String(error);
+  // Deno prefixes errors thrown by module hooks with their name.
+  const message = (error?.message || String(error)).replace(/^(?:Error: )+(?=\[env-runner\])/, "");
   if (message.startsWith("[env-runner]") || /:\d+:\d+/.test(message)) {
     return message;
   }
@@ -208,7 +234,13 @@ async function _importFresh(entryPath: string, virtual?: boolean): Promise<AppEn
   const filePath = qIndex === -1 ? entryPath : entryPath.slice(0, qIndex);
 
   let mod: any;
-  if (virtual && refreshVirtualModule(filePath)) {
+  const bunPath = filePath.startsWith("file:") ? fileURLToPath(filePath) : filePath;
+  if (!virtual && "Bun" in globalThis && servedByPluginHooks(bunPath)) {
+    // Bun drops the query of a file served by the plugins' `onLoad`: evict it
+    // instead (`require.cache` also holds ESM there, by path).
+    delete createRequire(import.meta.url).cache[bunPath];
+    mod = await import(bunPath);
+  } else if (virtual && refreshVirtualModule(filePath)) {
     // Bun: `refreshVirtualModule()` bumped or re-registered the key (a `?query`
     // doesn't reach every key there).
     mod = await import(filePath);

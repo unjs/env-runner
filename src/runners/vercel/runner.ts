@@ -3,7 +3,7 @@ import type { WorkerHooks } from "../../types.ts";
 import { randomBytes } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
-import type { EnvRunnerData } from "../../common/base-runner.ts";
+import type { EnvRunnerData, EnvRunnerPluginOption } from "../../common/base-runner.ts";
 import { NodeWorkerEnvRunner } from "../node-worker/runner.ts";
 import { warnIfVercelOidcTokenInvalid } from "./oidc.ts";
 
@@ -26,6 +26,8 @@ export class VercelEnvRunner extends NodeWorkerEnvRunner {
     workerEntry?: string;
     hooks?: WorkerHooks;
     data?: EnvRunnerData;
+    /** Host-side transform plugins (see `EnvRunnerPluginOption`). */
+    plugins?: EnvRunnerPluginOption[];
   }) {
     _defaultEntry ||= fileURLToPath(import.meta.resolve("env-runner/runners/vercel/worker"));
     super({ ...opts, workerEntry: opts.workerEntry || _defaultEntry });
