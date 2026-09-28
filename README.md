@@ -451,7 +451,9 @@ const oxc = {
     filter: { moduleType: ["ts", "tsx", "jsx"], id: { exclude: "**/generated/**" } },
     handler(code, id, { moduleType }) {
       const result = transformSync(id, code, { sourcemap: true, lang: moduleType });
-      if (result.errors.length > 0) this.error(result.errors[0].message);
+      // `errors` also holds warnings: only fail on errors.
+      const errors = result.errors.filter((error) => error.severity === "Error");
+      if (errors.length > 0) this.error(errors.map((error) => error.message).join("\n"));
       return { code: result.code, map: result.map, moduleType: "js" };
     },
   },
