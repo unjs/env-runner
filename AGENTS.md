@@ -19,7 +19,7 @@ src/
 │   ├── ws-proxy.ts          # createRunnerWSProxyPlugin() — runtime-native WS upgrade proxy
 │   └── virtual-modules.ts   # registerVirtualModules() — registerHooks()/Bun.plugin wiring for node/bun/deno workers
 ├── plugin/                  # host-side `plugins` runner option (see .agents/PLUGINS.md)
-│   ├── pipeline.ts          # public plugin types + createPluginPipeline() (host: filters, ordering, source maps) + transformVirtualModules()
+│   ├── pipeline.ts          # public plugin types + createPluginPipeline() (host: filters, ordering, source maps, `this.resolve()`, `fallback` resolveId phase) + transformVirtualModules()
 │   ├── filter.ts            # filter matching shared by host and worker (candidates, serialized filters + expressions, prefilters)
 │   ├── glob.ts              # host: resolveGlob() + globToRegExp() — `id` globs compiled to RegExps for host and workers
 │   ├── hooks.ts             # worker: registerPluginHooks() — registerHooks/Bun.plugin resolve + load hooks that send imports/modules to the runner
