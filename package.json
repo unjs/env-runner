@@ -51,7 +51,7 @@
   "devDependencies": {
     "@netlify/runtime": "^5.0.5",
     "@types/node": "^26.6.2",
-    "@vercel/queue": "^0.6.0",
+    "@vercel/queue": "^0.7.0",
     "@vitest/coverage-v8": "^5.0.1",
     "automd": "^0.4.3",
     "changelogen": "^0.6.2",
@@ -64,7 +64,7 @@
     "oxlint": "^1.85.0",
     "typescript": "^7.0.2",
     "vitest": "^5.0.1",
-    "wrangler": "^4.138.0"
+    "wrangler": "^4.140.0"
   },
   "packageManager": "pnpm@12.6.0"
 }
