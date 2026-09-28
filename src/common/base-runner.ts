@@ -18,8 +18,8 @@ import type {
   VirtualModuleUpdates,
 } from "../virtual-loader.ts";
 import { hostEnv } from "./host-env.ts";
-import { normalizeTransformOptions } from "./transform.ts";
-import type { TransformOptions } from "./transform.ts";
+import { normalizePluginEntries } from "./plugins.ts";
+import type { EnvRunnerPluginEntry } from "./plugins.ts";
 
 export type {
   VirtualModule,
@@ -30,19 +30,16 @@ export type {
   VirtualModuleUpdates,
 } from "../virtual-loader.ts";
 export type {
-  TransformOptions,
-  SerializedRegExp,
-  SourceTransformer,
+  EnvRunnerPlugin,
+  EnvRunnerPluginEntry,
+  EnvRunnerPluginFactory,
   TransformHandler,
   TransformHandlerMeta,
   TransformHandlerResult,
   TransformHookFilter,
   TransformModuleType,
-  TransformPlugin,
-  TransformPluginFactory,
-  TransformerEntry,
   TransformStringFilter,
-} from "./transform.ts";
+} from "./plugins.ts";
 
 export interface EnvRunnerData {
   name?: string;
@@ -58,11 +55,11 @@ export interface EnvRunnerData {
   virtual?: VirtualModules;
 
   /**
-   * Transform the entry, its imports and matching virtual modules with
-   * transformer modules (e.g. `env-runner/transformers/oxc` for TypeScript
-   * enums and JSX). Not supported by the `self` runner.
+   * Plugin modules whose `transform` hooks run on the entry, its imports and
+   * virtual modules their filters match (e.g. `env-runner/plugins/oxc` for
+   * TypeScript enums and JSX). Not supported by the `self` runner.
    */
-  transform?: TransformOptions;
+  plugins?: EnvRunnerPluginEntry[];
 
   [key: string]: unknown;
 }
@@ -96,8 +93,8 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
     this._name = opts.name;
     this._workerEntry = opts.workerEntry;
     // Resolve specifiers from the host cwd; throws early for non-serializable options.
-    this._data = opts.data?.transform
-      ? { ...opts.data, transform: normalizeTransformOptions(opts.data.transform) }
+    this._data = opts.data?.plugins
+      ? { ...opts.data, plugins: normalizePluginEntries(opts.data.plugins) }
       : opts.data;
     this._hooks = opts.hooks || {};
     this._messageListeners = new Set();

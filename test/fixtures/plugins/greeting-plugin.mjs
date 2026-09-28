@@ -3,7 +3,7 @@ export default {
   name: "greeting-plugin",
   transform: {
     order: "pre",
-    filter: { id: "**/transform/**", code: "__GREETING__" },
+    filter: { id: "**/plugins/**", code: "__GREETING__" },
     handler(code, _id, meta) {
       // Only the JSX expression: the source still has its `declare const`.
       const greeting = `${meta.options?.greeting ?? "hi"} from ${meta.moduleType}`;

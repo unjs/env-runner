@@ -7,14 +7,14 @@ import {
   refreshVirtualModule,
   registeredVirtualModules,
   registerVirtualModules,
-  setVirtualModulesTransformer,
+  setVirtualModulesPlugins,
 } from "./virtual-modules.ts";
 import {
-  getActiveTransformer,
-  loadTransformer,
-  registerTransformHooks,
-  type TransformOptions,
-} from "./transform.ts";
+  loadPlugins,
+  registerPluginHooks,
+  servedByPluginHooks,
+  type EnvRunnerPluginEntry,
+} from "./plugins.ts";
 import { findVirtualPathKey } from "../virtual-loader.ts";
 
 export interface AppEntryIPCContext {
@@ -120,21 +120,21 @@ export function isVirtualEntry(
 }
 
 /**
- * Register `data.transform` and `data.virtual` hooks; await before importing
+ * Register `data.plugins` and `data.virtual` hooks; await before importing
  * the entry. Resolves to an idempotent unregister function.
  */
 export async function registerWorkerHooks(data: {
-  transform?: TransformOptions;
+  plugins?: EnvRunnerPluginEntry[];
   virtual?: Parameters<typeof registerVirtualModules>[0];
 }): Promise<() => void> {
-  const transformer = await loadTransformer(data.transform);
-  const unregisterTransform = await registerTransformHooks(transformer);
+  const pipeline = await loadPlugins(data.plugins);
+  const unregisterPlugins = await registerPluginHooks(pipeline);
   // Also applies to modules added later by virtual module updates.
-  setVirtualModulesTransformer(transformer);
+  setVirtualModulesPlugins(pipeline);
   const unregisterVirtual = await registerVirtualModules(data.virtual);
   return () => {
     unregisterVirtual();
-    unregisterTransform();
+    unregisterPlugins();
   };
 }
 
@@ -238,9 +238,9 @@ async function _importFresh(entryPath: string, virtual?: boolean): Promise<AppEn
   const filePath = qIndex === -1 ? entryPath : entryPath.slice(0, qIndex);
 
   let mod: any;
-  if (!virtual && (globalThis as any).Bun && getActiveTransformer()?.filter(filePath)) {
-    // Bun drops the query of a transformed file (served by the transform
-    // plugin): evict it instead (`require.cache` also holds ESM there).
+  if (!virtual && (globalThis as any).Bun && servedByPluginHooks(filePath)) {
+    // Bun drops the query of a file served by the plugins' `onLoad`: evict it
+    // instead (`require.cache` also holds ESM there).
     delete require.cache[filePath];
     mod = await import(filePath);
   } else if (virtual && refreshVirtualModule(filePath)) {

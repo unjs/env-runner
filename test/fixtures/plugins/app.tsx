@@ -1,4 +1,4 @@
-// @ts-nocheck -- JSX pragma `h` is served by `data.transform` (no `--jsx` in tsconfig)
+// @ts-nocheck -- JSX pragma `h` is served by `data.plugins` (no `--jsx` in tsconfig)
 import { h } from "./h.ts";
 import { Status, label } from "./dep.ts";
 

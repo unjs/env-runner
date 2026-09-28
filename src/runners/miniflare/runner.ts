@@ -12,12 +12,8 @@ import { BaseEnvRunner } from "../../common/base-runner.ts";
 import type { EnvRunnerData } from "../../common/base-runner.ts";
 import { resolveRuntimeDep } from "../../common/runtime-deps.ts";
 import type { RuntimeDep } from "../../common/runtime-deps.ts";
-import {
-  loadTransformer,
-  transformedFormat,
-  transformVirtualModule,
-} from "../../common/transform.ts";
-import type { Transformer, TransformOptions } from "../../common/transform.ts";
+import { loadPlugins, transformedFormat, transformVirtualModule } from "../../common/plugins.ts";
+import type { EnvRunnerPluginEntry, PluginPipeline } from "../../common/plugins.ts";
 import {
   encodeVirtualModules,
   expandVirtualInvalidation,
@@ -180,8 +176,8 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
   #miniflare?: InstanceType<any>;
   #miniflareOptions: Record<string, unknown>;
   #transformRequest?: (id: string) => Promise<TransformResult | null | undefined>;
-  // `data.transform`, applied on the host (workerd only parses JS).
-  #transformer?: Transformer;
+  // `data.plugins`, applied on the host (workerd only parses JS).
+  #plugins?: PluginPipeline;
   #reloadCounter = 0;
   #virtual?: MiniflareVirtualModules;
   #cacheEntry?: MiniflareCacheEntry;
@@ -460,8 +456,8 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
     key: string,
     module: ResolvedVirtualModule,
   ): Promise<ServedVirtualModule> {
-    if (this.#transformer) {
-      module = transformVirtualModule(this.#transformer, key, module);
+    if (this.#plugins) {
+      module = transformVirtualModule(this.#plugins, key, module);
     }
     const format = virtualModuleFormat(key, module);
     const source = typeof module === "string" ? module : module.source;
@@ -492,7 +488,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
     const supportedCompatibilityDate = await resolveSupportedCompatibilityDate(miniflare);
 
     const entryPath = this._data?.entry as string | undefined;
-    this.#transformer = await loadTransformer(this._data?.transform as TransformOptions);
+    this.#plugins = await loadPlugins(this._data?.plugins as EnvRunnerPluginEntry[] | undefined);
     const initialVirtual = await this.#prepareVirtualModules();
     // Always created, even empty: updates may add keys later.
     const virtual = createMiniflareVirtualModules({ ...initialVirtual });
@@ -645,25 +641,19 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
         },
       };
 
-      // When transformRequest or `data.transform` is provided, add module rules
+      // When transformRequest or `data.plugins` is provided, add module rules
       // so miniflare's ModuleLocator doesn't reject non-JS extensions (e.g. .ts,
       // .tsx, .jsx). v5 has no ModuleLocator (and rejects `modulesRules`):
       // imports all go through the fallback service.
       if (
-        (this.#transformRequest || this.#transformer) &&
+        (this.#transformRequest || this.#plugins) &&
         !options.modulesRules &&
         !miniflare.convertV4MiniflareOptions &&
         !skipLocator
       ) {
-        const extensions = new Set([
-          ".ts",
-          ".tsx",
-          ".jsx",
-          ".mts",
-          ...(this.#transformer?.extensions ?? []),
-        ]);
+        const extensions = [".ts", ".tsx", ".jsx", ".mts", ...(this.#plugins ? [".cts"] : [])];
         options.modulesRules = [
-          { type: "ESModule", include: [...extensions].map((ext) => `**/*${ext}`) },
+          { type: "ESModule", include: extensions.map((ext) => `**/*${ext}`) },
         ];
       }
 
@@ -674,7 +664,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
         // Read live: updates change it in place.
         const _virtual = virtual;
         const _transformRequest = this.#transformRequest;
-        const _transformer = this.#transformer;
+        const _plugins = this.#plugins;
         const _exportConditions = this.#exportConditions;
         // `modulePath`: the served module's path, which its relative imports join onto.
         const _applyVirtualVersions = (code: string, modulePath: string | undefined) =>
@@ -881,9 +871,9 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
           modulePathMap.set(name, resolvedPath);
 
           let transformed: string | undefined;
-          if (_transformer?.filter(resolvedPath)) {
+          if (_plugins?.filter(resolvedPath)) {
             try {
-              transformed = _transformer.transform(resolvedPath, contents);
+              transformed = _plugins.transform(resolvedPath, contents);
             } catch (error: any) {
               // A named import of this module fails at link time before the
               // throw runs (hiding it), so also report it on the host.
@@ -931,7 +921,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
         ...this.#miniflareOptions,
         _exportConditions: this.#exportConditions,
         _exports: this.#exports,
-        _transform: this._data?.transform,
+        _plugins: this._data?.plugins,
         // The fallback service closure captures the virtual map, so instances
         // are only shareable when the resolved sources are identical (bytes
         // compared as base64, not as JSON objects of indices).

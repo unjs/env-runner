@@ -12,18 +12,18 @@ import {
   virtualModuleFormat,
 } from "../virtual-loader.ts";
 import type { ResolvedVirtualModule, VirtualModuleWire } from "../virtual-loader.ts";
-import { transformVirtualModule } from "./transform.ts";
-import type { Transformer } from "./transform.ts";
+import { transformVirtualModule } from "./plugins.ts";
+import type { PluginPipeline } from "./plugins.ts";
 
 /**
- * Transform matching virtual modules (`data.transform`) before each backend
- * prepares them, at registration and on updates. Set before registering.
+ * Run `data.plugins` on matching virtual modules before each backend prepares
+ * them, at registration and on updates. Set before registering.
  */
-export function setVirtualModulesTransformer(transformer: Transformer | undefined): void {
-  _transformer = transformer;
+export function setVirtualModulesPlugins(pipeline: PluginPipeline | undefined): void {
+  _plugins = pipeline;
 }
 
-let _transformer: Transformer | undefined;
+let _plugins: PluginPipeline | undefined;
 
 /**
  * Serve virtual modules; await before importing the entry. Formats follow
@@ -766,7 +766,7 @@ async function _prepareVirtualModules(
     out[key] =
       module === null
         ? module
-        : prepare(key, _transformer ? transformVirtualModule(_transformer, key, module) : module);
+        : prepare(key, _plugins ? transformVirtualModule(_plugins, key, module) : module);
   }
   return out;
 }

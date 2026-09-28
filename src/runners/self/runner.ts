@@ -146,9 +146,9 @@ export class SelfEnvRunner extends BaseEnvRunner {
       );
       return;
     }
-    if (this._data?.transform) {
+    if (this._data?.plugins?.length) {
       // Module hooks would apply to the whole host process.
-      console.warn("[env-runner] the self runner does not support `data.transform`; ignoring.");
+      console.warn("[env-runner] the self runner does not support `data.plugins`; ignoring.");
     }
     this.#active = true;
     resolveEntry(entryPath)
