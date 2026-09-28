@@ -71,6 +71,19 @@ for (const { name, create, skip, bun, miniflare, cjsOptions } of runners) {
       expect(await res.json()).toEqual(expected);
     });
 
+    it('runs a rolldown-like plugin object (filter, `order: "pre"`)', async () => {
+      runner = create({
+        name: "transform-plugin",
+        data: {
+          entry: fixture("app.tsx"),
+          transform: { ...transform, transformers: [fixture("greeting-plugin.mjs")] },
+        },
+      });
+      await runner.waitForReady();
+      const res = await runner.fetch("http://localhost/");
+      expect(await res.json()).toEqual({ ...expected, children: ["Ok", "hi from tsx"] });
+    });
+
     it("re-transforms the entry on reloadModule()", async () => {
       const dir = mkdtempSync(join(tmpdir(), "env-runner-transform-"));
       cpSync(resolve(_dir, "fixtures/transform"), dir, { recursive: true });
@@ -246,6 +259,63 @@ describe("transform options", () => {
     // Without oxc, the transformer's map is relative to the original source.
     const own = (await loadTransformer({ oxc: false, transformers: [fixture("mapped.mjs")] }))!;
     expect(decodeMap(own.transform("/app/a.js", "a()")).mappings).toBe("AAAA");
+  });
+
+  it("orders plugins: pre (source) → oxc → normal/functions (js) → post", async () => {
+    const calls: string[] = [];
+    (globalThis as any).__transformCalls = calls;
+    const transformer = (await loadTransformer({
+      transformers: [fixture("order-post.mjs"), fixture("order-fn.mjs"), fixture("order-pre.mjs")],
+    }))!;
+    transformer.transform("/app/a.ts", "const a: number = 1;");
+    expect(calls).toEqual(["pre:ts:typed", "fn:js:untyped", "post:js:untyped"]);
+  });
+
+  it("applies rolldown hook filter semantics", async () => {
+    const { normalizeTransformer } = await import("../src/common/transform-plugin.ts");
+    const matches = (filter: any, id: string, code = "", moduleType = "ts") =>
+      normalizeTransformer({ transform: { filter, handler: () => {} } }, "t").matches(
+        id,
+        code,
+        moduleType,
+      );
+    // Plain values include; exclude wins over include.
+    expect(matches({ id: /\.ts$/ }, "/app/a.ts")).toBe(true);
+    expect(matches({ id: [/\.tsx$/, "**/*.ts"] }, "/app/a.ts")).toBe(true);
+    expect(matches({ id: { include: "**/src/**", exclude: /skip/ } }, "/app/src/skip.ts")).toBe(
+      false,
+    );
+    expect(matches({ id: { exclude: "**/vendor/**" } }, "/app/src/a.ts")).toBe(true);
+    // Relative globs resolve from cwd.
+    expect(matches({ id: "src/**" }, `${process.cwd()}/src/a.ts`)).toBe(true);
+    expect(matches({ id: "src/**" }, "/elsewhere/src/a.ts")).toBe(false);
+    // `code` strings are substrings; all properties must match.
+    expect(matches({ code: "import.meta.env" }, "/a.ts", "x(import.meta.env.X)")).toBe(true);
+    expect(matches({ code: "import.meta.env", id: /\.tsx$/ }, "/a.ts", "import.meta.env")).toBe(
+      false,
+    );
+    expect(matches({ moduleType: ["tsx"] }, "/a.tsx", "", "tsx")).toBe(true);
+    expect(matches({ moduleType: { include: ["ts"] } }, "/a.tsx", "", "tsx")).toBe(false);
+    // Stateful RegExps don't alternate.
+    const g = /a/g;
+    expect([matches({ code: g }, "/a.ts", "a"), matches({ code: g }, "/a.ts", "a")]).toEqual([
+      true,
+      true,
+    ]);
+  });
+
+  it("rejects invalid transformer exports and async handlers", async () => {
+    const { normalizeTransformer } = await import("../src/common/transform-plugin.ts");
+    expect(() => normalizeTransformer(undefined, "x")).toThrow(/no usable default export/);
+    expect(() => normalizeTransformer({ name: "x" }, "x")).toThrow(/transform/);
+    expect(() =>
+      normalizeTransformer({ transform: { order: "early", handler() {} } }, "x"),
+    ).toThrow(/order/);
+    const transformer = (await loadTransformer({
+      oxc: false,
+      transformers: [fixture("async.mjs")],
+    }))!;
+    expect(() => transformer.transform("/app/a.ts", "a")).toThrow(/synchronous/);
   });
 
   it("only runs custom transformers with `oxc: false`", async () => {

@@ -20,6 +20,12 @@ export {
   type OxcJsxOptions,
   type SerializedRegExp,
   type SourceTransformer,
+  type TransformHandler,
+  type TransformHandlerResult,
+  type TransformHookFilter,
+  type TransformModuleType,
+  type TransformPlugin,
+  type TransformStringFilter,
   BaseEnvRunner,
 } from "./common/base-runner.ts";
 export { RunnerManager } from "./manager.ts";

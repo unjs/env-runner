@@ -16,6 +16,7 @@ src/
 │   ├── runtime-deps.ts      # resolveRuntimeDep()/resolveRuntimeDepSpecifier() — "module | specifier | false" resolver
 │   ├── host-env.ts          # hostEnv() — worker/child env: host env + FORCE_COLOR/COLUMNS from the host TTY
 │   ├── transform.ts         # data.transform: loadTransformer() (oxc-transform + custom transformers), registerTransformHooks()
+│   ├── transform-plugin.ts  # normalizeTransformer() — function or rolldown-like `{ transform }` object + hook filters
 │   ├── ws-proxy.ts          # createRunnerWSProxyPlugin() — runtime-native WS upgrade proxy
 │   └── virtual-modules.ts   # registerVirtualModules() — registerHooks()/Bun.plugin wiring for node/bun/deno workers
 ├── runners/

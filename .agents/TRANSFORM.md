@@ -6,9 +6,28 @@ Source transforms (TypeScript beyond erasable syntax, JSX, custom) for the entry
 
 - Lives in `data` (not a runner option), so it reaches every runner the same way `data.virtual` does, and must stay **JSON-serializable**: custom transformers are module specifiers, never functions.
 - `BaseEnvRunner` calls `normalizeTransformOptions()` in its constructor: `true` → `{}`, specifiers (`transformers`, `oxcTransform`) resolved from the host cwd to `file:` URLs. Function transformers throw a `TypeError` at construction.
-- `loadTransformer()` (in the worker; on the host for miniflare) imports `oxc-transform` via `resolveRuntimeDep({ required: true })` unless `oxc: false`, then imports each transformer (default export, sync `(code, id) => string | { code, map } | nullish`).
-- Pipeline: oxc (`sourcemap` forced from `transform.sourcemap`, default `true`) → custom transformers in order → inline `sourceMappingURL` (`sources` is the file URL for absolute ids). oxc diagnostics with severity `Error` throw a `SyntaxError` with codeframes and the id.
-- Maps are never composed. A transformer `map` is kept only when no earlier step changed the code, since it is relative to the transformer's input; otherwise it is dropped, because a wrong map is worse than none. Code-only results keep the previous map.
+- `loadTransformer()` (in the worker; on the host for miniflare) imports `oxc-transform` via `resolveRuntimeDep({ required: true })` unless `oxc: false`, then imports each transformer.
+- `normalizeTransformer()` (`src/common/transform-plugin.ts`) accepts a default export that is either:
+  - a function (the handler), or
+  - a rolldown-like `{ name?, transform }` object, where `transform` is a function or `{ order?, filter?, handler }`.
+
+  Plugin factories aren't detected: a function is always the handler. Bad shapes throw a `TypeError` naming the specifier. A handler returning a thenable throws, since hooks are sync. Handlers get `(code, id, { moduleType })` with no rolldown plugin context.
+
+- Hook filters mirror rolldown:
+  - `id`: glob strings go through `path.matchesGlob` (namespace access, since a named import fails to link before Node 22.5). Relative globs resolve from cwd, like Vite's `createFilter`, because rolldown's docs don't say. RegExps are tested against the `/`-separated id.
+  - `code`: strings are substrings.
+  - `moduleType`: a list or `{ include }`.
+  - Any value can be `{ include, exclude }`, and exclude wins. All given properties must match. `lastIndex` is reset for `g`/`y` RegExps.
+- Pipeline, keeping list order within each group:
+  1. `pre` handlers, which see the source (`moduleType` from the extension, as in rolldown, where plugin transforms precede the built-in TS/JSX transform)
+  2. oxc (`sourcemap` forced from `transform.sourcemap`, default `true`), after which `moduleType` becomes `js`
+  3. functions and default-order plugins
+  4. `post` handlers
+  5. an inline `sourceMappingURL` (`sources` is the file URL for absolute ids)
+
+  oxc diagnostics with severity `Error` throw a `SyntaxError` with codeframes and the id.
+
+- Maps are never composed. The first map-producing step that changes the code sets the map. A second one would be relative to already-mapped code, so it drops the map, because a wrong map is worse than none. Code-only results keep the current map, and a step returning unchanged code is a no-op.
 - `filter(id)` strips the query and normalizes `\` to `/`, then checks all of:
   - the extension is in `extensions` (default `.ts .mts .cts .tsx .jsx`)
   - no `exclude` substring (default `/node_modules/`)
@@ -60,6 +79,8 @@ Further fixtures:
 - `cjs/` has a package.json without `"type"`: `lib.ts` (CommonJS with an enum), `dep.cts`, and `vendor/plain.ts` (CommonJS, excluded).
 - `app-cjs.ts` and `app-vendor.ts` import them.
 - `mapped.mjs` is a transformer returning its own map.
+- `greeting-plugin.mjs` is a rolldown-like object: `pre` order, with a glob `id` filter and a `code` filter.
+- `order-*.mjs` and `async.mjs` exercise ordering and the async error.
 
 Cases:
 
@@ -71,5 +92,6 @@ Cases:
 - CommonJS `.ts` + `.cts` (not Bun; Deno passes `--unstable-detect-cjs`)
 - `exclude` to the native loader (not miniflare: workerd can't parse TS)
 - `include` with a case-insensitive RegExp that leaves out `vendor/plain.ts`, which would return `"hi"` instead of `"vendor"` if transformed
+- a plugin-object transformer (`"hi from tsx"` proves it ran on the source, before oxc)
 
-Option-level tests cover normalization, filtering, errors, source maps and `oxc: false`.
+Option-level tests cover normalization, filtering, errors, source maps, plugin ordering, rolldown filter semantics, invalid exports and `oxc: false`.

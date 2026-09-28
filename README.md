@@ -354,7 +354,7 @@ const runner = new NodeProcessEnvRunner({
     transform: {
       // oxc-transform `TransformOptions` (`true` or omitted: defaults, `false`: skip oxc)
       oxc: { jsx: { runtime: "automatic", importSource: "preact" } },
-      // Custom transforms: specifiers whose default export is `(code, id) => string | { code, map } | undefined`
+      // Custom transforms: specifiers whose default export is a function or a rolldown-like plugin object (see below)
       transformers: ["./build/inline-env.mjs"],
       // extensions: [".ts", ".mts", ".cts", ".tsx", ".jsx"], // default
       // include: /\/src\//,                                  // only matching paths / virtual keys
@@ -366,7 +366,45 @@ const runner = new NodeProcessEnvRunner({
 });
 ```
 
-`data.transform: true` enables oxc with its defaults. A file is transformed when its extension is in `extensions`, it contains no `exclude` substring, and it matches `include` (if set). `include` is a single RegExp, tested against `/`-separated paths and virtual keys. It is sent to the worker as `{ source, flags }`, with the stateful `g`/`y` flags dropped. On Bun it is folded into the plugin's filter RegExp, which sees native separators, so on Windows match `[\\/]`. The options must stay JSON-serializable (they cross into the worker), so custom transformers are **module specifiers** (resolved from the working directory) rather than functions. They run after oxc, in order, on plain JavaScript, and must be **synchronous** (Node.js module hooks are). Source maps are not composed: a transformer's returned `map` is only used when nothing earlier (oxc included) changed the code, and a code-only result keeps the previous map (so keep such changes line-preserving). Stack traces use the inline source maps with `--enable-source-maps`.
+`data.transform: true` enables oxc with its defaults. A file is transformed when its extension is in `extensions`, it contains no `exclude` substring, and it matches `include` (if set). `include` is a single RegExp, tested against `/`-separated paths and virtual keys. It is sent to the worker as `{ source, flags }`, with the stateful `g`/`y` flags dropped. On Bun it is folded into the plugin's filter RegExp, which sees native separators, so on Windows match `[\\/]`. The options must stay JSON-serializable (they cross into the worker), so custom transformers are **module specifiers**, resolved from the working directory, rather than functions. A transformer module has a single default export:
+
+```js
+// A function: runs after oxc, on plain JavaScript
+export default (code, id, meta) => code.replaceAll("__VERSION__", '"1.0.0"');
+```
+
+```js
+// A rolldown-like plugin object (only the `transform` hook is used)
+export default {
+  name: "inline-env",
+  transform: {
+    order: "pre", // before oxc, on the TS/JSX source (default: after oxc; "post": last)
+    filter: { id: "src/**", code: "import.meta.env" }, // rolldown hook filter
+    handler(code, id, meta) {
+      // meta.moduleType: "ts" | "tsx" | "jsx" | "js" ("js" once oxc ran)
+      return { code: code.replaceAll("import.meta.env", "process.env") };
+    },
+  },
+};
+```
+
+`transform` can also be a plain function. Handlers return a string, `{ code, map }`, or nothing to keep the code.
+
+**Rules:**
+
+- **Sync only:** handlers must be synchronous (Node.js module hooks are), and returning a Promise throws.
+- **Not rolldown's plugin context:** `this` isn't one.
+- **Pass the plugin object, not a factory:** a function default export is treated as the handler.
+- **Order:** `pre` handlers → oxc → functions and default-order plugins → `post` handlers. Within each group, list order is kept.
+
+**Filters** follow rolldown's semantics. All given properties must match:
+
+- `id`: strings are globs (`path.matchesGlob`, Node.js >= 22.5), with relative globs resolved from the working directory. RegExps are tested against the `/`-separated id.
+- `code`: strings are substrings, RegExps are tested.
+- `moduleType`: a list, or `{ include }`.
+- Values can be arrays or `{ include, exclude }`, and exclude wins.
+
+**Source maps are not composed.** The first returned `map` (oxc's, or a `pre` handler's) is used, and a second one drops both. Code-only results keep the current map, so keep such changes line-preserving. Stack traces use the inline source maps with `--enable-source-maps`.
 
 How transforms are applied:
 

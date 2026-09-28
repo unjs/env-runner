@@ -3,6 +3,22 @@ import { isAbsolute } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { init as initEsmLexer, parse as parseEsm } from "es-module-lexer";
 import { resolveRuntimeDep, resolveSpecifier } from "./runtime-deps.ts";
+import { normalizeTransformer } from "./transform-plugin.ts";
+import type {
+  NormalizedTransformer,
+  SourceMapLike,
+  TransformModuleType,
+} from "./transform-plugin.ts";
+
+export type {
+  SourceTransformer,
+  TransformHandler,
+  TransformHandlerResult,
+  TransformHookFilter,
+  TransformModuleType,
+  TransformPlugin,
+  TransformStringFilter,
+} from "./transform-plugin.ts";
 
 /**
  * [`oxc-transform`](https://oxc.rs/docs/guide/usage/transformer)
@@ -63,7 +79,9 @@ export interface TransformOptions {
 
   /**
    * Module specifiers (resolved from cwd) whose default export is a sync
-   * {@link SourceTransformer}. They run after oxc, in order, on plain JS.
+   * {@link SourceTransformer}: a function or a rolldown-like plugin object.
+   * They run in order after oxc, on plain JS; plugins with `order: "pre"`
+   * run before it (on the TS/JSX source), `"post"` ones last.
    */
   transformers?: (string | URL)[];
 
@@ -103,26 +121,6 @@ export interface TransformOptions {
 export interface SerializedRegExp {
   source: string;
   flags?: string;
-}
-
-/**
- * Custom transform, the default export of a `transformers` module. Must be
- * sync (Node.js module hooks are). Return nullish to keep the code. A returned
- * `map` is only used when no earlier step (oxc included) changed the code, as
- * maps aren't composed; code-only results keep the previous map (so they
- * should preserve lines).
- */
-export type SourceTransformer = (
-  code: string,
-  id: string,
-) => string | { code: string; map?: SourceMapLike | null } | null | undefined;
-
-interface SourceMapLike {
-  version?: number;
-  mappings: string;
-  names?: string[];
-  sources?: string[];
-  sourcesContent?: (string | null)[];
 }
 
 /** A loaded {@link TransformOptions} pipeline. */
@@ -217,7 +215,7 @@ export async function loadTransformer(
     oxcTransform = (id, code) => oxc!.transformSync(id, code, oxcOptions);
   }
 
-  const transformers: SourceTransformer[] = [];
+  const transformers: NormalizedTransformer[] = [];
   for (const specifier of opts.transformers ?? []) {
     let mod: any;
     try {
@@ -227,14 +225,11 @@ export async function loadTransformer(
         cause: error,
       });
     }
-    const fn = mod?.default;
-    if (typeof fn !== "function") {
-      throw new TypeError(
-        `[env-runner] transformer "${specifier}" must default-export a function \`(code, id) => string | { code, map } | undefined\`.`,
-      );
-    }
-    transformers.push(fn);
+    transformers.push(normalizeTransformer(mod?.default, String(specifier)));
   }
+  const byOrder = (order: NormalizedTransformer["order"]) =>
+    transformers.filter((transformer) => transformer.order === order);
+  const [pre, normal, post] = [byOrder("pre"), byOrder("normal"), byOrder("post")];
 
   const filter = (id: string) => {
     const path = _stripQuery(id).replaceAll("\\", "/");
@@ -247,8 +242,43 @@ export async function loadTransformer(
 
   const transform = (id: string, code: string) => {
     id = _stripQuery(id);
+    const matchId = id.replaceAll("\\", "/");
+    let moduleType = _moduleType(id);
+    // Maps aren't composed: the first map is kept, a second one would be
+    // relative to already-mapped code, so both are dropped. Code-only steps
+    // keep the current map (they should preserve lines).
     let map: SourceMapLike | null | undefined;
-    let changed = false;
+    let mapped = false;
+    const apply = (next: string, nextMap: SourceMapLike | null | undefined) => {
+      if (next === code) {
+        return;
+      }
+      code = next;
+      if (nextMap) {
+        map = mapped ? undefined : nextMap;
+        mapped = true;
+      }
+    };
+    const run = (group: NormalizedTransformer[]) => {
+      for (const transformer of group) {
+        if (!transformer.matches(matchId, code, moduleType)) {
+          continue;
+        }
+        const result = transformer.handler(code, id, { moduleType });
+        if (typeof (result as any)?.then === "function") {
+          throw new TypeError(
+            `[env-runner] transformer "${transformer.name}" returned a Promise for "${id}"; transforms must be synchronous.`,
+          );
+        }
+        if (typeof result === "string") {
+          apply(result, undefined);
+        } else if (result) {
+          apply(result.code ?? code, result.map);
+        }
+      }
+    };
+
+    run(pre);
     if (oxcTransform) {
       const result = oxcTransform(id, code);
       const errors = result.errors.filter((error) => error.severity === "Error");
@@ -258,24 +288,12 @@ export async function loadTransformer(
             errors.map((error) => error.codeframe || error.message).join("\n"),
         );
       }
-      code = result.code;
-      map = result.map;
-      changed = true;
+      apply(result.code, result.map);
+      moduleType = "js";
     }
-    for (const transformer of transformers) {
-      const result = transformer(code, id);
-      if (typeof result === "string") {
-        code = result;
-      } else if (result) {
-        code = result.code;
-        // A map is relative to this transformer's input: only valid when that
-        // input is the original source (no composition). Else drop it.
-        map = result.map ? (changed ? undefined : result.map) : map;
-      } else {
-        continue;
-      }
-      changed = true;
-    }
+    run(normal);
+    run(post);
+
     if (sourcemap && map) {
       const source = isAbsolute(id) ? pathToFileURL(id).href : id;
       const json = JSON.stringify({ ...map, sources: [source], file: undefined });
@@ -433,6 +451,15 @@ function _bunLoader(path: string): string {
       return "js";
     }
   }
+}
+
+// Module type before oxc, from the extension (rolldown's `moduleType`).
+function _moduleType(id: string): TransformModuleType {
+  const ext = id.slice(id.lastIndexOf(".") + 1);
+  if (ext === "tsx" || ext === "jsx") {
+    return ext;
+  }
+  return /^[cm]?ts$/.test(ext) ? "ts" : "js";
 }
 
 function _stripQuery(id: string): string {

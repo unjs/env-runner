@@ -16,6 +16,12 @@ export type {
   OxcJsxOptions,
   SerializedRegExp,
   SourceTransformer,
+  TransformHandler,
+  TransformHandlerResult,
+  TransformHookFilter,
+  TransformModuleType,
+  TransformPlugin,
+  TransformStringFilter,
 } from "./transform.ts";
 
 export interface EnvRunnerData {
