@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { isAbsolute } from "node:path";
+import { dirname, isAbsolute, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { init as initEsmLexer, parse as parseEsm } from "es-module-lexer";
 import {
@@ -30,6 +30,17 @@ export interface PluginWorkerData extends TransformChannel {
 const PLUGIN_SCHEME = "env-runner-plugin:";
 const BUN_NAMESPACE = "env-runner-plugin";
 
+// Bun: specifiers with another extension than scripts (with a query), and
+// the marker query of the files the plugins loaded for them.
+const BUN_OTHER_FILE = /\.(?![cm]?[jt]sx?(?:\?|$))[\w-]+(?:\?.*)?$/i;
+const BUN_LOADED_MARKER = "__env_runner_plugin";
+const BUN_LOADED_FILE = new RegExp(String.raw`\?${BUN_LOADED_MARKER}$`);
+
+interface BunResolveArgs {
+  path: string;
+  importer: string;
+}
+
 let _active: ((path: string) => boolean) | undefined;
 
 /**
@@ -58,10 +69,11 @@ export function servedByPluginHooks(path: string): boolean {
  *   evaluates hook output as plain ESM, so TypeScript is stripped here and
  *   CommonJS wrapped (`commonJSToESM()`).
  * - Bun: a `Bun.plugin` (can't be removed) with `onResolve` (only for the
- *   specifiers Bun asks plugins about) and an `onLoad` with
+ *   specifiers Bun asks plugins about) and an `onLoad` for scripts with
  *   {@link createBunFilter}. Its output is always evaluated as ESM, so
  *   CommonJS is wrapped, also for files the filter passes but no plugin
- *   matches.
+ *   matches. Other file types are loaded in `onResolve`, which can decline,
+ *   so files no plugin changes keep Bun's native loaders.
  *
  * Warns once and skips on runtimes without either backend.
  */
@@ -179,7 +191,10 @@ export async function registerPluginHooks(
     // `onLoad` output is evaluated as ESM, with `loader`.
     const serve = (path: string, result: TransformedCode) => {
       if (result.moduleType === "json") {
-        return { exports: { default: _parseJSON(path, result.code) }, loader: "object" };
+        // Like Bun's JSON modules: top-level keys are named exports too.
+        const value = _parseJSON(path, result.code);
+        const named = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+        return { exports: { ...named, default: value }, loader: "object" };
       }
       const { code } = result;
       return {
@@ -187,10 +202,22 @@ export async function registerPluginHooks(
         loader: result.moduleType === "ts" ? "ts" : "js",
       };
     };
+    // Other file types are loaded while resolving, where Bun still accepts no
+    // result (it loads any file natively, unknown ones as a path): served
+    // with a marker query, kept here until Bun loads them.
+    const loaded = new Map<string, TransformedCode>();
+    const loadOther = (file: string) => {
+      const result = matches(file) ? client.load(file) : undefined;
+      if (!result) {
+        return undefined;
+      }
+      loaded.set(file, result);
+      return { path: `${file}?${BUN_LOADED_MARKER}` };
+    };
     // Bun calls `onResolve` again with the path it returned and no importer.
     const onResolve =
       (namespace?: string) =>
-      ({ path, importer }: { path: string; importer: string }) => {
+      ({ path, importer }: BunResolveArgs) => {
         if (_active !== served || (!namespace && importer === "")) {
           return undefined;
         }
@@ -206,7 +233,12 @@ export async function registerPluginHooks(
           return undefined;
         }
         if (_idPath(resolved.id)) {
-          return { path: resolved.id };
+          const file = stripQuery(resolved.id);
+          return (
+            (!resolved.external && BUN_OTHER_FILE.test(file) && loadOther(file)) || {
+              path: resolved.id,
+            }
+          );
         }
         return resolved.external
           ? undefined
@@ -220,23 +252,15 @@ export async function registerPluginHooks(
           if (result) {
             return serve(path, result);
           }
-          // `onLoad` can't decline: untouched files are served like Bun would.
+          // `onLoad` can't decline: untouched code is served with the loader
+          // Bun would use.
           const contents = readFileSync(path, "utf8");
-          const loader = _bunLoader(path);
-          if (loader === "json") {
-            return { exports: { default: _parseJSON(path, contents) }, loader: "object" };
-          }
-          if (!loader) {
-            throw new Error(
-              `[env-runner] "${path}" matched the runner's plugin filters, but no plugin loaded or transformed it.`,
-            );
-          }
           return {
             contents:
               transformedFormat(path, contents) === "commonjs"
                 ? commonJSToESM(path, contents)
                 : contents,
-            loader,
+            loader: _bunLoader(path),
           };
         });
         if (resolvePrefilters.length > 0) {
@@ -246,6 +270,19 @@ export async function registerPluginHooks(
             build.onResolve({ filter: /.*/, namespace: scheme }, onResolve(scheme));
           }
         }
+        build.onResolve({ filter: BUN_OTHER_FILE }, ({ path, importer }: BunResolveArgs) => {
+          const file = _active === served && importer ? _bunFilePath(path, importer) : undefined;
+          return file === undefined ? undefined : loadOther(file);
+        });
+        build.onLoad({ filter: BUN_LOADED_FILE }, ({ path }: { path: string }) => {
+          const file = stripQuery(path);
+          const result = loaded.get(file) ?? client.load(file);
+          loaded.delete(file);
+          if (!result) {
+            throw new Error(`[env-runner] no plugin loaded or transformed "${file}" anymore`);
+          }
+          return serve(file, result);
+        });
         build.onLoad({ filter: /.*/, namespace: BUN_NAMESPACE }, ({ path }: { path: string }) => {
           const id = decodeURIComponent(path);
           return serve(id, client.load(id, true)!);
@@ -309,6 +346,20 @@ function _bunImporterId(importer: string): string | undefined {
   return importer.startsWith(prefix)
     ? decodeURIComponent(importer.slice(prefix.length))
     : stripQuery(importer);
+}
+
+// Path a relative or absolute Bun specifier (query stripped) refers to;
+// `undefined` for bare ones (packages).
+function _bunFilePath(specifier: string, importer: string): string | undefined {
+  const path = stripQuery(specifier);
+  if (isAbsolute(path)) {
+    return path;
+  }
+  if (!/^\.\.?[\\/]/.test(path)) {
+    return undefined;
+  }
+  const from = stripQuery(importer);
+  return resolve(isAbsolute(from) ? dirname(from) : process.cwd(), path);
 }
 
 // Names the file, as Node's JSON errors do.
@@ -390,39 +441,32 @@ const BUN_EXTENSIONS: Record<string, string[]> = {
  * Bun's `onLoad` filter (a single RegExp) for these plugins. Bun evaluates
  * plugin output as ESM and `onLoad` can't decline, so it follows the plugins'
  * prefilters as closely as a RegExp can: no `/node_modules/` (either
- * separator), then per plugin filter
+ * separator), then one alternative per plugin with
  *
- * - script files: the extensions its `moduleType` filter implies (all
- *   non-CommonJS script extensions without one, or with filter expressions),
- *   never `.cjs`/`.cts`, and its `id` filter: excludes as a negative
- *   lookahead, and includes as a lookahead (when they can all be folded);
- * - other files (no query), only when its whole `id` filter folds: the
- *   extensions of the other module types it lists, or with an `id` include
- *   and no `moduleType` filter any other extension (not `.json`, `.node` or
- *   `.wasm`, except for `load` filters).
+ * - the extensions its `moduleType` filter implies (all non-CommonJS script
+ *   extensions without one, or with filter expressions), never `.cjs`/`.cts`;
+ * - its `id` filter: excludes as a negative lookahead, and includes as a
+ *   lookahead (when they can all be folded).
  *
  * Bun paths keep native separators: compiled globs match either one, RegExps
  * written for `/` are only folded where that is the separator (`windows`
  * false). The RegExp takes the folded patterns' flags; if they differ, or one
  * has backreferences or named groups (which don't survive being spliced
  * together), no `id` filter is folded in. The prefilter still decides per
- * module; script (and JSON) files the RegExp lets through but no plugin
- * matches load like Bun would.
+ * module; paths the RegExp lets through but no plugin matches load with Bun's
+ * native loader.
  */
 export function createBunFilter(
   prefilters: SerializedPrefilter[],
   windows = process.platform === "win32",
 ): RegExp {
+  const escape = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const sep = String.raw`(?:\\|\/)`;
   const foldable = (pattern: SerializedPattern) => pattern.glob || !windows;
-  const plugins = prefilters.map(({ id, moduleTypes, expr, load }) => ({
+  const plugins = prefilters.map(({ id, moduleTypes, expr }) => ({
     moduleTypes: expr ? undefined : moduleTypes,
     exclude: id?.exclude.filter(foldable) ?? [],
     include: id && id.include.length > 0 && id.include.every(foldable) ? id.include : [],
-    // Every `id` pattern folds (other files need the exact filter).
-    exact: !expr && (!id || [...id.include, ...id.exclude].every(foldable)),
-    named: !expr && (id?.include.length ?? 0) > 0,
-    load,
   }));
   const folded = plugins.flatMap(({ include, exclude }) => [...include, ...exclude]);
   const flagSet = new Set(folded.map((pattern) => pattern.flags));
@@ -430,7 +474,13 @@ export function createBunFilter(
   const foldIds =
     flagSet.size <= 1 && !folded.some(({ source }) => /\\[1-9]|\\k<|\(\?<(?![=!])/.test(source));
   const branches = new Set<string>();
-  for (const { moduleTypes, include, exclude, exact, named, load } of plugins) {
+  for (const { moduleTypes, include, exclude } of plugins) {
+    const extensions = moduleTypes
+      ? moduleTypes.flatMap((type) => BUN_EXTENSIONS[type] ?? [])
+      : Object.values(BUN_EXTENSIONS).flat();
+    if (extensions.length === 0) {
+      continue;
+    }
     let lookaheads = "";
     if (foldIds && exclude.length > 0) {
       lookaheads += `(?!.*?(?:${exclude.map(({ source }) => source).join("|")}))`;
@@ -438,24 +488,7 @@ export function createBunFilter(
     if (foldIds && include.length > 0) {
       lookaheads += `(?=.*?(?:${include.map(({ source }) => source).join("|")}))`;
     }
-    const extensions = moduleTypes
-      ? moduleTypes.flatMap((type) => BUN_EXTENSIONS[type] ?? [])
-      : Object.values(BUN_EXTENSIONS).flat();
-    if (extensions.length > 0) {
-      branches.add(`${lookaheads}.*${_extensionGroup(extensions)}$`);
-    }
-    if (!exact || (!foldIds && (include.length > 0 || exclude.length > 0))) {
-      continue;
-    }
-    if (moduleTypes) {
-      const other = moduleTypes.filter((type) => !BUN_EXTENSIONS[type] && /^\w+$/.test(type));
-      if (other.length > 0) {
-        branches.add(`${lookaheads}[^?]*${_extensionGroup(other.map((type) => `.${type}`))}$`);
-      }
-    } else if (named) {
-      const skipped = load ? String.raw`c[jt]s` : String.raw`c[jt]s|json|node|wasm`;
-      branches.add(`${lookaheads}(?![^?]*\\.(?:${skipped})$)[^?]*$`);
-    }
+    branches.add(`${lookaheads}.*(?:${[...new Set(extensions)].map(escape).join("|")})$`);
   }
   return new RegExp(
     `^(?!.*${sep}node_modules${sep})(?:${[...branches].join("|") || "(?!)"})`,
@@ -520,33 +553,22 @@ export function resolveSchemes(prefilters: SerializedPrefilter[]): string[] {
   return [...schemes];
 }
 
-function _extensionGroup(extensions: string[]): string {
-  const escape = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return `(?:${[...new Set(extensions)].map(escape).join("|")})`;
-}
-
-// Bun's native loader for untouched files (and loads after unregistering),
-// `undefined` for files it can't be given back.
-function _bunLoader(path: string): string | undefined {
+// Bun's native loader, for untouched code and loads after unregistering.
+function _bunLoader(path: string): string {
   const ext = path.slice(path.lastIndexOf(".") + 1);
   switch (ext) {
     case "ts":
-    case "mts":
-    case "cts": {
+    case "mts": {
       return "ts";
     }
     case "tsx":
-    case "jsx":
-    case "json": {
+    case "jsx": {
       return ext;
     }
-    case "js":
-    case "mjs":
-    case "cjs": {
+    default: {
       return "js";
     }
   }
-  return undefined;
 }
 
 const _noop = () => {};

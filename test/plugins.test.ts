@@ -17,6 +17,7 @@ import * as miniflare from "miniflare";
 import { MiniflareEnvRunner } from "../src/runners/miniflare/runner.ts";
 import { createPluginPipeline, transformVirtualModules } from "../src/plugin/pipeline.ts";
 import { createPrefilter, moduleTypeOf } from "../src/plugin/filter.ts";
+import { globToRegExp, resolveGlob } from "../src/plugin/glob.ts";
 import {
   createBunFilter,
   createBunResolveFilter,
@@ -115,9 +116,10 @@ function resolvers(seen: [string, string | undefined][]): EnvRunnerPlugin[] {
       transform: {
         filter: { id: /\.yaml$/ },
         handler(code) {
+          // Fixtures may be checked out with CRLF (Windows).
           const entries = code
             .trim()
-            .split("\n")
+            .split(/\r?\n/)
             .map((line) => line.split(": "));
           return `export default ${JSON.stringify(Object.fromEntries(entries))};`;
         },
@@ -197,6 +199,33 @@ for (const { name, create, skip, cjsOptions } of runners) {
         ["virtual:suffix", "\0virtual:message"],
       ]);
     });
+
+    it.runIf(name === "BunProcessEnvRunner")(
+      "leaves other files no plugin changes to Bun, even when a filter names them",
+      async () => {
+        const seen: string[] = [];
+        const all: EnvRunnerPlugin = {
+          name: "all",
+          transform: {
+            filter: { id: "**/fixtures/plugins/**" },
+            handler: (_code, id) => void seen.push(id.split(/[\\/]/).pop()!),
+          },
+        };
+        runner = create({
+          name: "plugins-files",
+          plugins: [resolvers([]), all],
+          data: { entry: fixture("app-files.ts") },
+        });
+        await runner.waitForReady();
+        const res = await runner.fetch("http://localhost/");
+        expect(await res.json()).toEqual({
+          note: "hello",
+          logo: "logo.svg",
+          yaml: { name: "env-runner", kind: "yaml" },
+        });
+        expect(seen).toEqual(expect.arrayContaining(["app-files.ts", "note.txt", "logo.svg"]));
+      },
+    );
 
     it('runs `order: "pre"` handlers first', async () => {
       const pre: EnvRunnerPlugin = {
@@ -613,7 +642,7 @@ describe("plugins", () => {
   });
 
   it("builds Bun's `onLoad` filter from the prefilters", () => {
-    const filter = (prefilters: any[]) => createBunFilter(prefilters);
+    const filter = (prefilters: any[]) => createBunFilter(prefilters, false);
     const all = filter([{}]);
     expect(all.test("/app/a.ts")).toBe(true);
     expect(all.test("/app/a.cts")).toBe(false);
@@ -692,6 +721,23 @@ describe("plugin filters", () => {
     }
     return seen;
   };
+
+  it("escapes the working directory of relative globs", () => {
+    for (const dir of ["/tmp/app[1]", "/tmp/app{a,b}", "/tmp/a*b?", String.raw`C:\work\app(1)`]) {
+      const glob = resolveGlob("src/**", dir);
+      const base = dir.replaceAll("\\", "/");
+      expect(globToRegExp(glob).test(`${base}/src/a.ts`), dir).toBe(true);
+      expect(globToRegExp(glob).test(`${base.replace(/[[{*?(]/, "x")}/src/a.ts`), dir).toBe(false);
+    }
+  });
+
+  it("keeps `\\` escapes in absolute globs using `/` on Windows", () => {
+    expect(resolveGlob(String.raw`/r/\[x\].ts`, "/", true)).toBe(String.raw`/r/\[x\].ts`);
+    // `\` separators only: a Windows path.
+    expect(resolveGlob(String.raw`C:\app\*.ts`, "/", true)).toBe("C:/app/*.ts");
+    expect(resolveGlob(String.raw`C:/r/\*.ts`, "/", true)).toBe(String.raw`C:/r/\*.ts`);
+    expect(resolveGlob(String.raw`/r/\[x\].ts`, "/", false)).toBe(String.raw`/r/\[x\].ts`);
+  });
 
   it("matches globs with `*` and `**` into dot files and directories", async () => {
     const ids = ["/app/src/a.ts", "/app/.nitro/b.ts", "/app/src/.env.ts", "/app/src/A.TS"];
@@ -1146,32 +1192,31 @@ describe("plugin `resolveId`/`load` hooks", () => {
     expect(seen).toEqual(["/app/a.vue:js"]);
   });
 
-  it("adds other file types to Bun's `onLoad` filter only when the filter folds", () => {
+  it("keeps other file types out of Bun's `onLoad` filter", () => {
     const filter = (plugin: EnvRunnerPlugin) =>
-      createBunFilter(createPluginPipeline([plugin])!.prefilters);
-    const vue = filter({ transform: { filter: { id: /\.vue$/ }, handler() {} } });
-    expect(vue.test("/app/a.vue")).toBe(true);
-    expect(vue.test("/app/a.vue?x")).toBe(false);
-    expect(vue.test("/app/a.json")).toBe(false);
-    expect(vue.test("/app/a.cjs")).toBe(false);
+      createBunFilter(createPluginPipeline([plugin])!.prefilters, false);
+    // `onLoad` can't decline: they are loaded while resolving instead.
+    const named = filter({ transform: { filter: { id: ["/app/**", /\.vue$/] }, handler() {} } });
+    expect(named.test("/app/a.ts")).toBe(true);
+    expect(named.test("/app/a.vue")).toBe(false);
+    expect(named.test("/app/a.txt")).toBe(false);
     const json = filter({ transform: { filter: { moduleType: ["json"] }, handler() {} } });
-    expect(json.test("/app/a.json")).toBe(true);
-    expect(json.test("/app/a.ts")).toBe(false);
-    const load = filter({ load: { filter: { id: /\.json$/ }, handler() {} } });
-    expect(load.test("/app/a.json")).toBe(true);
-    // Expressions only cover scripts.
-    const expr = filter({
-      transform: {
-        filter: [{ kind: "include", expr: { kind: "id", pattern: /\.vue$/ } }],
-        handler() {},
+    expect(json.test("/app/a.json")).toBe(false);
+  });
+
+  it("serves plugin ids with any extension from plain `load` hooks", async () => {
+    const pipeline = createPluginPipeline([
+      {
+        resolveId: (source) => (source === "virtual:config.json" ? "\0config.json" : null),
+        load: (id) => (id === "\0config.json" ? '{"a":1}' : id === "\0x.vue" ? "<p/>" : null),
       },
-    });
-    expect(expr.test("/app/a.vue")).toBe(false);
-    // Not folded on Windows (RegExps see `\`): other files are left out.
-    const windows = createBunFilter(
-      createPluginPipeline([{ transform: { filter: { id: /\.vue$/ }, handler() {} } }])!.prefilters,
-      true,
-    );
-    expect(windows.test(String.raw`C:\app\a.vue`)).toBe(false);
+      // Unfiltered: doesn't see JSON (another type), sees the `.vue` module as `js`.
+      { transform: (_code, _id, { moduleType }) => `// ${moduleType}` },
+    ])!;
+    expect(await pipeline.load("\0config.json")).toEqual({ code: '{"a":1}', moduleType: "json" });
+    // Loaded code of another type without a `moduleType` becomes `js`.
+    expect(await pipeline.load("\0x.vue")).toEqual({ code: "// js", moduleType: "js" });
+    // Disk files still need a filter naming them.
+    expect(await pipeline.load("/app/c.json", () => '{"b":1}')).toBeUndefined();
   });
 });

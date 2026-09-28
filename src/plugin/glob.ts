@@ -8,17 +8,24 @@ const SEGMENT_CHAR = String.raw`[^\\/]`;
 
 /**
  * Resolve a glob from cwd unless it starts with `**` or is absolute (`..` and
- * `.` segments are normalized, `\` escapes kept).
+ * `.` segments are normalized, `\` escapes kept). cwd is escaped, so glob
+ * characters in it (`[`, `{`, ...) match literally.
  */
-export function resolveGlob(pattern: string, cwd = process.cwd()): string {
+export function resolveGlob(
+  pattern: string,
+  cwd = process.cwd(),
+  windows = process.platform === "win32",
+): string {
   if (pattern.startsWith("**")) {
     return pattern;
   }
-  if (nodePath.isAbsolute(pattern)) {
-    // Windows paths may use `\` separators, which can't be escapes there.
-    return process.platform === "win32" ? pattern.replaceAll("\\", "/") : pattern;
+  if ((windows ? nodePath.win32 : nodePath.posix).isAbsolute(pattern)) {
+    // A Windows path written with `\` separators only (`C:\app\*.ts`): they
+    // can't be escapes there. With `/` separators, `\` stays an escape.
+    return windows && !pattern.includes("/") ? pattern.replaceAll("\\", "/") : pattern;
   }
-  return nodePath.posix.join(cwd.replaceAll("\\", "/"), pattern);
+  const base = cwd.replaceAll("\\", "/").replace(/[*?[\]{}()!+@,\\]/g, "\\$&");
+  return nodePath.posix.join(base, pattern);
 }
 
 /**

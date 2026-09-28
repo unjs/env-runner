@@ -413,7 +413,9 @@ export function createPluginPipeline(
   const load = async (id: string, read?: () => string) => {
     const matchId = normalizeFilterId(id);
     let moduleType = moduleTypeOf(id);
-    const required = requiredMatch(moduleType);
+    // Plugin ids (no `read`) have no fallback: every matching hook may load
+    // them, whatever their extension.
+    const required = read ? requiredMatch(moduleType) : undefined;
     for (const hook of loadHooks) {
       if (!satisfiesMatch(hook.match(matchId, moduleType), required)) {
         continue;
