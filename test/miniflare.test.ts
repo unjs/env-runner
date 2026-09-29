@@ -1,6 +1,6 @@
 import { fileURLToPath } from "node:url";
 import { resolve, dirname, join } from "node:path";
-import { writeFileSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, writeFileSync, mkdtempSync, rmSync } from "node:fs";
 import { describe, expect, it, afterEach, vi } from "vitest";
 import * as miniflare from "miniflare";
 import { MiniflareEnvRunner } from "../src/runners/miniflare/runner.ts";
@@ -386,6 +386,118 @@ describe("MiniflareEnvRunner (transformRequest)", () => {
     const res = await runner.fetch("http://localhost/");
     expect(await res.text()).toBe("raw");
   });
+});
+
+describe("MiniflareEnvRunner (node_modules resolution)", () => {
+  let runner: MiniflareEnvRunner | undefined;
+  let tmpDir: string | undefined;
+
+  afterEach(async () => {
+    await runner?.close();
+    runner = undefined;
+    if (tmpDir) {
+      rmSync(tmpDir, { recursive: true, force: true });
+      tmpDir = undefined;
+    }
+  });
+
+  function writeFiles(files: Record<string, string>) {
+    tmpDir = mkdtempSync(join(_dir, ".tmp-node-modules-"));
+    for (const [path, contents] of Object.entries(files)) {
+      mkdirSync(dirname(join(tmpDir, path)), { recursive: true });
+      writeFileSync(join(tmpDir, path), contents);
+    }
+    return tmpDir;
+  }
+
+  it("resolves conditional exports and require() from CommonJS packages", async () => {
+    const dir = writeFiles({
+      "node_modules/dual-pkg/package.json": JSON.stringify({
+        name: "dual-pkg",
+        exports: {
+          ".": {
+            node: { import: "./dist/node.mjs", require: "./dist/node.cjs" },
+            default: { import: "./dist/default.mjs", require: "./dist/default.cjs" },
+          },
+        },
+      }),
+      "node_modules/dual-pkg/dist/node.mjs": `export const which = "node.mjs";`,
+      "node_modules/dual-pkg/dist/node.cjs": `exports.which = "node.cjs";`,
+      "node_modules/dual-pkg/dist/default.mjs": `export const which = "default.mjs";`,
+      "node_modules/dual-pkg/dist/default.cjs": `exports.which = "default.cjs";`,
+      "node_modules/cjs-pkg/package.json": JSON.stringify({
+        name: "cjs-pkg",
+        main: "dist/index.cjs",
+      }),
+      "node_modules/cjs-pkg/dist/index.cjs": [
+        `const { which } = require("dual-pkg");`,
+        `const { local } = require("./local.cjs");`,
+        `module.exports = { nextTick: typeof require("node:process").nextTick, which, local };`,
+      ].join("\n"),
+      "node_modules/cjs-pkg/dist/local.cjs": `exports.local = "local.cjs";`,
+      // Same basename as the package's file, next to the importer
+      "src/deep/index.cjs": `exports.local = "wrong";`,
+      "src/deep/other.mjs": `export * as dual from "dual-pkg";`,
+      "src/deep/app.mjs": [
+        `import { which } from "dual-pkg";`,
+        `import * as dual from "dual-pkg";`,
+        `import { dual as otherDual } from "./other.mjs";`,
+        `import cjs from "cjs-pkg";`,
+        `export default { fetch: () => Response.json({ which, cjs, same: dual === otherDual }) };`,
+      ].join("\n"),
+    });
+
+    runner = new MiniflareEnvRunner({
+      miniflare,
+      name: "test-node-modules",
+      data: { entry: join(dir, "src/deep/app.mjs") },
+    });
+    await waitForReady(runner);
+
+    const res = await runner.fetch("http://localhost/");
+    expect(await res.json()).toEqual({
+      which: "default.mjs",
+      cjs: { nextTick: "function", which: "default.cjs", local: "local.cjs" },
+      same: true,
+    });
+  });
+
+  it.each(["import", "require"])(
+    "does not polyfill node: modules workerd lacks (%s)",
+    async (method) => {
+      const dir = writeFiles({
+        // Not used, even when installed
+        "node_modules/unenv/package.json": JSON.stringify({
+          name: "unenv",
+          exports: { "./node/*": "./node/*.mjs" },
+        }),
+        "node_modules/unenv/node/does_not_exist.mjs": `export default "polyfill";`,
+        "node_modules/cjs-pkg/package.json": JSON.stringify({ name: "cjs-pkg", main: "index.cjs" }),
+        "node_modules/cjs-pkg/index.cjs": `module.exports = require("node:does_not_exist");`,
+        "app.mjs": [
+          method === "import"
+            ? `import value from "node:does_not_exist";`
+            : `import value from "cjs-pkg";`,
+          `export default { fetch: () => new Response(value) };`,
+        ].join("\n"),
+      });
+      const error = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        runner = new MiniflareEnvRunner({
+          miniflare,
+          name: `test-node-builtin-${method}`,
+          data: { entry: join(dir, "app.mjs") },
+        });
+        const cause = await runner.waitForReady().then(
+          () => undefined,
+          (error: Error) => error.cause as Error,
+        );
+        expect(cause?.message).toMatch(/No such module "node:does_not_exist"/);
+      } finally {
+        error.mockRestore();
+      }
+    },
+  );
 });
 
 describe("MiniflareEnvRunner (auto-detect exports)", () => {
