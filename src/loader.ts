@@ -1,5 +1,5 @@
 import type { WorkerHooks, EnvRunner } from "./types.ts";
-import type { EnvRunnerData } from "./common/base-runner.ts";
+import type { EnvRunnerData, EnvRunnerPluginOption } from "./common/base-runner.ts";
 
 export type RunnerName =
   | "node-worker"
@@ -16,6 +16,8 @@ export interface LoadRunnerOptions {
   workerEntry?: string;
   hooks?: WorkerHooks;
   data?: EnvRunnerData;
+  /** Host-side transform plugins (see `EnvRunnerPluginOption`). */
+  plugins?: EnvRunnerPluginOption[];
   execArgv?: string[];
   /** Runner-specific constructor options (e.g. `miniflare` for the `miniflare` runner). */
   [key: string]: unknown;

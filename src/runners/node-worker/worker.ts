@@ -9,21 +9,19 @@ import {
   isVirtualEntry,
   toServerOptions,
   formatInitError,
+  registerWorkerHooks,
   type AppEntry,
 } from "../../common/worker-utils.ts";
-import {
-  registerVirtualModules,
-  handleUpdateVirtualModules,
-} from "../../common/virtual-modules.ts";
+import { handleUpdateVirtualModules } from "../../common/virtual-modules.ts";
 
 const data = workerData || {};
 const sendMessage = (message: unknown) => parentPort?.postMessage(message);
 
-let unregisterVirtualModules: () => void;
+let unregisterHooks: () => void;
 let entry: AppEntry;
 let server: Server;
 try {
-  unregisterVirtualModules = await registerVirtualModules(data.virtual);
+  unregisterHooks = await registerWorkerHooks(data);
   // After registering: entry detection follows the live registrations.
   entry = await resolveEntry(data.entry, isVirtualEntry(data.entry));
   // The entry's own srvx options are forwarded, so `serve()` can throw on a
@@ -62,7 +60,7 @@ parentPort?.on("message", async (message) => {
     Promise.resolve(entry.ipc?.onClose?.())
       .then(() => server.close())
       .then(() => {
-        unregisterVirtualModules();
+        unregisterHooks();
         parentPort?.postMessage({ event: "exit" });
       });
     return;

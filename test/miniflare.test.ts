@@ -462,6 +462,39 @@ describe("MiniflareEnvRunner (node_modules resolution)", () => {
     });
   });
 
+  it("serves a file a plugin resolves a CommonJS require() to under its path", async () => {
+    const dir = writeFiles({
+      "polyfill/node/process.mjs": `import { nextTick } from "../_internal/utils.mjs";\nexport default { nextTick };`,
+      "polyfill/_internal/utils.mjs": `export const nextTick = () => {};`,
+      "node_modules/cjs-pkg/package.json": JSON.stringify({ name: "cjs-pkg", main: "index.cjs" }),
+      "node_modules/cjs-pkg/index.cjs": `module.exports = typeof require("node:process").nextTick;`,
+      "app.mjs": `import value from "cjs-pkg";\nexport default { fetch: () => new Response(value) };`,
+    });
+    const seen: string[] = [];
+    runner = new MiniflareEnvRunner({
+      miniflare,
+      name: "test-plugin-require",
+      data: { entry: join(dir, "app.mjs") },
+      plugins: [
+        {
+          resolveId: {
+            filter: { id: /^node:process$/ },
+            handler(source) {
+              seen.push(source);
+              return join(dir, "polyfill/node/process.mjs");
+            },
+          },
+        },
+      ],
+    });
+    await waitForReady(runner);
+
+    const res = await runner.fetch("http://localhost/");
+    expect(await res.text()).toBe("function");
+    // Resolved once: the redirect's re-request reuses it.
+    expect(seen).toEqual(["node:process"]);
+  });
+
   it.each(["import", "require"])(
     "does not polyfill node: modules workerd lacks (%s)",
     async (method) => {

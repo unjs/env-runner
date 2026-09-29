@@ -6,7 +6,7 @@ import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import { BaseEnvRunner } from "../../common/base-runner.ts";
-import type { EnvRunnerData } from "../../common/base-runner.ts";
+import type { EnvRunnerData, EnvRunnerPluginOption } from "../../common/base-runner.ts";
 
 export type { EnvRunnerData as DenoProcessEnvRunnerData } from "../../common/base-runner.ts";
 
@@ -20,6 +20,8 @@ export class DenoProcessEnvRunner extends BaseEnvRunner {
     workerEntry?: string;
     hooks?: WorkerHooks;
     data?: EnvRunnerData;
+    /** Host-side transform plugins (see `EnvRunnerPluginOption`). */
+    plugins?: EnvRunnerPluginOption[];
     execArgv?: string[];
   }) {
     _defaultEntry ||= fileURLToPath(import.meta.resolve("env-runner/runners/deno-process/worker"));
@@ -44,6 +46,10 @@ export class DenoProcessEnvRunner extends BaseEnvRunner {
 
   protected _runtimeType() {
     return "process";
+  }
+
+  protected override _resolveConditions() {
+    return ["deno", "node", "import"];
   }
 
   protected async _closeRuntime() {
