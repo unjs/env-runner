@@ -100,7 +100,10 @@ export interface MiniflareEnvRunnerOptions {
   persistent?: boolean;
   /** Wrap the user's `fetch` in a try/catch that returns structured JSON error responses. Default: `true`. */
   captureErrors?: boolean;
-  /** Export conditions for the fallback service (default `["workerd", "worker"]`). */
+  /**
+   * Export conditions for the fallback service (default `["workerd", "worker"]`),
+   * plus `import` or `require` matching how the module is loaded.
+   */
   exportConditions?: string[];
   /**
    * Load a wrangler config into Miniflare options (compat date/flags, bindings).
@@ -756,6 +759,9 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
         // Map workerd module names to real filesystem paths for correct
         // relative import resolution from bare-specifier modules.
         const modulePathMap = new Map<string, string>();
+        // Locations redirected to (see below) → what they were resolved to, so
+        // workerd's re-request doesn't run the resolution (and plugins) again.
+        const _redirects = new Map<string, { path: string; id?: string }>();
         const _lexersReady = Promise.all([ensureCjsLexer(), initEsmLexer]);
         options.unsafeModuleFallbackService = async (request: Request) => {
           await _lexersReady;
@@ -768,6 +774,10 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
           }
           const cleanSpecifier = specifier.split("?")[0] || specifier;
           const cleanRaw = rawSpecifier?.split("?")[0];
+          // `require()` calls (incl. from CommonJS modules served below) resolve
+          // with the `require` export condition.
+          const method =
+            request.headers.get("x-resolve-method") === "require" ? "require" : "import";
 
           // Virtual modules override real files. Keep the query (a reload's too) in the name
           // so reloads get a fresh workerd module identity.
@@ -834,6 +844,8 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
           let resolvedId: string | undefined;
           // Returned by a `resolveId` hook (may be under node_modules).
           let pluginResolved = false;
+          // Resolved from a bare specifier (see the redirect below).
+          let bareResolved = false;
 
           // The plugins' `resolveId` hooks, after virtual modules (as in workers),
           // and the `fallback` ones where resolving it here fails.
@@ -893,16 +905,31 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
               return _pluginErrorModule(name, error);
             }
           };
-          const pluginPath = await _pluginResolve(false);
-          if (pluginPath instanceof Response) {
-            return pluginPath;
+          const redirected = _redirects.get(specifier);
+          if (redirected) {
+            _redirects.delete(specifier);
+            resolvedPath = redirected.path;
+            resolvedId = redirected.id;
+            pluginResolved = redirected.id !== undefined;
+          } else if (
+            method === "require" &&
+            cleanRaw?.startsWith("node:") &&
+            specifier === cleanRaw + NODE_REQUIRE_SUFFIX
+          ) {
+            // The `require("node:*")` shim redirected to below.
+            return Response.json({ name: specifier, esModule: createNodeRequireShim(cleanRaw) });
+          } else {
+            const pluginPath = await _pluginResolve(false);
+            if (pluginPath instanceof Response) {
+              return pluginPath;
+            }
+            resolvedPath = pluginPath;
           }
-          resolvedPath = pluginPath;
 
           // file:// URL specifier — convert to filesystem path
           const fileUrlRaw = cleanRaw || cleanSpecifier;
           if (resolvedPath !== undefined) {
-            // Resolved by a plugin.
+            // Resolved by a plugin, or before a redirect.
           } else if (fileUrlRaw.startsWith("file://")) {
             try {
               resolvedPath = fileURLToPath(fileUrlRaw);
@@ -925,39 +952,43 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
             if (cleanRaw.startsWith("cloudflare:")) {
               return new Response(null, { status: 404 });
             }
-            // For node:* builtins not natively supported by workerd, use unenv polyfill
+            // node:* modules are workerd built-ins too: a 404 lets workerd load
+            // its own (or report it missing, as in production).
             if (cleanRaw.startsWith("node:")) {
-              const nodeName = cleanRaw.slice(5);
-              try {
-                resolvedPath = contextRequire.resolve(`unenv/node/${nodeName}`);
-              } catch {
-                return new Response(null, { status: 404 });
+              // workerd's `require()` asks the fallback before some built-ins
+              // (`node:process`) and fails on a 404: serve an ES module
+              // importing the built-in, under a name of its own.
+              if (method === "require") {
+                const location = cleanRaw + NODE_REQUIRE_SUFFIX;
+                return new Response(null, { status: 301, headers: { location } });
               }
-            } else {
-              try {
-                // Use exsolve with export conditions so packages with conditional
-                // exports (e.g. srvx with "workerd" condition) resolve correctly.
-                const resolved = resolveModulePath(cleanRaw, {
-                  from: referrerReal || entryBase,
-                  conditions: _exportConditions,
-                  try: true,
-                });
-                resolvedPath = resolved || contextRequire.resolve(cleanRaw);
-              } catch {
-                const failed = await _pluginResolve(true);
-                if (failed instanceof Response) {
-                  return failed;
-                }
-                if (failed === undefined) {
-                  // Return an empty stub for unresolvable bare specifiers (e.g. optional native addons like bufferutil)
-                  const name = cleanSpecifier.startsWith("/")
-                    ? cleanSpecifier.slice(1)
-                    : cleanSpecifier;
-                  return Response.json({ name, esModule: "export default undefined;" });
-                }
-                resolvedPath = failed;
-              }
+              return new Response(null, { status: 404 });
             }
+            try {
+              // Use exsolve with export conditions so packages with conditional
+              // exports (e.g. srvx with "workerd" condition) resolve correctly.
+              // It only matches the given conditions, so add `import`/`require`.
+              const resolved = resolveModulePath(cleanRaw, {
+                from: referrerReal || entryBase,
+                conditions: [..._exportConditions, method],
+                try: true,
+              });
+              resolvedPath = resolved || contextRequire.resolve(cleanRaw);
+            } catch {
+              const failed = await _pluginResolve(true);
+              if (failed instanceof Response) {
+                return failed;
+              }
+              if (failed === undefined) {
+                // Return an empty stub for unresolvable bare specifiers (e.g. optional native addons like bufferutil)
+                const name = cleanSpecifier.startsWith("/")
+                  ? cleanSpecifier.slice(1)
+                  : cleanSpecifier;
+                return Response.json({ name, esModule: "export default undefined;" });
+              }
+              resolvedPath = failed;
+            }
+            bareResolved = true;
           } else {
             // Resolve against the referrer's real filesystem path
             const referrerReal =
@@ -994,6 +1025,29 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
               return failed;
             }
             resolvedPath = failed ?? resolvedPath;
+          }
+
+          // Name a module resolved from a bare specifier or by a plugin by its
+          // real path: one instance per file, and its relative imports and
+          // `require()` calls resolve from where it lives (a bare specifier is
+          // joined onto the importer's directory, a `node:` one not at all).
+          // workerd re-requests the location with the same `rawSpecifier`,
+          // which resolves to it again.
+          if (bareResolved || pluginResolved) {
+            const path = toWorkerdPath(resolvedPath);
+            if (cleanSpecifier !== path) {
+              const location = pluginResolved
+                ? restoreInternalQuery(path + queryOf(resolvedId!), specifier)
+                : path + rawQuery;
+              _redirects.set(location, {
+                path: resolvedPath,
+                id: pluginResolved ? resolvedId : undefined,
+              });
+              return new Response(null, {
+                status: 301,
+                headers: { location: Buffer.from(location, "utf8").toString("latin1") },
+              });
+            }
           }
 
           // Try Vite transform pipeline first (TS/JSX → JS, etc.)
@@ -1505,6 +1559,26 @@ function commonJSExports(contents: string): string[] {
   } catch {
     return [];
   }
+}
+
+const NODE_REQUIRE_SUFFIX = "?__require";
+
+/**
+ * `require("node:*")` target: workerd's `require()` of an ES module returns its
+ * default export. workerd also caches it under the requested name, so without
+ * the built-in its import resolves to itself (reading it throws).
+ */
+function createNodeRequireShim(specifier: string): string {
+  const quoted = JSON.stringify(specifier);
+  const notFound = JSON.stringify(`No such module ${quoted}.`);
+  return [
+    `import * as __mod__ from ${quoted};`,
+    `export * from ${quoted};`,
+    `let __default__;`,
+    `try { __default__ = __mod__.default ?? __mod__; } catch { throw new Error(${notFound}); }`,
+    `export default __default__;`,
+    ``,
+  ].join("\n");
 }
 
 function createCjsEsmShim(cjsSpecifier: string, contents: string): string {
