@@ -1,6 +1,18 @@
 # Changelog
 
 
+## v0.3.3
+
+[compare changes](https://github.com/unjs/env-runner/compare/v0.3.2...v0.3.3)
+
+### 🩹 Fixes
+
+- **miniflare:** Resolve conditional exports and `require()` from CommonJS packages ([#68](https://github.com/unjs/env-runner/pull/68))
+
+### ❤️ Contributors
+
+- Pi0x <x@pi0.io>
+
 ## v0.3.2
 
 [compare changes](https://github.com/unjs/env-runner/compare/v0.3.0...v0.3.2)
