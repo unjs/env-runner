@@ -1,3 +1,6 @@
+import type { WorkerExportType } from "./exports.ts";
+import { generateExportStubs } from "./exports.ts";
+
 const IPC_PATH = "/__env_runner_ipc";
 
 /** Service binding name used for cross-request IPC (worker → runner). */
@@ -19,6 +22,8 @@ export function generateWrapper(
     captureErrors?: boolean;
     /** Class names re-exported from the entry, or a module specifier re-exported with `export *`. */
     exports?: string[] | string;
+    /** Exports declared by the config, exported as stubs resolving the entry's classes on use. */
+    stubs?: Record<string, WorkerExportType>;
     /** Import `node:process` as the `process` global (needs `nodejs_compat`). Default: `true`. */
     nodeCompat?: boolean;
   },
@@ -45,6 +50,12 @@ if (!globalThis.process) { globalThis.process = __process; }`;
             .join("\n")
         : "";
 
+  // The exports check runs whenever the entry's namespace provides the classes.
+  const exportStubs =
+    typeof opts?.exports === "string"
+      ? ""
+      : generateExportStubs(opts?.stubs || {}, Array.isArray(opts?.exports) ? opts.exports : []);
+
   const captureErrors = opts?.captureErrors ?? true;
 
   const fetchBody = captureErrors
@@ -67,12 +78,15 @@ if (!globalThis.process) { globalThis.process = __process; }`;
   return /* js */ `${processShim}
 ${staticReExport}
 ${explicitExports}
+${exportStubs}
 
 const __IPC_PATH = "${IPC_PATH}";
 const __IPC_BINDING = "${IPC_BINDING}";
 const __UNSAFE_EVAL_BINDING = "${UNSAFE_EVAL_BINDING}";
 const __entryPath = ${JSON.stringify(entryPath)};
+let __entryModule;
 let __userEntry;
+let __entryLoading;
 let __server;
 let __ipcInitialized = false;
 let __serverWs;
@@ -161,8 +175,30 @@ async function __loadEntry(env, path) {
     "loadEntry",
     "path"
   );
-  const mod = await importFn(path);
-  return mod.default || mod;
+  return importFn(path);
+}
+
+function __setEntry(mod) {
+  const entry = mod.default || mod;
+  __server = __createServer(entry);
+  __entryModule = mod;
+  __userEntry = entry;
+}
+
+// Loads the entry once, for the IPC init request or an export stub used first.
+async function __ensureEntry(env) {
+  if (__userEntry) return;
+  __entryLoading ||= __loadEntry(env, __entryPath)
+    .then(__setEntry)
+    .finally(() => {
+      __entryLoading = undefined;
+    });
+  await __entryLoading;
+}
+
+// Where the Worker's classes come from: the entry's \`resolveExports()\` hook, or its namespace.
+async function __entryExports() {
+  return __userEntry?.resolveExports ? await __userEntry.resolveExports() : __entryModule;
 }
 
 // Where an entry load error was thrown (first stack frame), so one thrown by a
@@ -201,11 +237,13 @@ async function __handleWsMessage(env, data) {
   if (msg.type === "reload" && env.__ENV_RUNNER_UNSAFE_EVAL__) {
     const version = msg.version || 0;
     try {
-      const newEntry = await __loadEntry(env, __entryPath + "?__envRunnerReload=" + version);
+      const newModule = await __loadEntry(env, __entryPath + "?__envRunnerReload=" + version);
+      const newEntry = newModule.default || newModule;
       const newServer = __createServer(newEntry);
       if (__userEntry?.ipc?.onClose) {
         await __userEntry.ipc.onClose();
       }
+      __entryModule = newModule;
       __userEntry = newEntry;
       __server = newServer;
       __crosswsAdapter = undefined;
@@ -215,6 +253,7 @@ async function __handleWsMessage(env, data) {
         await __userEntry.ipc.onOpen({ sendMessage: __sendMessage });
       }
       __sendMessage({ event: "module-reloaded" });
+      __runExportsCheck();
     } catch (e) {
       __sendMessage({ event: "module-reloaded", error: String(e) });
     }
@@ -226,6 +265,12 @@ async function __handleWsMessage(env, data) {
       await __userEntry.ipc.onClose();
     }
     return;
+  }
+}
+
+function __runExportsCheck() {
+  if (typeof __checkExports === "function") {
+    __checkExports().catch(() => {});
   }
 }
 
@@ -250,11 +295,7 @@ export default {
     // the WebSocket upgrade opens the channel.
     if (url.pathname === __IPC_PATH) {
       try {
-        if (!__userEntry) {
-          const entry = await __loadEntry(env, __entryPath);
-          __server = __createServer(entry);
-          __userEntry = entry;
-        }
+        await __ensureEntry(env);
       } catch (e) {
         const message = "Failed to load entry: " + String(e) + __errorLocation(e);
         return new Response(message, { status: 500 });
@@ -280,6 +321,9 @@ export default {
           await __userEntry.ipc.onOpen({ sendMessage: __sendMessage });
         }
       }
+
+      // In the socket's request context, which outlives the check.
+      __runExportsCheck();
 
       return new Response(null, { status: 101, webSocket: client });
     }

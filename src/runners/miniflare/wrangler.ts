@@ -33,12 +33,11 @@ const WRANGLER_OPTION_DENYLIST = new Set([
   "unsafeUseModuleFallbackService",
 ]);
 
-// Options a single fetch-only dev worker can't run (workerd refuses to start
+// Options a single dev worker can't run (workerd refuses to start
 // without their targets). Opt in via `miniflareOptions`.
 const WRANGLER_OPTION_DROPLIST = new Set([
   "assets",
   "serviceBindings",
-  "workflows",
   "queueConsumers",
   "tails",
   "streamingTails",
@@ -113,6 +112,14 @@ export interface LoadedWranglerConfig {
   options?: Record<string, unknown>;
   /** Absolute path of the config file that was actually loaded (not set for inline-only configs). */
   configFile?: string;
+  /** The config's `exports` (file merged with inline), which declare the Worker's exported classes. */
+  exports?: Record<string, WranglerExport>;
+}
+
+/** An entry of the wrangler config's `exports`. */
+export interface WranglerExport {
+  type?: "durable-object" | "worker" | "workflow" | (string & {});
+  [key: string]: unknown;
 }
 
 /** Resolve the `wrangler` option into Miniflare options (see `MiniflareEnvRunnerOptions.wrangler`). */
@@ -171,7 +178,7 @@ export async function loadWranglerConfig(
         envFiles,
       });
     }
-    filterLocalDurableObjects(
+    filterLocalScriptBindings(
       options,
       dropped,
       (inline && wranglerWorkerName(inline, env)) ?? file?.workerName,
@@ -182,6 +189,7 @@ export async function loadWranglerConfig(
       options,
       // `readWranglerConfigMinimal` returns undefined for skipped/unparsable files.
       configFile: file ? configPath : undefined,
+      exports: mergeWranglerExports(file?.config.exports, inlineConfig?.exports),
     };
   }
 
@@ -191,6 +199,7 @@ export async function loadWranglerConfig(
   let fileOptions: Record<string, unknown> | undefined;
   let fileSecrets: unknown;
   let fileWorkerName: string | undefined;
+  let fileExports: unknown;
   if (configPath) {
     try {
       const config = wrangler.unstable_readConfig(
@@ -203,12 +212,14 @@ export async function loadWranglerConfig(
       );
       fileWorkerName = config?.name;
       fileSecrets = config?.secrets;
+      fileExports = config?.exports;
       fileLoaded = true;
     } catch (error) {
       warnWranglerLoadError(`"${configPath}"`, error);
     }
   }
   let inlineOptions: Record<string, unknown> | undefined;
+  let inlineExports: unknown;
   if (inline) {
     try {
       // `readConfig` throws for an `--env` the inline config lacks (the file may
@@ -224,6 +235,7 @@ export async function loadWranglerConfig(
       // re-anchor to the project. Reading them here also keeps inline `vars`
       // from beating the file's secrets (`.dev.vars` wins within each read).
       inlineConfig.userConfigPath = configPath;
+      inlineExports = inlineConfig.exports;
       // Read the inline part under the file's `secrets` declaration (as if
       // merged): explicit-secrets mode only loads declared keys (+ process.env).
       if (fileLoaded && inlineConfig.secrets === undefined) {
@@ -252,9 +264,9 @@ export async function loadWranglerConfig(
     }
   }
   const options = mergeWranglerMiniflareOptions(fileOptions, inlineOptions);
-  // Durable Objects are filtered after the merge, against the effective
-  // worker name: the inline config's `name` when set, else the file's.
-  filterLocalDurableObjects(
+  // Durable Objects and Workflows are filtered after the merge, against the
+  // effective worker name: the inline config's `name` when set, else the file's.
+  filterLocalScriptBindings(
     options,
     dropped,
     (inline && wranglerWorkerName(inline, env)) ?? fileWorkerName,
@@ -263,6 +275,7 @@ export async function loadWranglerConfig(
   return {
     options,
     configFile: fileLoaded ? configPath : undefined,
+    exports: mergeWranglerExports(fileExports, inlineExports),
   };
 }
 
@@ -401,7 +414,7 @@ function findWranglerConfigInDir(dir: string): string | undefined {
   return undefined;
 }
 
-/** Durable Objects are filtered after the file + inline merge (`filterLocalDurableObjects()`). */
+/** Durable Objects and Workflows are filtered after the file + inline merge (`filterLocalScriptBindings()`). */
 function pickWranglerMiniflareOptions(
   workerOptions: Record<string, unknown>,
   dropped: DroppedWranglerOptions,
@@ -462,36 +475,55 @@ function describeDroppedOption(value: unknown): string[] {
 }
 
 /**
- * Drop Durable Object bindings to other scripts (workerd won't start). A
- * `scriptName` equal to `workerName` is local, as in `wrangler dev`, so it is
- * stripped (the runner's worker has its own name).
+ * Drop Durable Object and Workflow bindings to other scripts (workerd won't
+ * start). A `scriptName` equal to `workerName` is local, as in `wrangler dev`,
+ * so it is stripped (the runner's worker has its own name).
  */
-function filterLocalDurableObjects(
+function filterLocalScriptBindings(
   options: Record<string, unknown> | undefined,
   dropped: DroppedWranglerOptions,
   workerName?: string,
 ): void {
-  const value = options?.durableObjects;
-  if (!options || !isPlainObject(value)) {
-    return;
-  }
-  const out: Record<string, unknown> = {};
-  for (const [name, binding] of Object.entries(value)) {
-    if (typeof binding === "string" || (isPlainObject(binding) && !binding.scriptName)) {
-      out[name] = binding;
-    } else if (isPlainObject(binding) && workerName && binding.scriptName === workerName) {
-      const { scriptName: _scriptName, ...local } = binding;
-      out[name] = local;
+  for (const [key, name] of [
+    ["durableObjects", "durable_objects"],
+    ["workflows", "workflows"],
+  ] as const) {
+    const value = options?.[key];
+    if (!options || !isPlainObject(value)) {
+      continue;
+    }
+    const out: Record<string, unknown> = {};
+    for (const [binding, config] of Object.entries(value)) {
+      if (typeof config === "string" || (isPlainObject(config) && !config.scriptName)) {
+        out[binding] = config;
+      } else if (isPlainObject(config) && workerName && config.scriptName === workerName) {
+        const { scriptName: _scriptName, ...local } = config;
+        out[binding] = local;
+      } else {
+        const scriptName = isPlainObject(config) ? config.scriptName : undefined;
+        addDropped(dropped, name, [`${binding} → script "${String(scriptName)}"`]);
+      }
+    }
+    if (Object.keys(out).length > 0) {
+      options[key] = out;
     } else {
-      const scriptName = isPlainObject(binding) ? binding.scriptName : undefined;
-      addDropped(dropped, "durable_objects", [`${name} → script "${String(scriptName)}"`]);
+      delete options[key];
     }
   }
-  if (Object.keys(out).length > 0) {
-    options.durableObjects = out;
-  } else {
-    delete options.durableObjects;
+}
+
+/** Inline `exports` entries replace the file's by name. */
+function mergeWranglerExports(
+  file: unknown,
+  inline: unknown,
+): Record<string, WranglerExport> | undefined {
+  if (!isPlainObject(file) && !isPlainObject(inline)) {
+    return undefined;
   }
+  return {
+    ...(isPlainObject(file) ? file : undefined),
+    ...(isPlainObject(inline) ? inline : undefined),
+  } as Record<string, WranglerExport>;
 }
 
 // Fields wrangler does not inherit from the top level into a named env
@@ -704,7 +736,6 @@ function mapWranglerConfigToMiniflare(
     ["services", config.services, "binding"],
     ["assets", config.assets, "binding"],
     ["queues.consumers", config.queues?.consumers, "queue"],
-    ["workflows", config.workflows, "binding"],
     ["tail_consumers", config.tail_consumers, "service"],
     ["streaming_tail_consumers", config.streaming_tail_consumers, "service"],
   ] as const) {
@@ -766,6 +797,17 @@ function mapWranglerConfigToMiniflare(
     .filter(([className]) => !doBindings.some((b) => b?.class_name === className))
     .map(([className, sqlite]) => ({ className, useSQLite: sqlite }));
   if (unbound.length > 0) out.additionalUnboundDurableObjects = unbound;
+  const workflows: Record<string, unknown> = {};
+  for (const w of Array.isArray(config.workflows) ? config.workflows : []) {
+    // Like Durable Objects, `script_name` is kept for `filterLocalScriptBindings()`.
+    if (!w?.binding || !w?.name || !w?.class_name) continue;
+    workflows[w.binding] = {
+      name: w.name,
+      className: w.class_name,
+      ...(w.script_name ? { scriptName: w.script_name } : {}),
+    };
+  }
+  if (Object.keys(workflows).length > 0) out.workflows = workflows;
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
