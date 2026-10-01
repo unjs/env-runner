@@ -609,6 +609,240 @@ export default {
   });
 });
 
+describe("MiniflareEnvRunner (lazy exports)", () => {
+  let runner: MiniflareEnvRunner | undefined;
+  let tmpDir: string | undefined;
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    await runner?.close();
+    runner = undefined;
+    if (tmpDir) {
+      rmSync(tmpDir, { recursive: true, force: true });
+      tmpDir = undefined;
+    }
+  });
+
+  function writeEntry(files: Record<string, string>): string {
+    tmpDir ??= mkdtempSync(join(_dir, ".tmp-lazy-exports-"));
+    for (const [name, contents] of Object.entries(files)) {
+      writeFileSync(join(tmpDir, name), contents);
+    }
+    return join(tmpDir, "worker.mjs");
+  }
+
+  const counterEntry = (version: string) => `
+import { DurableObject } from "cloudflare:workers";
+export { Counter } from "./counter.mjs";
+import { hits } from "./counter.mjs";
+export default {
+  async fetch(request, env) {
+    const stub = env.COUNTER.get(env.COUNTER.idFromName("test"));
+    const url = new URL(request.url);
+    if (url.pathname === "/rpc") return Response.json({ count: await stub.increment() });
+    if (url.pathname === "/fetch") return stub.fetch(request);
+    return Response.json({ hits: hits() });
+  },
+};
+// ${version}
+`;
+  const counterModule = (version: string) => `
+import { DurableObject } from "cloudflare:workers";
+let _hits = 0;
+export const hits = () => _hits;
+export class Counter extends DurableObject {
+  async increment() {
+    _hits++;
+    const count = ((await this.ctx.storage.get("count")) || 0) + 1;
+    await this.ctx.storage.put("count", count);
+    return count;
+  }
+  fetch() {
+    return new Response(${JSON.stringify(version)});
+  }
+}
+`;
+
+  it("resolves config-declared Durable Objects from the entry on use", async () => {
+    const entryPath = writeEntry({
+      "worker.mjs": counterEntry("v1"),
+      "counter.mjs": counterModule("v1"),
+    });
+    runner = new MiniflareEnvRunner({
+      miniflare,
+      name: "test-lazy-do",
+      data: { entry: entryPath },
+      wrangler: {
+        compatibility_date: "2025-01-01",
+        durable_objects: { bindings: [{ name: "COUNTER", class_name: "Counter" }] },
+        migrations: [{ tag: "v1", new_sqlite_classes: ["Counter"] }],
+      },
+      // Don't persist to the cwd's `.wrangler/state`.
+      miniflareOptions: { defaultPersistRoot: undefined },
+    });
+    await waitForReady(runner);
+    expect(await (await runner.fetch("http://localhost/rpc")).json()).toEqual({ count: 1 });
+    expect(await (await runner.fetch("http://localhost/rpc")).json()).toEqual({ count: 2 });
+    expect(await (await runner.fetch("http://localhost/fetch")).text()).toBe("v1");
+    // The Durable Object shares the entry's module instance.
+    expect(await (await runner.fetch("http://localhost/")).json()).toEqual({ hits: 2 });
+  });
+
+  it("follows reloadModule() without losing Durable Object state", async () => {
+    // reloadModule() re-imports the entry only, so the class lives in it.
+    const entry = (version: string) =>
+      counterModule(version) +
+      counterEntry(version).replace(/^import .*$|^export \{ Counter \}.*$/gm, "");
+    const entryPath = writeEntry({ "worker.mjs": entry("v1") });
+    runner = new MiniflareEnvRunner({
+      miniflare,
+      name: "test-lazy-do-reload",
+      data: { entry: entryPath },
+      miniflareOptions: {
+        compatibilityDate: "2025-01-01",
+        durableObjects: { COUNTER: { className: "Counter", useSQLite: true } },
+      },
+    });
+    await waitForReady(runner);
+    expect(await (await runner.fetch("http://localhost/rpc")).json()).toEqual({ count: 1 });
+    expect(await (await runner.fetch("http://localhost/fetch")).text()).toBe("v1");
+
+    writeEntry({ "worker.mjs": entry("v2") });
+    await runner.reloadModule();
+
+    expect(await (await runner.fetch("http://localhost/fetch")).text()).toBe("v2");
+    expect(await (await runner.fetch("http://localhost/rpc")).json()).toEqual({ count: 2 });
+    // Hits count in the reloaded module, which the Durable Object now uses.
+    expect(await (await runner.fetch("http://localhost/")).json()).toEqual({ hits: 1 });
+  });
+
+  it("resolves classes from the entry's resolveExports() hook", async () => {
+    const entryPath = writeEntry({
+      "worker.mjs": `
+import { DurableObject } from "cloudflare:workers";
+class CounterImpl extends DurableObject {
+  fetch() { return new Response("from hook"); }
+}
+export default {
+  resolveExports: async () => ({ Counter: CounterImpl }),
+  fetch(request, env) {
+    return env.COUNTER.get(env.COUNTER.idFromName("test")).fetch(request);
+  },
+};`,
+    });
+    runner = new MiniflareEnvRunner({
+      miniflare,
+      name: "test-lazy-hook",
+      data: { entry: entryPath },
+      miniflareOptions: { durableObjects: { COUNTER: "Counter" } },
+    });
+    await waitForReady(runner);
+    expect(await (await runner.fetch("http://localhost/")).text()).toBe("from hook");
+  });
+
+  it("stubs typed WorkerEntrypoint exports without binding them", async () => {
+    const entryPath = writeEntry({
+      "worker.mjs": `
+import { WorkerEntrypoint } from "cloudflare:workers";
+export class Greeter extends WorkerEntrypoint {
+  greet(name) { return "hello " + name; }
+}
+export default {
+  async fetch(request, env, ctx) {
+    return Response.json({
+      greeting: await ctx.exports.Greeter.greet("world"),
+      bound: typeof env.GREETER,
+    });
+  },
+};`,
+    });
+    runner = new MiniflareEnvRunner({
+      miniflare,
+      name: "test-lazy-entrypoint",
+      data: { entry: entryPath },
+      exports: { Greeter: { type: "WorkerEntrypoint" } },
+      miniflareOptions: {
+        compatibilityDate: "2025-01-01",
+        compatibilityFlags: ["enable_ctx_exports"],
+      },
+    });
+    await waitForReady(runner);
+    expect(await (await runner.fetch("http://localhost/")).json()).toEqual({
+      greeting: "hello world",
+      bound: "undefined",
+    });
+  });
+
+  it("runs Workflows from the wrangler config", async () => {
+    const entryPath = writeEntry({
+      "worker.mjs": `
+import { WorkflowEntrypoint } from "cloudflare:workers";
+export class Doubler extends WorkflowEntrypoint {
+  async run(event, step) {
+    return step.do("double", async () => event.payload.value * 2);
+  }
+}
+export default {
+  async fetch(request, env) {
+    const instance = await env.DOUBLER.create({ params: { value: 21 } });
+    for (let i = 0; i < 100; i++) {
+      const status = await instance.status();
+      if (status.status === "complete" || status.status === "errored") {
+        return Response.json(status);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    return new Response("timeout", { status: 504 });
+  },
+};`,
+    });
+    runner = new MiniflareEnvRunner({
+      miniflare,
+      name: "test-lazy-workflow",
+      data: { entry: entryPath },
+      wrangler: {
+        compatibility_date: "2025-01-01",
+        workflows: [{ binding: "DOUBLER", name: "doubler", class_name: "Doubler" }],
+      },
+      miniflareOptions: { defaultPersistRoot: undefined },
+    });
+    await waitForReady(runner);
+    const res = await runner.fetch("http://localhost/");
+    expect(await res.json()).toMatchObject({ status: "complete", output: 42 });
+  });
+
+  it("warns about missing and undeclared Worker exports", async () => {
+    const warnings: string[] = [];
+    const capture = (...args: unknown[]) => {
+      warnings.push(args.map(String).join(" "));
+    };
+    vi.spyOn(console, "warn").mockImplementation(capture);
+    vi.spyOn(console, "error").mockImplementation(capture);
+    vi.spyOn(console, "log").mockImplementation(capture);
+    const entryPath = writeEntry({
+      "helper.mjs": `
+import { WorkerEntrypoint } from "cloudflare:workers";
+export class Undeclared extends WorkerEntrypoint {}`,
+      "worker.mjs": `
+export { Undeclared } from "./helper.mjs";
+export default { fetch: () => new Response("ok") };`,
+    });
+    runner = new MiniflareEnvRunner({
+      miniflare,
+      name: "test-lazy-warnings",
+      data: { entry: entryPath },
+      miniflareOptions: { durableObjects: { MISSING: "Missing" } },
+    });
+    await waitForReady(runner);
+    expect(await (await runner.fetch("http://localhost/")).text()).toBe("ok");
+    await vi.waitFor(() => {
+      const text = warnings.join("\n");
+      expect(text).toContain('"Missing" is declared as a DurableObject but not exported');
+      expect(text).toContain('"Undeclared" extends WorkerEntrypoint but is not declared');
+    });
+  });
+});
+
 describe("MiniflareEnvRunner (error capture)", () => {
   let runner: MiniflareEnvRunner | undefined;
   let tmpDir: string | undefined;

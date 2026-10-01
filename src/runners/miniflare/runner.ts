@@ -32,6 +32,7 @@ import {
 import type { ResolvedVirtualModule, VirtualModule } from "../../virtual-loader.ts";
 import { generateWrapper, IPC_BINDING, UNSAFE_EVAL_BINDING } from "./wrapper.ts";
 import { isPlainObject, loadWranglerConfig } from "./wrangler.ts";
+import { declaredWorkerExports } from "./exports.ts";
 import type { WranglerInlineConfig, WranglerModule } from "./wrangler.ts";
 
 export type { WranglerInlineConfig, WranglerModule } from "./wrangler.ts";
@@ -45,9 +46,12 @@ export interface TransformResult {
   code: string;
 }
 
-/** Detected or declared export for auto-wiring Durable Object / Entrypoint bindings. */
+/**
+ * Declared export. A typed one is exported as a stub resolving the entry's
+ * class on use (a `DurableObject` also gets a binding when it has none).
+ */
 export interface MiniflareExportInfo {
-  type?: "DurableObject" | "WorkerEntrypoint" | "class";
+  type?: "DurableObject" | "WorkerEntrypoint" | "WorkflowEntrypoint" | "class";
 }
 
 /** The `miniflare` package namespace (v4 or v5), as imported by the app. */
@@ -86,14 +90,20 @@ export interface MiniflareEnvRunnerOptions {
    */
   transformRequest?: (id: string) => Promise<TransformResult | null | undefined>;
   /**
-   * Named exports (Durable Objects, WorkerEntrypoints) to bind and re-export.
-   * Default (or `true`): detect `export class` in the entry and auto-bind them;
-   * a record merges with detected ones; `false` disables it.
+   * Named exports (Durable Objects, WorkerEntrypoints, Workflows) of the Worker.
+   * Classes the config declares (local Durable Object and Workflow bindings,
+   * the wrangler config's `exports`, typed entries here) are exported as stubs
+   * that resolve the class from the entry (or its `resolveExports()` hook) on
+   * use, so they follow `reloadModule()`. A warning lists declared classes the
+   * entry lacks and exported ones nothing declares.
+   * Default (or `true`): also detect `export class` in the entry and auto-bind
+   * them as Durable Objects; a record merges with detected ones; `false`
+   * disables detection.
    * A module specifier (absolute path or `data.virtual` key; relative paths
    * resolve from the entry's directory) is re-exported with `export *` instead:
-   * nothing is detected or auto-bound (configure bindings with `wrangler` or
-   * `miniflareOptions`) and the entry's own classes are not re-exported.
-   * Exports load at startup, so changes need a new runner (not `reloadModule()`).
+   * nothing is stubbed, detected or auto-bound (configure bindings with
+   * `wrangler` or `miniflareOptions`) and it loads at startup, so changes need
+   * a new runner.
    */
   exports?: Record<string, MiniflareExportInfo> | boolean | string;
   /** Reuse the Miniflare instance across runner swaps; only `dispose()` destroys it. */
@@ -115,7 +125,7 @@ export interface MiniflareEnvRunnerOptions {
    *   lacks the selected env
    *
    * Options a single dev worker can't run (`assets`, services, queue consumers,
-   * workflows, tails, other-script Durable Objects) are dropped with a warning.
+   * tails, other-script Durable Objects and Workflows) are dropped with a warning.
    * `defaultPersistRoot` (v5: `resourcePersistencePath`) defaults to
    * `.wrangler/state/v3` next to the config (else cwd), shared with
    * `wrangler dev`. The `wrangler` package gives full fidelity (and may run its
@@ -505,7 +515,11 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
 
     // Optional wrangler config → Miniflare options (compat date/flags +
     // bindings). User-provided `miniflareOptions` win; flags are merged.
-    const { options: wranglerOptions, configFile: wranglerConfigFile } = await loadWranglerConfig({
+    const {
+      options: wranglerOptions,
+      configFile: wranglerConfigFile,
+      exports: wranglerExports,
+    } = await loadWranglerConfig({
       wrangler: this.#wrangler,
       env: this.#wranglerEnv,
       entryPath,
@@ -587,8 +601,14 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
               typeof this.#exports === "object" ? this.#exports : {},
             );
 
+      // Typed entries other than Durable Objects aren't bound.
+      const explicitExports = typeof this.#exports === "object" ? this.#exports : {};
+      const bindableExports = detectedExports.filter((name) => {
+        const type = explicitExports[name]?.type;
+        return !type || type === "DurableObject" || type === "class";
+      });
       // Skip exports whose class is already bound or whose binding name is taken.
-      if (detectedExports.length > 0) {
+      if (bindableExports.length > 0) {
         const existingDOs = isPlainObject(options.durableObjects) ? options.durableObjects : {};
         const boundClasses = new Set(
           Object.values(existingDOs).map((b) =>
@@ -596,7 +616,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
           ),
         );
         const autoDOs: Record<string, unknown> = { ...existingDOs };
-        for (const name of detectedExports) {
+        for (const name of bindableExports) {
           const bindingName = toScreamingSnakeCase(name);
           if (!autoDOs[bindingName] && !boundClasses.has(name)) {
             autoDOs[bindingName] = name;
@@ -605,12 +625,20 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
         options.durableObjects = autoDOs;
       }
 
+      // Config-declared classes are lazy stubs (they follow reloads and share
+      // the entry's module instance); only the rest is re-exported statically.
+      const stubs =
+        typeof this.#exports === "string"
+          ? {}
+          : declaredWorkerExports({ options, wranglerExports, explicit: explicitExports });
+      const staticExports = detectedExports.filter((name) => !(name in stubs));
       const script = generateWrapper(
         entryIsVirtual ? toWorkerdPath(resolvedEntry) : resolvedEntry,
         {
           dynamicOnly: true,
           captureErrors: this.#captureErrors,
-          exports: typeof this.#exports === "string" ? this.#exports : detectedExports,
+          exports: typeof this.#exports === "string" ? this.#exports : staticExports,
+          stubs,
           nodeCompat: !(options.compatibilityFlags as string[]).includes("no_nodejs_compat"),
         },
       );
@@ -619,7 +647,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
       // reach the fallback service. v4's ModuleLocator would read them from disk
       // instead, but it only walks `script`; a module list skips it.
       const skipLocator =
-        typeof this.#exports === "string" || (entryIsVirtual && detectedExports.length > 0);
+        typeof this.#exports === "string" || (entryIsVirtual && staticExports.length > 0);
       if (skipLocator) {
         options.modules = [{ type: "ESModule", path: scriptPath, contents: script }];
       } else {

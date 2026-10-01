@@ -365,7 +365,7 @@ const SHARED_CASES: WranglerCase[] = [
     },
   },
   {
-    name: "drops services, assets, queue consumers, workflows and tails from the config",
+    name: "drops services, assets, queue consumers, external workflows and tails from the config",
     entry: DO_ENTRY,
     files: {
       "public/index.html": "<h1>hi</h1>",
@@ -379,7 +379,14 @@ const SHARED_CASES: WranglerCase[] = [
           producers: [{ binding: "MY_QUEUE", queue: "my-queue" }],
           consumers: [{ queue: "my-queue" }],
         },
-        workflows: [{ binding: "MY_WORKFLOW", name: "my-workflow", class_name: "Greeter" }],
+        workflows: [
+          {
+            binding: "MY_WORKFLOW",
+            name: "my-workflow",
+            class_name: "Greeter",
+            script_name: "other-worker",
+          },
+        ],
         tail_consumers: [{ service: "tail-worker" }],
       }),
     },
@@ -404,12 +411,46 @@ const SHARED_CASES: WranglerCase[] = [
         "services (OTHER_SERVICE)",
         "assets (ASSETS)",
         "queues.consumers (my-queue)",
-        "workflows (MY_WORKFLOW)",
+        'workflows (MY_WORKFLOW → script "other-worker")',
         "tail_consumers (tail-worker)",
         "pass them via miniflareOptions",
       ]) {
         expect(dropped[0]).toContain(part);
       }
+    },
+  },
+  {
+    name: "keeps local workflows (a script_name naming this worker is local)",
+    entry: `import { WorkflowEntrypoint } from "cloudflare:workers";
+export class Greeter extends WorkflowEntrypoint {}
+export class Other extends WorkflowEntrypoint {}
+export default {
+  fetch: (request, env) =>
+    Response.json({ own: typeof env.MY_WORKFLOW?.create, self: typeof env.SELF_WORKFLOW?.create }),
+};`,
+    files: {
+      "wrangler.json": JSON.stringify({
+        name: "test",
+        compatibility_date: "2024-09-01",
+        workflows: [
+          { binding: "MY_WORKFLOW", name: "my-workflow", class_name: "Greeter" },
+          {
+            binding: "SELF_WORKFLOW",
+            name: "self-workflow",
+            class_name: "Other",
+            script_name: "test",
+          },
+        ],
+      }),
+    },
+    options: () => ({ wrangler: true, exports: false }),
+    assert: (json, { mfOptions }) => {
+      expect(json).toEqual({ own: "function", self: "function" });
+      expect(mfOptions.workflows).toMatchObject({
+        MY_WORKFLOW: { name: "my-workflow", className: "Greeter" },
+        SELF_WORKFLOW: { name: "self-workflow", className: "Other" },
+      });
+      expect(mfOptions.workflows.SELF_WORKFLOW.scriptName).toBeUndefined();
     },
   },
   {
