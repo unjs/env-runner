@@ -23,13 +23,6 @@ export function declaredWorkerExports(opts: {
 }): Record<string, WorkerExportType> {
   const { options } = opts;
   const out: Record<string, WorkerExportType> = {};
-  const local = (binding: unknown) =>
-    typeof binding === "string"
-      ? binding
-      : isPlainObject(binding) && !binding.scriptName && typeof binding.className === "string"
-        ? binding.className
-        : undefined;
-
   const durableObjects = [
     ...(isPlainObject(options.durableObjects) ? Object.values(options.durableObjects) : []),
     ...(Array.isArray(options.additionalUnboundDurableObjects)
@@ -37,11 +30,11 @@ export function declaredWorkerExports(opts: {
       : []),
   ];
   for (const binding of durableObjects) {
-    const name = local(binding);
+    const name = localClassName(binding);
     if (name) out[name] = "DurableObject";
   }
   for (const binding of isPlainObject(options.workflows) ? Object.values(options.workflows) : []) {
-    const name = typeof binding === "string" ? undefined : local(binding);
+    const name = typeof binding === "string" ? undefined : localClassName(binding);
     if (name) out[name] = "WorkflowEntrypoint";
   }
   for (const name of isPlainObject(options.workflowExports)
@@ -75,6 +68,15 @@ export function declaredWorkerExports(opts: {
   return out;
 }
 
+/** Class name of a Durable Object or Workflow binding to this Worker. */
+export function localClassName(binding: unknown): string | undefined {
+  return typeof binding === "string"
+    ? binding
+    : isPlainObject(binding) && !binding.scriptName && typeof binding.className === "string"
+      ? binding.className
+      : undefined;
+}
+
 /**
  * Wrapper code exporting a stub class per declared export (like
  * `@cloudflare/vite-plugin`): workerd needs the classes at startup, but the
@@ -86,8 +88,12 @@ export function generateExportStubs(
   declared: Record<string, WorkerExportType>,
   staticExports: string[],
 ): string {
+  // Export names can be any string, and must not shadow the wrapper's globals.
   const stubs = Object.entries(declared)
-    .map(([name, type]) => `export const ${name} = __stub_${type}(${JSON.stringify(name)});`)
+    .map(
+      ([name, type], i) =>
+        `const __stub${i} = __stub_${type}(${JSON.stringify(name)});\nexport { __stub${i} as ${JSON.stringify(name)} };`,
+    )
     .join("\n");
   return /* js */ `import {
   DurableObject as __DurableObject,

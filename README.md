@@ -818,6 +818,7 @@ Declared classes come from:
 // worker.ts
 import { WorkerEntrypoint } from "cloudflare:workers";
 export { Counter } from "./counter.ts"; // bound in wrangler.json
+// Declared in wrangler.json: "exports": { "Greeter": { "type": "worker" } }
 export class Greeter extends WorkerEntrypoint {
   greet(name: string) {
     return `hello ${name}`;
@@ -840,11 +841,13 @@ export default {
 };
 ```
 
+As with `@cloudflare/vite-plugin`, the other kind's handler names can't be RPC methods of a stub: `email`, `queue`, `scheduled`, `tail`, `tailStream`, `test` and `trace` for Durable Objects; `alarm` and `webSocketClose`/`webSocketError`/`webSocketMessage` for `WorkerEntrypoint`s.
+
 After the entry loads (and after each reload), a warning lists declared classes the entry doesn't export (or of the wrong kind) and exported `DurableObject`/`WorkerEntrypoint`/`WorkflowEntrypoint` subclasses nothing declares, with the config to add.
 
 #### Auto-detected Exports
 
-`MiniflareEnvRunner` automatically scans the entry file for `export class` declarations and wires them as Durable Object bindings (binding name = class name). This means you don't need to manually configure `miniflareOptions.durableObjects` for simple cases:
+`MiniflareEnvRunner` automatically scans the entry file for `export class` declarations and wires them as Durable Object bindings (binding name = class name in `SCREAMING_SNAKE_CASE`, e.g. `COUNTER`). Classes that `extends WorkerEntrypoint`/`WorkflowEntrypoint`, or that the config declares as such, aren't bound; undeclared ones are re-exported as is, so they work but don't follow `reloadModule()` (declare them to get a stub). This means you don't need to manually configure `miniflareOptions.durableObjects` for simple cases:
 
 ```ts
 // worker.ts
@@ -874,7 +877,7 @@ await using runner = new MiniflareEnvRunner({
 });
 ```
 
-Auto-wired bindings are merged with Durable Object bindings from `miniflareOptions` and a wrangler config: exports whose class is already bound (or whose binding name is taken) are skipped, as are typed `WorkerEntrypoint`/`WorkflowEntrypoint` entries. Set `exports: false` to disable auto-detection entirely (declared classes are still stubbed).
+Auto-wired bindings are merged with Durable Object bindings from `miniflareOptions` and a wrangler config: exports whose class is already bound (or whose binding name is taken) are skipped. Set `exports: false` to disable auto-detection entirely (declared classes are still stubbed).
 
 #### Exports Module
 

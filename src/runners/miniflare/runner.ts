@@ -32,7 +32,8 @@ import {
 import type { ResolvedVirtualModule, VirtualModule } from "../../virtual-loader.ts";
 import { generateWrapper, IPC_BINDING, UNSAFE_EVAL_BINDING } from "./wrapper.ts";
 import { isPlainObject, loadWranglerConfig } from "./wrangler.ts";
-import { declaredWorkerExports } from "./exports.ts";
+import { declaredWorkerExports, localClassName } from "./exports.ts";
+import type { WorkerExportType } from "./exports.ts";
 import type { WranglerInlineConfig, WranglerModule } from "./wrangler.ts";
 
 export type { WranglerInlineConfig, WranglerModule } from "./wrangler.ts";
@@ -97,8 +98,9 @@ export interface MiniflareEnvRunnerOptions {
    * use, so they follow `reloadModule()`. A warning lists declared classes the
    * entry lacks and exported ones nothing declares.
    * Default (or `true`): also detect `export class` in the entry and auto-bind
-   * them as Durable Objects; a record merges with detected ones; `false`
-   * disables detection.
+   * them as Durable Objects, except `WorkerEntrypoint`/`WorkflowEntrypoint`
+   * classes (by config, else by `extends`); a record merges with detected ones;
+   * `false` disables detection.
    * A module specifier (absolute path or `data.virtual` key; relative paths
    * resolve from the entry's directory) is re-exported with `export *` instead:
    * nothing is stubbed, detected or auto-bound (configure bindings with
@@ -593,37 +595,11 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
       const entrySource = entryIsVirtual
         ? virtualModuleCodeSource(entryKey, virtual.sources[entryKey])
         : _tryReadFile(resolvedEntry);
+      const explicitExports = typeof this.#exports === "object" ? this.#exports : {};
       const detectedExports =
         this.#exports === false || typeof this.#exports === "string"
-          ? []
-          : detectExportedClasses(
-              entrySource,
-              typeof this.#exports === "object" ? this.#exports : {},
-            );
-
-      // Typed entries other than Durable Objects aren't bound.
-      const explicitExports = typeof this.#exports === "object" ? this.#exports : {};
-      const bindableExports = detectedExports.filter((name) => {
-        const type = explicitExports[name]?.type;
-        return !type || type === "DurableObject" || type === "class";
-      });
-      // Skip exports whose class is already bound or whose binding name is taken.
-      if (bindableExports.length > 0) {
-        const existingDOs = isPlainObject(options.durableObjects) ? options.durableObjects : {};
-        const boundClasses = new Set(
-          Object.values(existingDOs).map((b) =>
-            typeof b === "string" ? b : isPlainObject(b) && !b.scriptName ? b.className : undefined,
-          ),
-        );
-        const autoDOs: Record<string, unknown> = { ...existingDOs };
-        for (const name of bindableExports) {
-          const bindingName = toScreamingSnakeCase(name);
-          if (!autoDOs[bindingName] && !boundClasses.has(name)) {
-            autoDOs[bindingName] = name;
-          }
-        }
-        options.durableObjects = autoDOs;
-      }
+          ? {}
+          : detectExportedClasses(entrySource, explicitExports);
 
       // Config-declared classes are lazy stubs (they follow reloads and share
       // the entry's module instance); only the rest is re-exported statically.
@@ -631,7 +607,28 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
         typeof this.#exports === "string"
           ? {}
           : declaredWorkerExports({ options, wranglerExports, explicit: explicitExports });
-      const staticExports = detectedExports.filter((name) => !(name in stubs));
+
+      // Bind the other detected classes as Durable Objects, unless declared or
+      // extending another kind, already bound, or their binding name is taken.
+      const existingDOs = isPlainObject(options.durableObjects) ? options.durableObjects : {};
+      const boundClasses = new Set(Object.values(existingDOs).map(localClassName));
+      const autoDOs: Record<string, unknown> = { ...existingDOs };
+      for (const [name, base] of Object.entries(detectedExports)) {
+        const bindingName = toScreamingSnakeCase(name);
+        if (
+          (stubs[name] ?? base ?? "DurableObject") === "DurableObject" &&
+          !boundClasses.has(name) &&
+          !autoDOs[bindingName]
+        ) {
+          autoDOs[bindingName] = name;
+          stubs[name] = "DurableObject";
+        }
+      }
+      if (Object.keys(autoDOs).length > 0) {
+        options.durableObjects = autoDOs;
+      }
+
+      const staticExports = Object.keys(detectedExports).filter((name) => !(name in stubs));
       const script = generateWrapper(
         entryIsVirtual ? toWorkerdPath(resolvedEntry) : resolvedEntry,
         {
@@ -1264,16 +1261,21 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
 function detectExportedClasses(
   entrySource: string | undefined,
   explicit: Record<string, MiniflareExportInfo>,
-): string[] {
-  const names = new Set(Object.keys(explicit));
+): Record<string, WorkerExportType | undefined> {
+  const classes: Record<string, WorkerExportType | undefined> = {};
+  for (const name of Object.keys(explicit)) classes[name] = undefined;
   if (entrySource) {
-    const re = /\bexport\s+class\s+(\w+)/g;
+    const re = /\bexport\s+class\s+(\w+)(?:\s+extends\s+(\w+))?/g;
     let match;
     while ((match = re.exec(entrySource))) {
-      if (match[1]) names.add(match[1]);
+      const base = match[2];
+      classes[match[1]!] =
+        base === "DurableObject" || base === "WorkerEntrypoint" || base === "WorkflowEntrypoint"
+          ? base
+          : undefined;
     }
   }
-  return [...names];
+  return classes;
 }
 
 /**
