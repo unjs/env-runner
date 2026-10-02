@@ -46,7 +46,7 @@ if (!globalThis.process) { globalThis.process = __process; }`;
       ? `export * from ${JSON.stringify(opts.exports)};`
       : opts?.dynamicOnly && opts.exports?.length
         ? opts.exports
-            .map((name) => `export { ${name} } from ${JSON.stringify(entryPath)};`)
+            .map((name) => `export { ${JSON.stringify(name)} } from ${JSON.stringify(entryPath)};`)
             .join("\n")
         : "";
 

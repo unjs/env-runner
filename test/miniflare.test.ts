@@ -773,6 +773,62 @@ export default {
     });
   });
 
+  it("keeps undeclared WorkerEntrypoints as static exports", async () => {
+    const entryPath = writeEntry({
+      "worker.mjs": `
+import { WorkerEntrypoint } from "cloudflare:workers";
+export class Greeter extends WorkerEntrypoint {
+  greet(name) { return "hello " + name; }
+}
+export default {
+  async fetch(request, env, ctx) {
+    return Response.json({
+      greeting: await ctx.exports.Greeter.greet("world"),
+      bound: typeof env.GREETER,
+    });
+  },
+};`,
+    });
+    runner = new MiniflareEnvRunner({
+      miniflare,
+      name: "test-lazy-static-entrypoint",
+      data: { entry: entryPath },
+      miniflareOptions: {
+        compatibilityDate: "2025-01-01",
+        compatibilityFlags: ["enable_ctx_exports"],
+      },
+    });
+    await waitForReady(runner);
+    expect(await (await runner.fetch("http://localhost/")).json()).toEqual({
+      greeting: "hello world",
+      bound: "undefined",
+    });
+  });
+
+  it("exports stubs under names that shadow the wrapper's globals", async () => {
+    const entryPath = writeEntry({
+      "worker.mjs": `
+import { DurableObject } from "cloudflare:workers";
+class Thing extends DurableObject {
+  fetch() { return new Response("thing"); }
+}
+export { Thing as URL };
+export default {
+  fetch(request, env) {
+    return env.THING.get(env.THING.idFromName("test")).fetch(request);
+  },
+};`,
+    });
+    runner = new MiniflareEnvRunner({
+      miniflare,
+      name: "test-lazy-shadowing",
+      data: { entry: entryPath },
+      miniflareOptions: { durableObjects: { THING: "URL" } },
+    });
+    await waitForReady(runner);
+    expect(await (await runner.fetch("http://localhost/")).text()).toBe("thing");
+  });
+
   it("runs Workflows from the wrangler config", async () => {
     const entryPath = writeEntry({
       "worker.mjs": `
@@ -784,11 +840,11 @@ export class Doubler extends WorkflowEntrypoint {
 }
 export default {
   async fetch(request, env) {
-    const instance = await env.DOUBLER.create({ params: { value: 21 } });
+    const instance = await env.WORKFLOW.create({ params: { value: 21 } });
     for (let i = 0; i < 100; i++) {
       const status = await instance.status();
       if (status.status === "complete" || status.status === "errored") {
-        return Response.json(status);
+        return Response.json({ ...status, autoBound: typeof env.DOUBLER });
       }
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
@@ -802,13 +858,17 @@ export default {
       data: { entry: entryPath },
       wrangler: {
         compatibility_date: "2025-01-01",
-        workflows: [{ binding: "DOUBLER", name: "doubler", class_name: "Doubler" }],
+        workflows: [{ binding: "WORKFLOW", name: "doubler", class_name: "Doubler" }],
       },
       miniflareOptions: { defaultPersistRoot: undefined },
     });
     await waitForReady(runner);
     const res = await runner.fetch("http://localhost/");
-    expect(await res.json()).toMatchObject({ status: "complete", output: 42 });
+    expect(await res.json()).toMatchObject({
+      status: "complete",
+      output: 42,
+      autoBound: "undefined",
+    });
   });
 
   it("warns about missing and undeclared Worker exports", async () => {
