@@ -49,23 +49,23 @@
     "srvx": "^1.0.5"
   },
   "devDependencies": {
-    "@netlify/runtime": "^5.0.5",
+    "@netlify/runtime": "^5.0.6",
     "@types/node": "^26.6.3",
     "@vercel/queue": "^0.7.0",
-    "@vitest/coverage-v8": "^5.0.2",
+    "@vitest/coverage-v8": "^5.0.3",
     "automd": "^0.4.3",
     "changelogen": "^0.6.2",
     "cjs-module-lexer": "^2.2.1",
     "env-runner-fixture": "link:",
     "es-module-lexer": "^3.0.2",
     "miniflare": "^5.20260921.1-alpha",
-    "obuild": "^0.4.40",
-    "oxc-transform": "^0.151.0",
-    "oxfmt": ">=0.70.0",
-    "oxlint": "^1.85.0",
+    "obuild": "^0.4.43",
+    "oxc-transform": "^0.152.0",
+    "oxfmt": ">=0.71.0",
+    "oxlint": "^1.86.0",
     "typescript": "^7.0.2",
-    "vitest": "^5.0.2",
-    "wrangler": "^4.141.0"
+    "vitest": "^5.0.3",
+    "wrangler": "^4.145.0"
   },
-  "packageManager": "pnpm@12.6.0"
+  "packageManager": "pnpm@12.8.2"
 }
