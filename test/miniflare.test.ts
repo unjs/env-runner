@@ -753,6 +753,55 @@ export class Counter extends DurableObject {
     expect(await (await runner.fetch("http://localhost/")).json()).toEqual({ hits: 1 });
   });
 
+  it("detects classes of bundled entries, ignoring comments and strings", async () => {
+    const entryPath = writeEntry({
+      "worker.mjs": `
+import { DurableObject as DurableObject2, WorkerEntrypoint } from "cloudflare:workers";
+// export class Fake extends DurableObject2 {}
+const text = "export class Str {}";
+var Counter = class extends DurableObject2 {
+  fetch() { return new Response("counter"); }
+};
+class Greeter extends WorkerEntrypoint {
+  greet(name) { return "hello " + name; }
+}
+function helper() {}
+var worker_default = {
+  async fetch(request, env, ctx) {
+    return Response.json({
+      counter: await (await env.MY_COUNTER.get(env.MY_COUNTER.idFromName("x")).fetch(request)).text(),
+      greeting: await ctx.exports.Greeter.greet("bundle"),
+      greeter: typeof env.GREETER,
+      fake: typeof env.FAKE,
+      str: typeof env.STR,
+      helper: typeof env.HELPER,
+      text,
+    });
+  },
+};
+export { Counter as MyCounter, Greeter, helper, worker_default as default };`,
+    });
+    runner = new MiniflareEnvRunner({
+      miniflare,
+      name: "test-lazy-bundled",
+      data: { entry: entryPath },
+      miniflareOptions: {
+        compatibilityDate: "2025-01-01",
+        compatibilityFlags: ["enable_ctx_exports"],
+      },
+    });
+    await waitForReady(runner);
+    expect(await (await runner.fetch("http://localhost/")).json()).toEqual({
+      counter: "counter",
+      greeting: "hello bundle",
+      greeter: "undefined",
+      fake: "undefined",
+      str: "undefined",
+      helper: "undefined",
+      text: "export class Str {}",
+    });
+  });
+
   it("resolves classes from the entry's resolveExports() hook", async () => {
     const entryPath = writeEntry({
       "worker.mjs": `

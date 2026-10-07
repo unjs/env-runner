@@ -95,8 +95,8 @@ export interface MiniflareEnvRunnerOptions {
    *   the wrangler config's `exports`, entries of this record) are exported as
    *   stubs resolving the class from the entry (or its `resolveExports()` hook)
    *   on use, so they follow `reloadModule()`.
-   * - Without any declared class (default, or `true`), `export class` names of
-   *   the entry are detected instead; `false` disables detection.
+   * - Without any declared class (default, or `true`), the entry's exported
+   *   classes are detected instead; `false` disables detection.
    * - Untyped entries of this record and detected classes not extending
    *   `WorkerEntrypoint`/`WorkflowEntrypoint` are Durable Objects, bound as
    *   `SCREAMING_SNAKE_CASE` when they have no binding.
@@ -592,13 +592,14 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
       const entryDir = dirname(entryBase);
 
       // Declared classes are lazy stubs: they follow reloads and share the
-      // entry's module instance. Without any, `export class` names of the
-      // entry are detected (zero-config). Nothing is stubbed for a module specifier.
+      // entry's module instance. Without any, the entry's classes are detected
+      // (zero-config). Nothing is stubbed for a module specifier.
       const explicitExports = typeof this.#exports === "object" ? this.#exports : {};
       const declared =
         typeof this.#exports === "string"
           ? {}
           : declaredWorkerExports({ options, wranglerExports, explicit: explicitExports });
+      await initEsmLexer;
       const detected =
         this.#exports === false ||
         typeof this.#exports === "string" ||
@@ -1252,17 +1253,62 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
 
 // #region Helpers
 
-/** Detect `export class` names in the entry: Durable Objects unless they extend another kind. */
+/**
+ * Classes the entry exports (`export class X`, `export { X, Y as Z }`), by
+ * export name: Durable Objects unless they extend another kind. Exports that
+ * aren't classes declared in the entry (functions, values, re-exports from
+ * other modules) are skipped, as is everything when the lexer can't parse it
+ * (JSX, unsupported TypeScript). Expects the ESM lexer to be initialized.
+ */
 function detectExportedClasses(entrySource: string | undefined): Record<string, WorkerExportType> {
   const classes: Record<string, WorkerExportType> = {};
-  if (entrySource) {
-    const re = /\bexport\s+class\s+(\w+)(?:\s+extends\s+(\w+))?/g;
-    let match;
-    while ((match = re.exec(entrySource))) {
-      classes[match[1]!] = isWorkerExportType(match[2]) ? match[2] : "DurableObject";
+  if (!entrySource) {
+    return classes;
+  }
+  let imports: ReturnType<typeof parseEsm>[0];
+  let exports: ReturnType<typeof parseEsm>[1];
+  try {
+    [imports, exports] = parseEsm(entrySource);
+  } catch {
+    return classes;
+  }
+  // Local names of the `cloudflare:workers` base classes (bundlers rename them).
+  const bases = new Map<string, WorkerExportType>();
+  for (const imp of imports) {
+    if (imp.type === "static" && imp.specifier === "cloudflare:workers") {
+      const statement = entrySource.slice(imp.importStart, imp.importEnd);
+      const re = /\b(DurableObject|WorkerEntrypoint|WorkflowEntrypoint)(?:\s+as\s+([\w$]+))?/g;
+      for (const [, base, alias] of statement.matchAll(re)) {
+        bases.set(alias ?? base!, base as WorkerExportType);
+      }
     }
   }
+  for (const exp of exports) {
+    if (exp.type !== "direct" || exp.typeOnly || exp.name === "default" || !exp.localName) {
+      continue;
+    }
+    const heritage = classHeritage(entrySource, exp.localName);
+    if (heritage === undefined) {
+      continue;
+    }
+    const base = /\bextends\s+(?:[\w$]+\.)*([\w$]+)/.exec(heritage)?.[1];
+    const type = base && (bases.get(base) ?? base);
+    classes[exp.name] = isWorkerExportType(type) ? type : "DurableObject";
+  }
   return classes;
+}
+
+/**
+ * What follows the name of a local class declaration (`class X ... {`, or
+ * `X = class ... {` as bundlers emit), up to its body; `undefined` if `name`
+ * isn't declared as a class.
+ */
+function classHeritage(source: string, name: string): string | undefined {
+  const id = name.replace(/[$()*+.?[\\\]^{|}]/g, "\\$&");
+  const re = new RegExp(
+    `(?:(?<![\\w$])class\\s+${id}|(?<![\\w$.])${id}\\s*=\\s*class(?:\\s+(?!extends\\b)[\\w$]+)?)(?![\\w$])([^{]*)\\{`,
+  );
+  return re.exec(source)?.[1];
 }
 
 /**
