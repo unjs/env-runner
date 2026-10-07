@@ -24,6 +24,8 @@ export default defineBuildConfig({
     {
       type: "bundle",
       input,
+      minify: true,
+      minifyLibs: true,
       // Not dependencies (nor peer dependencies): runners take these as
       // explicit options and only fall back to an optional dynamic import
       // resolved from the user's project. Keep them external so they are never

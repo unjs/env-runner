@@ -44,8 +44,6 @@
   },
   "dependencies": {
     "crossws": "^0.4.15",
-    "exsolve": "^1.1.3",
-    "httpxy": "^0.5.5",
     "srvx": "^1.0.5"
   },
   "devDependencies": {
@@ -58,6 +56,8 @@
     "cjs-module-lexer": "^2.3.0",
     "env-runner-fixture": "link:",
     "es-module-lexer": "^3.0.3",
+    "exsolve": "^1.1.3",
+    "httpxy": "^0.5.5",
     "miniflare": "^5.20260921.1-alpha",
     "obuild": "^0.4.43",
     "oxc-transform": "^0.153.0",
