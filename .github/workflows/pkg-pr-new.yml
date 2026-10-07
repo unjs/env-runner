@@ -1,0 +1,21 @@
+name: pkg.pr.new
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: unjs/setup-jup@85aa1e9e4cd2995fba3bee414cde74bf88637a2c # v1.0.0
+        with:
+          install: --frozen-lockfile
+          cache: false
+          cache-dependencies: false
+      - run: pnpm build
+      - run: pnpx pkg-pr-new publish
