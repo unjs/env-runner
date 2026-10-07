@@ -805,9 +805,22 @@ function mapWranglerConfigToMiniflare(
       name: w.name,
       className: w.class_name,
       ...(w.script_name ? { scriptName: w.script_name } : {}),
+      ...(w.limits?.steps !== undefined ? { stepLimit: w.limits.steps } : {}),
     };
   }
   if (Object.keys(workflows).length > 0) out.workflows = workflows;
+  // Workflows declared under `exports`, by class name.
+  const workflowExports: Record<string, unknown> = {};
+  for (const [className, entry] of isPlainObject(config.exports)
+    ? Object.entries<any>(config.exports)
+    : []) {
+    if (entry?.type !== "workflow" || typeof entry.name !== "string") continue;
+    workflowExports[className] = {
+      name: entry.name,
+      ...(entry.limits?.steps !== undefined ? { stepLimit: entry.limits.steps } : {}),
+    };
+  }
+  if (Object.keys(workflowExports).length > 0) out.workflowExports = workflowExports;
   return Object.keys(out).length > 0 ? out : undefined;
 }
 

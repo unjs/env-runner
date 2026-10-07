@@ -455,6 +455,43 @@ export default {
     },
   },
   {
+    name: "maps workflow exports and step limits",
+    entry: `import { WorkflowEntrypoint } from "cloudflare:workers";
+export class Doubler extends WorkflowEntrypoint {}
+export class Tripler extends WorkflowEntrypoint {}
+export default {
+  fetch: (request, env) => Response.json({ workflow: typeof env.MY_WORKFLOW?.create }),
+};`,
+    files: {
+      "wrangler.json": JSON.stringify({
+        name: "test",
+        compatibility_date: "2024-09-01",
+        workflows: [
+          {
+            binding: "MY_WORKFLOW",
+            name: "doubler",
+            class_name: "Doubler",
+            limits: { steps: 3 },
+          },
+        ],
+        exports: { Tripler: { type: "workflow", name: "tripler", limits: { steps: 5 } } },
+      }),
+    },
+    options: () => ({ wrangler: true }),
+    assert: (json, { mfOptions }) => {
+      expect(json).toEqual({ workflow: "function" });
+      expect(mfOptions.workflows.MY_WORKFLOW).toMatchObject({
+        name: "doubler",
+        className: "Doubler",
+        stepLimit: 3,
+      });
+      expect(mfOptions.workflowExports).toEqual({ Tripler: { name: "tripler", stepLimit: 5 } });
+      // Both are exported as stubs.
+      expect(mfOptions.script).toContain('as "Doubler"');
+      expect(mfOptions.script).toContain('as "Tripler"');
+    },
+  },
+  {
     name: "dedupes dropped options reported by both the file and inline configs",
     entry: DO_ENTRY,
     files: {
