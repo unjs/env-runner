@@ -22,6 +22,8 @@ export function generateWrapper(
     captureErrors?: boolean;
     /** Worker exports, as stubs resolving the entry's classes on use, or a module specifier re-exported with `export *`. */
     exports?: Record<string, WorkerExportType> | string;
+    /** Stub names the config declares (default: all); the others get a deploy hint. */
+    configuredExports?: string[];
     /** Import `node:process` as the `process` global (needs `nodejs_compat`). Default: `true`. */
     nodeCompat?: boolean;
   },
@@ -40,8 +42,8 @@ if (!globalThis.process) { globalThis.process = __process; }`;
   // separate exports module wholesale, or stubs resolving the entry's classes.
   const workerExports =
     typeof opts?.exports === "string"
-      ? `export * from ${JSON.stringify(opts.exports)};\nconst __checkExports = async () => {};\nconst __exportTypes = async () => undefined;`
-      : generateExportStubs(opts?.exports || {});
+      ? `export * from ${JSON.stringify(opts.exports)};\nconst __checkExports = async () => undefined;\nconst __exportTypes = async () => undefined;`
+      : generateExportStubs(opts?.exports || {}, opts?.configuredExports);
 
   const captureErrors = opts?.captureErrors ?? true;
 
@@ -260,8 +262,12 @@ async function __handleWsMessage(env, data) {
   }
 }
 
+// The host warns (deduped across restarts).
 function __runExportsCheck() {
-  __checkExports().catch(() => {});
+  __checkExports().then(
+    (warnings) => warnings && __sendMessage({ event: "worker-exports", warnings }),
+    () => {},
+  );
 }
 
 let __crosswsAdapter;
@@ -281,8 +287,8 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // IPC: a plain request loads the entry (204, or a 500 with the error), then
-    // the WebSocket upgrade opens the channel.
+    // IPC: a plain request loads the entry (its export types, or a 500 with the
+    // error), then the WebSocket upgrade opens the channel.
     if (url.pathname === __IPC_PATH) {
       try {
         await __ensureEntry(env);
@@ -291,7 +297,7 @@ export default {
         return new Response(message, { status: 500 });
       }
       if (request.headers.get("upgrade") !== "websocket") {
-        return new Response(null, { status: 204 });
+        return Response.json({ exportTypes: await __exportTypes().catch(() => undefined) });
       }
 
       const pair = new WebSocketPair();

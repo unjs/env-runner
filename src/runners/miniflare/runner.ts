@@ -95,19 +95,20 @@ export interface MiniflareEnvRunnerOptions {
    *   the wrangler config's `exports`, entries of this record) are exported as
    *   stubs resolving the class from the entry (or its `resolveExports()` hook)
    *   on use, so they follow `reloadModule()`.
-   * - Without any declared class (default, or `true`), the entry's exported
-   *   classes are detected instead, from its source at startup and from the
-   *   loaded module after each reload (restarting Miniflare when they
-   *   change); `false` disables detection.
-   * - Untyped entries of this record and detected classes not extending
+   * - The entry's own classes are added: detected in its source at startup
+   *   when the config declares none (default, or `true`), and read from the
+   *   loaded module after its first load and each reload, restarting
+   *   Miniflare when they change the exports; `false` disables both.
+   * - Untyped entries of this record and the entry's classes not extending
    *   `WorkerEntrypoint`/`WorkflowEntrypoint` are Durable Objects, bound as
-   *   `SCREAMING_SNAKE_CASE` when they have no binding.
+   *   `SCREAMING_SNAKE_CASE` when they have no binding (the entry's only when
+   *   the config declares no classes).
    * - A module specifier (absolute path or `data.virtual` key; relative paths
    *   resolve from the entry's directory) is re-exported with `export *`
    *   instead: nothing is stubbed, detected or bound, and it loads at startup,
    *   so changes need a new runner.
    *
-   * A warning lists declared classes the entry lacks and exported ones nothing declares.
+   * A warning lists declared classes the entry lacks and exported ones the config doesn't declare.
    */
   exports?: Record<string, MiniflareExportInfo> | boolean | string;
   /** Reuse the Miniflare instance across runner swaps; only `dispose()` destroys it. */
@@ -186,13 +187,16 @@ type ServedVirtualModule = Required<VirtualModule> & {
 };
 
 /**
- * Entry classes detected when the config declares none: from the entry's
- * source at startup, then from the loaded module after each reload.
+ * The Worker's export stubs: the config's classes plus the entry's (detected
+ * in its source at startup when the config declares none, then read from the
+ * loaded module after each load).
  */
-interface MiniflareDetectedExports {
-  types: Record<string, WorkerExportType>;
-  /** Stubs and Durable Object bindings for `types` (set here) → Miniflare options. */
-  setTypes(types: Record<string, WorkerExportType>): Record<string, unknown>;
+interface MiniflareWorkerExports {
+  stubs: Record<string, WorkerExportType>;
+  /** Miniflare options for the module's classes, if they change the stubs (then applied). */
+  update(moduleTypes: Record<string, WorkerExportType>): Record<string, unknown> | undefined;
+  /** Last warnings of the entry's export check (warned on change). */
+  warnings: string;
 }
 
 interface MiniflareCacheEntry {
@@ -202,7 +206,7 @@ interface MiniflareCacheEntry {
   // Receiver of the instance's `__ENV_RUNNER_IPC` binding; retargeted to the
   // runner that attaches last (like the IPC WebSocket).
   ipc: { runner: MiniflareEnvRunner };
-  detected?: MiniflareDetectedExports;
+  workerExports?: MiniflareWorkerExports;
 }
 
 // Module-level cache for persistent Miniflare instances
@@ -214,7 +218,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
   #transformRequest?: (id: string) => Promise<TransformResult | null | undefined>;
   #reloadCounter = 0;
   #virtual?: MiniflareVirtualModules;
-  #detected?: MiniflareDetectedExports;
+  #workerExports?: MiniflareWorkerExports;
   #cacheEntry?: MiniflareCacheEntry;
   #ws?: { send(data: string): void; close(): void };
   #persistent: boolean;
@@ -346,11 +350,10 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
       },
     );
     // workerd needs the Worker's exports at startup: restart when the
-    // reloaded entry's classes differ from the detected ones.
-    const detected = this.#detected;
-    const types = isPlainObject(exportTypes) ? workerExportTypes(exportTypes) : undefined;
-    if (detected && types && !sameExportTypes(detected.types, types)) {
-      await this.#restart(detected.setTypes(types));
+    // reloaded entry's classes change them.
+    const options = this.#updateExports(exportTypes);
+    if (options) {
+      await this.#restart(options);
     } else {
       this.#ws?.send(JSON.stringify({ type: "check-exports" }));
     }
@@ -402,6 +405,14 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
 
   // #region Protected methods
 
+  protected override _handleMessage(message: any) {
+    if (message?.event === "worker-exports") {
+      this.#warnExports(message.warnings);
+      return;
+    }
+    super._handleMessage(message);
+  }
+
   protected _hasRuntime() {
     return Boolean(this.#miniflare);
   }
@@ -443,6 +454,46 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
   // #endregion
 
   // #region Private methods
+
+  /**
+   * Load the entry with a plain request, so a load error arrives as a normal
+   * response: miniflare leaves the socket of a failed WebSocket upgrade without
+   * an error listener, and disposing workerd then resets it (an uncaught
+   * ECONNRESET on Windows). Returns the export types the wrapper reports.
+   */
+  async #loadEntry(): Promise<unknown> {
+    const loadRes = await this.#miniflare.dispatchFetch("http://localhost" + IPC_PATH);
+    const loadBody = await loadRes.text().catch(() => "");
+    if (!loadRes.ok) {
+      throw new Error(`Failed to establish WebSocket IPC channel (${loadRes.status}: ${loadBody})`);
+    }
+    try {
+      return JSON.parse(loadBody).exportTypes;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Miniflare options when the entry's reported classes change the export stubs. */
+  #updateExports(exportTypes: unknown): Record<string, unknown> | undefined {
+    if (!this.#workerExports || !isPlainObject(exportTypes)) {
+      return undefined;
+    }
+    return this.#workerExports.update(workerExportTypes(exportTypes));
+  }
+
+  /** Warn about the entry's exports when the warnings change (also across restarts). */
+  #warnExports(warnings: unknown) {
+    const state = this.#workerExports;
+    if (!state || !Array.isArray(warnings)) {
+      return;
+    }
+    const text = warnings.join("\n");
+    if (text && text !== state.warnings) {
+      console.warn("[env-runner] Worker exports:\n  - " + warnings.join("\n  - "));
+    }
+    state.warnings = text;
+  }
 
   async #resolveMiniflare(): Promise<MiniflareModule> {
     this.#miniflareModule = (await resolveRuntimeDep<MiniflareModule>({
@@ -614,22 +665,24 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
         : resolve("__env_runner_virtual_entry__.mjs");
       const entryDir = dirname(entryBase);
 
-      // Declared classes are lazy stubs: they follow reloads and share the
-      // entry's module instance. Without any, the entry's classes are detected
-      // (zero-config). Nothing is stubbed for a module specifier.
+      // Exports are lazy stubs: they follow reloads and share the entry's
+      // module instance. The config's classes come first; the entry's are added
+      // (detected in its source when the config declares none, zero-config),
+      // and again from the loaded module after each load (see `#connect()`).
+      // Nothing is stubbed for a module specifier.
       const explicitExports = typeof this.#exports === "object" ? this.#exports : {};
       const declared =
         typeof this.#exports === "string"
           ? {}
           : declaredWorkerExports({ options, wranglerExports, explicit: explicitExports });
-      const detect =
+      const zeroConfig =
         this.#exports !== false &&
         typeof this.#exports !== "string" &&
         Object.keys(declared).length === 0;
-      if (detect) {
+      if (zeroConfig) {
         await initEsmLexer;
       }
-      const detectedTypes = detect
+      const detectedTypes = zeroConfig
         ? detectExportedClasses(
             entryIsVirtual
               ? virtualModuleCodeSource(entryKey, virtual.sources[entryKey])
@@ -645,13 +698,18 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
       // ModuleLocator would read it from disk instead, but it only walks
       // `script`; a module list skips it.
       const skipLocator = typeof this.#exports === "string";
-      // Sets the stubs and Durable Object bindings for the detected classes.
-      const applyExports = (detected: Record<string, WorkerExportType>) => {
-        const stubs = { ...detected, ...declared };
-        // Bind explicit and detected Durable Objects unless already bound or
-        // their binding name is taken.
+      // Config classes win; the entry's only add names or type undeclared ones.
+      const stubsFor = (moduleTypes: Record<string, WorkerExportType>) => ({
+        ...(this.#exports === false ? {} : moduleTypes),
+        ...declared,
+      });
+      // Sets the stubs and Durable Object bindings for the entry's classes.
+      const applyExports = (moduleTypes: Record<string, WorkerExportType>) => {
+        const stubs = stubsFor(moduleTypes);
+        // Bind explicit Durable Objects, and the entry's in zero-config mode,
+        // unless already bound or their binding name is taken.
         const autoDOs: Record<string, unknown> = { ...existingDOs };
-        for (const name of Object.keys({ ...explicitExports, ...detected })) {
+        for (const name of Object.keys({ ...explicitExports, ...(zeroConfig && moduleTypes) })) {
           const bindingName = toScreamingSnakeCase(name);
           if (stubs[name] === "DurableObject" && !boundClasses.has(name) && !autoDOs[bindingName]) {
             autoDOs[bindingName] = name;
@@ -669,6 +727,8 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
             dynamicOnly: true,
             captureErrors: this.#captureErrors,
             exports: typeof this.#exports === "string" ? this.#exports : stubs,
+            // Zero-config classes need no declaration (no deploy hint).
+            configuredExports: Object.keys(zeroConfig ? stubs : declared),
             nodeCompat: !(options.compatibilityFlags as string[]).includes("no_nodejs_compat"),
           },
         );
@@ -678,19 +738,20 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
           options.script = script;
           options.scriptPath = scriptPath;
         }
+        return stubs;
       };
-      applyExports(detectedTypes);
-      if (detect) {
-        const detected: MiniflareDetectedExports = {
-          types: detectedTypes,
-          setTypes: (types) => {
-            detected.types = types;
-            applyExports(types);
-            return toMiniflareOptions(miniflare, options);
-          },
-        };
-        this.#detected = detected;
-      }
+      const workerExports: MiniflareWorkerExports = {
+        stubs: applyExports(detectedTypes),
+        update: (moduleTypes) => {
+          if (skipLocator || sameExportTypes(stubsFor(moduleTypes), workerExports.stubs)) {
+            return undefined;
+          }
+          workerExports.stubs = applyExports(moduleTypes);
+          return toMiniflareOptions(miniflare, options);
+        },
+        warnings: "",
+      };
+      this.#workerExports = workerExports;
       // Use "/" as modulesRoot so absolute paths don't produce ".." relative paths
       if (!options.modulesRoot) {
         options.modulesRoot = "/";
@@ -1239,7 +1300,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
         cached.ipc.runner = this;
         // Adopt the state the live fallback service closes over.
         this.#virtual = cached.virtual;
-        this.#detected = cached.detected;
+        this.#workerExports = cached.workerExports;
       }
     }
 
@@ -1252,7 +1313,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
           refCount: 1,
           virtual,
           ipc,
-          detected: this.#detected,
+          workerExports: this.#workerExports,
         };
         _miniflareCache.set(this.#cacheKey, this.#cacheEntry);
       }
@@ -1278,16 +1339,15 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
     await this.#connect();
   }
 
-  /** Load the entry and open the IPC WebSocket. */
+  /**
+   * Load the entry (restarting once if its classes change the export stubs)
+   * and open the IPC WebSocket.
+   */
   async #connect() {
-    // Load the entry with a plain request first, so a load error arrives as a
-    // normal response: miniflare leaves the socket of a failed WebSocket upgrade
-    // without an error listener, and disposing workerd then resets it (an
-    // uncaught ECONNRESET on Windows).
-    const loadRes = await this.#miniflare.dispatchFetch("http://localhost" + IPC_PATH);
-    const loadBody = await loadRes.text().catch(() => "");
-    if (!loadRes.ok) {
-      throw new Error(`Failed to establish WebSocket IPC channel (${loadRes.status}: ${loadBody})`);
+    const options = this.#updateExports(await this.#loadEntry());
+    if (options) {
+      await this.#miniflare.setOptions(options);
+      await this.#loadEntry();
     }
 
     // Establish persistent WebSocket connection for IPC

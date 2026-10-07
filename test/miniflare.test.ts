@@ -619,7 +619,7 @@ export default {
     expect(await res.json()).toEqual({ count: 1 });
   });
 
-  it("doesn't scan the entry when the config declares classes", async () => {
+  it("doesn't auto-bind the entry's classes when the config declares classes", async () => {
     tmpDir = mkdtempSync(join(_dir, ".tmp-auto-do-"));
     const entryPath = join(tmpDir, "worker.mjs");
     writeFileSync(
@@ -824,6 +824,115 @@ export { Greeter as RenamedGreeter };`,
       other: "undefined",
     });
     expect(reloaded).toHaveLength(2);
+  });
+
+  it("adds the entry's undeclared classes after its first load", async () => {
+    const entryPath = writeEntry({
+      "greeter.mjs": `
+import { WorkerEntrypoint } from "cloudflare:workers";
+export class Greeter extends WorkerEntrypoint {
+  greet(name) { return "hello " + name; }
+}`,
+      "worker.mjs": `
+import { DurableObject } from "cloudflare:workers";
+export { Greeter } from "./greeter.mjs";
+export class Counter extends DurableObject {
+  hello() { return "counter"; }
+}
+export class Other extends DurableObject {
+  hello() { return "other"; }
+}
+export default {
+  async fetch(request, env, ctx) {
+    return Response.json({
+      counter: await env.COUNTER.get(env.COUNTER.idFromName("x")).hello(),
+      other: typeof ctx.exports.Other,
+      greeting: await ctx.exports.Greeter.greet("world"),
+      autoBound: typeof env.OTHER,
+    });
+  },
+};`,
+    });
+    runner = new MiniflareEnvRunner({
+      miniflare,
+      name: "test-lazy-first-load",
+      data: { entry: entryPath },
+      wrangler: {
+        compatibility_date: "2025-01-01",
+        compatibility_flags: ["enable_ctx_exports"],
+        durable_objects: { bindings: [{ name: "COUNTER", class_name: "Counter" }] },
+      },
+      miniflareOptions: { defaultPersistRoot: undefined },
+    });
+    await waitForReady(runner);
+    // Exported but not bound: a Durable Object namespace needs a binding.
+    expect(await (await runner.fetch("http://localhost/")).json()).toEqual({
+      counter: "counter",
+      other: "function",
+      greeting: "hello world",
+      autoBound: "undefined",
+    });
+  });
+
+  it("restarts when a reload adds or removes an undeclared class", async () => {
+    const entry = (classes: string) => `
+import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
+export class Counter extends DurableObject {
+  async increment() {
+    const count = ((await this.ctx.storage.get("count")) || 0) + 1;
+    await this.ctx.storage.put("count", count);
+    return count;
+  }
+}
+${classes}
+export default {
+  async fetch(request, env, ctx) {
+    globalThis.startId ??= crypto.randomUUID();
+    return Response.json({
+      startId: globalThis.startId,
+      count: await env.COUNTER.get(env.COUNTER.idFromName("x")).increment(),
+      greeting: ctx.exports.Greeter ? await ctx.exports.Greeter.greet("world") : null,
+    });
+  },
+};`;
+    const entryPath = writeEntry({ "worker.mjs": entry("") });
+    runner = new MiniflareEnvRunner({
+      miniflare,
+      name: "test-lazy-declared-restart",
+      data: { entry: entryPath },
+      miniflareOptions: {
+        compatibilityDate: "2025-01-01",
+        compatibilityFlags: ["enable_ctx_exports"],
+        durableObjects: { COUNTER: { className: "Counter", useSQLite: true } },
+      },
+    });
+    await waitForReady(runner);
+    const first = await (await runner.fetch("http://localhost/")).json();
+    expect(first).toMatchObject({ count: 1, greeting: null });
+
+    // Unchanged classes: no restart.
+    await runner.reloadModule();
+    expect(await (await runner.fetch("http://localhost/")).json()).toEqual({
+      startId: first.startId,
+      count: 2,
+      greeting: null,
+    });
+
+    writeEntry({
+      "worker.mjs": entry(`export class Greeter extends WorkerEntrypoint {
+  greet(name) { return "hello " + name; }
+}`),
+    });
+    await runner.reloadModule();
+    const added = await (await runner.fetch("http://localhost/")).json();
+    expect(added).toMatchObject({ count: 3, greeting: "hello world" });
+    expect(added.startId).not.toBe(first.startId);
+
+    writeEntry({ "worker.mjs": entry("") });
+    await runner.reloadModule();
+    const removed = await (await runner.fetch("http://localhost/")).json();
+    expect(removed).toMatchObject({ count: 4, greeting: null });
+    expect(removed.startId).not.toBe(added.startId);
   });
 
   it("detects classes of bundled entries, ignoring comments and strings", async () => {
@@ -1149,12 +1258,18 @@ export default {
     await vi.waitFor(() => {
       const text = warnings.join("\n");
       expect(text).toContain('"Missing" is declared as a DurableObject but not exported');
-      expect(text).toContain('"Undeclared" extends WorkerEntrypoint but is not declared');
+      expect(text).toContain(
+        `"Undeclared" extends WorkerEntrypoint but the wrangler config doesn't declare it: add "exports": { "Undeclared": { "type": "worker" } } to deploy it.`,
+      );
     });
     const { error } = await (await runner.fetch("http://localhost/missing")).json();
     expect(error).toBe(
       '"Missing" is declared as a DurableObject but the entry does not export it.',
     );
+    // Unchanged warnings aren't repeated.
+    await runner.reloadModule();
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(warnings.join("\n").split('"Missing" is declared as')).toHaveLength(2);
   });
 
   it("doesn't warn about a default export extending WorkerEntrypoint", async () => {

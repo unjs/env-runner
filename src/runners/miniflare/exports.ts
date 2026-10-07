@@ -73,12 +73,16 @@ export function localClassName(binding: unknown): string | undefined {
 }
 
 /**
- * Wrapper code exporting a stub class per declared export, resolving the
- * entry's class on use (see `workerExportsRuntime()`). Expects the wrapper's
+ * Wrapper code exporting a stub class per export, resolving the entry's class
+ * on use (see `workerExportsRuntime()`). Expects the wrapper's
  * `__ensureEntry()`, `__entryExports()` and `__userEnv()`, and defines
- * `__checkExports()` and `__exportTypes()`.
+ * `__checkExports()` and `__exportTypes()`. `configured`: the names the config
+ * declares (default: all).
  */
-export function generateExportStubs(declared: Record<string, WorkerExportType>): string {
+export function generateExportStubs(
+  declared: Record<string, WorkerExportType>,
+  configured: string[] = Object.keys(declared),
+): string {
   // Export names can be any string, and must not shadow the wrapper's globals.
   const stubs = Object.keys(declared)
     .map(
@@ -100,6 +104,7 @@ const __workerExports = (${workerExportsRuntime.toString()})(
   },
   ${JSON.stringify(declared)},
   { ensureEntry: __ensureEntry, entryExports: __entryExports, userEnv: __userEnv },
+  ${JSON.stringify(configured)},
 );
 const __checkExports = __workerExports.checkExports;
 const __exportTypes = __workerExports.exportTypes;

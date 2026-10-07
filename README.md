@@ -840,7 +840,9 @@ export default {
 
 As with `@cloudflare/vite-plugin`, Durable Objects can't have RPC methods named `email`, `queue`, `scheduled`, `tail`, `tailStream`, `test` or `trace`, and `WorkerEntrypoint`s can't have ones named `alarm`, `webSocketClose`, `webSocketError` or `webSocketMessage`.
 
-A warning after each load lists declared classes the entry doesn't export, and exported classes nothing declares.
+The entry's own classes are added to these after it loads (including ones it re-exports from other modules, see [below](#auto-detected-exports)): a class the config doesn't declare is still exported, so a `WorkerEntrypoint` works through `ctx.exports`, but it isn't bound. Declared classes stay exported even when the entry lacks them, and their stubs throw a clear error on use.
+
+A warning after each load lists declared classes the entry doesn't export, and exported classes the wrangler config doesn't declare (deploys need the declaration).
 
 #### Auto-detected Exports
 
@@ -876,7 +878,7 @@ await using runner = new MiniflareEnvRunner({
 
 Auto-wired bindings are merged with Durable Object bindings from `miniflareOptions` and a wrangler config: exports whose class is already bound (or whose binding name is taken) are skipped. Set `exports: false` to disable auto-detection entirely (declared classes still work).
 
-After each `reloadModule()`, the classes are read from the loaded entry instead (including ones it re-exports from other modules): a class extending a `cloudflare:workers` base gets that type, any other class is a Durable Object, and other values are skipped. When they differ from the current ones, Miniflare restarts with the new exports and bindings and loads the entry again: persisted Durable Object storage is kept, in-flight requests and WebSockets drop.
+After the entry first loads and after each `reloadModule()`, its classes are also read from the loaded module (so re-exports and entries the scan can't parse are covered): a class extending a `cloudflare:workers` base gets that type, any other class is a Durable Object, and functions and other values are skipped. In every mode except `exports: false`, when they change the exports, Miniflare restarts with the new exports and bindings and loads the entry again: persisted Durable Object storage is kept, in-flight requests and WebSockets drop. An unchanged entry never restarts.
 
 #### Exports Module
 
@@ -899,7 +901,7 @@ const runner = new MiniflareEnvRunner({
 });
 ```
 
-An exports module loads when the worker starts: recreate the runner when its classes change (`reloadModule()` only reloads the request entry). The list of declared classes is fixed at startup too, so recreate the runner when the config changes; only [auto-detected](#auto-detected-exports) classes follow reloads.
+An exports module loads when the worker starts: recreate the runner when its classes change (`reloadModule()` only reloads the request entry). The classes the config declares are fixed at startup too, so recreate the runner when the config changes; the entry's own classes follow reloads (see [above](#auto-detected-exports)).
 
 #### Error Capture
 

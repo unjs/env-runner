@@ -14,17 +14,19 @@ export interface WorkerExportsHost {
  * Runs inside workerd: the wrapper inlines it with `toString()`, so it must
  * not reference anything outside its own body.
  *
- * Returns a stub class per declared export (like `@cloudflare/vite-plugin`):
- * workerd needs the classes at startup, but the entry loads dynamically, so
- * each stub resolves the entry's class on use (and again after a reload).
+ * Returns a stub class per export (like `@cloudflare/vite-plugin`): workerd
+ * needs the classes at startup, but the entry loads dynamically, so each stub
+ * resolves the entry's class on use (and again after a reload). `configured`
+ * names the exports the config declares (the others get a deploy hint).
  */
 export function workerExportsRuntime(
   bases: WorkerExportBases,
   declared: Record<string, WorkerExportType>,
   host: WorkerExportsHost,
+  configured: string[],
 ): {
   stubs: Record<string, unknown>;
-  checkExports: () => Promise<void>;
+  checkExports: () => Promise<string[] | undefined>;
   exportTypes: () => Promise<Record<string, WorkerExportType> | undefined>;
 } {
   const DO_KEYS = [
@@ -234,10 +236,8 @@ export function workerExportsRuntime(
     stubs[name] = createStub[type](name);
   }
 
-  let lastWarnings = "";
-
   // After each entry (re)load: declared classes the entry lacks, and exported
-  // classes workerd won't see because nothing declares them. Warns on change.
+  // classes the config doesn't declare (deploys need it). The host warns on change.
   async function checkExports() {
     let exports;
     try {
@@ -256,25 +256,21 @@ export function workerExportsRuntime(
       }
     }
     for (const name of Object.keys(exports)) {
-      if (name === "default" || name in declared) continue;
+      if (name === "default" || configured.includes(name)) continue;
       const type = (Object.keys(bases) as WorkerExportType[]).find((type) =>
         extendsBase(exports[name], type),
       );
       if (type) {
         warnings.push(
-          `"${name}" extends ${type} but is not declared, so workerd can't use it: ${hints[type](name)} to the wrangler config.`,
+          `"${name}" extends ${type} but the wrangler config doesn't declare it: ${hints[type](name)} to deploy it.`,
         );
       }
     }
-    const text = warnings.join("\n");
-    if (text && text !== lastWarnings) {
-      console.warn("[env-runner] Worker exports:\n  - " + warnings.join("\n  - "));
-    }
-    lastWarnings = text;
+    return warnings;
   }
 
-  // Classes the loaded entry exports, by type: like the host's source detection,
-  // classes not extending a base are Durable Objects; other values are skipped.
+  // Classes the loaded entry exports, by type: classes not extending a base are
+  // Durable Objects; functions and other values are skipped.
   async function exportTypes() {
     let exports;
     try {
