@@ -82,7 +82,7 @@ export function localClassName(binding: unknown): string | undefined {
  * `@cloudflare/vite-plugin`): workerd needs the classes at startup, but the
  * entry loads dynamically, so each stub resolves the entry's class on use (and
  * again after a reload). Expects the wrapper's `__ensureEntry()`,
- * `__entryExports()`, `__userEnv()` and `__entryPath`.
+ * `__entryExports()` and `__userEnv()`.
  */
 export function generateExportStubs(
   declared: Record<string, WorkerExportType>,
@@ -110,7 +110,7 @@ const __kInstance = Symbol("instance");
 const __kEnsureInstance = Symbol("ensureInstance");
 
 function __expected(name, what) {
-  return 'Expected "' + name + '" export of "' + __entryPath + '" to ' + what;
+  return 'Expected "' + name + '" export of the entry to ' + what;
 }
 
 async function __resolveExport(env, name) {
@@ -118,8 +118,7 @@ async function __resolveExport(env, name) {
   const value = (await __entryExports())?.[name];
   if (value === undefined) {
     throw new TypeError(
-      '"' + name + '" is declared as a ' + __declaredExports[name] +
-        ' but "' + __entryPath + '" does not export it.'
+      '"' + name + '" is declared as a ' + __declaredExports[name] + " but the entry does not export it."
     );
   }
   return value;

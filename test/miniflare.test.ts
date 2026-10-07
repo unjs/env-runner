@@ -885,7 +885,12 @@ import { WorkerEntrypoint } from "cloudflare:workers";
 export class Undeclared extends WorkerEntrypoint {}`,
       "worker.mjs": `
 export { Undeclared } from "./helper.mjs";
-export default { fetch: () => new Response("ok") };`,
+export default {
+  fetch: (req, env) =>
+    new URL(req.url).pathname === "/missing"
+      ? env.MISSING.get(env.MISSING.idFromName("x")).fetch(req)
+      : new Response("ok"),
+};`,
     });
     runner = new MiniflareEnvRunner({
       miniflare,
@@ -900,6 +905,10 @@ export default { fetch: () => new Response("ok") };`,
       expect(text).toContain('"Missing" is declared as a DurableObject but not exported');
       expect(text).toContain('"Undeclared" extends WorkerEntrypoint but is not declared');
     });
+    const { error } = await (await runner.fetch("http://localhost/missing")).json();
+    expect(error).toBe(
+      '"Missing" is declared as a DurableObject but the entry does not export it.',
+    );
   });
 });
 
