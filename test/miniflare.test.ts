@@ -607,6 +607,43 @@ export default {
     const res = await runner.fetch("http://localhost/counter/increment");
     expect(res.status).toBe(500);
   });
+  it("binds untyped explicit exports as Durable Objects", async () => {
+    runner = new MiniflareEnvRunner({
+      miniflare,
+      name: "test-explicit-do",
+      data: { entry: workerDoEntry },
+      exports: { Counter: {} },
+    });
+    await waitForReady(runner);
+    const res = await runner.fetch("http://localhost/counter/increment");
+    expect(await res.json()).toEqual({ count: 1 });
+  });
+
+  it("doesn't scan the entry when the config declares classes", async () => {
+    tmpDir = mkdtempSync(join(_dir, ".tmp-auto-do-"));
+    const entryPath = join(tmpDir, "worker.mjs");
+    writeFileSync(
+      entryPath,
+      `
+export class Counter {}
+export class Other {}
+export default {
+  fetch: (request, env) =>
+    Response.json({ counter: typeof env.COUNTER?.idFromName, other: typeof env.OTHER }),
+};`,
+    );
+    runner = new MiniflareEnvRunner({
+      miniflare,
+      name: "test-auto-do-declared",
+      data: { entry: entryPath },
+      miniflareOptions: { durableObjects: { COUNTER: "Counter" } },
+    });
+    await waitForReady(runner);
+    expect(await (await runner.fetch("http://localhost/")).json()).toEqual({
+      counter: "function",
+      other: "undefined",
+    });
+  });
 });
 
 describe("MiniflareEnvRunner (lazy exports)", () => {
@@ -868,6 +905,56 @@ export default {
       status: "complete",
       output: 42,
       autoBound: "undefined",
+    });
+  });
+
+  // The stubs are inlined with `Function.prototype.toString()`, so run them
+  // from the bundled `dist` too (built before the tests, see global setup).
+  it("runs the export stubs from the built package", async () => {
+    const { MiniflareEnvRunner: BuiltRunner } =
+      await import("../dist/runners/miniflare/runner.mjs");
+    const entryPath = writeEntry({
+      "worker.mjs": `
+import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
+export class Counter extends DurableObject {
+  async increment() {
+    const count = ((await this.ctx.storage.get("count")) || 0) + 1;
+    await this.ctx.storage.put("count", count);
+    return count;
+  }
+}
+export class Greeter extends WorkerEntrypoint {
+  greet(name) {
+    return "hello " + name;
+  }
+}
+export default {
+  async fetch(request, env, ctx) {
+    const stub = env.COUNTER.get(env.COUNTER.idFromName("test"));
+    return Response.json({
+      count: await stub.increment(),
+      greeting: await ctx.exports.Greeter.greet("dist"),
+    });
+  },
+};`,
+    });
+    runner = new BuiltRunner({
+      miniflare,
+      name: "test-lazy-dist",
+      data: { entry: entryPath },
+      wrangler: {
+        compatibility_date: "2025-01-01",
+        compatibility_flags: ["enable_ctx_exports"],
+        durable_objects: { bindings: [{ name: "COUNTER", class_name: "Counter" }] },
+        migrations: [{ tag: "v1", new_sqlite_classes: ["Counter"] }],
+        exports: { Greeter: { type: "worker" } },
+      },
+      miniflareOptions: { defaultPersistRoot: undefined },
+    }) as unknown as MiniflareEnvRunner;
+    await waitForReady(runner);
+    expect(await (await runner.fetch("http://localhost/")).json()).toEqual({
+      count: 1,
+      greeting: "hello dist",
     });
   });
 

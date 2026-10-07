@@ -21,8 +21,9 @@ export function isWorkerExportType(type: unknown): type is WorkerExportType {
 /**
  * Worker exports declared by the config, by class name: local Durable Object
  * and Workflow bindings of the Miniflare options, the wrangler config's
- * `exports`, then typed entries of the runner's `exports` record (later wins).
- * The wrapper exports a lazy stub for each, resolved from the entry on use.
+ * `exports`, then entries of the runner's `exports` record (later wins; an
+ * untyped entry is a Durable Object). The wrapper exports a lazy stub for
+ * each, resolved from the entry on use.
  */
 export function declaredWorkerExports(opts: {
   options: Record<string, unknown>;
@@ -57,9 +58,7 @@ export function declaredWorkerExports(opts: {
     }
   }
   for (const [name, info] of Object.entries(opts.explicit || {})) {
-    if (isWorkerExportType(info?.type)) {
-      out[name] = info.type;
-    }
+    out[name] = isWorkerExportType(info?.type) ? info.type : "DurableObject";
   }
   return out;
 }

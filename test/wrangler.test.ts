@@ -332,7 +332,7 @@ const SHARED_CASES: WranglerCase[] = [
     warns: ['compatibility date "2999-01-01" is newer than the installed workerd supports'],
   },
   {
-    name: "drops Durable Object bindings to another script and merges auto-wired exports",
+    name: "drops Durable Object bindings to another script and skips auto-wiring declared configs",
     entry: DO_ENTRY,
     options: () => ({
       wrangler: {
@@ -347,13 +347,14 @@ const SHARED_CASES: WranglerCase[] = [
         migrations: [{ tag: "v1", new_classes: ["Counter", "Greeter"] }],
       },
     }),
-    // LOCAL (wrangler) + GREETER (auto-wired); Counter is already bound, so no
-    // COUNTER binding; the external-script binding is dropped.
+    // Only LOCAL (wrangler): the config declares classes, so the entry isn't
+    // scanned and Greeter (declared by `migrations`) stays unbound, as in
+    // `wrangler dev`; the external-script binding is dropped.
     assert: (json) =>
       expect(json).toMatchObject({
         greeting: "do",
         local: "function",
-        greeter: "function",
+        greeter: "undefined",
         counter: "undefined",
         external: "undefined",
       }),

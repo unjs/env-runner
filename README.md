@@ -844,7 +844,7 @@ A warning after each load lists declared classes the entry doesn't export, and e
 
 #### Auto-detected Exports
 
-`MiniflareEnvRunner` automatically scans the entry file for `export class` declarations and wires them as Durable Object bindings (binding name = class name in `SCREAMING_SNAKE_CASE`, e.g. `COUNTER`). `WorkerEntrypoint`/`WorkflowEntrypoint` classes aren't bound; declare them (see above) so they follow reloads. This means you don't need to manually configure `miniflareOptions.durableObjects` for simple cases:
+When the config declares no classes (see above), `MiniflareEnvRunner` scans the entry file for `export class` declarations and wires them as Durable Object bindings (binding name = class name in `SCREAMING_SNAKE_CASE`, e.g. `COUNTER`). `WorkerEntrypoint`/`WorkflowEntrypoint` classes aren't bound. This means you don't need to manually configure `miniflareOptions.durableObjects` for simple cases:
 
 ```ts
 // worker.ts
@@ -862,14 +862,14 @@ export default {
 };
 ```
 
-To explicitly declare exports or override auto-detection:
+To explicitly declare exports:
 
 ```ts
 await using runner = new MiniflareEnvRunner({
   miniflare,
   name: "my-worker",
   data: { entry: "./worker.ts" },
-  // Explicit exports (merged with auto-detected ones)
+  // Replaces auto-detection
   exports: { Counter: { type: "DurableObject" }, Greeter: { type: "WorkerEntrypoint" } },
 });
 ```
