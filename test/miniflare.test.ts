@@ -908,6 +908,43 @@ export default {
     });
   });
 
+  it("reports a Workflow class without run()", async () => {
+    const entryPath = writeEntry({
+      "worker.mjs": `
+import { WorkflowEntrypoint } from "cloudflare:workers";
+export class Doubler extends WorkflowEntrypoint {}
+export default {
+  async fetch(request, env) {
+    const instance = await env.WORKFLOW.create();
+    for (let i = 0; i < 100; i++) {
+      const status = await instance.status();
+      if (status.status === "complete" || status.status === "errored") {
+        return Response.json(status);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    return new Response("timeout", { status: 504 });
+  },
+};`,
+    });
+    runner = new MiniflareEnvRunner({
+      miniflare,
+      name: "test-lazy-workflow-run",
+      data: { entry: entryPath },
+      wrangler: {
+        compatibility_date: "2025-01-01",
+        workflows: [{ binding: "WORKFLOW", name: "doubler", class_name: "Doubler" }],
+      },
+      miniflareOptions: { defaultPersistRoot: undefined },
+    });
+    await waitForReady(runner);
+    const status = await (await runner.fetch("http://localhost/")).json();
+    expect(status).toMatchObject({ status: "errored" });
+    expect(JSON.stringify(status)).toContain(
+      'Expected \\"Doubler\\" export of the entry to define a `run()` method.',
+    );
+  });
+
   // The stubs are inlined with `Function.prototype.toString()`, so run them
   // from the bundled `dist` too (built before the tests, see global setup).
   it("runs the export stubs from the built package", async () => {
@@ -996,6 +1033,32 @@ export default {
     expect(error).toBe(
       '"Missing" is declared as a DurableObject but the entry does not export it.',
     );
+  });
+
+  it("doesn't warn about a default export extending WorkerEntrypoint", async () => {
+    const warnings: string[] = [];
+    const capture = (...args: unknown[]) => {
+      warnings.push(args.map(String).join(" "));
+    };
+    vi.spyOn(console, "warn").mockImplementation(capture);
+    vi.spyOn(console, "error").mockImplementation(capture);
+    vi.spyOn(console, "log").mockImplementation(capture);
+    const entryPath = writeEntry({
+      "worker.mjs": `
+import { WorkerEntrypoint } from "cloudflare:workers";
+export default class extends WorkerEntrypoint {}`,
+    });
+    runner = new MiniflareEnvRunner({
+      miniflare,
+      name: "test-lazy-default",
+      data: { entry: entryPath },
+      miniflareOptions: { durableObjects: { MISSING: "Missing" } },
+    });
+    await waitForReady(runner);
+    await vi.waitFor(() => {
+      expect(warnings.join("\n")).toContain('"Missing" is declared');
+    });
+    expect(warnings.join("\n")).not.toContain('"default"');
   });
 });
 

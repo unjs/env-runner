@@ -214,7 +214,7 @@ export function workerExportsRuntime(
     class Stub extends bases.WorkflowEntrypoint {
       async run(...args: unknown[]) {
         const ctor = await resolveExport(this.env, name);
-        return construct(this, ctor, name, "WorkflowEntrypoint").run(...args);
+        return method(construct(this, ctor, name, "WorkflowEntrypoint"), name, "run")(...args);
       }
     }
     return Stub;
@@ -252,7 +252,7 @@ export function workerExportsRuntime(
       }
     }
     for (const name of Object.keys(exports)) {
-      if (name in declared) continue;
+      if (name === "default" || name in declared) continue;
       const type = (Object.keys(bases) as WorkerExportType[]).find((type) =>
         extendsBase(exports[name], type),
       );
