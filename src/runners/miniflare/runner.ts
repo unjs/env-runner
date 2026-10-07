@@ -96,7 +96,9 @@ export interface MiniflareEnvRunnerOptions {
    *   stubs resolving the class from the entry (or its `resolveExports()` hook)
    *   on use, so they follow `reloadModule()`.
    * - Without any declared class (default, or `true`), the entry's exported
-   *   classes are detected instead; `false` disables detection.
+   *   classes are detected instead, from its source at startup and from the
+   *   loaded module after each reload (restarting Miniflare when they
+   *   change); `false` disables detection.
    * - Untyped entries of this record and detected classes not extending
    *   `WorkerEntrypoint`/`WorkflowEntrypoint` are Durable Objects, bound as
    *   `SCREAMING_SNAKE_CASE` when they have no binding.
@@ -183,6 +185,16 @@ type ServedVirtualModule = Required<VirtualModule> & {
   format: "module" | "commonjs" | "json" | "text" | "bytes" | "wasm";
 };
 
+/**
+ * Entry classes detected when the config declares none: from the entry's
+ * source at startup, then from the loaded module after each reload.
+ */
+interface MiniflareDetectedExports {
+  types: Record<string, WorkerExportType>;
+  /** Stubs and Durable Object bindings for `types` (set here) → Miniflare options. */
+  setTypes(types: Record<string, WorkerExportType>): Record<string, unknown>;
+}
+
 interface MiniflareCacheEntry {
   mf: InstanceType<any>;
   refCount: number;
@@ -190,6 +202,7 @@ interface MiniflareCacheEntry {
   // Receiver of the instance's `__ENV_RUNNER_IPC` binding; retargeted to the
   // runner that attaches last (like the IPC WebSocket).
   ipc: { runner: MiniflareEnvRunner };
+  detected?: MiniflareDetectedExports;
 }
 
 // Module-level cache for persistent Miniflare instances
@@ -201,6 +214,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
   #transformRequest?: (id: string) => Promise<TransformResult | null | undefined>;
   #reloadCounter = 0;
   #virtual?: MiniflareVirtualModules;
+  #detected?: MiniflareDetectedExports;
   #cacheEntry?: MiniflareCacheEntry;
   #ws?: { send(data: string): void; close(): void };
   #persistent: boolean;
@@ -322,7 +336,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
       return;
     }
     this.#reloadCounter++;
-    await this._request(
+    const { exportTypes } = await this._request<{ exportTypes?: Record<string, unknown> }>(
       { type: "reload", version: this.#reloadCounter },
       {
         match: (msg) => msg?.event === "module-reloaded",
@@ -331,6 +345,15 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
         send: (message) => this.#ws!.send(JSON.stringify(message)),
       },
     );
+    // workerd needs the Worker's exports at startup: restart when the
+    // reloaded entry's classes differ from the detected ones.
+    const detected = this.#detected;
+    const types = isPlainObject(exportTypes) ? workerExportTypes(exportTypes) : undefined;
+    if (detected && types && !sameExportTypes(detected.types, types)) {
+      await this.#restart(detected.setTypes(types));
+    } else {
+      this.#ws?.send(JSON.stringify({ type: "check-exports" }));
+    }
   }
 
   /**
@@ -599,53 +622,74 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
         typeof this.#exports === "string"
           ? {}
           : declaredWorkerExports({ options, wranglerExports, explicit: explicitExports });
-      await initEsmLexer;
-      const detected =
-        this.#exports === false ||
-        typeof this.#exports === "string" ||
-        Object.keys(declared).length > 0
-          ? {}
-          : detectExportedClasses(
-              entryIsVirtual
-                ? virtualModuleCodeSource(entryKey, virtual.sources[entryKey])
-                : _tryReadFile(resolvedEntry),
-            );
-      const stubs = { ...detected, ...declared };
+      const detect =
+        this.#exports !== false &&
+        typeof this.#exports !== "string" &&
+        Object.keys(declared).length === 0;
+      if (detect) {
+        await initEsmLexer;
+      }
+      const detectedTypes = detect
+        ? detectExportedClasses(
+            entryIsVirtual
+              ? virtualModuleCodeSource(entryKey, virtual.sources[entryKey])
+              : _tryReadFile(resolvedEntry),
+          )
+        : {};
 
-      // Bind explicit and detected Durable Objects unless already bound or
-      // their binding name is taken.
-      const existingDOs = isPlainObject(options.durableObjects) ? options.durableObjects : {};
+      const baseDOs = options.durableObjects;
+      const existingDOs = isPlainObject(baseDOs) ? baseDOs : {};
       const boundClasses = new Set(Object.values(existingDOs).map(localClassName));
-      const autoDOs: Record<string, unknown> = { ...existingDOs };
-      for (const name of Object.keys({ ...explicitExports, ...detected })) {
-        const bindingName = toScreamingSnakeCase(name);
-        if (stubs[name] === "DurableObject" && !boundClasses.has(name) && !autoDOs[bindingName]) {
-          autoDOs[bindingName] = name;
-        }
-      }
-      if (Object.keys(autoDOs).length > 0) {
-        options.durableObjects = autoDOs;
-      }
-
-      const script = generateWrapper(
-        entryIsVirtual ? toWorkerdPath(resolvedEntry) : resolvedEntry,
-        {
-          dynamicOnly: true,
-          captureErrors: this.#captureErrors,
-          exports: typeof this.#exports === "string" ? this.#exports : stubs,
-          nodeCompat: !(options.compatibilityFlags as string[]).includes("no_nodejs_compat"),
-        },
-      );
       const scriptPath = entryDir + "/__env_runner_wrapper.mjs";
       // A static `exports` module re-export must reach the fallback service. v4's
       // ModuleLocator would read it from disk instead, but it only walks
       // `script`; a module list skips it.
       const skipLocator = typeof this.#exports === "string";
-      if (skipLocator) {
-        options.modules = [{ type: "ESModule", path: scriptPath, contents: script }];
-      } else {
-        options.script = script;
-        options.scriptPath = scriptPath;
+      // Sets the stubs and Durable Object bindings for the detected classes.
+      const applyExports = (detected: Record<string, WorkerExportType>) => {
+        const stubs = { ...detected, ...declared };
+        // Bind explicit and detected Durable Objects unless already bound or
+        // their binding name is taken.
+        const autoDOs: Record<string, unknown> = { ...existingDOs };
+        for (const name of Object.keys({ ...explicitExports, ...detected })) {
+          const bindingName = toScreamingSnakeCase(name);
+          if (stubs[name] === "DurableObject" && !boundClasses.has(name) && !autoDOs[bindingName]) {
+            autoDOs[bindingName] = name;
+          }
+        }
+        if (Object.keys(autoDOs).length > 0) {
+          options.durableObjects = autoDOs;
+        } else if (baseDOs === undefined) {
+          delete options.durableObjects;
+        }
+
+        const script = generateWrapper(
+          entryIsVirtual ? toWorkerdPath(resolvedEntry) : resolvedEntry,
+          {
+            dynamicOnly: true,
+            captureErrors: this.#captureErrors,
+            exports: typeof this.#exports === "string" ? this.#exports : stubs,
+            nodeCompat: !(options.compatibilityFlags as string[]).includes("no_nodejs_compat"),
+          },
+        );
+        if (skipLocator) {
+          options.modules = [{ type: "ESModule", path: scriptPath, contents: script }];
+        } else {
+          options.script = script;
+          options.scriptPath = scriptPath;
+        }
+      };
+      applyExports(detectedTypes);
+      if (detect) {
+        const detected: MiniflareDetectedExports = {
+          types: detectedTypes,
+          setTypes: (types) => {
+            detected.types = types;
+            applyExports(types);
+            return toMiniflareOptions(miniflare, options);
+          },
+        };
+        this.#detected = detected;
       }
       // Use "/" as modulesRoot so absolute paths don't produce ".." relative paths
       if (!options.modulesRoot) {
@@ -1195,6 +1239,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
         cached.ipc.runner = this;
         // Adopt the state the live fallback service closes over.
         this.#virtual = cached.virtual;
+        this.#detected = cached.detected;
       }
     }
 
@@ -1207,11 +1252,34 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
           refCount: 1,
           virtual,
           ipc,
+          detected: this.#detected,
         };
         _miniflareCache.set(this.#cacheKey, this.#cacheEntry);
       }
     }
 
+    await this.#connect();
+
+    // Signal ready with a dummy address (fetch is overridden)
+    this._handleMessage({ address: { host: "127.0.0.1", port: 0 } });
+  }
+
+  /**
+   * Restart workerd with new options (persisted state is kept) and reconnect;
+   * the new instance loads the entry again.
+   */
+  async #restart(options: Record<string, unknown>) {
+    if (this.#ws) {
+      this.#ws.send(JSON.stringify({ type: "shutdown" }));
+      this.#ws.close();
+      this.#ws = undefined;
+    }
+    await this.#miniflare.setOptions(options);
+    await this.#connect();
+  }
+
+  /** Load the entry and open the IPC WebSocket. */
+  async #connect() {
     // Load the entry with a plain request first, so a load error arrives as a
     // normal response: miniflare leaves the socket of a failed WebSocket upgrade
     // without an error listener, and disposing workerd then resets it (an
@@ -1243,9 +1311,6 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
         // Ignore malformed messages
       }
     });
-
-    // Signal ready with a dummy address (fetch is overridden)
-    this._handleMessage({ address: { host: "127.0.0.1", port: 0 } });
   }
 
   // #endregion
@@ -1309,6 +1374,25 @@ function classHeritage(source: string, name: string): string | undefined {
     `(?:(?<![\\w$])class\\s+${id}|(?<![\\w$.])${id}\\s*=\\s*class(?:\\s+(?!extends\\b)[\\w$]+)?)(?![\\w$])([^{]*)\\{`,
   );
   return re.exec(source)?.[1];
+}
+
+/** Valid entries of the export types the wrapper reports. */
+function workerExportTypes(types: Record<string, unknown>): Record<string, WorkerExportType> {
+  const out: Record<string, WorkerExportType> = {};
+  for (const [name, type] of Object.entries(types)) {
+    if (isWorkerExportType(type)) {
+      out[name] = type;
+    }
+  }
+  return out;
+}
+
+function sameExportTypes(
+  a: Record<string, WorkerExportType>,
+  b: Record<string, WorkerExportType>,
+): boolean {
+  const keys = Object.keys(a);
+  return keys.length === Object.keys(b).length && keys.every((key) => a[key] === b[key]);
 }
 
 /**

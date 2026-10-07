@@ -22,7 +22,11 @@ export function workerExportsRuntime(
   bases: WorkerExportBases,
   declared: Record<string, WorkerExportType>,
   host: WorkerExportsHost,
-): { stubs: Record<string, unknown>; checkExports: () => Promise<void> } {
+): {
+  stubs: Record<string, unknown>;
+  checkExports: () => Promise<void>;
+  exportTypes: () => Promise<Record<string, WorkerExportType> | undefined>;
+} {
   const DO_KEYS = [
     "alarm",
     "connect",
@@ -269,5 +273,30 @@ export function workerExportsRuntime(
     lastWarnings = text;
   }
 
-  return { stubs, checkExports };
+  // Classes the loaded entry exports, by type: like the host's source detection,
+  // classes not extending a base are Durable Objects; other values are skipped.
+  async function exportTypes() {
+    let exports;
+    try {
+      exports = await host.entryExports();
+    } catch {
+      return;
+    }
+    if (!exports || typeof exports !== "object") return;
+    const types: Record<string, WorkerExportType> = {};
+    for (const [name, value] of Object.entries(exports)) {
+      if (name === "default" || typeof value !== "function") continue;
+      const type = (Object.keys(bases) as WorkerExportType[]).find((type) =>
+        extendsBase(value, type),
+      );
+      if (type) {
+        types[name] = type;
+      } else if (/^class\b/.test(Function.prototype.toString.call(value))) {
+        types[name] = "DurableObject";
+      }
+    }
+    return types;
+  }
+
+  return { stubs, checkExports, exportTypes };
 }

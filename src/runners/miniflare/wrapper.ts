@@ -40,7 +40,7 @@ if (!globalThis.process) { globalThis.process = __process; }`;
   // separate exports module wholesale, or stubs resolving the entry's classes.
   const workerExports =
     typeof opts?.exports === "string"
-      ? `export * from ${JSON.stringify(opts.exports)};\nconst __checkExports = async () => {};`
+      ? `export * from ${JSON.stringify(opts.exports)};\nconst __checkExports = async () => {};\nconst __exportTypes = async () => undefined;`
       : generateExportStubs(opts?.exports || {});
 
   const captureErrors = opts?.captureErrors ?? true;
@@ -238,11 +238,17 @@ async function __handleWsMessage(env, data) {
         __ipcInitialized = true;
         await __userEntry.ipc.onOpen({ sendMessage: __sendMessage });
       }
-      __sendMessage({ event: "module-reloaded" });
-      __runExportsCheck();
+      // The host restarts with new stubs when these changed, else asks for the check.
+      const exportTypes = await __exportTypes().catch(() => undefined);
+      __sendMessage({ event: "module-reloaded", exportTypes });
     } catch (e) {
       __sendMessage({ event: "module-reloaded", error: String(e) });
     }
+    return;
+  }
+
+  if (msg.type === "check-exports") {
+    __runExportsCheck();
     return;
   }
 

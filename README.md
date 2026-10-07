@@ -876,6 +876,8 @@ await using runner = new MiniflareEnvRunner({
 
 Auto-wired bindings are merged with Durable Object bindings from `miniflareOptions` and a wrangler config: exports whose class is already bound (or whose binding name is taken) are skipped. Set `exports: false` to disable auto-detection entirely (declared classes still work).
 
+After each `reloadModule()`, the classes are read from the loaded entry instead (including ones it re-exports from other modules): a class extending a `cloudflare:workers` base gets that type, any other class is a Durable Object, and other values are skipped. When they differ from the current ones, Miniflare restarts with the new exports and bindings and loads the entry again: persisted Durable Object storage is kept, in-flight requests and WebSockets drop.
+
 #### Exports Module
 
 To load named exports from a separate module, set `exports` to its absolute path or a `data.virtual` key (a relative path resolves from the entry's directory, not the working directory). The wrapper re-exports it with `export *`, so re-exports and exported aliases work.
@@ -897,7 +899,7 @@ const runner = new MiniflareEnvRunner({
 });
 ```
 
-An exports module loads when the worker starts: recreate the runner when its classes change (`reloadModule()` only reloads the request entry). In every mode the list of exports is fixed at startup, so recreate the runner when a class is added or removed.
+An exports module loads when the worker starts: recreate the runner when its classes change (`reloadModule()` only reloads the request entry). The list of declared classes is fixed at startup too, so recreate the runner when the config changes; only [auto-detected](#auto-detected-exports) classes follow reloads.
 
 #### Error Capture
 

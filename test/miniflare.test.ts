@@ -753,6 +753,79 @@ export class Counter extends DurableObject {
     expect(await (await runner.fetch("http://localhost/")).json()).toEqual({ hits: 1 });
   });
 
+  it("restarts with new stubs when a reload changes the entry's classes", async () => {
+    const entry = (classes: string, fetch: string) => `
+import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
+export class Counter extends DurableObject {
+  async increment() {
+    const count = ((await this.ctx.storage.get("count")) || 0) + 1;
+    await this.ctx.storage.put("count", count);
+    return count;
+  }
+}
+${classes}
+export function helper() {}
+export default {
+  async fetch(request, env, ctx) {
+    const counter = env.COUNTER.get(env.COUNTER.idFromName("test"));
+    return Response.json({ count: await counter.increment(), helper: typeof env.HELPER, ${fetch} });
+  },
+};`;
+    const entryPath = writeEntry({ "worker.mjs": entry("", "") });
+    const reloaded: unknown[] = [];
+    runner = new MiniflareEnvRunner({
+      miniflare,
+      name: "test-lazy-restart",
+      data: { entry: entryPath },
+      miniflareOptions: {
+        compatibilityDate: "2025-01-01",
+        compatibilityFlags: ["enable_ctx_exports"],
+      },
+    });
+    runner.onMessage((msg: any) => {
+      if (msg?.event === "module-reloaded") reloaded.push(msg);
+    });
+    await waitForReady(runner);
+    expect(await (await runner.fetch("http://localhost/")).json()).toEqual({
+      count: 1,
+      helper: "undefined",
+    });
+
+    // Adds a Durable Object (auto-bound) and a WorkerEntrypoint.
+    writeEntry({
+      "worker.mjs": entry(
+        `export class Other extends DurableObject {
+  hello() { return "other"; }
+}
+class Greeter extends WorkerEntrypoint {
+  greet(name) { return "hello " + name; }
+}
+export { Greeter as RenamedGreeter };`,
+        `other: await env.OTHER.get(env.OTHER.idFromName("x")).hello(),
+    greeting: await ctx.exports.RenamedGreeter.greet("world"),`,
+      ),
+    });
+    await runner.reloadModule();
+    expect(runner.ready).toBe(true);
+    // Durable Object storage survives the restart.
+    expect(await (await runner.fetch("http://localhost/")).json()).toEqual({
+      count: 2,
+      helper: "undefined",
+      other: "other",
+      greeting: "hello world",
+    });
+
+    // Removing them restarts again.
+    writeEntry({ "worker.mjs": entry("", "other: typeof env.OTHER,") });
+    await runner.reloadModule();
+    expect(await (await runner.fetch("http://localhost/")).json()).toEqual({
+      count: 3,
+      helper: "undefined",
+      other: "undefined",
+    });
+    expect(reloaded).toHaveLength(2);
+  });
+
   it("detects classes of bundled entries, ignoring comments and strings", async () => {
     const entryPath = writeEntry({
       "worker.mjs": `
@@ -1246,6 +1319,43 @@ describe("MiniflareEnvRunner (persistent)", () => {
     // `module-reloaded` must reach runner2, not the closed runner1
     await runner2.reloadModule(2000);
 
+    await runner2.close();
+  });
+
+  it("shares classes detected after a reload with runners reusing the instance", async () => {
+    tmpDir = mkdtempSync(join(_dir, ".tmp-persistent-"));
+    const entryPath = join(tmpDir, "worker.mjs");
+    const entry = (classes: string) => `
+import { DurableObject } from "cloudflare:workers";
+${classes}
+export default {
+  fetch: async (request, env) =>
+    Response.json({ other: env.OTHER && (await env.OTHER.get(env.OTHER.idFromName("x")).hello()) }),
+};`;
+    writeFileSync(entryPath, entry(""));
+    const options = {
+      miniflare,
+      data: { entry: entryPath },
+      persistent: true,
+      miniflareOptions: { compatibilityDate: "2025-01-01" },
+    };
+
+    const runner1 = new MiniflareEnvRunner({ name: "test-persistent-restart-1", ...options });
+    await waitForReady(runner1);
+    writeFileSync(
+      entryPath,
+      entry(`export class Other extends DurableObject { hello() { return "other"; } }`),
+    );
+    await runner1.reloadModule();
+    expect(await (await runner1.fetch("http://localhost/")).json()).toEqual({ other: "other" });
+    await runner1.close();
+
+    // Detects the class at startup too, adopting the restarted instance.
+    const runner2 = new MiniflareEnvRunner({ name: "test-persistent-restart-2", ...options });
+    await waitForReady(runner2);
+    expect(await (await runner2.fetch("http://localhost/")).json()).toEqual({ other: "other" });
+    await runner2.reloadModule();
+    expect(await (await runner2.fetch("http://localhost/")).json()).toEqual({ other: "other" });
     await runner2.close();
   });
 
