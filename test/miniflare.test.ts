@@ -1145,6 +1145,53 @@ export default {
     expect(await (await runner.fetch("http://localhost/")).text()).toBe("from hook");
   });
 
+  it("reads a resolveExports() hook's classes once IPC is open", async () => {
+    // Like a dev server whose hook needs data the host sends over IPC once ready.
+    const entryPath = writeEntry({
+      "worker.mjs": `
+import { DurableObject } from "cloudflare:workers";
+class Counter extends DurableObject {
+  hello() { return "counter"; }
+}
+let classes;
+const waiters = [];
+export default {
+  async resolveExports() {
+    if (!classes) await new Promise((resolve) => waiters.push(resolve));
+    return classes;
+  },
+  ipc: {
+    onMessage(message) {
+      if (message?.type !== "register") return;
+      classes = { Counter };
+      for (const resolve of waiters.splice(0)) resolve();
+    },
+  },
+  async fetch(request, env) {
+    return Response.json({ counter: await env.COUNTER.get(env.COUNTER.idFromName("x")).hello() });
+  },
+};`,
+    });
+    let readyCount = 0;
+    runner = new MiniflareEnvRunner({
+      miniflare,
+      name: "test-lazy-hook-ipc",
+      data: { entry: entryPath },
+      miniflareOptions: { compatibilityDate: "2025-01-01" },
+      hooks: {
+        // Signaled again after the restart, so the new instance gets the data too.
+        onReady: (runner) => {
+          readyCount++;
+          runner.sendMessage({ type: "register" });
+        },
+      },
+    });
+    await waitForReady(runner);
+    // The hook's class isn't in the source: restarts to export and bind it.
+    await vi.waitFor(() => expect(readyCount).toBe(2), { timeout: 10_000 });
+    expect(await (await runner.fetch("http://localhost/")).json()).toEqual({ counter: "counter" });
+  });
+
   it("stubs typed WorkerEntrypoint exports without binding them", async () => {
     const entryPath = writeEntry({
       "worker.mjs": `

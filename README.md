@@ -829,7 +829,7 @@ export default {
 };
 ```
 
-The classes are the entry's named exports, or come from its `resolveExports()` hook, called on each use (for entries that load the app themselves, e.g. through a module runner):
+The classes are the entry's named exports, or come from its `resolveExports()` hook, called on each use (for entries that load the app themselves, e.g. through a module runner). The hook is first called once the IPC channel is open, so it can wait for data the host sends from `onReady`:
 
 ```ts
 export default {
@@ -878,7 +878,7 @@ await using runner = new MiniflareEnvRunner({
 
 Auto-wired bindings are merged with Durable Object bindings from `miniflareOptions` and a wrangler config: exports whose class is already bound (or whose binding name is taken) are skipped. Set `exports: false` to disable auto-detection entirely (declared classes still work).
 
-After the entry first loads and after each `reloadModule()`, its classes are also read from the loaded module (so re-exports and entries the scan can't parse are covered): a class extending a `cloudflare:workers` base gets that type, any other class is a Durable Object unless it extends a built-in (`class HttpError extends Error`, `EventTarget`, `Map`, ...), and functions and other values are skipped. The startup scan applies the same rule to classes declared in the entry, treating constructors of the global scope as built-ins. In every mode except `exports: false`, when they change the exports, Miniflare restarts with the new exports and bindings and loads the entry again: persisted Durable Object storage is kept, in-flight requests and WebSockets drop. An unchanged entry never restarts.
+After the entry first loads and after each `reloadModule()`, its classes are also read from the loaded module (so re-exports and entries the scan can't parse are covered): a class extending a `cloudflare:workers` base gets that type, any other class is a Durable Object unless it extends a built-in (`class HttpError extends Error`, `EventTarget`, `Map`, ...), and functions and other values are skipped. The startup scan applies the same rule to classes declared in the entry, treating constructors of the global scope as built-ins. With a `resolveExports()` hook, they are read once the IPC channel is open instead of after the first load. In every mode except `exports: false`, when they change the exports, Miniflare restarts with the new exports and bindings and loads the entry again: persisted Durable Object storage is kept, in-flight requests and WebSockets drop, and the runner signals ready again (`onReady`), so a host can resend what it sends the entry over IPC. An unchanged entry never restarts.
 
 #### Exports Module
 

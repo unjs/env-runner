@@ -221,6 +221,8 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
   #workerExports?: MiniflareWorkerExports;
   // Options of a restart for changed exports that failed (retried by `reloadModule()`).
   #pendingRestart?: Record<string, unknown>;
+  // Restart for the classes a `resolveExports()` hook reports once IPC is open.
+  #restarting?: Promise<void>;
   #cacheEntry?: MiniflareCacheEntry;
   #ws?: { send(data: string): void; close(): void };
   #persistent: boolean;
@@ -339,6 +341,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
   /** Hot-reload the entry without recreating the Miniflare instance. */
   override async reloadModule(timeout = 5000): Promise<void> {
     await this._virtualUpdates;
+    await this.#restarting;
     // A restart for changed exports failed: retry it, which loads the current entry.
     if (this.#pendingRestart) {
       await this.#restart(this.#pendingRestart);
@@ -419,7 +422,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
 
   protected override _handleMessage(message: any) {
     if (message?.event === "worker-exports") {
-      this.#warnExports(message.warnings);
+      this.#onWorkerExports(message);
       return;
     }
     super._handleMessage(message);
@@ -492,6 +495,31 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
       return undefined;
     }
     return this.#workerExports.update(workerExportTypes(exportTypes));
+  }
+
+  /**
+   * The entry's export check, run once IPC is open (and after reloads). Classes
+   * from a `resolveExports()` hook are only known then: restart in the
+   * background when they change the stubs (the new instance checks again).
+   */
+  #onWorkerExports(message: { warnings?: unknown; exportTypes?: unknown }) {
+    if (this.closed || this.#restarting || this.#pendingRestart) {
+      return;
+    }
+    const options = this.#updateExports(message.exportTypes);
+    if (!options) {
+      this.#warnExports(message.warnings);
+      return;
+    }
+    this.#restarting = this.#restart(options)
+      .catch((error) => {
+        if (!this.closed) {
+          console.error("[env-runner]", error);
+        }
+      })
+      .finally(() => {
+        this.#restarting = undefined;
+      });
   }
 
   /** Warn about the entry's exports when the warnings change (also across restarts). */
@@ -1348,14 +1376,18 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
     }
 
     await this.#connect();
+    this.#signalReady();
+  }
 
-    // Signal ready with a dummy address (fetch is overridden)
+  /** Signal ready with a dummy address (fetch is overridden). */
+  #signalReady() {
     this._handleMessage({ address: { host: "127.0.0.1", port: 0 } });
   }
 
   /**
    * Restart workerd with new options (persisted state is kept) and reconnect;
-   * the new instance loads the entry again. On failure the runner stays
+   * the new instance loads the entry again, and ready is signaled again so
+   * hosts resend what the entry got over IPC. On failure the runner stays
    * disconnected until `reloadModule()` retries.
    */
   async #restart(options: Record<string, unknown>) {
@@ -1375,6 +1407,9 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
       );
     }
     this.#pendingRestart = undefined;
+    if (!this.closed) {
+      this.#signalReady();
+    }
   }
 
   /**

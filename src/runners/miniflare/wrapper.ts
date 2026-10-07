@@ -262,10 +262,12 @@ async function __handleWsMessage(env, data) {
   }
 }
 
-// The host warns (deduped across restarts).
-function __runExportsCheck() {
-  __checkExports().then(
-    (warnings) => warnings && __sendMessage({ event: "worker-exports", warnings }),
+// The host warns (deduped across restarts). \`withTypes\`: also report the
+// entry's classes, which the host restarts for when they change the stubs.
+function __runExportsCheck(withTypes) {
+  Promise.all([__checkExports(), withTypes ? __exportTypes() : undefined]).then(
+    ([warnings, exportTypes]) =>
+      (warnings || exportTypes) && __sendMessage({ event: "worker-exports", warnings, exportTypes }),
     () => {},
   );
 }
@@ -296,8 +298,13 @@ export default {
         const message = "Failed to load entry: " + String(e) + __errorLocation(e);
         return new Response(message, { status: 500 });
       }
+      // A \`resolveExports()\` hook may need the IPC channel (host data sent once
+      // ready), so its classes are reported after the channel opens.
       if (request.headers.get("upgrade") !== "websocket") {
-        return Response.json({ exportTypes: await __exportTypes().catch(() => undefined) });
+        const exportTypes = __userEntry.resolveExports
+          ? undefined
+          : await __exportTypes().catch(() => undefined);
+        return Response.json({ exportTypes });
       }
 
       const pair = new WebSocketPair();
@@ -319,7 +326,7 @@ export default {
       }
 
       // In the socket's request context, which outlives the check.
-      __runExportsCheck();
+      __runExportsCheck(Boolean(__userEntry.resolveExports));
 
       return new Response(null, { status: 101, webSocket: client });
     }
