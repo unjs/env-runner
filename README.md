@@ -805,14 +805,11 @@ The callback should return `{ code: string }` for transformed modules, or `null`
 
 #### Worker Exports
 
-workerd instantiates Durable Object, `WorkerEntrypoint` and `WorkflowEntrypoint` classes from the Worker's named exports, which it reads at startup, before the entry is loaded. So for each class the config declares, the wrapper exports a stub (like `@cloudflare/vite-plugin`) that resolves the class from the loaded entry when it is used. Stubs follow `reloadModule()` (a Durable Object is re-created with its storage kept when its class changes) and share the entry's module instance, so module state is the same in requests and in the classes. The classes receive `env` without env-runner's internal bindings.
-
-Declared classes come from:
+Durable Object, `WorkerEntrypoint` and `WorkflowEntrypoint` classes declared in the config run from the current entry, so they share module state with requests and follow `reloadModule()`. A Durable Object is re-created with the new code and keeps its storage. Classes are declared by:
 
 - local Durable Object bindings (`durable_objects` / `miniflareOptions.durableObjects`, also [auto-wired](#auto-detected-exports) ones) and SQLite/KV-backed classes from `migrations`
 - local Workflows (`workflows` / `miniflareOptions.workflows`)
 - the wrangler config's `exports` (`{ "Greeter": { "type": "worker" } }`, also `durable-object` and `workflow`)
-- typed entries of the `exports` option (`{ Greeter: { type: "WorkerEntrypoint" } }`; `DurableObject` entries are also auto-wired)
 
 ```ts
 // worker.ts
@@ -841,13 +838,13 @@ export default {
 };
 ```
 
-As with `@cloudflare/vite-plugin`, the other kind's handler names can't be RPC methods of a stub: `email`, `queue`, `scheduled`, `tail`, `tailStream`, `test` and `trace` for Durable Objects; `alarm` and `webSocketClose`/`webSocketError`/`webSocketMessage` for `WorkerEntrypoint`s.
+As with `@cloudflare/vite-plugin`, Durable Objects can't have RPC methods named `email`, `queue`, `scheduled`, `tail`, `tailStream`, `test` or `trace`, and `WorkerEntrypoint`s can't have ones named `alarm`, `webSocketClose`, `webSocketError` or `webSocketMessage`.
 
-After the entry loads (and after each reload), a warning lists declared classes the entry doesn't export (or of the wrong kind) and exported `DurableObject`/`WorkerEntrypoint`/`WorkflowEntrypoint` subclasses nothing declares, with the config to add.
+A warning after each load lists declared classes the entry doesn't export, and exported classes nothing declares.
 
 #### Auto-detected Exports
 
-`MiniflareEnvRunner` automatically scans the entry file for `export class` declarations and wires them as Durable Object bindings (binding name = class name in `SCREAMING_SNAKE_CASE`, e.g. `COUNTER`). Classes that `extends WorkerEntrypoint`/`WorkflowEntrypoint`, or that the config declares as such, aren't bound; undeclared ones are re-exported as is, so they work but don't follow `reloadModule()` (declare them to get a stub). This means you don't need to manually configure `miniflareOptions.durableObjects` for simple cases:
+`MiniflareEnvRunner` automatically scans the entry file for `export class` declarations and wires them as Durable Object bindings (binding name = class name in `SCREAMING_SNAKE_CASE`, e.g. `COUNTER`). `WorkerEntrypoint`/`WorkflowEntrypoint` classes aren't bound; declare them (see above) so they follow reloads. This means you don't need to manually configure `miniflareOptions.durableObjects` for simple cases:
 
 ```ts
 // worker.ts
@@ -877,7 +874,7 @@ await using runner = new MiniflareEnvRunner({
 });
 ```
 
-Auto-wired bindings are merged with Durable Object bindings from `miniflareOptions` and a wrangler config: exports whose class is already bound (or whose binding name is taken) are skipped. Set `exports: false` to disable auto-detection entirely (declared classes are still stubbed).
+Auto-wired bindings are merged with Durable Object bindings from `miniflareOptions` and a wrangler config: exports whose class is already bound (or whose binding name is taken) are skipped. Set `exports: false` to disable auto-detection entirely (declared classes still work).
 
 #### Exports Module
 
