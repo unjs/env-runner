@@ -773,7 +773,7 @@ export default {
     });
   });
 
-  it("keeps undeclared WorkerEntrypoints as static exports", async () => {
+  it("exports undeclared WorkerEntrypoints as stubs", async () => {
     const entryPath = writeEntry({
       "worker.mjs": `
 import { WorkerEntrypoint } from "cloudflare:workers";

@@ -20,10 +20,8 @@ export function generateWrapper(
   opts?: {
     dynamicOnly?: boolean;
     captureErrors?: boolean;
-    /** Class names re-exported from the entry, or a module specifier re-exported with `export *`. */
-    exports?: string[] | string;
-    /** Exports declared by the config, exported as stubs resolving the entry's classes on use. */
-    stubs?: Record<string, WorkerExportType>;
+    /** Worker exports, as stubs resolving the entry's classes on use, or a module specifier re-exported with `export *`. */
+    exports?: Record<string, WorkerExportType> | string;
     /** Import `node:process` as the `process` global (needs `nodejs_compat`). Default: `true`. */
     nodeCompat?: boolean;
   },
@@ -39,22 +37,11 @@ if (!globalThis.process) { globalThis.process = __process; }`;
   const staticReExport = opts?.dynamicOnly ? "" : `export * from ${JSON.stringify(entryPath)};`;
 
   // workerd requires DO/Entrypoint classes as static named exports: re-export a
-  // separate exports module wholesale, or (in dynamicOnly mode) the named classes
-  // from the entry.
-  const explicitExports =
+  // separate exports module wholesale, or stubs resolving the entry's classes.
+  const workerExports =
     typeof opts?.exports === "string"
-      ? `export * from ${JSON.stringify(opts.exports)};`
-      : opts?.dynamicOnly && opts.exports?.length
-        ? opts.exports
-            .map((name) => `export { ${JSON.stringify(name)} } from ${JSON.stringify(entryPath)};`)
-            .join("\n")
-        : "";
-
-  // The exports check runs whenever the entry's namespace provides the classes.
-  const exportStubs =
-    typeof opts?.exports === "string"
-      ? ""
-      : generateExportStubs(opts?.stubs || {}, Array.isArray(opts?.exports) ? opts.exports : []);
+      ? `export * from ${JSON.stringify(opts.exports)};\nconst __checkExports = async () => {};`
+      : generateExportStubs(opts?.exports || {});
 
   const captureErrors = opts?.captureErrors ?? true;
 
@@ -77,8 +64,7 @@ if (!globalThis.process) { globalThis.process = __process; }`;
 
   return /* js */ `${processShim}
 ${staticReExport}
-${explicitExports}
-${exportStubs}
+${workerExports}
 
 const __IPC_PATH = "${IPC_PATH}";
 const __IPC_BINDING = "${IPC_BINDING}";
@@ -269,9 +255,7 @@ async function __handleWsMessage(env, data) {
 }
 
 function __runExportsCheck() {
-  if (typeof __checkExports === "function") {
-    __checkExports().catch(() => {});
-  }
+  __checkExports().catch(() => {});
 }
 
 let __crosswsAdapter;

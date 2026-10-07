@@ -30,7 +30,7 @@ src/
 │   ├── bun-process/         # BunProcessEnvRunner + worker
 │   ├── deno-process/        # DenoProcessEnvRunner + worker
 │   ├── self/                # SelfEnvRunner (in-process, no worker)
-│   ├── miniflare/           # MiniflareEnvRunner + wrapper.ts (in-memory workerd wrapper) + wrangler.ts (config → Miniflare options) + exports.ts (lazy DO/entrypoint/workflow stubs) + dotenv.ts (minimal-reader dev vars)
+│   ├── miniflare/           # MiniflareEnvRunner + wrapper.ts (in-memory workerd wrapper) + wrangler.ts (config → Miniflare options) + exports.ts (declared Worker exports) + exports-runtime.ts (lazy DO/entrypoint/workflow stubs, inlined into the wrapper) + dotenv.ts (minimal-reader dev vars)
 │   ├── vercel/              # VercelEnvRunner (extends node-worker) + worker, oidc.ts, queue-dev.ts
 │   └── netlify/             # NetlifyEnvRunner (extends node-worker) + worker
 ├── types.ts                 # Core interfaces

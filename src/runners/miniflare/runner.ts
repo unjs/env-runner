@@ -32,7 +32,7 @@ import {
 import type { ResolvedVirtualModule, VirtualModule } from "../../virtual-loader.ts";
 import { generateWrapper, IPC_BINDING, UNSAFE_EVAL_BINDING } from "./wrapper.ts";
 import { isPlainObject, loadWranglerConfig } from "./wrangler.ts";
-import { declaredWorkerExports, localClassName } from "./exports.ts";
+import { declaredWorkerExports, isWorkerExportType, localClassName } from "./exports.ts";
 import type { WorkerExportType } from "./exports.ts";
 import type { WranglerInlineConfig, WranglerModule } from "./wrangler.ts";
 
@@ -93,10 +93,10 @@ export interface MiniflareEnvRunnerOptions {
   /**
    * Named exports (Durable Objects, WorkerEntrypoints, Workflows) of the Worker.
    * Classes the config declares (local Durable Object and Workflow bindings,
-   * the wrangler config's `exports`, typed entries here) are exported as stubs
-   * that resolve the class from the entry (or its `resolveExports()` hook) on
-   * use, so they follow `reloadModule()`. A warning lists declared classes the
-   * entry lacks and exported ones nothing declares.
+   * the wrangler config's `exports`, typed entries here) and detected ones are
+   * exported as stubs that resolve the class from the entry (or its
+   * `resolveExports()` hook) on use, so they follow `reloadModule()`. A warning
+   * lists declared classes the entry lacks and exported ones nothing declares.
    * Default (or `true`): also detect `export class` in the entry and auto-bind
    * them as Durable Objects, except `WorkerEntrypoint`/`WorkflowEntrypoint`
    * classes (by config, else by `extends`); a record merges with detected ones;
@@ -601,50 +601,43 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
           ? {}
           : detectExportedClasses(entrySource, explicitExports);
 
-      // Config-declared classes are lazy stubs (they follow reloads and share
-      // the entry's module instance); only the rest is re-exported statically.
+      // Declared and detected classes are lazy stubs: they follow reloads and
+      // share the entry's module instance.
       const stubs =
         typeof this.#exports === "string"
           ? {}
           : declaredWorkerExports({ options, wranglerExports, explicit: explicitExports });
 
-      // Bind the other detected classes as Durable Objects, unless declared or
-      // extending another kind, already bound, or their binding name is taken.
+      // Detected classes are Durable Objects unless they extend another kind;
+      // bind them unless already bound or their binding name is taken.
       const existingDOs = isPlainObject(options.durableObjects) ? options.durableObjects : {};
       const boundClasses = new Set(Object.values(existingDOs).map(localClassName));
       const autoDOs: Record<string, unknown> = { ...existingDOs };
       for (const [name, base] of Object.entries(detectedExports)) {
+        const type = (stubs[name] ??= base ?? "DurableObject");
         const bindingName = toScreamingSnakeCase(name);
-        if (
-          (stubs[name] ?? base ?? "DurableObject") === "DurableObject" &&
-          !boundClasses.has(name) &&
-          !autoDOs[bindingName]
-        ) {
+        if (type === "DurableObject" && !boundClasses.has(name) && !autoDOs[bindingName]) {
           autoDOs[bindingName] = name;
-          stubs[name] = "DurableObject";
         }
       }
       if (Object.keys(autoDOs).length > 0) {
         options.durableObjects = autoDOs;
       }
 
-      const staticExports = Object.keys(detectedExports).filter((name) => !(name in stubs));
       const script = generateWrapper(
         entryIsVirtual ? toWorkerdPath(resolvedEntry) : resolvedEntry,
         {
           dynamicOnly: true,
           captureErrors: this.#captureErrors,
-          exports: typeof this.#exports === "string" ? this.#exports : staticExports,
-          stubs,
+          exports: typeof this.#exports === "string" ? this.#exports : stubs,
           nodeCompat: !(options.compatibilityFlags as string[]).includes("no_nodejs_compat"),
         },
       );
       const scriptPath = entryDir + "/__env_runner_wrapper.mjs";
-      // Static re-exports (an `exports` module, or a virtual entry's classes) must
-      // reach the fallback service. v4's ModuleLocator would read them from disk
-      // instead, but it only walks `script`; a module list skips it.
-      const skipLocator =
-        typeof this.#exports === "string" || (entryIsVirtual && staticExports.length > 0);
+      // A static `exports` module re-export must reach the fallback service. v4's
+      // ModuleLocator would read it from disk instead, but it only walks
+      // `script`; a module list skips it.
+      const skipLocator = typeof this.#exports === "string";
       if (skipLocator) {
         options.modules = [{ type: "ESModule", path: scriptPath, contents: script }];
       } else {
@@ -1268,11 +1261,7 @@ function detectExportedClasses(
     const re = /\bexport\s+class\s+(\w+)(?:\s+extends\s+(\w+))?/g;
     let match;
     while ((match = re.exec(entrySource))) {
-      const base = match[2];
-      classes[match[1]!] =
-        base === "DurableObject" || base === "WorkerEntrypoint" || base === "WorkflowEntrypoint"
-          ? base
-          : undefined;
+      classes[match[1]!] = isWorkerExportType(match[2]) ? match[2] : undefined;
     }
   }
   return classes;
