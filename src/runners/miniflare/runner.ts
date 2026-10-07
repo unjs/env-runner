@@ -32,6 +32,8 @@ import {
 import type { ResolvedVirtualModule, VirtualModule } from "../../virtual-loader.ts";
 import { generateWrapper, IPC_BINDING, UNSAFE_EVAL_BINDING } from "./wrapper.ts";
 import { isPlainObject, loadWranglerConfig } from "./wrangler.ts";
+import { declaredWorkerExports, isWorkerExportType, localClassName } from "./exports.ts";
+import type { WorkerExportType } from "./exports.ts";
 import type { WranglerInlineConfig, WranglerModule } from "./wrangler.ts";
 
 export type { WranglerInlineConfig, WranglerModule } from "./wrangler.ts";
@@ -45,9 +47,10 @@ export interface TransformResult {
   code: string;
 }
 
-/** Detected or declared export for auto-wiring Durable Object / Entrypoint bindings. */
+/** Declared export, a Durable Object unless typed otherwise. */
 export interface MiniflareExportInfo {
-  type?: "DurableObject" | "WorkerEntrypoint" | "class";
+  /** `"class"` is deprecated (same as no `type`). */
+  type?: "DurableObject" | "WorkerEntrypoint" | "WorkflowEntrypoint" | "class";
 }
 
 /** The `miniflare` package namespace (v4 or v5), as imported by the app. */
@@ -86,14 +89,27 @@ export interface MiniflareEnvRunnerOptions {
    */
   transformRequest?: (id: string) => Promise<TransformResult | null | undefined>;
   /**
-   * Named exports (Durable Objects, WorkerEntrypoints) to bind and re-export.
-   * Default (or `true`): detect `export class` in the entry and auto-bind them;
-   * a record merges with detected ones; `false` disables it.
-   * A module specifier (absolute path or `data.virtual` key; relative paths
-   * resolve from the entry's directory) is re-exported with `export *` instead:
-   * nothing is detected or auto-bound (configure bindings with `wrangler` or
-   * `miniflareOptions`) and the entry's own classes are not re-exported.
-   * Exports load at startup, so changes need a new runner (not `reloadModule()`).
+   * Named exports (Durable Objects, WorkerEntrypoints, Workflows) of the Worker.
+   *
+   * - Classes the config declares (local Durable Object and Workflow bindings,
+   *   the wrangler config's `exports`, entries of this record) are exported as
+   *   stubs resolving the class from the entry (or its `resolveExports()` hook)
+   *   on use, so they follow `reloadModule()`.
+   * - The entry's own classes are added: detected in its source at startup
+   *   (default, or `true`), and read from the loaded module after its first
+   *   load and each reload, restarting Miniflare when they change the
+   *   exports; `false` disables both.
+   * - Untyped entries of this record and the entry's classes not extending
+   *   `WorkerEntrypoint`/`WorkflowEntrypoint` (or a built-in like `Error`) are
+   *   Durable Objects, bound as `SCREAMING_SNAKE_CASE` when they have no
+   *   binding. The entry's are only bound when the config declares no
+   *   classes; otherwise they get a namespace without a binding (`ctx.exports`).
+   * - A module specifier (absolute path or `data.virtual` key; relative paths
+   *   resolve from the entry's directory) is re-exported with `export *`
+   *   instead: nothing is stubbed, detected or bound, and it loads at startup,
+   *   so changes need a new runner.
+   *
+   * A warning lists declared classes the entry lacks and exported ones the config doesn't declare.
    */
   exports?: Record<string, MiniflareExportInfo> | boolean | string;
   /** Reuse the Miniflare instance across runner swaps; only `dispose()` destroys it. */
@@ -115,7 +131,7 @@ export interface MiniflareEnvRunnerOptions {
    *   lacks the selected env
    *
    * Options a single dev worker can't run (`assets`, services, queue consumers,
-   * workflows, tails, other-script Durable Objects) are dropped with a warning.
+   * tails, other-script Durable Objects and Workflows) are dropped with a warning.
    * `defaultPersistRoot` (v5: `resourcePersistencePath`) defaults to
    * `.wrangler/state/v3` next to the config (else cwd), shared with
    * `wrangler dev`. The `wrangler` package gives full fidelity (and may run its
@@ -171,6 +187,18 @@ type ServedVirtualModule = Required<VirtualModule> & {
   format: "module" | "commonjs" | "json" | "text" | "bytes" | "wasm";
 };
 
+/**
+ * The Worker's export stubs: the config's classes plus the entry's (detected
+ * in its source at startup, then read from the loaded module after each load).
+ */
+interface MiniflareWorkerExports {
+  stubs: Record<string, WorkerExportType>;
+  /** Miniflare options for the module's classes, if they change the stubs (then applied). */
+  update(moduleTypes: Record<string, WorkerExportType>): Record<string, unknown> | undefined;
+  /** Last warnings of the entry's export check (warned on change). */
+  warnings: string;
+}
+
 interface MiniflareCacheEntry {
   mf: InstanceType<any>;
   refCount: number;
@@ -178,6 +206,7 @@ interface MiniflareCacheEntry {
   // Receiver of the instance's `__ENV_RUNNER_IPC` binding; retargeted to the
   // runner that attaches last (like the IPC WebSocket).
   ipc: { runner: MiniflareEnvRunner };
+  workerExports?: MiniflareWorkerExports;
 }
 
 // Module-level cache for persistent Miniflare instances
@@ -189,6 +218,11 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
   #transformRequest?: (id: string) => Promise<TransformResult | null | undefined>;
   #reloadCounter = 0;
   #virtual?: MiniflareVirtualModules;
+  #workerExports?: MiniflareWorkerExports;
+  // Options of a restart for changed exports that failed (retried by `reloadModule()`).
+  #pendingRestart?: Record<string, unknown>;
+  // Restart for the classes a `resolveExports()` hook reports once IPC is open.
+  #restarting?: Promise<void>;
   #cacheEntry?: MiniflareCacheEntry;
   #ws?: { send(data: string): void; close(): void };
   #persistent: boolean;
@@ -288,6 +322,11 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
   }
 
   sendMessage(message: unknown) {
+    if (!this.#ws && this.#pendingRestart) {
+      throw new Error(
+        "Miniflare env runner is disconnected after a failed restart; call reloadModule() to retry.",
+      );
+    }
     if (!this.#ws) {
       throw new Error("Miniflare env runner should be initialized before sending messages.");
     }
@@ -302,6 +341,12 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
   /** Hot-reload the entry without recreating the Miniflare instance. */
   override async reloadModule(timeout = 5000): Promise<void> {
     await this._virtualUpdates;
+    await this.#restarting;
+    // A restart for changed exports failed: retry it, which loads the current entry.
+    if (this.#pendingRestart) {
+      await this.#restart(this.#pendingRestart);
+      return;
+    }
     if (!this.#ws) {
       throw new Error("Miniflare env runner should be initialized before reloading.");
     }
@@ -310,7 +355,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
       return;
     }
     this.#reloadCounter++;
-    await this._request(
+    const { exportTypes } = await this._request<{ exportTypes?: Record<string, unknown> }>(
       { type: "reload", version: this.#reloadCounter },
       {
         match: (msg) => msg?.event === "module-reloaded",
@@ -319,6 +364,14 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
         send: (message) => this.#ws!.send(JSON.stringify(message)),
       },
     );
+    // workerd needs the Worker's exports at startup: restart when the
+    // reloaded entry's classes change them.
+    const options = this.#updateExports(exportTypes);
+    if (options) {
+      await this.#restart(options);
+    } else {
+      this.#ws?.send(JSON.stringify({ type: "check-exports" }));
+    }
   }
 
   /**
@@ -367,6 +420,14 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
 
   // #region Protected methods
 
+  protected override _handleMessage(message: any) {
+    if (message?.event === "worker-exports") {
+      this.#onWorkerExports(message);
+      return;
+    }
+    super._handleMessage(message);
+  }
+
   protected _hasRuntime() {
     return Boolean(this.#miniflare);
   }
@@ -408,6 +469,71 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
   // #endregion
 
   // #region Private methods
+
+  /**
+   * Load the entry with a plain request, so a load error arrives as a normal
+   * response: miniflare leaves the socket of a failed WebSocket upgrade without
+   * an error listener, and disposing workerd then resets it (an uncaught
+   * ECONNRESET on Windows). Returns the export types the wrapper reports.
+   */
+  async #loadEntry(): Promise<unknown> {
+    const loadRes = await this.#miniflare.dispatchFetch("http://localhost" + IPC_PATH);
+    const loadBody = await loadRes.text().catch(() => "");
+    if (!loadRes.ok) {
+      throw new Error(`Failed to establish WebSocket IPC channel (${loadRes.status}: ${loadBody})`);
+    }
+    try {
+      return JSON.parse(loadBody).exportTypes;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Miniflare options when the entry's reported classes change the export stubs. */
+  #updateExports(exportTypes: unknown): Record<string, unknown> | undefined {
+    if (!this.#workerExports || !isPlainObject(exportTypes)) {
+      return undefined;
+    }
+    return this.#workerExports.update(workerExportTypes(exportTypes));
+  }
+
+  /**
+   * The entry's export check, run once IPC is open (and after reloads). Classes
+   * from a `resolveExports()` hook are only known then: restart in the
+   * background when they change the stubs (the new instance checks again).
+   */
+  #onWorkerExports(message: { warnings?: unknown; exportTypes?: unknown }) {
+    if (this.closed || this.#restarting || this.#pendingRestart) {
+      return;
+    }
+    const options = this.#updateExports(message.exportTypes);
+    if (!options) {
+      this.#warnExports(message.warnings);
+      return;
+    }
+    this.#restarting = this.#restart(options)
+      .catch((error) => {
+        if (!this.closed) {
+          console.error("[env-runner]", error);
+        }
+      })
+      .finally(() => {
+        this.#restarting = undefined;
+      });
+  }
+
+  /** Warn about the entry's exports when the warnings change (also across restarts). */
+  #warnExports(warnings: unknown) {
+    const state = this.#workerExports;
+    if (!state || !Array.isArray(warnings)) {
+      return;
+    }
+    const text = warnings.join("\n");
+    if (text && text !== state.warnings) {
+      console.warn("[env-runner] Worker exports:\n  - " + warnings.join("\n  - "));
+    }
+    state.warnings = text;
+  }
 
   async #resolveMiniflare(): Promise<MiniflareModule> {
     this.#miniflareModule = (await resolveRuntimeDep<MiniflareModule>({
@@ -505,7 +631,11 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
 
     // Optional wrangler config → Miniflare options (compat date/flags +
     // bindings). User-provided `miniflareOptions` win; flags are merged.
-    const { options: wranglerOptions, configFile: wranglerConfigFile } = await loadWranglerConfig({
+    const {
+      options: wranglerOptions,
+      configFile: wranglerConfigFile,
+      exports: wranglerExports,
+    } = await loadWranglerConfig({
       wrangler: this.#wrangler,
       env: this.#wranglerEnv,
       entryPath,
@@ -575,57 +705,109 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
         : resolve("__env_runner_virtual_entry__.mjs");
       const entryDir = dirname(entryBase);
 
-      // Auto-detect exported classes from entry source (skipped for a module specifier)
-      const entrySource = entryIsVirtual
-        ? virtualModuleCodeSource(entryKey, virtual.sources[entryKey])
-        : _tryReadFile(resolvedEntry);
-      const detectedExports =
-        this.#exports === false || typeof this.#exports === "string"
-          ? []
-          : detectExportedClasses(
-              entrySource,
-              typeof this.#exports === "object" ? this.#exports : {},
-            );
+      // Exports are lazy stubs: they follow reloads and share the entry's
+      // module instance. The config's classes come first; the entry's are added
+      // (detected in its source, so the first load rarely restarts), and again
+      // from the loaded module after each load (see `#connect()`). Nothing is
+      // stubbed for a module specifier.
+      const explicitExports = typeof this.#exports === "object" ? this.#exports : {};
+      const declared =
+        typeof this.#exports === "string"
+          ? {}
+          : declaredWorkerExports({ options, wranglerExports, explicit: explicitExports });
+      const detect = this.#exports !== false && typeof this.#exports !== "string";
+      const zeroConfig = detect && Object.keys(declared).length === 0;
+      if (detect) {
+        await initEsmLexer;
+      }
+      const detectedTypes = detect
+        ? detectExportedClasses(
+            entryIsVirtual
+              ? virtualModuleCodeSource(entryKey, virtual.sources[entryKey])
+              : _tryReadFile(resolvedEntry),
+          )
+        : {};
 
-      // Skip exports whose class is already bound or whose binding name is taken.
-      if (detectedExports.length > 0) {
-        const existingDOs = isPlainObject(options.durableObjects) ? options.durableObjects : {};
-        const boundClasses = new Set(
-          Object.values(existingDOs).map((b) =>
-            typeof b === "string" ? b : isPlainObject(b) && !b.scriptName ? b.className : undefined,
-          ),
-        );
+      const baseDOs = options.durableObjects;
+      const baseUnboundDOs = options.additionalUnboundDurableObjects;
+      const existingDOs = isPlainObject(baseDOs) ? baseDOs : {};
+      const boundClasses = new Set(Object.values(existingDOs).map(localClassName));
+      const scriptPath = entryDir + "/__env_runner_wrapper.mjs";
+      // A static `exports` module re-export must reach the fallback service. v4's
+      // ModuleLocator would read it from disk instead, but it only walks
+      // `script`; a module list skips it.
+      const skipLocator = typeof this.#exports === "string";
+      // Config classes win; the entry's only add names or type undeclared ones.
+      const stubsFor = (moduleTypes: Record<string, WorkerExportType>) => ({
+        ...(this.#exports === false ? {} : moduleTypes),
+        ...declared,
+      });
+      // Sets the stubs and Durable Object bindings for the entry's classes.
+      const applyExports = (moduleTypes: Record<string, WorkerExportType>) => {
+        const stubs = stubsFor(moduleTypes);
+        // Bind explicit Durable Objects, and the entry's in zero-config mode,
+        // unless already bound or their binding name is taken.
         const autoDOs: Record<string, unknown> = { ...existingDOs };
-        for (const name of detectedExports) {
+        for (const name of Object.keys({ ...explicitExports, ...(zeroConfig && moduleTypes) })) {
           const bindingName = toScreamingSnakeCase(name);
-          if (!autoDOs[bindingName] && !boundClasses.has(name)) {
+          if (stubs[name] === "DurableObject" && !boundClasses.has(name) && !autoDOs[bindingName]) {
             autoDOs[bindingName] = name;
           }
         }
-        options.durableObjects = autoDOs;
-      }
+        if (Object.keys(autoDOs).length > 0) {
+          options.durableObjects = autoDOs;
+        } else if (baseDOs === undefined) {
+          delete options.durableObjects;
+        }
+        // The entry's Durable Objects the config doesn't declare get a
+        // namespace without a binding (for `ctx.exports`).
+        const unboundDOs = zeroConfig
+          ? []
+          : Object.keys(stubs)
+              .filter((name) => !(name in declared) && stubs[name] === "DurableObject")
+              .map((className) => ({ className }));
+        if (unboundDOs.length > 0) {
+          options.additionalUnboundDurableObjects = [
+            ...(Array.isArray(baseUnboundDOs) ? baseUnboundDOs : []),
+            ...unboundDOs,
+          ];
+        } else if (baseUnboundDOs === undefined) {
+          delete options.additionalUnboundDurableObjects;
+        } else {
+          options.additionalUnboundDurableObjects = baseUnboundDOs;
+        }
 
-      const script = generateWrapper(
-        entryIsVirtual ? toWorkerdPath(resolvedEntry) : resolvedEntry,
-        {
-          dynamicOnly: true,
-          captureErrors: this.#captureErrors,
-          exports: typeof this.#exports === "string" ? this.#exports : detectedExports,
-          nodeCompat: !(options.compatibilityFlags as string[]).includes("no_nodejs_compat"),
+        const script = generateWrapper(
+          entryIsVirtual ? toWorkerdPath(resolvedEntry) : resolvedEntry,
+          {
+            dynamicOnly: true,
+            captureErrors: this.#captureErrors,
+            exports: typeof this.#exports === "string" ? this.#exports : stubs,
+            // Zero-config classes need no declaration (no deploy hint).
+            configuredExports: Object.keys(zeroConfig ? stubs : declared),
+            nodeCompat: !(options.compatibilityFlags as string[]).includes("no_nodejs_compat"),
+          },
+        );
+        if (skipLocator) {
+          options.modules = [{ type: "ESModule", path: scriptPath, contents: script }];
+        } else {
+          options.script = script;
+          options.scriptPath = scriptPath;
+        }
+        return stubs;
+      };
+      const workerExports: MiniflareWorkerExports = {
+        stubs: applyExports(detectedTypes),
+        update: (moduleTypes) => {
+          if (skipLocator || sameExportTypes(stubsFor(moduleTypes), workerExports.stubs)) {
+            return undefined;
+          }
+          workerExports.stubs = applyExports(moduleTypes);
+          return toMiniflareOptions(miniflare, options);
         },
-      );
-      const scriptPath = entryDir + "/__env_runner_wrapper.mjs";
-      // Static re-exports (an `exports` module, or a virtual entry's classes) must
-      // reach the fallback service. v4's ModuleLocator would read them from disk
-      // instead, but it only walks `script`; a module list skips it.
-      const skipLocator =
-        typeof this.#exports === "string" || (entryIsVirtual && detectedExports.length > 0);
-      if (skipLocator) {
-        options.modules = [{ type: "ESModule", path: scriptPath, contents: script }];
-      } else {
-        options.script = script;
-        options.scriptPath = scriptPath;
-      }
+        warnings: "",
+      };
+      this.#workerExports = workerExports;
       // Use "/" as modulesRoot so absolute paths don't produce ".." relative paths
       if (!options.modulesRoot) {
         options.modulesRoot = "/";
@@ -1174,6 +1356,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
         cached.ipc.runner = this;
         // Adopt the state the live fallback service closes over.
         this.#virtual = cached.virtual;
+        this.#workerExports = cached.workerExports;
       }
     }
 
@@ -1186,19 +1369,58 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
           refCount: 1,
           virtual,
           ipc,
+          workerExports: this.#workerExports,
         };
         _miniflareCache.set(this.#cacheKey, this.#cacheEntry);
       }
     }
 
-    // Load the entry with a plain request first, so a load error arrives as a
-    // normal response: miniflare leaves the socket of a failed WebSocket upgrade
-    // without an error listener, and disposing workerd then resets it (an
-    // uncaught ECONNRESET on Windows).
-    const loadRes = await this.#miniflare.dispatchFetch("http://localhost" + IPC_PATH);
-    const loadBody = await loadRes.text().catch(() => "");
-    if (!loadRes.ok) {
-      throw new Error(`Failed to establish WebSocket IPC channel (${loadRes.status}: ${loadBody})`);
+    await this.#connect();
+    this.#signalReady();
+  }
+
+  /** Signal ready with a dummy address (fetch is overridden). */
+  #signalReady() {
+    this._handleMessage({ address: { host: "127.0.0.1", port: 0 } });
+  }
+
+  /**
+   * Restart workerd with new options (persisted state is kept) and reconnect;
+   * the new instance loads the entry again, and ready is signaled again so
+   * hosts resend what the entry got over IPC. On failure the runner stays
+   * disconnected until `reloadModule()` retries.
+   */
+  async #restart(options: Record<string, unknown>) {
+    if (this.#ws) {
+      this.#ws.send(JSON.stringify({ type: "shutdown" }));
+      this.#ws.close();
+      this.#ws = undefined;
+    }
+    this.#pendingRestart = options;
+    try {
+      await this.#miniflare.setOptions(options);
+      await this.#connect();
+    } catch (error) {
+      throw new Error(
+        "Failed to restart Miniflare for the changed Worker exports (reloadModule() retries).",
+        { cause: error },
+      );
+    }
+    this.#pendingRestart = undefined;
+    if (!this.closed) {
+      this.#signalReady();
+    }
+  }
+
+  /**
+   * Load the entry (restarting once if its classes change the export stubs)
+   * and open the IPC WebSocket.
+   */
+  async #connect() {
+    const options = this.#updateExports(await this.#loadEntry());
+    if (options) {
+      await this.#miniflare.setOptions(options);
+      await this.#loadEntry();
     }
 
     // Establish persistent WebSocket connection for IPC
@@ -1222,9 +1444,6 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
         // Ignore malformed messages
       }
     });
-
-    // Signal ready with a dummy address (fetch is overridden)
-    this._handleMessage({ address: { host: "127.0.0.1", port: 0 } });
   }
 
   // #endregion
@@ -1232,20 +1451,112 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
 
 // #region Helpers
 
-/** Detect `export class` names in the entry, merged with declared exports. */
-function detectExportedClasses(
-  entrySource: string | undefined,
-  explicit: Record<string, MiniflareExportInfo>,
-): string[] {
-  const names = new Set(Object.keys(explicit));
-  if (entrySource) {
-    const re = /\bexport\s+class\s+(\w+)/g;
-    let match;
-    while ((match = re.exec(entrySource))) {
-      if (match[1]) names.add(match[1]);
+/**
+ * Classes the entry exports (`export class X`, `export { X, Y as Z }`), by
+ * export name: Durable Objects unless they extend another kind or a built-in.
+ * Exports that aren't classes declared in the entry (functions, values,
+ * re-exports from other modules) are skipped, as is everything when the lexer
+ * can't parse it (JSX, unsupported TypeScript). Expects the ESM lexer to be
+ * initialized.
+ */
+function detectExportedClasses(entrySource: string | undefined): Record<string, WorkerExportType> {
+  const classes: Record<string, WorkerExportType> = {};
+  if (!entrySource) {
+    return classes;
+  }
+  let imports: ReturnType<typeof parseEsm>[0];
+  let exports: ReturnType<typeof parseEsm>[1];
+  try {
+    [imports, exports] = parseEsm(entrySource);
+  } catch {
+    return classes;
+  }
+  // Local names of the `cloudflare:workers` base classes (bundlers rename them).
+  const bases = new Map<string, WorkerExportType>();
+  for (const imp of imports) {
+    if (imp.type === "static" && imp.specifier === "cloudflare:workers") {
+      const statement = entrySource.slice(imp.importStart, imp.importEnd);
+      const re = /\b(DurableObject|WorkerEntrypoint|WorkflowEntrypoint)(?:\s+as\s+([\w$]+))?/g;
+      for (const [, base, alias] of statement.matchAll(re)) {
+        bases.set(alias ?? base!, base as WorkerExportType);
+      }
     }
   }
-  return [...names];
+  for (const exp of exports) {
+    if (exp.type !== "direct" || exp.typeOnly || exp.name === "default" || !exp.localName) {
+      continue;
+    }
+    const type = localClassType(entrySource, exp.localName, bases);
+    if (type) {
+      classes[exp.name] = type;
+    }
+  }
+  return classes;
+}
+
+/**
+ * Type of a class declared in the entry, following base classes declared there
+ * too: `undefined` when `name` isn't a class, `null` when it extends a built-in
+ * (a constructor on the host's `globalThis`, like `Error` or `EventTarget`).
+ */
+function localClassType(
+  source: string,
+  name: string,
+  bases: Map<string, WorkerExportType>,
+  seen = new Set<string>(),
+): WorkerExportType | null | undefined {
+  const heritage = classHeritage(source, name);
+  if (heritage === undefined) {
+    return undefined;
+  }
+  const base = /\bextends\s+(?:[\w$]+\.)*([\w$]+)/.exec(heritage)?.[1];
+  if (!base) {
+    return "DurableObject";
+  }
+  const type = bases.get(base) ?? base;
+  if (isWorkerExportType(type)) {
+    return type;
+  }
+  seen.add(name);
+  const local = seen.has(base) ? undefined : localClassType(source, base, bases, seen);
+  if (local !== undefined) {
+    return local;
+  }
+  return Object.hasOwn(globalThis, base) && typeof (globalThis as any)[base] === "function"
+    ? null
+    : "DurableObject";
+}
+
+/**
+ * What follows the name of a local class declaration (`class X ... {`, or
+ * `X = class ... {` as bundlers emit), up to its body; `undefined` if `name`
+ * isn't declared as a class.
+ */
+function classHeritage(source: string, name: string): string | undefined {
+  const id = name.replace(/[$()*+.?[\\\]^{|}]/g, "\\$&");
+  const re = new RegExp(
+    `(?:(?<![\\w$])class\\s+${id}|(?<![\\w$.])${id}\\s*=\\s*class(?:\\s+(?!extends\\b)[\\w$]+)?)(?![\\w$])([^{]*)\\{`,
+  );
+  return re.exec(source)?.[1];
+}
+
+/** Valid entries of the export types the wrapper reports. */
+function workerExportTypes(types: Record<string, unknown>): Record<string, WorkerExportType> {
+  const out: Record<string, WorkerExportType> = {};
+  for (const [name, type] of Object.entries(types)) {
+    if (isWorkerExportType(type)) {
+      out[name] = type;
+    }
+  }
+  return out;
+}
+
+function sameExportTypes(
+  a: Record<string, WorkerExportType>,
+  b: Record<string, WorkerExportType>,
+): boolean {
+  const keys = Object.keys(a);
+  return keys.length === Object.keys(b).length && keys.every((key) => a[key] === b[key]);
 }
 
 /**

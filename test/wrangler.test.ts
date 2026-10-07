@@ -332,7 +332,7 @@ const SHARED_CASES: WranglerCase[] = [
     warns: ['compatibility date "2999-01-01" is newer than the installed workerd supports'],
   },
   {
-    name: "drops Durable Object bindings to another script and merges auto-wired exports",
+    name: "drops Durable Object bindings to another script and skips auto-wiring declared configs",
     entry: DO_ENTRY,
     options: () => ({
       wrangler: {
@@ -347,13 +347,14 @@ const SHARED_CASES: WranglerCase[] = [
         migrations: [{ tag: "v1", new_classes: ["Counter", "Greeter"] }],
       },
     }),
-    // LOCAL (wrangler) + GREETER (auto-wired); Counter is already bound, so no
-    // COUNTER binding; the external-script binding is dropped.
+    // Only LOCAL (wrangler): the config declares classes, so the entry isn't
+    // scanned and Greeter (declared by `migrations`) stays unbound, as in
+    // `wrangler dev`; the external-script binding is dropped.
     assert: (json) =>
       expect(json).toMatchObject({
         greeting: "do",
         local: "function",
-        greeter: "function",
+        greeter: "undefined",
         counter: "undefined",
         external: "undefined",
       }),
@@ -365,7 +366,7 @@ const SHARED_CASES: WranglerCase[] = [
     },
   },
   {
-    name: "drops services, assets, queue consumers, workflows and tails from the config",
+    name: "drops services, assets, queue consumers, external workflows and tails from the config",
     entry: DO_ENTRY,
     files: {
       "public/index.html": "<h1>hi</h1>",
@@ -379,7 +380,14 @@ const SHARED_CASES: WranglerCase[] = [
           producers: [{ binding: "MY_QUEUE", queue: "my-queue" }],
           consumers: [{ queue: "my-queue" }],
         },
-        workflows: [{ binding: "MY_WORKFLOW", name: "my-workflow", class_name: "Greeter" }],
+        workflows: [
+          {
+            binding: "MY_WORKFLOW",
+            name: "my-workflow",
+            class_name: "Greeter",
+            script_name: "other-worker",
+          },
+        ],
         tail_consumers: [{ service: "tail-worker" }],
       }),
     },
@@ -404,12 +412,83 @@ const SHARED_CASES: WranglerCase[] = [
         "services (OTHER_SERVICE)",
         "assets (ASSETS)",
         "queues.consumers (my-queue)",
-        "workflows (MY_WORKFLOW)",
+        'workflows (MY_WORKFLOW → script "other-worker")',
         "tail_consumers (tail-worker)",
         "pass them via miniflareOptions",
       ]) {
         expect(dropped[0]).toContain(part);
       }
+    },
+  },
+  {
+    name: "keeps local workflows (a script_name naming this worker is local)",
+    entry: `import { WorkflowEntrypoint } from "cloudflare:workers";
+export class Greeter extends WorkflowEntrypoint {}
+export class Other extends WorkflowEntrypoint {}
+export default {
+  fetch: (request, env) =>
+    Response.json({ own: typeof env.MY_WORKFLOW?.create, self: typeof env.SELF_WORKFLOW?.create }),
+};`,
+    files: {
+      "wrangler.json": JSON.stringify({
+        name: "test",
+        compatibility_date: "2024-09-01",
+        workflows: [
+          { binding: "MY_WORKFLOW", name: "my-workflow", class_name: "Greeter" },
+          {
+            binding: "SELF_WORKFLOW",
+            name: "self-workflow",
+            class_name: "Other",
+            script_name: "test",
+          },
+        ],
+      }),
+    },
+    options: () => ({ wrangler: true, exports: false }),
+    assert: (json, { mfOptions }) => {
+      expect(json).toEqual({ own: "function", self: "function" });
+      expect(mfOptions.workflows).toMatchObject({
+        MY_WORKFLOW: { name: "my-workflow", className: "Greeter" },
+        SELF_WORKFLOW: { name: "self-workflow", className: "Other" },
+      });
+      expect(mfOptions.workflows.SELF_WORKFLOW.scriptName).toBeUndefined();
+    },
+  },
+  {
+    name: "maps workflow exports and step limits",
+    entry: `import { WorkflowEntrypoint } from "cloudflare:workers";
+export class Doubler extends WorkflowEntrypoint {}
+export class Tripler extends WorkflowEntrypoint {}
+export default {
+  fetch: (request, env) => Response.json({ workflow: typeof env.MY_WORKFLOW?.create }),
+};`,
+    files: {
+      "wrangler.json": JSON.stringify({
+        name: "test",
+        compatibility_date: "2024-09-01",
+        workflows: [
+          {
+            binding: "MY_WORKFLOW",
+            name: "doubler",
+            class_name: "Doubler",
+            limits: { steps: 3 },
+          },
+        ],
+        exports: { Tripler: { type: "workflow", name: "tripler", limits: { steps: 5 } } },
+      }),
+    },
+    options: () => ({ wrangler: true }),
+    assert: (json, { mfOptions }) => {
+      expect(json).toEqual({ workflow: "function" });
+      expect(mfOptions.workflows.MY_WORKFLOW).toMatchObject({
+        name: "doubler",
+        className: "Doubler",
+        stepLimit: 3,
+      });
+      expect(mfOptions.workflowExports).toEqual({ Tripler: { name: "tripler", stepLimit: 5 } });
+      // Both are exported as stubs.
+      expect(mfOptions.script).toContain('as "Doubler"');
+      expect(mfOptions.script).toContain('as "Tripler"');
     },
   },
   {

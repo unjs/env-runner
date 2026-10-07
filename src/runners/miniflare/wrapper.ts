@@ -1,3 +1,6 @@
+import type { WorkerExportType } from "./exports.ts";
+import { generateExportStubs } from "./exports.ts";
+
 const IPC_PATH = "/__env_runner_ipc";
 
 /** Service binding name used for cross-request IPC (worker → runner). */
@@ -17,8 +20,10 @@ export function generateWrapper(
   opts?: {
     dynamicOnly?: boolean;
     captureErrors?: boolean;
-    /** Class names re-exported from the entry, or a module specifier re-exported with `export *`. */
-    exports?: string[] | string;
+    /** Worker exports, as stubs resolving the entry's classes on use, or a module specifier re-exported with `export *`. */
+    exports?: Record<string, WorkerExportType> | string;
+    /** Stub names the config declares (default: all); the others get a deploy hint. */
+    configuredExports?: string[];
     /** Import `node:process` as the `process` global (needs `nodejs_compat`). Default: `true`. */
     nodeCompat?: boolean;
   },
@@ -34,16 +39,11 @@ if (!globalThis.process) { globalThis.process = __process; }`;
   const staticReExport = opts?.dynamicOnly ? "" : `export * from ${JSON.stringify(entryPath)};`;
 
   // workerd requires DO/Entrypoint classes as static named exports: re-export a
-  // separate exports module wholesale, or (in dynamicOnly mode) the named classes
-  // from the entry.
-  const explicitExports =
+  // separate exports module wholesale, or stubs resolving the entry's classes.
+  const workerExports =
     typeof opts?.exports === "string"
-      ? `export * from ${JSON.stringify(opts.exports)};`
-      : opts?.dynamicOnly && opts.exports?.length
-        ? opts.exports
-            .map((name) => `export { ${name} } from ${JSON.stringify(entryPath)};`)
-            .join("\n")
-        : "";
+      ? `export * from ${JSON.stringify(opts.exports)};\nconst __checkExports = async () => undefined;\nconst __exportTypes = async () => undefined;`
+      : generateExportStubs(opts?.exports || {}, opts?.configuredExports);
 
   const captureErrors = opts?.captureErrors ?? true;
 
@@ -66,13 +66,15 @@ if (!globalThis.process) { globalThis.process = __process; }`;
 
   return /* js */ `${processShim}
 ${staticReExport}
-${explicitExports}
+${workerExports}
 
 const __IPC_PATH = "${IPC_PATH}";
 const __IPC_BINDING = "${IPC_BINDING}";
 const __UNSAFE_EVAL_BINDING = "${UNSAFE_EVAL_BINDING}";
 const __entryPath = ${JSON.stringify(entryPath)};
+let __entryModule;
 let __userEntry;
+let __entryLoading;
 let __server;
 let __ipcInitialized = false;
 let __serverWs;
@@ -161,8 +163,30 @@ async function __loadEntry(env, path) {
     "loadEntry",
     "path"
   );
-  const mod = await importFn(path);
-  return mod.default || mod;
+  return importFn(path);
+}
+
+function __setEntry(mod) {
+  const entry = mod.default || mod;
+  __server = __createServer(entry);
+  __entryModule = mod;
+  __userEntry = entry;
+}
+
+// Loads the entry once, for the IPC init request or an export stub used first.
+async function __ensureEntry(env) {
+  if (__userEntry) return;
+  __entryLoading ||= __loadEntry(env, __entryPath)
+    .then(__setEntry)
+    .finally(() => {
+      __entryLoading = undefined;
+    });
+  await __entryLoading;
+}
+
+// Where the Worker's classes come from: the entry's \`resolveExports()\` hook, or its namespace.
+async function __entryExports() {
+  return __userEntry?.resolveExports ? await __userEntry.resolveExports() : __entryModule;
 }
 
 // Where an entry load error was thrown (first stack frame), so one thrown by a
@@ -201,11 +225,13 @@ async function __handleWsMessage(env, data) {
   if (msg.type === "reload" && env.__ENV_RUNNER_UNSAFE_EVAL__) {
     const version = msg.version || 0;
     try {
-      const newEntry = await __loadEntry(env, __entryPath + "?__envRunnerReload=" + version);
+      const newModule = await __loadEntry(env, __entryPath + "?__envRunnerReload=" + version);
+      const newEntry = newModule.default || newModule;
       const newServer = __createServer(newEntry);
       if (__userEntry?.ipc?.onClose) {
         await __userEntry.ipc.onClose();
       }
+      __entryModule = newModule;
       __userEntry = newEntry;
       __server = newServer;
       __crosswsAdapter = undefined;
@@ -214,10 +240,17 @@ async function __handleWsMessage(env, data) {
         __ipcInitialized = true;
         await __userEntry.ipc.onOpen({ sendMessage: __sendMessage });
       }
-      __sendMessage({ event: "module-reloaded" });
+      // The host restarts with new stubs when these changed, else asks for the check.
+      const exportTypes = await __exportTypes().catch(() => undefined);
+      __sendMessage({ event: "module-reloaded", exportTypes });
     } catch (e) {
       __sendMessage({ event: "module-reloaded", error: String(e) });
     }
+    return;
+  }
+
+  if (msg.type === "check-exports") {
+    __runExportsCheck();
     return;
   }
 
@@ -227,6 +260,16 @@ async function __handleWsMessage(env, data) {
     }
     return;
   }
+}
+
+// The host warns (deduped across restarts). \`withTypes\`: also report the
+// entry's classes, which the host restarts for when they change the stubs.
+function __runExportsCheck(withTypes) {
+  Promise.all([__checkExports(), withTypes ? __exportTypes() : undefined]).then(
+    ([warnings, exportTypes]) =>
+      (warnings || exportTypes) && __sendMessage({ event: "worker-exports", warnings, exportTypes }),
+    () => {},
+  );
 }
 
 let __crosswsAdapter;
@@ -246,21 +289,22 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // IPC: a plain request loads the entry (204, or a 500 with the error), then
-    // the WebSocket upgrade opens the channel.
+    // IPC: a plain request loads the entry (its export types, or a 500 with the
+    // error), then the WebSocket upgrade opens the channel.
     if (url.pathname === __IPC_PATH) {
       try {
-        if (!__userEntry) {
-          const entry = await __loadEntry(env, __entryPath);
-          __server = __createServer(entry);
-          __userEntry = entry;
-        }
+        await __ensureEntry(env);
       } catch (e) {
         const message = "Failed to load entry: " + String(e) + __errorLocation(e);
         return new Response(message, { status: 500 });
       }
+      // A \`resolveExports()\` hook may need the IPC channel (host data sent once
+      // ready), so its classes are reported after the channel opens.
       if (request.headers.get("upgrade") !== "websocket") {
-        return new Response(null, { status: 204 });
+        const exportTypes = __userEntry.resolveExports
+          ? undefined
+          : await __exportTypes().catch(() => undefined);
+        return Response.json({ exportTypes });
       }
 
       const pair = new WebSocketPair();
@@ -280,6 +324,9 @@ export default {
           await __userEntry.ipc.onOpen({ sendMessage: __sendMessage });
         }
       }
+
+      // In the socket's request context, which outlives the check.
+      __runExportsCheck(Boolean(__userEntry.resolveExports));
 
       return new Response(null, { status: 101, webSocket: client });
     }

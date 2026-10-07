@@ -2064,8 +2064,7 @@ describe("MiniflareEnvRunner virtual module invalidation", () => {
 });
 
 describe("MiniflareEnvRunner virtual entry exports", () => {
-  // The wrapper statically re-exports DO/Entrypoint classes; the fallback
-  // serves them at startup (miniflare v4 skips its on-disk ModuleLocator).
+  // The wrapper's DO stubs import the virtual entry through the fallback.
   it.each([
     { kind: "`#`", entry: "#entry", msg: "#msg" },
     { kind: "path-keyed", entry: resolve(ghostDir, "entry.mjs"), msg: "./msg.mjs" },

@@ -30,7 +30,7 @@ src/
 │   ├── bun-process/         # BunProcessEnvRunner + worker
 │   ├── deno-process/        # DenoProcessEnvRunner + worker
 │   ├── self/                # SelfEnvRunner (in-process, no worker)
-│   ├── miniflare/           # MiniflareEnvRunner + wrapper.ts (in-memory workerd wrapper) + wrangler.ts (config → Miniflare options) + dotenv.ts (minimal-reader dev vars)
+│   ├── miniflare/           # MiniflareEnvRunner + wrapper.ts (in-memory workerd wrapper) + wrangler.ts (config → Miniflare options) + exports.ts (declared Worker exports) + exports-runtime.ts (lazy DO/entrypoint/workflow stubs, inlined into the wrapper) + dotenv.ts (minimal-reader dev vars)
 │   ├── vercel/              # VercelEnvRunner (extends node-worker) + worker, oidc.ts, queue-dev.ts
 │   └── netlify/             # NetlifyEnvRunner (extends node-worker) + worker
 ├── types.ts                 # Core interfaces
@@ -58,6 +58,7 @@ export default {
   middleware?: [], plugins?: [],
   ...ServerOptions, // other srvx options are forwarded to serve()
   ipc?: { onOpen?({ sendMessage }), onMessage?(message), onClose?() },
+  resolveExports?: () => Record<string, unknown> | Promise<...>,  // miniflare: Worker classes (default: entry namespace)
 };
 ```
 
@@ -68,7 +69,7 @@ export default {
 
 ## Miniflare
 
-Details in [`.agents/MINIFLARE.md`](.agents/MINIFLARE.md). In short: the wrapper handles requests like `srvx/cloudflare` (plugins/middleware/error, `request.runtime`/`ip`/`waitUntil`, internal `__ENV_RUNNER_*` bindings hidden from `env`); `wrangler` (`true` | path | inline config) + `wranglerConfigPath`/`wranglerEnv`/`wranglerEnvFiles` load wrangler configs into Miniflare options, with unsupported bindings dropped (warned) and user `miniflareOptions` winning; `exports` auto-binds the entry's `export class`es as Durable Objects, or takes a module specifier (disk or virtual) re-exported with `export *` whose bindings come from wrangler/`miniflareOptions` (exports are fixed at startup). Supports miniflare v4 and v5: options are built in the v4 format and converted with v5's `convertV4MiniflareOptions`.
+Details in [`.agents/MINIFLARE.md`](.agents/MINIFLARE.md). In short: the wrapper handles requests like `srvx/cloudflare` (plugins/middleware/error, `request.runtime`/`ip`/`waitUntil`, internal `__ENV_RUNNER_*` bindings hidden from `env`); `wrangler` (`true` | path | inline config) + `wranglerConfigPath`/`wranglerEnv`/`wranglerEnvFiles` load wrangler configs into Miniflare options, with unsupported bindings dropped (warned) and user `miniflareOptions` winning; Worker classes are exported as lazy stubs that follow `reloadModule()`: the config's ∪ the entry's (es-module-lexer at startup, then the loaded module after the first load and each reload, restarting Miniflare when the set changes); other classes are Durable Objects unless they extend a built-in (`Error`, `EventTarget`, ...): auto-bound in zero-config mode, else unbound namespaces (`additionalUnboundDurableObjects`, for `ctx.exports`). `exports` takes `false` (no detection) or a module specifier (disk or virtual) re-exported with `export *` whose bindings come from wrangler/`miniflareOptions` (its export names are fixed at startup). Supports miniflare v4 and v5: options are built in the v4 format and converted with v5's `convertV4MiniflareOptions`.
 
 ## Reference docs (`.agents/`)
 
