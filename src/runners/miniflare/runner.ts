@@ -100,9 +100,10 @@ export interface MiniflareEnvRunnerOptions {
    *   loaded module after its first load and each reload, restarting
    *   Miniflare when they change the exports; `false` disables both.
    * - Untyped entries of this record and the entry's classes not extending
-   *   `WorkerEntrypoint`/`WorkflowEntrypoint` are Durable Objects, bound as
-   *   `SCREAMING_SNAKE_CASE` when they have no binding (the entry's only when
-   *   the config declares no classes).
+   *   `WorkerEntrypoint`/`WorkflowEntrypoint` (or a built-in like `Error`) are
+   *   Durable Objects, bound as `SCREAMING_SNAKE_CASE` when they have no
+   *   binding. The entry's are only bound when the config declares no
+   *   classes; otherwise they get a namespace without a binding (`ctx.exports`).
    * - A module specifier (absolute path or `data.virtual` key; relative paths
    *   resolve from the entry's directory) is re-exported with `export *`
    *   instead: nothing is stubbed, detected or bound, and it loads at startup,
@@ -691,6 +692,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
         : {};
 
       const baseDOs = options.durableObjects;
+      const baseUnboundDOs = options.additionalUnboundDurableObjects;
       const existingDOs = isPlainObject(baseDOs) ? baseDOs : {};
       const boundClasses = new Set(Object.values(existingDOs).map(localClassName));
       const scriptPath = entryDir + "/__env_runner_wrapper.mjs";
@@ -719,6 +721,23 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
           options.durableObjects = autoDOs;
         } else if (baseDOs === undefined) {
           delete options.durableObjects;
+        }
+        // The entry's Durable Objects the config doesn't declare get a
+        // namespace without a binding (for `ctx.exports`).
+        const unboundDOs = zeroConfig
+          ? []
+          : Object.keys(stubs)
+              .filter((name) => !(name in declared) && stubs[name] === "DurableObject")
+              .map((className) => ({ className }));
+        if (unboundDOs.length > 0) {
+          options.additionalUnboundDurableObjects = [
+            ...(Array.isArray(baseUnboundDOs) ? baseUnboundDOs : []),
+            ...unboundDOs,
+          ];
+        } else if (baseUnboundDOs === undefined) {
+          delete options.additionalUnboundDurableObjects;
+        } else {
+          options.additionalUnboundDurableObjects = baseUnboundDOs;
         }
 
         const script = generateWrapper(
@@ -1380,10 +1399,11 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
 
 /**
  * Classes the entry exports (`export class X`, `export { X, Y as Z }`), by
- * export name: Durable Objects unless they extend another kind. Exports that
- * aren't classes declared in the entry (functions, values, re-exports from
- * other modules) are skipped, as is everything when the lexer can't parse it
- * (JSX, unsupported TypeScript). Expects the ESM lexer to be initialized.
+ * export name: Durable Objects unless they extend another kind or a built-in.
+ * Exports that aren't classes declared in the entry (functions, values,
+ * re-exports from other modules) are skipped, as is everything when the lexer
+ * can't parse it (JSX, unsupported TypeScript). Expects the ESM lexer to be
+ * initialized.
  */
 function detectExportedClasses(entrySource: string | undefined): Record<string, WorkerExportType> {
   const classes: Record<string, WorkerExportType> = {};
@@ -1412,15 +1432,45 @@ function detectExportedClasses(entrySource: string | undefined): Record<string, 
     if (exp.type !== "direct" || exp.typeOnly || exp.name === "default" || !exp.localName) {
       continue;
     }
-    const heritage = classHeritage(entrySource, exp.localName);
-    if (heritage === undefined) {
-      continue;
+    const type = localClassType(entrySource, exp.localName, bases);
+    if (type) {
+      classes[exp.name] = type;
     }
-    const base = /\bextends\s+(?:[\w$]+\.)*([\w$]+)/.exec(heritage)?.[1];
-    const type = base && (bases.get(base) ?? base);
-    classes[exp.name] = isWorkerExportType(type) ? type : "DurableObject";
   }
   return classes;
+}
+
+/**
+ * Type of a class declared in the entry, following base classes declared there
+ * too: `undefined` when `name` isn't a class, `null` when it extends a built-in
+ * (a constructor on the host's `globalThis`, like `Error` or `EventTarget`).
+ */
+function localClassType(
+  source: string,
+  name: string,
+  bases: Map<string, WorkerExportType>,
+  seen = new Set<string>(),
+): WorkerExportType | null | undefined {
+  const heritage = classHeritage(source, name);
+  if (heritage === undefined) {
+    return undefined;
+  }
+  const base = /\bextends\s+(?:[\w$]+\.)*([\w$]+)/.exec(heritage)?.[1];
+  if (!base) {
+    return "DurableObject";
+  }
+  const type = bases.get(base) ?? base;
+  if (isWorkerExportType(type)) {
+    return type;
+  }
+  seen.add(name);
+  const local = seen.has(base) ? undefined : localClassType(source, base, bases, seen);
+  if (local !== undefined) {
+    return local;
+  }
+  return Object.hasOwn(globalThis, base) && typeof (globalThis as any)[base] === "function"
+    ? null
+    : "DurableObject";
 }
 
 /**

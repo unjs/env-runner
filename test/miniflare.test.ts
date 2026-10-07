@@ -935,6 +935,104 @@ export default {
     expect(removed.startId).not.toBe(added.startId);
   });
 
+  it("gives undeclared Durable Objects a namespace without a binding", async () => {
+    const entry = (classes: string) => `
+import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
+export class Counter extends DurableObject {}
+export class Other extends DurableObject {
+  async increment() {
+    const count = ((await this.ctx.storage.get("count")) || 0) + 1;
+    await this.ctx.storage.put("count", count);
+    return count;
+  }
+}
+${classes}
+export default {
+  async fetch(request, env, ctx) {
+    const other = ctx.exports.Other.get(ctx.exports.Other.idFromName("x"));
+    return Response.json({ count: await other.increment(), bound: typeof env.OTHER });
+  },
+};`;
+    const entryPath = writeEntry({ "worker.mjs": entry("") });
+    runner = new MiniflareEnvRunner({
+      miniflare,
+      name: "test-lazy-unbound-do",
+      data: { entry: entryPath },
+      miniflareOptions: {
+        compatibilityDate: "2025-01-01",
+        compatibilityFlags: ["enable_ctx_exports"],
+        durableObjects: { COUNTER: "Counter" },
+      },
+    });
+    await waitForReady(runner);
+    expect(await (await runner.fetch("http://localhost/")).json()).toEqual({
+      count: 1,
+      bound: "undefined",
+    });
+    // A restart (new class) keeps its storage.
+    writeEntry({ "worker.mjs": entry("export class Greeter extends WorkerEntrypoint {}") });
+    const setOptions = vi.spyOn(miniflare.Miniflare.prototype, "setOptions");
+    await runner.reloadModule();
+    expect(setOptions).toHaveBeenCalledTimes(1);
+    expect(await (await runner.fetch("http://localhost/")).json()).toEqual({
+      count: 2,
+      bound: "undefined",
+    });
+  });
+
+  it.each([
+    ["zero-config", {}],
+    ["config-declared", { durableObjects: { COUNTER: "Counter" } }],
+  ])("skips classes extending built-ins (%s)", async (_mode, extraOptions) => {
+    const warnings: string[] = [];
+    const capture = (...args: unknown[]) => {
+      warnings.push(args.map(String).join(" "));
+    };
+    vi.spyOn(console, "warn").mockImplementation(capture);
+    vi.spyOn(console, "error").mockImplementation(capture);
+    vi.spyOn(console, "log").mockImplementation(capture);
+    const setOptions = vi.spyOn(miniflare.Miniflare.prototype, "setOptions");
+    const entryPath = writeEntry({
+      "worker.mjs": `
+import { DurableObject } from "cloudflare:workers";
+export class Counter extends DurableObject {
+  hello() { return "counter"; }
+}
+export class HttpError extends Error {}
+export class Emitter extends EventTarget {}
+class BaseError extends Error {}
+export class NotFoundError extends BaseError {}
+export default {
+  async fetch(request, env, ctx) {
+    return Response.json({
+      counter: await env.COUNTER.get(env.COUNTER.idFromName("x")).hello(),
+      exported: ["HttpError", "Emitter", "NotFoundError"].filter((name) => ctx.exports[name]),
+      bound: [env.HTTP_ERROR, env.EMITTER, env.NOT_FOUND_ERROR].filter(Boolean).length,
+      error: new NotFoundError("x") instanceof Error,
+    });
+  },
+};`,
+    });
+    runner = new MiniflareEnvRunner({
+      miniflare,
+      name: "test-lazy-builtins",
+      data: { entry: entryPath },
+      miniflareOptions: {
+        compatibilityDate: "2025-01-01",
+        compatibilityFlags: ["enable_ctx_exports"],
+        ...extraOptions,
+      },
+    });
+    await waitForReady(runner);
+    const expected = { counter: "counter", exported: [], bound: 0, error: true };
+    expect(await (await runner.fetch("http://localhost/")).json()).toEqual(expected);
+    await runner.reloadModule();
+    expect(await (await runner.fetch("http://localhost/")).json()).toEqual(expected);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(setOptions).not.toHaveBeenCalled();
+    expect(warnings.join("\n")).not.toMatch(/HttpError|Emitter|NotFoundError/);
+  });
+
   it("detects classes of bundled entries, ignoring comments and strings", async () => {
     const entryPath = writeEntry({
       "worker.mjs": `

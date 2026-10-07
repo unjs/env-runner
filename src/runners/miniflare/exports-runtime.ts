@@ -269,8 +269,20 @@ export function workerExportsRuntime(
     return warnings;
   }
 
-  // Classes the loaded entry exports, by type: classes not extending a base are
-  // Durable Objects; functions and other values are skipped.
+  // Whether a class inherits from a built-in (`Error`, `EventTarget`, `Map`, ...).
+  function extendsBuiltin(ctor: any) {
+    for (
+      let base = Object.getPrototypeOf(ctor);
+      base && base !== Function.prototype;
+      base = Object.getPrototypeOf(base)
+    ) {
+      if (Function.prototype.toString.call(base).includes("[native code]")) return true;
+    }
+    return false;
+  }
+
+  // Classes the loaded entry exports, by type: other classes are Durable Objects
+  // unless they extend a built-in; functions and other values are skipped.
   async function exportTypes() {
     let exports;
     try {
@@ -287,7 +299,10 @@ export function workerExportsRuntime(
       );
       if (type) {
         types[name] = type;
-      } else if (/^class\b/.test(Function.prototype.toString.call(value))) {
+      } else if (
+        /^class\b/.test(Function.prototype.toString.call(value)) &&
+        !extendsBuiltin(value)
+      ) {
         types[name] = "DurableObject";
       }
     }
