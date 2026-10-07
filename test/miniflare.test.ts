@@ -954,6 +954,7 @@ export default {
   },
 };`;
     const entryPath = writeEntry({ "worker.mjs": entry("") });
+    const setOptions = vi.spyOn(miniflare.Miniflare.prototype, "setOptions");
     runner = new MiniflareEnvRunner({
       miniflare,
       name: "test-lazy-unbound-do",
@@ -969,14 +970,52 @@ export default {
       count: 1,
       bound: "undefined",
     });
+    // The undeclared class is detected in the source: no restart at startup.
+    expect(setOptions).not.toHaveBeenCalled();
     // A restart (new class) keeps its storage.
     writeEntry({ "worker.mjs": entry("export class Greeter extends WorkerEntrypoint {}") });
-    const setOptions = vi.spyOn(miniflare.Miniflare.prototype, "setOptions");
     await runner.reloadModule();
     expect(setOptions).toHaveBeenCalledTimes(1);
     expect(await (await runner.fetch("http://localhost/")).json()).toEqual({
       count: 2,
       bound: "undefined",
+    });
+  });
+
+  it("retries a failed restart on the next reloadModule()", async () => {
+    const entry = (classes: string) => `
+import { WorkerEntrypoint } from "cloudflare:workers";
+${classes}
+export default {
+  async fetch(request, env, ctx) {
+    return Response.json({ greeting: ctx.exports.Greeter ? await ctx.exports.Greeter.greet("world") : null });
+  },
+};`;
+    const entryPath = writeEntry({ "worker.mjs": entry("") });
+    runner = new MiniflareEnvRunner({
+      miniflare,
+      name: "test-lazy-restart-retry",
+      data: { entry: entryPath },
+      miniflareOptions: {
+        compatibilityDate: "2025-01-01",
+        compatibilityFlags: ["enable_ctx_exports"],
+      },
+    });
+    await waitForReady(runner);
+    expect(await (await runner.fetch("http://localhost/")).json()).toEqual({ greeting: null });
+
+    writeEntry({
+      "worker.mjs": entry(`export class Greeter extends WorkerEntrypoint {
+  greet(name) { return "hello " + name; }
+}`),
+    });
+    vi.spyOn(miniflare.Miniflare.prototype, "setOptions").mockRejectedValueOnce(new Error("boom"));
+    await expect(runner.reloadModule()).rejects.toThrow(/Failed to restart Miniflare/);
+    expect(() => runner!.sendMessage({ type: "hello" })).toThrow(/failed restart/);
+
+    await runner.reloadModule();
+    expect(await (await runner.fetch("http://localhost/")).json()).toEqual({
+      greeting: "hello world",
     });
   });
 

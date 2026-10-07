@@ -96,9 +96,9 @@ export interface MiniflareEnvRunnerOptions {
    *   stubs resolving the class from the entry (or its `resolveExports()` hook)
    *   on use, so they follow `reloadModule()`.
    * - The entry's own classes are added: detected in its source at startup
-   *   when the config declares none (default, or `true`), and read from the
-   *   loaded module after its first load and each reload, restarting
-   *   Miniflare when they change the exports; `false` disables both.
+   *   (default, or `true`), and read from the loaded module after its first
+   *   load and each reload, restarting Miniflare when they change the
+   *   exports; `false` disables both.
    * - Untyped entries of this record and the entry's classes not extending
    *   `WorkerEntrypoint`/`WorkflowEntrypoint` (or a built-in like `Error`) are
    *   Durable Objects, bound as `SCREAMING_SNAKE_CASE` when they have no
@@ -189,8 +189,7 @@ type ServedVirtualModule = Required<VirtualModule> & {
 
 /**
  * The Worker's export stubs: the config's classes plus the entry's (detected
- * in its source at startup when the config declares none, then read from the
- * loaded module after each load).
+ * in its source at startup, then read from the loaded module after each load).
  */
 interface MiniflareWorkerExports {
   stubs: Record<string, WorkerExportType>;
@@ -220,6 +219,8 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
   #reloadCounter = 0;
   #virtual?: MiniflareVirtualModules;
   #workerExports?: MiniflareWorkerExports;
+  // Options of a restart for changed exports that failed (retried by `reloadModule()`).
+  #pendingRestart?: Record<string, unknown>;
   #cacheEntry?: MiniflareCacheEntry;
   #ws?: { send(data: string): void; close(): void };
   #persistent: boolean;
@@ -319,6 +320,11 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
   }
 
   sendMessage(message: unknown) {
+    if (!this.#ws && this.#pendingRestart) {
+      throw new Error(
+        "Miniflare env runner is disconnected after a failed restart; call reloadModule() to retry.",
+      );
+    }
     if (!this.#ws) {
       throw new Error("Miniflare env runner should be initialized before sending messages.");
     }
@@ -333,6 +339,11 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
   /** Hot-reload the entry without recreating the Miniflare instance. */
   override async reloadModule(timeout = 5000): Promise<void> {
     await this._virtualUpdates;
+    // A restart for changed exports failed: retry it, which loads the current entry.
+    if (this.#pendingRestart) {
+      await this.#restart(this.#pendingRestart);
+      return;
+    }
     if (!this.#ws) {
       throw new Error("Miniflare env runner should be initialized before reloading.");
     }
@@ -668,22 +679,20 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
 
       // Exports are lazy stubs: they follow reloads and share the entry's
       // module instance. The config's classes come first; the entry's are added
-      // (detected in its source when the config declares none, zero-config),
-      // and again from the loaded module after each load (see `#connect()`).
-      // Nothing is stubbed for a module specifier.
+      // (detected in its source, so the first load rarely restarts), and again
+      // from the loaded module after each load (see `#connect()`). Nothing is
+      // stubbed for a module specifier.
       const explicitExports = typeof this.#exports === "object" ? this.#exports : {};
       const declared =
         typeof this.#exports === "string"
           ? {}
           : declaredWorkerExports({ options, wranglerExports, explicit: explicitExports });
-      const zeroConfig =
-        this.#exports !== false &&
-        typeof this.#exports !== "string" &&
-        Object.keys(declared).length === 0;
-      if (zeroConfig) {
+      const detect = this.#exports !== false && typeof this.#exports !== "string";
+      const zeroConfig = detect && Object.keys(declared).length === 0;
+      if (detect) {
         await initEsmLexer;
       }
-      const detectedTypes = zeroConfig
+      const detectedTypes = detect
         ? detectExportedClasses(
             entryIsVirtual
               ? virtualModuleCodeSource(entryKey, virtual.sources[entryKey])
@@ -1346,7 +1355,8 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
 
   /**
    * Restart workerd with new options (persisted state is kept) and reconnect;
-   * the new instance loads the entry again.
+   * the new instance loads the entry again. On failure the runner stays
+   * disconnected until `reloadModule()` retries.
    */
   async #restart(options: Record<string, unknown>) {
     if (this.#ws) {
@@ -1354,8 +1364,17 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
       this.#ws.close();
       this.#ws = undefined;
     }
-    await this.#miniflare.setOptions(options);
-    await this.#connect();
+    this.#pendingRestart = options;
+    try {
+      await this.#miniflare.setOptions(options);
+      await this.#connect();
+    } catch (error) {
+      throw new Error(
+        "Failed to restart Miniflare for the changed Worker exports (reloadModule() retries).",
+        { cause: error },
+      );
+    }
+    this.#pendingRestart = undefined;
   }
 
   /**
