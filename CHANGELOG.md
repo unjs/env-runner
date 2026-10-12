@@ -1,6 +1,32 @@
 # Changelog
 
 
+## v0.3.4
+
+[compare changes](https://github.com/unjs/env-runner/compare/v0.3.3...v0.3.4)
+
+### 🚀 Enhancements
+
+- **miniflare:** Lazy worker export stubs ([#72](https://github.com/unjs/env-runner/pull/72))
+
+### 📦 Build
+
+- Reduce dist/install size ([9b39f20](https://github.com/unjs/env-runner/commit/9b39f20))
+
+### 🏡 Chore
+
+- Update deps ([02edcb5](https://github.com/unjs/env-runner/commit/02edcb5))
+- Update lockfile ([75b8734](https://github.com/unjs/env-runner/commit/75b8734))
+
+### 🤖 CI
+
+- Set up pr preview package ([#71](https://github.com/unjs/env-runner/pull/71))
+
+### ❤️ Contributors
+
+- Pooya Parsa ([@pi0](https://github.com/pi0))
+- Rihan Arfan ([@RihanArfan](https://github.com/RihanArfan))
+
 ## v0.3.3
 
 [compare changes](https://github.com/unjs/env-runner/compare/v0.3.2...v0.3.3)
