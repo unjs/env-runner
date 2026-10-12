@@ -432,7 +432,7 @@ The code formats are named like Node's [load formats](https://nodejs.org/api/mod
 
 Virtual modules are registered inside the worker, before the entry is imported. On Node.js (>= 22.15 / 23.5) and Deno (>= 2.8) this uses [ESM customization hooks](https://nodejs.org/api/module.html#moduleregisterhooksoptions) (`module.registerHooks`); on Bun (which does not implement `registerHooks`) it uses a [`Bun.plugin()`](https://bun.com/docs/runtime/plugins) runtime plugin instead, also for the Node.js runners when the host runtime is Bun. Each source is served in its format, and virtual specifiers (including a virtual entry) resolve across `reloadModule()`. On runtimes supporting neither mechanism, a warning is logged and registration is skipped. When the worker shuts down gracefully the registration is unregistered again (the `registerHooks` registration is deregistered; on Bun, which has no plugin-removal API, the registration is detached so fresh loads and reloads stop resolving, and an overridden real file loads from disk again).
 
-On `MiniflareEnvRunner` there is no in-worker registration: the runner's module fallback service serves virtual specifiers to workerd directly (taking precedence over disk files and the `transformRequest` pipeline, so a virtual key overrides a real file with the same path). Named `exports` (Durable Objects / WorkerEntrypoints) also work with virtual entries. One limitation on miniflare v4: a **real** entry with auto-detected named exports can't import virtual modules, because miniflare's module locator reads its imports from disk at startup. Use a virtual entry, a separate `exports` module or miniflare v5 instead.
+On `MiniflareEnvRunner` there is no in-worker registration: the runner's module fallback service serves virtual specifiers to workerd directly (taking precedence over disk files and the `transformRequest` pipeline, so a virtual key overrides a real file with the same path). Named `exports` (Durable Objects / WorkerEntrypoints / Workflows) also work with virtual entries.
 
 #### Plugins (`plugins`)
 
@@ -679,7 +679,7 @@ const response = await runner.fetch("http://localhost/api");
 
 Passing `miniflare` explicitly is preferred — the version you install is then the version that runs. A specifier works too (`miniflare: "miniflare"`). If you omit it, the runner imports `miniflare` itself and only fails (with an actionable error) when the package isn't installed either. The `miniflareOptions` object is passed directly to the [Miniflare constructor](https://developers.cloudflare.com/workers/testing/miniflare/) — you can configure bindings, KV, D1, Durable Objects, and any other Miniflare option.
 
-The entry uses the same `AppEntry` format as the other runners. Requests are handled like srvx's Cloudflare adapter (`srvx/cloudflare`): the entry's `plugins`, `middleware` and `error` handler are applied, and the request carries `request.runtime` (`{ name: "cloudflare", cloudflare: { env, context } }`), `request.ip` (from `cf-connecting-ip`) and `request.waitUntil()`. For Workers-style entries, `fetch` still receives `(request, env, ctx)`. env-runner's internal bindings are never exposed on `env`. Listener-level srvx options (`maxRequestBodySize`, `trustProxy`, `node`/`bun`/`deno`, ...) do not apply to miniflare.
+The entry uses the same `AppEntry` format as the other runners, plus an optional `resolveExports()` hook (see [Worker exports](#worker-exports)). Requests are handled like srvx's Cloudflare adapter (`srvx/cloudflare`): the entry's `plugins`, `middleware` and `error` handler are applied, and the request carries `request.runtime` (`{ name: "cloudflare", cloudflare: { env, context } }`), `request.ip` (from `cf-connecting-ip`) and `request.waitUntil()`. For Workers-style entries, `fetch` still receives `(request, env, ctx)`. env-runner's internal bindings are never exposed on `env`. Listener-level srvx options (`maxRequestBodySize`, `trustProxy`, `node`/`bun`/`deno`, ...) do not apply to miniflare.
 
 When you don't set a compatibility date, it defaults to the date supported by the installed `workerd` binary rather than today's date — the binary always lags the calendar slightly, and pinning a future date makes `workerd` refuse to start. Set the runner's `compatibilityDate` option to pin one, or to `"latest"` to use the installed `workerd`'s supported date explicitly (no need to import `miniflare` for `supportedCompatibilityDate`). Precedence: `miniflareOptions.compatibilityDate` > `compatibilityDate` > the wrangler config's `compatibility_date` > the supported date. Whatever the source, a date newer than the installed `workerd` supports falls back to the supported date with a warning (like `wrangler dev`).
 
@@ -739,7 +739,7 @@ await using runner = new MiniflareEnvRunner({
 
 A missing `wranglerConfigPath` file warns (an inline config is still applied). When `wrangler` is itself a string path, that path wins and `wranglerConfigPath` is ignored.
 
-The runner hosts a single fetch-only worker, so config entries it can't run are **dropped**: `assets`, `services`, `queues.consumers`, `workflows`, `tail_consumers`/`streaming_tail_consumers`, and Durable Object bindings to another script (`script_name`). Durable Object bindings to local classes (exported by your entry or an [exports module](#exports-module)) are kept — including bindings whose `script_name` is the worker's own `name` (the inline config's `name` when set, else the file's; with `wranglerEnv` suffixed `-<env>` unless the env section sets a `name`, e.g. `my-worker-staging`), which are local in `wrangler dev` too — and merged with [auto-detected exports](#auto-detected-exports). Pass any of the dropped options via `miniflareOptions` to opt back in.
+The runner hosts a single worker, so config entries it can't run are **dropped**: `assets`, `services`, `queues.consumers`, `tail_consumers`/`streaming_tail_consumers`, and Durable Object and Workflow bindings to another script (`script_name`). Durable Object and Workflow bindings to local classes (exported by your entry or an [exports module](#exports-module)) are kept — including bindings whose `script_name` is the worker's own `name` (the inline config's `name` when set, else the file's; with `wranglerEnv` suffixed `-<env>` unless the env section sets a `name`, e.g. `my-worker-staging`), which are local in `wrangler dev` too — and merged with [auto-detected exports](#auto-detected-exports). Pass any of the dropped options via `miniflareOptions` to opt back in.
 
 Whenever `wrangler` is enabled (`true`, a path, or an inline config), local state (KV, D1, R2, Durable Objects, ...) persists under `<dir>/.wrangler/state/v3` — the same place `wrangler dev` uses, so both share data. `<dir>` is the directory of the loaded config file, else of the requested config path (`wrangler` string or `wranglerConfigPath`, even if the file is missing), else the current working directory (e.g. inline-only configs, or `wrangler: true` with no file found). Set `miniflareOptions.defaultPersistRoot` (or any `*Persist` option, e.g. `kvPersist: false`; on miniflare v5, `resourcePersistencePath`) to opt out.
 
@@ -775,9 +775,9 @@ await using runner = new MiniflareEnvRunner({
 
 Paths resolve against the loaded config file's directory (else the current working directory) and later files override earlier ones. When set (non-empty), `.dev.vars` is not read; when unset, wrangler's defaults apply (`.dev.vars[.<env>]`, else `.env*`); an empty array reads `.dev.vars` but no `.env*` files. Both the `wrangler` package and the built-in minimal reader honor it.
 
-Without `wranglerModule`, `wrangler` is imported optionally; if that fails too, a built-in minimal reader handles JSON/JSONC files and inline objects (TOML files are skipped with a warning). It follows wrangler's semantics for `env` selection (bindings and `vars` are not inherited into a named env), local ids (`preview_id` / `preview_bucket_name` / `preview_database_id` first, so state is shared with `wrangler dev`), SQLite-backed Durable Objects (`migrations[].new_sqlite_classes`) and dev vars (`.dev.vars[.<env>]`, `.env*`, `secrets.required`), but only maps common bindings (`vars`, KV, R2, D1, Durable Objects, queue producers); other bindings (e.g. `hyperdrive`, `ai`, `ratelimits`) are ignored with a warning. Pass `wranglerModule: false` to always use the minimal reader. Values you pass in `miniflareOptions` always take precedence over config-derived ones — binding records (e.g. `bindings`) merge per key, and `compatibilityFlags` are merged.
+Without `wranglerModule`, `wrangler` is imported optionally; if that fails too, a built-in minimal reader handles JSON/JSONC files and inline objects (TOML files are skipped with a warning). It follows wrangler's semantics for `env` selection (bindings and `vars` are not inherited into a named env), local ids (`preview_id` / `preview_bucket_name` / `preview_database_id` first, so state is shared with `wrangler dev`), SQLite-backed Durable Objects (`migrations[].new_sqlite_classes`) and dev vars (`.dev.vars[.<env>]`, `.env*`, `secrets.required`), but only maps common bindings (`vars`, KV, R2, D1, Durable Objects, Workflows, queue producers); other bindings (e.g. `hyperdrive`, `ai`, `ratelimits`) are ignored with a warning. Pass `wranglerModule: false` to always use the minimal reader. Values you pass in `miniflareOptions` always take precedence over config-derived ones — binding records (e.g. `bindings`) merge per key, and `compatibilityFlags` are merged.
 
-Config options a single dev worker can't run — `services`, `assets`, `queues.consumers`, `workflows`, `tail_consumers`/`streaming_tail_consumers`, and `durable_objects` bindings with a `script_name` naming another worker — are ignored with one warning listing them (e.g. `services (MY_SERVICE)`); pass the equivalent Miniflare options via `miniflareOptions` to opt in.
+Config options a single dev worker can't run — `services`, `assets`, `queues.consumers`, `tail_consumers`/`streaming_tail_consumers`, and `durable_objects`/`workflows` bindings with a `script_name` naming another worker — are ignored with one warning listing them (e.g. `services (MY_SERVICE)`); pass the equivalent Miniflare options via `miniflareOptions` to opt in.
 
 #### Module Transform Pipeline
 
@@ -803,9 +803,50 @@ When `transformRequest` is provided:
 
 The callback should return `{ code: string }` for transformed modules, or `null`/`undefined` to fall back to the default raw file read.
 
+#### Worker Exports
+
+Durable Object, `WorkerEntrypoint` and `WorkflowEntrypoint` classes declared in the config run from the current entry, so they share module state with requests and follow `reloadModule()`. A Durable Object is re-created with the new code and keeps its storage. Classes are declared by:
+
+- local Durable Object bindings (`durable_objects` / `miniflareOptions.durableObjects`, also [auto-wired](#auto-detected-exports) ones) and SQLite/KV-backed classes from `migrations`
+- local Workflows (`workflows` / `miniflareOptions.workflows`)
+- the wrangler config's `exports` (`{ "Greeter": { "type": "worker" } }`, also `durable-object` and `workflow`)
+
+```ts
+// worker.ts
+import { WorkerEntrypoint } from "cloudflare:workers";
+export { Counter } from "./counter.ts"; // bound in wrangler.json
+// Declared in wrangler.json: "exports": { "Greeter": { "type": "worker" } }
+export class Greeter extends WorkerEntrypoint {
+  greet(name: string) {
+    return `hello ${name}`;
+  }
+}
+
+export default {
+  async fetch(request, env, ctx) {
+    return new Response(await ctx.exports.Greeter.greet("world"));
+  },
+};
+```
+
+The classes are the entry's named exports, or come from its `resolveExports()` hook, called on each use (for entries that load the app themselves, e.g. through a module runner). The hook is first called once the IPC channel is open, so it can wait for data the host sends from `onReady`:
+
+```ts
+export default {
+  fetch: (request) => app.fetch(request),
+  resolveExports: () => import("./app/exports.ts"),
+};
+```
+
+As with `@cloudflare/vite-plugin`, Durable Objects can't have RPC methods named `email`, `queue`, `scheduled`, `tail`, `tailStream`, `test` or `trace`, and `WorkerEntrypoint`s can't have ones named `alarm`, `webSocketClose`, `webSocketError` or `webSocketMessage`.
+
+The entry's own classes are added to these after it loads (including ones it re-exports from other modules, see [below](#auto-detected-exports)): a class the config doesn't declare is still exported, so it works through `ctx.exports` (a Durable Object gets a namespace with key-value storage), but it gets no binding in `env`. Declared classes stay exported even when the entry lacks them, and their stubs throw a clear error on use.
+
+A warning after each load lists declared classes the entry doesn't export, and exported classes the wrangler config doesn't declare (deploys need the declaration).
+
 #### Auto-detected Exports
 
-`MiniflareEnvRunner` automatically scans the entry file for `export class` declarations and wires them as Durable Object bindings (binding name = class name). This means you don't need to manually configure `miniflareOptions.durableObjects` for simple cases:
+When the config declares no classes (see above), `MiniflareEnvRunner` scans the entry file for exported classes (`export class Counter`, or `export { Counter, Other as Renamed }` of classes declared in the entry, as bundlers emit) and wires them as Durable Object bindings (binding name = export name in `SCREAMING_SNAKE_CASE`, e.g. `COUNTER`). `WorkerEntrypoint`/`WorkflowEntrypoint` classes aren't bound. This means you don't need to manually configure `miniflareOptions.durableObjects` for simple cases:
 
 ```ts
 // worker.ts
@@ -823,25 +864,27 @@ export default {
 };
 ```
 
-To explicitly declare exports or override auto-detection:
+To explicitly declare exports:
 
 ```ts
 await using runner = new MiniflareEnvRunner({
   miniflare,
   name: "my-worker",
   data: { entry: "./worker.ts" },
-  // Explicit exports (merged with auto-detected ones)
-  exports: { Counter: { type: "DurableObject" } },
+  // Replaces auto-detection
+  exports: { Counter: { type: "DurableObject" }, Greeter: { type: "WorkerEntrypoint" } },
 });
 ```
 
-Auto-wired bindings are merged with Durable Object bindings from `miniflareOptions` and a wrangler config: exports whose class is already bound (or whose binding name is taken) are skipped. Set `exports: false` to disable auto-detection entirely.
+Auto-wired bindings are merged with Durable Object bindings from `miniflareOptions` and a wrangler config: exports whose class is already bound (or whose binding name is taken) are skipped. Set `exports: false` to disable auto-detection entirely (declared classes still work).
+
+After the entry first loads and after each `reloadModule()`, its classes are also read from the loaded module (so re-exports and entries the scan can't parse are covered): a class extending a `cloudflare:workers` base gets that type, any other class is a Durable Object unless it extends a built-in (`class HttpError extends Error`, `EventTarget`, `Map`, ...), and functions and other values are skipped. The startup scan applies the same rule to classes declared in the entry, treating constructors of the global scope as built-ins. With a `resolveExports()` hook, they are read once the IPC channel is open instead of after the first load. In every mode except `exports: false`, when they change the exports, Miniflare restarts with the new exports and bindings and loads the entry again: persisted Durable Object storage is kept, in-flight requests and WebSockets drop, and the runner signals ready again (`onReady`), so a host can resend what it sends the entry over IPC. An unchanged entry never restarts.
 
 #### Exports Module
 
 To load named exports from a separate module, set `exports` to its absolute path or a `data.virtual` key (a relative path resolves from the entry's directory, not the working directory). The wrapper re-exports it with `export *`, so re-exports and exported aliases work.
 
-In this mode nothing is auto-detected or auto-wired: configure the bindings with `wrangler` or `miniflareOptions`. The entry's own `export class` declarations are **not** re-exported either, so re-export them from the exports module if they are bound.
+In this mode nothing is stubbed, auto-detected or auto-wired: configure the bindings with `wrangler` or `miniflareOptions`. The entry's own `export class` declarations are **not** re-exported either, so re-export them from the exports module if they are bound.
 
 ```ts
 const runner = new MiniflareEnvRunner({
@@ -858,7 +901,7 @@ const runner = new MiniflareEnvRunner({
 });
 ```
 
-In both modes, named exports are registered when the worker starts. Recreate the runner when their implementation or export list changes; `reloadModule()` only reloads the request entry.
+An exports module loads when the worker starts: recreate the runner when its classes change (`reloadModule()` only reloads the request entry). The classes the config declares are fixed at startup too, so recreate the runner when the config changes; the entry's own classes follow reloads (see [above](#auto-detected-exports)).
 
 #### Error Capture
 

@@ -31,6 +31,12 @@ export interface AppEntry extends Omit<ServerOptions, "fetch"> {
   upgrade?: (context: UpgradeContext) => void;
   websocket?: Partial<Hooks>;
   ipc?: AppEntryIPC;
+  /**
+   * Miniflare only: the module whose named exports provide the Worker's
+   * Durable Object, `WorkerEntrypoint` and `WorkflowEntrypoint` classes
+   * (default: the entry module). Called on each use, so it can follow reloads.
+   */
+  resolveExports?: () => Record<string, unknown> | Promise<Record<string, unknown>>;
 }
 
 /** Worker-owned srvx options: the worker listens on a random loopback port behind the proxy. */
@@ -56,7 +62,14 @@ export const RESERVED_RUNTIME_OPTIONS = {
 
 /** Callers add `fetch` (bound lazily so reloads swap it) and the crossws plugin. */
 export function toServerOptions(entry: AppEntry): Omit<ServerOptions, "fetch"> {
-  const { fetch: _fetch, upgrade: _upgrade, websocket: _websocket, ipc: _ipc, ...options } = entry;
+  const {
+    fetch: _fetch,
+    upgrade: _upgrade,
+    websocket: _websocket,
+    ipc: _ipc,
+    resolveExports: _resolveExports,
+    ...options
+  } = entry;
   for (const key of RESERVED_SERVER_OPTIONS) {
     delete options[key];
   }
