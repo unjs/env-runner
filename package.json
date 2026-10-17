@@ -48,9 +48,9 @@
   },
   "devDependencies": {
     "@netlify/runtime": "^5.0.8",
-    "@types/node": "^26.6.4",
+    "@types/node": "^26.6.5",
     "@vercel/queue": "^0.8.0",
-    "@vitest/coverage-v8": "^5.0.3",
+    "@vitest/coverage-v8": "^5.0.4",
     "automd": "^0.4.3",
     "changelogen": "^0.6.2",
     "cjs-module-lexer": "^2.3.0",
@@ -59,13 +59,13 @@
     "exsolve": "^1.1.3",
     "httpxy": "^0.5.5",
     "miniflare": "^5.20260921.1-alpha",
-    "obuild": "^0.4.44",
-    "oxc-transform": "^0.153.0",
-    "oxfmt": ">=0.72.0",
-    "oxlint": "^1.87.0",
+    "obuild": "^0.4.45",
+    "oxc-transform": "^0.154.0",
+    "oxfmt": ">=0.73.0",
+    "oxlint": "^1.88.0",
     "typescript": "^7.0.2",
-    "vitest": "^5.0.3",
-    "wrangler": "^4.149.0"
+    "vitest": "^5.0.4",
+    "wrangler": "^4.151.0"
   },
-  "packageManager": "pnpm@12.11.0"
+  "packageManager": "pnpm@12.13.0"
 }
