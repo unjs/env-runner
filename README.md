@@ -293,7 +293,7 @@ The options are the srvx ones of the same names (the entry's own listener option
 
 #### Virtual Modules
 
-The Node.js runners (`NodeWorkerEnvRunner`, `NodeProcessEnvRunner`, and the runners built on top of them), `BunProcessEnvRunner`, `DenoProcessEnvRunner` (Deno >= 2.8), and `MiniflareEnvRunner` can serve **virtual modules** from an in-memory `specifier => source` map passed via `data.virtual` (`SelfEnvRunner` cannot, and closes with an error when it is set). The entry (and its dependencies) can then `import` them as if they were real files:
+All runners (the Node.js runners `NodeWorkerEnvRunner`, `NodeProcessEnvRunner` and the runners built on top of them, `BunProcessEnvRunner`, `DenoProcessEnvRunner` (Deno >= 2.8), `MiniflareEnvRunner` and `SelfEnvRunner`) can serve **virtual modules** from an in-memory `specifier => source` map passed via `data.virtual`. The entry (and its dependencies) can then `import` them as if they were real files:
 
 ```ts
 import { NodeWorkerEnvRunner } from "env-runner/runners/node-worker";
@@ -369,6 +369,8 @@ Other keys (`#name`, bare names) only match an import specifier equal to the key
 - `MiniflareEnvRunner` supports relative imports and overrides, and treats `file://` keys and imports like their path, but `import.meta.url` is undefined.
 
 On both, a virtual `data.entry` must be written exactly like its key.
+
+`SelfEnvRunner` registers the loader hooks in the **host process**, which suits a one-time server start. They apply to every import in the process (host code included; between live self runners, the latest one wins a key), they stay loaded on Bun (its plugins can't be removed), and the module cache only grows with updates and reloads. Path keys run under their `file:` URL plus a `?v=<n>` query there (also in `import.meta.url`), so the real file's URL never holds a virtual instance. When the host itself runs under a module runner that handles `import()` (such as Vitest's), its imports don't reach the hooks.
 
 Two path keys naming the same file (`/app/x.mjs` and `file:///app/x.mjs`) can't both be served, so the runner logs a warning naming both. Keep a single key per file.
 
@@ -481,9 +483,11 @@ On `MiniflareEnvRunner` there is no in-worker registration: the runner's module 
 
 #### Plugins (`plugins`)
 
-Pass the `plugins` runner option to resolve, load and transform the entry, its imports and virtual modules with **plugins that run on the host**. While resolving an import or loading a module, the worker sends it to the runner, the runner runs the plugins' `resolveId`, `load` and `transform` handlers and sends the result back, and the worker uses that result. Plugins are plain objects in the host process, so handlers can be async, close over host state and share work with the rest of your tooling. It works on every runner except `SelfEnvRunner`, which closes with an error (an empty list, or plugins without these hooks, count as no `plugins`). `loadRunner()` and `EnvServer` take the same `plugins` option (`EnvServer` passes it to every runner it creates).
+Pass the `plugins` runner option to resolve, load and transform the entry, its imports and virtual modules with **plugins that run on the host**. While resolving an import or loading a module, the worker sends it to the runner, the runner runs the plugins' `resolveId`, `load` and `transform` handlers and sends the result back, and the worker uses that result. Plugins are plain objects in the host process, so handlers can be async, close over host state and share work with the rest of your tooling. It works on every runner (an empty list, or plugins without these hooks, count as no `plugins`); on `SelfEnvRunner`, handlers must be synchronous (see below). `loadRunner()` and `EnvServer` take the same `plugins` option (`EnvServer` passes it to every runner it creates).
 
 > The runner `plugins` option is unrelated to the srvx server `plugins` of your [app entry](#app-entry): those stay on the entry's default export.
+
+**`SelfEnvRunner`:** there is no worker to wait while the host runs a handler, so the plugins run inside the host process's own loader hooks (`module.registerHooks` on Node.js and Deno, `Bun.plugin` on Bun), which are synchronous. Handlers for imports and disk modules must return their result directly: one returning a Promise fails that import with an error naming the plugin, hook and module (the `oxc` plugin below works as is, the async `version` one doesn't). Virtual modules are transformed before they are registered, so async handlers still work for them. In synchronous hooks, `this.resolve()` returns the result itself instead of a Promise (`await` works for both). The hooks apply to every import in the host process until the runner closes, and modules the process already loaded stay cached as they were.
 
 TypeScript enums, namespaces and JSX need a compiler. A plugin with [`oxc-transform`](https://oxc.rs/docs/guide/usage/transformer) (`npm i -D oxc-transform`) covers them:
 

@@ -1,13 +1,19 @@
 import type { WorkerHooks } from "../../types.ts";
 
 import { BaseEnvRunner } from "../../common/base-runner.ts";
-import type {
-  EnvRunnerData,
-  EnvRunnerPluginOption,
-  VirtualModuleUpdates,
-} from "../../common/base-runner.ts";
+import type { EnvRunnerData, EnvRunnerPluginOption } from "../../common/base-runner.ts";
 import type { AppEntry } from "../../common/worker-utils.ts";
-import { resolveEntry, reloadEntryModule } from "../../common/worker-utils.ts";
+import {
+  importFreshEntry,
+  isVirtualEntry,
+  resolveEntry,
+  reloadEntryModule,
+} from "../../common/worker-utils.ts";
+import { registerOwnedVirtualModules } from "../../common/virtual-modules.ts";
+import { createDirectTransformClient } from "../../plugin/channel.ts";
+import { registerPluginHooks } from "../../plugin/hooks.ts";
+import type { OwnedVirtualModules } from "../../common/virtual-modules.ts";
+import type { ResolvedVirtualModule } from "../../virtual-loader.ts";
 
 export type { EnvRunnerData as SelfEnvRunnerData } from "../../common/base-runner.ts";
 
@@ -20,16 +26,25 @@ interface NodeWSAdapter {
   closeAll: (code?: number, data?: string, force?: boolean) => void;
 }
 
+// Entries imported by self runners in this process.
+const _importedEntries = new Set<string>();
+
 export class SelfEnvRunner extends BaseEnvRunner {
   #active = false;
   #entry?: AppEntry;
   #wsAdapter?: NodeWSAdapter;
+  #virtual?: OwnedVirtualModules;
+  #unregisterPlugins?: () => void;
 
   constructor(opts: {
     name: string;
     hooks?: WorkerHooks;
     data?: EnvRunnerData;
-    /** Not supported: the runner closes with an error. */
+    /**
+     * Run in this process's loader hooks, so their handlers must be
+     * synchronous (virtual modules are still transformed before they are
+     * registered, where async handlers work).
+     */
     plugins?: EnvRunnerPluginOption[];
   }) {
     super({ ...opts, workerEntry: "" });
@@ -87,21 +102,8 @@ export class SelfEnvRunner extends BaseEnvRunner {
     await this.close();
   }
 
-  // The inherited versions would leak `update-virtual-modules` into
-  // `ipc.onMessage` and wait for an ack no worker sends.
-  override async updateVirtualModules(_changes: VirtualModuleUpdates): Promise<void> {
-    throw new Error(
-      "Cannot update virtual modules: the self runner does not support virtual modules",
-    );
-  }
-
-  override async invalidateModule(specifier: string): Promise<void> {
-    throw new Error(
-      `Cannot invalidate "${specifier}": the self runner does not support virtual modules`,
-    );
-  }
-
   override async reloadModule(): Promise<void> {
+    await this._virtualUpdates;
     const entryPath = this._data?.entry as string | undefined;
     if (!entryPath || !this.#entry) {
       throw new Error("Cannot reload: no entry loaded");
@@ -111,7 +113,12 @@ export class SelfEnvRunner extends BaseEnvRunner {
     };
     this.#wsAdapter?.closeAll(1001, undefined, true);
     this.#wsAdapter = undefined;
-    this.#entry = await reloadEntryModule(entryPath, this.#entry, sendFn);
+    this.#entry = await reloadEntryModule(
+      entryPath,
+      this.#entry,
+      sendFn,
+      isVirtualEntry(entryPath, this.#virtual?.modules()),
+    );
   }
 
   // #region Protected methods
@@ -124,6 +131,13 @@ export class SelfEnvRunner extends BaseEnvRunner {
     return "self";
   }
 
+  // Applied in the host process, where the entry is imported.
+  protected override async _applyVirtualUpdates(
+    changes: Record<string, ResolvedVirtualModule | null>,
+  ): Promise<void> {
+    await this.#virtual!.update(changes);
+  }
+
   protected async _closeRuntime() {
     if (!this.#active) {
       return;
@@ -133,6 +147,8 @@ export class SelfEnvRunner extends BaseEnvRunner {
     this.#wsAdapter = undefined;
     await this.#entry?.ipc?.onClose?.();
     this.#entry = undefined;
+    this.#virtual?.unregister();
+    this.#unregisterPlugins?.();
   }
 
   // #endregion
@@ -157,39 +173,64 @@ export class SelfEnvRunner extends BaseEnvRunner {
     if (this._rejectListen()) {
       return;
     }
-    // Nothing registers virtual modules in the host process; fail fast instead
-    // of a confusing import error for a virtual key.
-    if (Object.keys(this._data?.virtual ?? {}).length > 0) {
-      this.close(
-        new Error("Cannot use data.virtual: the self runner does not support virtual modules"),
-      );
-      return;
-    }
-    // Plugin transforms need a worker to block while the host runs them.
-    if (this._plugins) {
-      this.close(new Error("Cannot use plugins: the self runner does not support them"));
-      return;
-    }
-    this.#active = true;
-    resolveEntry(entryPath)
-      .then(async (entry) => {
-        // Closed mid-import: don't open IPC that `_closeRuntime()` will never close.
-        if (this.closed) {
-          return;
-        }
-        this.#entry = entry;
-        await entry.ipc?.onOpen?.({
-          sendMessage: (message) => {
-            queueMicrotask(() => this._handleMessage(message));
-          },
-        });
-        // Signal ready with a dummy address (fetch is overridden, address unused)
-        this._handleMessage({ address: { host: "127.0.0.1", port: 0 } });
-      })
-      .catch((error) => {
+    this._initWithVirtualData(() => {
+      this.#active = true;
+      this.#start(entryPath).catch((error) => {
         console.error("Self runner entry error:", error);
         this.close(error);
       });
+    });
+  }
+
+  async #start(entryPath: string) {
+    // Process-global hooks, owned by this runner (its updates change only them).
+    const registerVirtual = () =>
+      registerOwnedVirtualModules(
+        this._data?.virtual as Record<string, ResolvedVirtualModule> | undefined,
+      );
+    // Virtual keys win over the plugin hooks, as in workers
+    // (`registerWorkerHooks()`): the latest `registerHooks` registration runs
+    // first, Bun asks the earliest `onLoad` whose filter matches.
+    const bun = "Bun" in globalThis;
+    const virtualFirst = bun ? await registerVirtual() : undefined;
+    // The plugins run synchronously in the hooks: no worker blocks for them.
+    const unregisterPlugins = this._plugins
+      ? await registerPluginHooks(
+          {
+            prefilters: this._plugins.prefilters,
+            resolvePrefilters: this._plugins.resolvePrefilters,
+          },
+          entryPath,
+          createDirectTransformClient(this._plugins),
+        )
+      : undefined;
+    const virtual = virtualFirst ?? (await registerVirtual());
+    if (this.closed) {
+      virtual.unregister();
+      unregisterPlugins?.();
+      return;
+    }
+    this.#virtual = virtual;
+    this.#unregisterPlugins = unregisterPlugins;
+    const isVirtual = isVirtualEntry(entryPath, virtual.modules());
+    // The module cache is process-wide: a later runner for the same entry gets
+    // its own instance (and its own virtual modules).
+    const entry = _importedEntries.has(entryPath)
+      ? await importFreshEntry(entryPath, isVirtual)
+      : await resolveEntry(entryPath, isVirtual);
+    _importedEntries.add(entryPath);
+    // Closed mid-import: don't open IPC that `_closeRuntime()` will never close.
+    if (this.closed) {
+      return;
+    }
+    this.#entry = entry;
+    await entry.ipc?.onOpen?.({
+      sendMessage: (message) => {
+        queueMicrotask(() => this._handleMessage(message));
+      },
+    });
+    // Signal ready with a dummy address (fetch is overridden, address unused)
+    this._handleMessage({ address: { host: "127.0.0.1", port: 0 } });
   }
 
   // #endregion

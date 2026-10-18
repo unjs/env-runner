@@ -279,7 +279,7 @@ export async function reloadEntryModule(
   await currentEntry.ipc?.onClose?.();
 
   // Re-import a fresh instance, bypassing the module cache
-  const newEntry = await _importFresh(entryPath, virtual);
+  const newEntry = await importFreshEntry(entryPath, virtual);
 
   // Re-initialize IPC
   await newEntry.ipc?.onOpen?.({ sendMessage });
@@ -314,7 +314,11 @@ function _toReloadPath(entryPath: string): string {
 
 let _reloadCounter = 0;
 
-async function _importFresh(entryPath: string, virtual?: boolean): Promise<AppEntry> {
+/**
+ * Import a fresh instance of the entry (cache-busting query; Bun: evicted or
+ * refreshed). Its own dependencies stay cached.
+ */
+export async function importFreshEntry(entryPath: string, virtual?: boolean): Promise<AppEntry> {
   const qIndex = entryPath.indexOf("?");
   const filePath = qIndex === -1 ? entryPath : entryPath.slice(0, qIndex);
 

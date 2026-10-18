@@ -16,7 +16,7 @@ import {
 import type { SerializedFilterNode, SerializedPattern, SerializedPrefilter } from "./filter.ts";
 import { createTransformClient } from "./channel.ts";
 import { commonJSToESM, loadCommonJSLexer, virtualFileVersion } from "../common/virtual-modules.ts";
-import type { TransformChannel, TransformedCode } from "./channel.ts";
+import type { TransformChannel, TransformClient, TransformedCode } from "./channel.ts";
 
 /** Runner data key of {@link PluginWorkerData} (only set with the `plugins` option). */
 export const PLUGINS_DATA_KEY = "__envRunnerPlugins";
@@ -80,10 +80,14 @@ export function servedByPluginHooks(path: string): boolean {
  *   so files no plugin changes keep Bun's native loaders.
  *
  * Warns once and skips on runtimes without either backend.
+ *
+ * `transport` replaces the channel in `config` (the self runner runs the
+ * plugins in this thread, see `createDirectTransformClient()`).
  */
 export async function registerPluginHooks(
   config?: PluginWorkerData,
   entry?: string,
+  transport?: TransformClient,
 ): Promise<() => void> {
   if (!config) {
     return _noop;
@@ -107,7 +111,7 @@ export async function registerPluginHooks(
   const resolves = resolveTest(false);
   const resolvesFailed = resolveTest(true);
   const entryId = entry && (entry.startsWith("file:") ? _urlPath(entry) : stripQuery(entry));
-  const client = createTransformClient(config);
+  const client = transport ?? createTransformClient(config);
   await initEsmLexer;
   const { registerHooks, stripTypeScriptTypes } = await import("node:module");
   const isDeno = "Deno" in globalThis;
@@ -314,28 +318,35 @@ export async function registerPluginHooks(
           ? undefined
           : { path: encodeURIComponent(resolved.id), namespace: BUN_NAMESPACE };
       };
+    const loaders: BunLoaders = {
+      served,
+      // Bun keeps a path's query, in `path` and the module's identity.
+      script(path) {
+        const id = _bunId(path);
+        const result = matches(id) ? client.load(id) : undefined;
+        return result ? serve(stripQuery(path), result) : _bunNativeLoad(path);
+      },
+      marker(path) {
+        const id = _bunId(path);
+        const result = loaded.get(id) ?? client.load(id);
+        loaded.delete(id);
+        if (!result) {
+          throw new Error(`[env-runner] no plugin loaded or transformed "${id}" anymore`);
+        }
+        return serve(stripQuery(path), result);
+      },
+      namespaced(path) {
+        const id = decodeURIComponent(path);
+        return serve(id, client.load(id, true)!);
+      },
+    };
     bunPlugin({
       name: "env-runner-plugins",
       setup(build: any) {
-        // Bun keeps a path's query, in `path` and the module's identity.
-        build.onLoad({ filter }, ({ path }: { path: string }) => {
-          const id = _bunId(path);
-          const file = stripQuery(path);
-          const result = _active === served && matches(id) ? client.load(id) : undefined;
-          if (result) {
-            return serve(file, result);
-          }
-          // `onLoad` can't decline: untouched code is served with the loader
-          // Bun would use.
-          const contents = readFileSync(file, "utf8");
-          return {
-            contents:
-              transformedFormat(file, contents) === "commonjs"
-                ? commonJSToESM(file, contents)
-                : contents,
-            loader: _bunLoader(file),
-          };
-        });
+        // The active registration's loaders (see `_bunLoaders`).
+        build.onLoad({ filter }, ({ path }: { path: string }) =>
+          _bunLoaders?.served(path) ? _bunLoaders.script(path) : _bunNativeLoad(path),
+        );
         if (resolvePrefilters.length > 0) {
           build.onResolve({ filter: createBunResolveFilter(resolvePrefilters) }, onResolve());
           // `scheme:rest` specifiers only reach their namespace's callbacks.
@@ -347,25 +358,22 @@ export async function registerPluginHooks(
           const file = _active === served && importer ? _bunFilePath(path, importer) : undefined;
           return file === undefined ? undefined : loadOther(_bunId(file + queryOf(path)));
         });
-        build.onLoad({ filter: BUN_LOADED_FILE }, ({ path }: { path: string }) => {
-          const id = _bunId(path);
-          const result = loaded.get(id) ?? client.load(id);
-          loaded.delete(id);
-          if (!result) {
-            throw new Error(`[env-runner] no plugin loaded or transformed "${id}" anymore`);
-          }
-          return serve(stripQuery(path), result);
-        });
-        build.onLoad({ filter: /.*/, namespace: BUN_NAMESPACE }, ({ path }: { path: string }) => {
-          const id = decodeURIComponent(path);
-          return serve(id, client.load(id, true)!);
-        });
+        build.onLoad({ filter: BUN_LOADED_FILE }, ({ path }: { path: string }) =>
+          (_bunLoaders ?? loaders).marker(path),
+        );
+        build.onLoad({ filter: /.*/, namespace: BUN_NAMESPACE }, ({ path }: { path: string }) =>
+          (_bunLoaders ?? loaders).namespaced(path),
+        );
       },
     });
     _active = served;
+    _bunLoaders = loaders;
     return () => {
       if (_active === served) {
         _active = undefined;
+      }
+      if (_bunLoaders === loaders) {
+        _bunLoaders = undefined;
       }
     };
   }
@@ -373,6 +381,35 @@ export async function registerPluginHooks(
     "[env-runner] `plugins` requires `module.registerHooks` (Node.js >= 22.15 / Deno >= 2.8) or `Bun.plugin`; skipping.",
   );
   return _noop;
+}
+
+interface BunLoaders {
+  /** Whether its `onLoad` filter matches. */
+  served(path: string): boolean;
+  /** Scripts its `onLoad` filter matches. */
+  script(path: string): unknown;
+  /** Other files its `onResolve` loaded (marker query). */
+  marker(path: string): unknown;
+  /** Plugin ids (its namespace). */
+  namespaced(path: string): unknown;
+}
+
+// The `onLoad` callbacks of the latest live `Bun.plugin` registration. Bun
+// can't remove plugins and asks the earliest `onLoad` whose filter matches,
+// so every registration's callbacks run these (the self runner registers
+// once per runner in the host; a worker registers once).
+let _bunLoaders: BunLoaders | undefined;
+
+// `onLoad` can't decline: untouched code is served with the loader Bun would
+// use (CommonJS wrapped, since `onLoad` output is evaluated as ESM).
+function _bunNativeLoad(path: string): { contents: string; loader: string } {
+  const file = stripQuery(path);
+  const contents = readFileSync(file, "utf8");
+  return {
+    contents:
+      transformedFormat(file, contents) === "commonjs" ? commonJSToESM(file, contents) : contents,
+    loader: _bunLoader(file),
+  };
 }
 
 // Set while `_bunResolves()` runs: `Bun.resolveSync()` calls the plugins'

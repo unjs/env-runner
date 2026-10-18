@@ -39,7 +39,101 @@ export async function registerVirtualModules(
       }
     });
   }
-  let virtual = decodeVirtualModules(wire);
+  return (await _register(decodeVirtualModules(wire)))?.unregister ?? _noop;
+}
+
+/**
+ * Virtual modules owned by one caller, for hosts where several can share a
+ * process (self runners): {@link OwnedVirtualModules.update} changes only this
+ * registration. The hooks themselves stay process-global, like
+ * {@link registerVirtualModules}' (the latest registration wins a key).
+ */
+export interface OwnedVirtualModules {
+  /** {@link updateVirtualModules} for this registration only. */
+  update(changes: Record<string, VirtualModuleWire | null>): Promise<void>;
+  /** The live `key => module` view (sources as prepared), following updates. */
+  modules(): Record<string, ResolvedVirtualModule>;
+  /** Idempotent; later updates throw. */
+  unregister(): void;
+}
+
+/**
+ * {@link registerVirtualModules} with its own update path. An empty map
+ * registers nothing until an update adds a key.
+ *
+ * The module cache outlives the registration, so its modules start versioned
+ * (`?v=<n>`, like an update): path keys always, so a virtual instance never
+ * takes the real file's URL, and other keys an earlier owned registration
+ * served, so they don't resolve to its cached instances.
+ */
+export async function registerOwnedVirtualModules(
+  wire?: Record<string, VirtualModuleWire>,
+): Promise<OwnedVirtualModules> {
+  let owned =
+    wire && Object.keys(wire).length > 0 ? await _register(decodeVirtualModules(wire)) : undefined;
+  if (owned) {
+    const { registration } = owned;
+    const keys = Object.keys(registration.virtual).filter(
+      (key) => virtualKeyURL(key) !== undefined || _ownedKeys.has(key),
+    );
+    if ("updateKeys" in registration) {
+      for (const key of keys) {
+        registration.versions.set(key, ++_lastVersion);
+        // CommonJS is cached by filename, whatever the version.
+        delete registration.cache[virtualModuleCacheId(key)];
+      }
+    } else if (keys.length > 0) {
+      _bustBunModules(registration, keys);
+    }
+    _trackOwnedKeys(registration);
+  }
+  let closed = false;
+  return {
+    async update(wire) {
+      if (closed) {
+        throw new Error("Cannot update virtual modules: they were unregistered");
+      }
+      const changes = decodeVirtualModules(wire);
+      if (!owned) {
+        const added = _addedModules(changes);
+        if (Object.keys(added).length === 0) {
+          return;
+        }
+        // Then updated below, which versions them: their paths may be cached.
+        owned = await _register(added);
+        if (!owned) {
+          throw new Error("Cannot update virtual modules: this runtime can't serve them");
+        }
+        if (closed) {
+          owned.unregister();
+          return;
+        }
+      }
+      await _updateRegistrations([owned.registration], changes);
+      _trackOwnedKeys(owned.registration);
+    },
+    modules: () => owned?.registration.virtual ?? {},
+    unregister: _once(() => {
+      closed = true;
+      owned?.unregister();
+    }),
+  };
+}
+
+// Keys served by owned registrations so far (see `registerOwnedVirtualModules()`).
+const _ownedKeys = new Set<string>();
+
+function _trackOwnedKeys(registration: VirtualRegistration): void {
+  for (const key of Object.keys(registration.virtual)) {
+    _ownedKeys.add(key);
+  }
+}
+
+// Register a non-empty map with the first backend available; `undefined`
+// (after a warning) without one.
+async function _register(
+  virtual: Record<string, ResolvedVirtualModule>,
+): Promise<{ registration: VirtualRegistration; unregister: () => void } | undefined> {
   const { registerHooks, stripTypeScriptTypes, createRequire } = await import("node:module");
   if (typeof registerHooks === "function") {
     const isDeno = "Deno" in globalThis;
@@ -62,20 +156,20 @@ export async function registerVirtualModules(
     const registration: HooksRegistration = {
       virtual,
       versions,
-      version: 0,
       importers,
       prepare,
       updateKeys,
       cache: createRequire(import.meta.url).cache,
     };
     _hooksRegistrations.unshift(registration);
-    return _once(() => {
+    const unregister = _once(() => {
       const index = _hooksRegistrations.indexOf(registration);
       if (index !== -1) {
         _hooksRegistrations.splice(index, 1);
       }
       hooks.deregister();
     });
+    return { registration, unregister };
   }
   if (typeof (globalThis as any).Bun?.plugin === "function") {
     virtual = await _prepareVirtualModules(virtual, _prepareForBun);
@@ -86,7 +180,7 @@ export async function registerVirtualModules(
       setup: (build: any) => _setupBunPlugin(build, registration),
     });
     _bunRegistrations.unshift(registration);
-    return _once(() => {
+    const unregister = _once(() => {
       const index = _bunRegistrations.indexOf(registration);
       if (index !== -1) {
         _bunRegistrations.splice(index, 1);
@@ -97,11 +191,12 @@ export async function registerVirtualModules(
         _bunReleasedPaths.add(path);
       }
     });
+    return { registration, unregister };
   }
   console.warn(
     "[env-runner] virtual modules require `module.registerHooks` (Node.js >= 22.15 / Deno >= 2.8) or `Bun.plugin`; skipping registration.",
   );
-  return _noop;
+  return undefined;
 }
 
 /**
@@ -159,24 +254,39 @@ export async function updateVirtualModules(
 ): Promise<void> {
   const changes = decodeVirtualModules(wire);
   if (_hooksRegistrations.length === 0 && _bunRegistrations.length === 0) {
-    const added = Object.fromEntries(
-      Object.entries(changes).filter(
-        (entry): entry is [string, ResolvedVirtualModule] => entry[1] !== null,
-      ),
-    );
+    const added = _addedModules(changes);
     if (Object.keys(added).length === 0) {
       return;
     }
     // Registered with the added keys, then updated below like any registration,
     // which versions them: their paths may be cached from disk.
-    const unregister = await registerVirtualModules(added);
-    if (_hooksRegistrations.length === 0 && _bunRegistrations.length === 0) {
+    const registered = await _register(added);
+    if (!registered) {
       throw new Error("Cannot update virtual modules: this runtime can't serve them");
     }
-    _lazyUnregisters.push(unregister);
+    _lazyUnregisters.push(registered.unregister);
   }
-  const registrations: VirtualRegistration[] =
-    _hooksRegistrations.length > 0 ? _hooksRegistrations : _bunRegistrations;
+  await _updateRegistrations(
+    _hooksRegistrations.length > 0 ? _hooksRegistrations : _bunRegistrations,
+    changes,
+  );
+}
+
+function _addedModules(
+  changes: Record<string, ResolvedVirtualModule | null>,
+): Record<string, ResolvedVirtualModule> {
+  return Object.fromEntries(
+    Object.entries(changes).filter(
+      (entry): entry is [string, ResolvedVirtualModule] => entry[1] !== null,
+    ),
+  );
+}
+
+// A key changes in the registration serving it, a new key goes to the first.
+async function _updateRegistrations(
+  registrations: VirtualRegistration[],
+  changes: Record<string, ResolvedVirtualModule | null>,
+): Promise<void> {
   const groups = new Map<VirtualRegistration, Record<string, ResolvedVirtualModule | null>>();
   for (const [key, module] of Object.entries(changes)) {
     const owner =
@@ -249,6 +359,11 @@ type VirtualModulePreparer = (key: string, module: ResolvedVirtualModule) => Res
 // Serializes `handleUpdateVirtualModules()` (registering can await).
 let _pendingUpdate: Promise<void> = Promise.resolve();
 
+// Last version handed out, process-wide: a key and the disk file it overrides
+// (or uncovers), or the same key in another registration, never share a
+// `?v=<n>` URL.
+let _lastVersion = 0;
+
 // Unregisters of registrations created by `updateVirtualModules()`, run by the
 // unregister of an empty `registerVirtualModules()`.
 const _lazyUnregisters: (() => void)[] = [];
@@ -256,9 +371,6 @@ const _lazyUnregisters: (() => void)[] = [];
 interface HooksRegistration {
   virtual: Record<string, ResolvedVirtualModule>;
   versions: Map<string, number>;
-  // Last version handed out: unique per registration, so a key and the disk
-  // file it overrides (or uncovers) never share a `?v=<n>` URL.
-  version: number;
   // Resolved `module => importers` edges (keys and disk files), recorded by
   // the hooks; `versions` also covers the disk files.
   importers: Map<string, Set<string>>;
@@ -295,12 +407,18 @@ function _updateHooksRegistration(
     return url && url !== key ? [key, url] : [key];
   });
   for (const node of expandVirtualInvalidation(virtual, targets, importers)) {
-    versions.set(node, ++registration.version);
+    const previous = versions.get(node);
+    versions.set(node, ++_lastVersion);
     // Node caches a key's CommonJS instance whatever the version (a path key
     // by path, any key when `require()`d): evict it, so it re-evaluates (or
-    // the file it uncovers loads).
+    // the file it uncovers loads). A `virtual:` id keeps the version query,
+    // and `require()` reuses the resolved id, so evict the versioned one too.
     if (Object.hasOwn(virtual, node)) {
-      delete registration.cache[virtualModuleCacheId(node)];
+      const id = virtualModuleCacheId(node);
+      delete registration.cache[id];
+      if (previous && id.startsWith("virtual:")) {
+        delete registration.cache[`${id}?v=${previous}`];
+      }
     }
   }
   for (const key of removed) {
@@ -333,8 +451,6 @@ interface BunRegistration {
   removed: Map<string, string>;
   // Bumped to serve a fresh `?v=<n>` identity (`onResolve`-served keys only).
   versions: Map<string, number>;
-  // Last version handed out (unique per registration, see `HooksRegistration`).
-  version: number;
   // Resolved `key => importer keys` edges, recorded by `onResolve`.
   importers: Map<string, Set<string>>;
   // `key => module ids` served since the last bump, evicted on the next one.
@@ -383,7 +499,6 @@ function _createBunRegistration(
     dynamic: new Set(),
     removed: new Map(),
     versions: new Map(),
-    version: 0,
     importers: new Map(),
     served: new Map(),
     cache,
@@ -679,7 +794,7 @@ function _bustBunModules(registration: BunRegistration, keys: string[]): void {
       registration.build.module(key, () => _loadBunModule(key));
       continue;
     }
-    registration.versions.set(key, ++registration.version);
+    registration.versions.set(key, ++_lastVersion);
     for (const id of registration.served.get(key) ?? []) {
       delete registration.cache[id];
     }

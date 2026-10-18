@@ -74,8 +74,8 @@ export interface EnvRunnerData {
    * `{ "#virtual-import": "export const foo = 1" }`. A source is a string, a
    * `Uint8Array` or `{ source, format }` (format by extension by default), or
    * a factory returning one, which runs on the host before spawn. Change them
-   * at runtime with `updateVirtualModules()`. Not supported by the `self`
-   * runner (it closes with an error).
+   * at runtime with `updateVirtualModules()`. The `self` runner registers them
+   * in the host process (process-wide loader hooks).
    */
   virtual?: VirtualModules;
 

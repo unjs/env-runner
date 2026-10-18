@@ -19,7 +19,7 @@ Non-obvious notes on the shared/core modules. Directory map: [`AGENTS.md`](../AG
 ## Common helpers
 
 - **`worker-utils.ts`** — a specifier that is a `data.virtual` key skips all filesystem handling, so a virtual key **overrides** a real file at the same path. Workers detect a virtual entry with `isVirtualEntry()`: path-aware under `registerHooks` (Node/Deno), exact on Bun. Miniflare uses the exact `isVirtualSpecifier()` (see [`VIRTUAL-MODULES.md`](VIRTUAL-MODULES.md))
-- **Reload (`_importFresh()`)** re-imports the entry through the resolver with a `?__envRunnerReload=<n>` query, giving a fresh instance under its real identity. On Bun, a virtual entry is busted with `refreshVirtualModule()` instead (see [`VIRTUAL-MODULES.md`](VIRTUAL-MODULES.md))
+- **Reload (`importFreshEntry()`)** re-imports the entry through the resolver with a `?__envRunnerReload=<n>` query, giving a fresh instance under its real identity. On Bun, a virtual entry is busted with `refreshVirtualModule()` instead (see [`VIRTUAL-MODULES.md`](VIRTUAL-MODULES.md))
   - Real files use a `file:` URL on Node/Deno (it re-reads the file, and absolute `C:\` paths need URLs), but an **absolute path** on Bun. Bun ignores a query on `file:` URLs and returns the cached module, but honors it on paths. Verified on Node 24, Bun 1.4 and Deno 2.9, on every runner, `self` included on all three hosts
   - A `data:` URL (the old approach) broke relative imports (non-hierarchical base) and, on Deno, any load once custom hooks are registered
   - **Only the entry is re-evaluated**: its own disk dependencies stay cached (virtual ones are refreshed by `invalidateModule()`/`updateVirtualModules()`, see [`VIRTUAL-MODULES.md`](VIRTUAL-MODULES.md)). Each reload leaves one more entry instance in the module map

@@ -215,6 +215,21 @@ export interface TransformClient {
   load(path: string, virtual?: boolean, resolved?: boolean): TransformedCode | undefined;
 }
 
+/**
+ * A client running the plugins in this thread, synchronously (the self
+ * runner's hooks): a handler returning a Promise throws. Errors are thrown as
+ * they are.
+ */
+export function createDirectTransformClient(pipeline: PluginPipeline): TransformClient {
+  return {
+    resolve: (source, importer, options) => pipeline.sync.resolveId(source, importer, options),
+    load: (path, virtual, resolved) =>
+      pipeline.sync.load(path, virtual ? undefined : () => readFileSync(stripQuery(path), "utf8"), {
+        resolved,
+      }),
+  };
+}
+
 // A request taking longer than this logs a warning (once per request).
 const SLOW_REQUEST_MS = 10_000;
 

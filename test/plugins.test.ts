@@ -25,7 +25,6 @@ import { NodeWorkerEnvRunner } from "../src/runners/node-worker/runner.ts";
 import { NodeProcessEnvRunner } from "../src/runners/node-process/runner.ts";
 import { BunProcessEnvRunner } from "../src/runners/bun-process/runner.ts";
 import { DenoProcessEnvRunner } from "../src/runners/deno-process/runner.ts";
-import { SelfEnvRunner } from "../src/runners/self/runner.ts";
 import { EnvServer } from "../src/server.ts";
 import { RunnerManager } from "../src/manager.ts";
 import * as miniflare from "miniflare";
@@ -56,31 +55,48 @@ function hasRuntime(cmd: string): boolean {
   }
 }
 
+// The self runner registers its hooks in this process. Imported from `dist` (an
+// externalized `.mjs`) so its entry `import()` is native: through the vitest
+// module runner, the entry's imports would never reach the hooks.
+const { SelfEnvRunner } = (await import(
+  "env-runner/runners/self" as string
+)) as typeof import("../src/runners/self/runner.ts");
+
 const _dir = dirname(fileURLToPath(import.meta.url));
 const fixture = (name: string) => resolve(_dir, "fixtures/plugins", name);
 
 // A TypeScript/JSX plugin with `oxc-transform`, as an app would write it. The
-// handler is async: it runs on the host.
-function oxc(options: { id?: unknown } = {}): EnvRunnerPlugin {
+// handler is async (it runs on the host), unless `sync` (the self runner).
+function oxc(options: { id?: unknown; sync?: boolean } = {}): EnvRunnerPlugin {
+  const handler: PluginTransformHandler = function (code, path, { moduleType }) {
+    const result = transformSync(path, code, {
+      sourcemap: true,
+      lang: moduleType as "ts",
+      jsx: { runtime: "classic", pragma: "h" },
+    });
+    const errors = result.errors.filter((error) => error.severity === "Error");
+    if (errors.length > 0) {
+      this.error(errors.map((error) => error.message).join("\n"));
+    }
+    return { code: result.code, map: result.map, moduleType: "js" };
+  };
   return {
     name: "oxc",
     transform: {
       filter: { moduleType: ["ts", "tsx", "jsx"], ...(options.id ? { id: options.id } : {}) },
-      async handler(code, path, { moduleType }) {
-        await new Promise((r) => setTimeout(r, 1));
-        const result = transformSync(path, code, {
-          sourcemap: true,
-          lang: moduleType as "ts",
-          jsx: { runtime: "classic", pragma: "h" },
-        });
-        const errors = result.errors.filter((error) => error.severity === "Error");
-        if (errors.length > 0) {
-          this.error(errors.map((error) => error.message).join("\n"));
-        }
-        return { code: result.code, map: result.map, moduleType: "js" };
-      },
+      handler: options.sync ? handler : delayed(handler),
     },
   } as EnvRunnerPlugin;
+}
+
+// `handler`, made async (as most plugins on the host are).
+function delayed<T extends (...args: any[]) => any>(
+  handler: T,
+): (this: ThisParameterType<T>, ...args: Parameters<T>) => Promise<Awaited<ReturnType<T>>> {
+  return async function (this: ThisParameterType<T>, ...args: Parameters<T>) {
+    await new Promise((r) => setTimeout(r, 1));
+    return handler.apply(this, args);
+  };
 }
 
 // Replaces `__GREETING__`, recording the ids it saw (host-side state).
@@ -102,7 +118,16 @@ const expected = { tag: "div", props: { kind: "page" }, children: ["Ok", "hi"] }
 // `resolveId`/`load` plugins: `virtual:` modules (one importing another, one
 // loaded as TypeScript for the oxc plugin), an alias to a file, a `.yaml` file
 // and a JSON module. Records `[source, importer]` of resolved imports.
-function resolvers(seen: [string, string | undefined][]): EnvRunnerPlugin[] {
+function resolvers(seen: [string, string | undefined][], sync = false): EnvRunnerPlugin[] {
+  const load = (id: string) => {
+    if (id === "\0virtual:message") {
+      return 'import suffix from "virtual:suffix"; export default "hello" + suffix;';
+    }
+    if (id === "\0virtual:suffix") {
+      return { code: 'export default "!" as string;', moduleType: "ts" as const };
+    }
+  };
+  const alias = (source: string) => fixture(source.slice("@alias/".length));
   return [
     {
       name: "virtual",
@@ -113,25 +138,11 @@ function resolvers(seen: [string, string | undefined][]): EnvRunnerPlugin[] {
           return `\0${source}`;
         },
       },
-      load: {
-        filter: { id: /^\0virtual:/ },
-        async handler(id) {
-          await new Promise((r) => setTimeout(r, 1));
-          if (id === "\0virtual:message") {
-            return 'import suffix from "virtual:suffix"; export default "hello" + suffix;';
-          }
-          if (id === "\0virtual:suffix") {
-            return { code: 'export default "!" as string;', moduleType: "ts" };
-          }
-        },
-      },
+      load: { filter: { id: /^\0virtual:/ }, handler: sync ? load : delayed(load) },
     },
     {
       name: "alias",
-      resolveId: {
-        filter: { id: "@alias/**" },
-        handler: async (source) => fixture(source.slice("@alias/".length)),
-      },
+      resolveId: { filter: { id: "@alias/**" }, handler: sync ? alias : delayed(alias) },
     },
     {
       name: "yaml",
@@ -235,9 +246,11 @@ const runners = [
     name: "MiniflareEnvRunner",
     create: (opts: any) => new MiniflareEnvRunner({ miniflare, ...opts }),
   },
+  // Runs the plugins in this process's loader hooks: synchronous handlers only.
+  { name: "SelfEnvRunner", create: (opts: any) => new SelfEnvRunner(opts), sync: true },
 ];
 
-for (const { name, create, skip, cjsOptions } of runners) {
+for (const { name, create, skip, cjsOptions, sync } of runners) {
   const miniflareRunner = name === "MiniflareEnvRunner";
   describe.skipIf(skip ?? false)(`${name} plugins`, () => {
     let runner: EnvRunner;
@@ -250,7 +263,7 @@ for (const { name, create, skip, cjsOptions } of runners) {
       const seen: string[] = [];
       runner = create({
         name: "plugins",
-        plugins: [oxc(), greeting({ seen })],
+        plugins: [oxc({ sync }), greeting({ seen })],
         data: { entry: fixture("app.tsx") },
       });
       await runner.waitForReady();
@@ -264,7 +277,7 @@ for (const { name, create, skip, cjsOptions } of runners) {
       const seen: [string, string | undefined][] = [];
       runner = create({
         name: "plugins-resolve",
-        plugins: [oxc(), resolvers(seen)],
+        plugins: [oxc({ sync }), resolvers(seen, sync)],
         data: { entry: fixture("app-resolve.ts") },
       });
       await runner.waitForReady();
@@ -295,7 +308,7 @@ for (const { name, create, skip, cjsOptions } of runners) {
         };
         runner = create({
           name: "plugins-files",
-          plugins: [resolvers([]), all],
+          plugins: [resolvers([], sync), all],
           data: { entry: fixture("app-files.ts") },
         });
         await runner.waitForReady();
@@ -319,7 +332,7 @@ for (const { name, create, skip, cjsOptions } of runners) {
       };
       runner = create({
         name: "plugins-query",
-        plugins: [record, oxc(), queries(seen)],
+        plugins: [record, oxc({ sync }), queries(seen)],
         data: {
           entry: fixture("app-query.ts"),
           virtual: { "#stamp": "export default 1;" },
@@ -374,7 +387,7 @@ for (const { name, create, skip, cjsOptions } of runners) {
       };
       runner = create({
         name: "plugins-pre",
-        plugins: [oxc(), pre],
+        plugins: [oxc({ sync }), pre],
         data: { entry: fixture("app.tsx") },
       });
       await runner.waitForReady();
@@ -456,7 +469,7 @@ for (const { name, create, skip, cjsOptions } of runners) {
       const entry = join(dir, "app.tsx");
       runner = create({
         name: "plugins-reload",
-        plugins: [oxc(), greeting()],
+        plugins: [oxc({ sync }), greeting()],
         data: { entry },
       });
       try {
@@ -473,7 +486,7 @@ for (const { name, create, skip, cjsOptions } of runners) {
     it("transforms matching virtual modules (by extension or format)", async () => {
       runner = create({
         name: "plugins-virtual",
-        plugins: [oxc(), greeting()],
+        plugins: [oxc({ sync }), greeting()],
         data: {
           entry: "#entry.tsx",
           virtual: {
@@ -499,7 +512,9 @@ for (const { name, create, skip, cjsOptions } of runners) {
       });
     });
 
-    it("closes with the transform error of a disk module", async () => {
+    // Self: `dep.ts` is already cached in this process (see the synchronous
+    // self runner tests for its errors).
+    it.skipIf(sync)("closes with the transform error of a disk module", async () => {
       const failing: EnvRunnerPlugin = {
         name: "failing",
         transform: {
@@ -511,7 +526,7 @@ for (const { name, create, skip, cjsOptions } of runners) {
       };
       runner = create({
         name: "plugins-error",
-        plugins: [failing, oxc()],
+        plugins: [failing, oxc({ sync })],
         data: { entry: fixture("app.tsx") },
       });
       // Miniflare: a named import fails to link first (the error is logged on the host).
@@ -528,7 +543,7 @@ for (const { name, create, skip, cjsOptions } of runners) {
       let source = `export const value: string = "ok";`;
       runner = create({
         name: "plugins-invalidate",
-        plugins: [oxc()],
+        plugins: [oxc({ sync })],
         data: {
           entry: "#entry.ts",
           virtual: {
@@ -553,7 +568,7 @@ for (const { name, create, skip, cjsOptions } of runners) {
       runner = create({
         ...cjsOptions,
         name: "plugins-cjs",
-        plugins: [oxc(), greeting({ id: "**/cjs/**" })],
+        plugins: [oxc({ sync }), greeting({ id: "**/cjs/**" })],
         data: { entry: fixture("app-cjs.ts") },
       });
       await runner.waitForReady();
@@ -576,7 +591,7 @@ for (const { name, create, skip, cjsOptions } of runners) {
       runner = create({
         ...cjsOptions,
         name: "plugins-virtual-path",
-        plugins: [oxc(), greeting()],
+        plugins: [oxc({ sync }), greeting()],
         data: {
           entry: fixture("app-vendor.ts"),
           virtual: { [fixture("vendor/plain.ts")]: `export const value: string = "virtual";` },
@@ -656,7 +671,7 @@ for (const { name, create, skip, cjsOptions } of runners) {
         runner = create({
           ...cjsOptions,
           name: "plugins-id",
-          plugins: [oxc(), { ...greeting({ id }), name: "greeting" }],
+          plugins: [oxc({ sync }), { ...greeting({ id }), name: "greeting" }],
           data: {
             entry: fixture("app-vendor.ts"),
           },
@@ -674,7 +689,7 @@ for (const { name, create, skip, cjsOptions } of runners) {
       runner = create({
         name: "plugins-expressions",
         plugins: [
-          oxc(),
+          oxc({ sync }),
           {
             name: "greeting",
             transform: {
@@ -728,6 +743,114 @@ describe("MiniflareEnvRunner plugins (persistent)", () => {
       expect(await (await second.fetch("http://localhost/")).text()).toBe("two");
     } finally {
       await second.close();
+    }
+  });
+});
+
+describe("SelfEnvRunner plugins (synchronous)", () => {
+  let runner: EnvRunner | undefined;
+
+  afterEach(async () => {
+    await runner?.close();
+    runner = undefined;
+  });
+
+  it("closes when a handler for a disk module is async", async () => {
+    runner = new SelfEnvRunner({
+      name: "self-async",
+      plugins: [oxc()],
+      data: { entry: fixture("app.tsx") },
+    });
+    const error = await runner.waitForReady().catch((error) => error);
+    expect(error.cause.message).toMatch(
+      /^\[env-runner\] plugin "oxc" returned a Promise from `transform` for ".*app\.tsx": the self runner only supports synchronous plugin hooks\.$/,
+    );
+    expect(runner.closed).toBe(true);
+  });
+
+  it("runs sync hooks on disk modules, and async ones on virtual modules", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "env-runner-self-plugins-"));
+    const greet = join(dir, "greet.ts");
+    writeFileSync(greet, "// @ts-nocheck\nexport const greet: string = __GREETING__;\n");
+    // A `file:` URL: Windows absolute paths aren't valid ESM specifiers.
+    const greetURL = JSON.stringify(pathToFileURL(greet).href);
+    const entry = (kind: string) => `import { greet } from ${greetURL};
+      enum Kind { Value = ${JSON.stringify(kind)} }
+      export default { fetch: () => Response.json([greet, Kind.Value]) };`;
+    runner = new SelfEnvRunner({
+      name: "self-virtual",
+      // Async oxc only on virtual keys (transformed before they are registered).
+      plugins: [oxc({ id: /^#/ }), greeting()],
+      data: { entry: "#entry.ts", virtual: { "#entry.ts": entry("first") } },
+    });
+    try {
+      await runner.waitForReady();
+      expect(await (await runner.fetch("http://localhost/")).json()).toEqual(["hi", "first"]);
+      await runner.updateVirtualModules!({ "#entry.ts": entry("second") });
+      await runner.reloadModule!();
+      expect(await (await runner.fetch("http://localhost/")).json()).toEqual(["hi", "second"]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("closes with the error of a sync handler on a disk module", async () => {
+    // Fresh files: modules earlier runners loaded stay cached in this process.
+    const dir = mkdtempSync(join(tmpdir(), "env-runner-self-plugins-"));
+    writeFileSync(join(dir, "dep.mjs"), "export default 1;\n");
+    writeFileSync(
+      join(dir, "app.mjs"),
+      'import dep from "./dep.mjs";\nexport default { fetch: () => new Response(String(dep)) };\n',
+    );
+    runner = new SelfEnvRunner({
+      name: "self-error",
+      plugins: [
+        {
+          name: "failing",
+          transform: {
+            filter: { id: /dep\.mjs$/ },
+            handler() {
+              throw new Error("nope");
+            },
+          },
+        },
+      ],
+      data: { entry: join(dir, "app.mjs") },
+    });
+    try {
+      const error = await runner.waitForReady().catch((error) => error);
+      expect(error.cause.message).toMatch(
+        /^\[env-runner\] plugin "failing" failed on ".*dep\.mjs": nope$/,
+      );
+      expect(runner.closed).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("unregisters its hooks on close", async () => {
+    // Under a `dist` directory, so vitest imports the files natively (the
+    // hooks apply to every import in the process).
+    const dir = join(mkdtempSync(join(tmpdir(), "env-runner-self-plugins-")), "dist");
+    mkdirSync(dir);
+    for (const name of ["open", "closed"]) {
+      writeFileSync(join(dir, `${name}.mjs`), "export default __GREETING__;\n");
+    }
+    runner = new SelfEnvRunner({
+      name: "self-close",
+      plugins: [greeting()],
+      data: { entry: fixture("typed.ts") },
+    });
+    try {
+      await runner.waitForReady();
+      expect((await import(pathToFileURL(join(dir, "open.mjs")).href)).default).toBe("hi");
+      await runner.close();
+      // Not transformed anymore: `__GREETING__` is undefined.
+      await expect(import(pathToFileURL(join(dir, "closed.mjs")).href)).rejects.toThrow(
+        /__GREETING__/,
+      );
+    } finally {
+      rmSync(dirname(dir), { recursive: true, force: true });
     }
   });
 });
@@ -791,17 +914,94 @@ describe("plugins", () => {
     ).toThrow(/`plugins\[0\]`/);
   });
 
-  it("closes the self runner", async () => {
-    const runner = new SelfEnvRunner({
-      name: "self",
-      plugins: [oxc()],
-      data: { entry: fixture("app.tsx") },
-    });
-    await expect(runner.waitForReady()).rejects.toMatchObject({
-      cause: {
-        message: expect.stringMatching(/Cannot use plugins: the self runner does not support them/),
+  it("runs the hooks synchronously with `sync`, rejecting async handlers", async () => {
+    const calls: unknown[] = [];
+    const pipeline = createPluginPipeline([
+      {
+        name: "alias",
+        resolveId: { filter: { id: /^#alias$/ }, handler: () => "/app/target.ts" },
       },
+      {
+        name: "lookup",
+        resolveId: {
+          filter: { id: /^#lookup$/ },
+          handler(this: PluginContext) {
+            const result = this.resolve("#alias");
+            calls.push(result);
+            return result as any;
+          },
+        },
+      },
+      {
+        name: "virtual",
+        load: {
+          filter: { id: /^\0v$/ },
+          handler: () => ({ code: "export const v: number = 1;", moduleType: "ts" }),
+        },
+      },
+      {
+        name: "throws",
+        transform: {
+          filter: { id: /throws/ },
+          handler() {
+            throw new Error("nope");
+          },
+        },
+      },
+      greeting(),
+    ])!;
+    const resolved = { id: "/app/target.ts", external: false };
+    // `this.resolve()` returns the result itself, a Promise with the async driver.
+    expect(pipeline.sync.resolveId("#lookup")).toEqual(resolved);
+    expect(calls).toEqual([resolved]);
+    await expect(pipeline.resolveId("#lookup")).resolves.toEqual(resolved);
+    expect(calls[1]).toBeInstanceOf(Promise);
+    expect(pipeline.sync.load("\0v")).toEqual({
+      code: "export const v: number = 1;",
+      moduleType: "ts",
     });
+    expect(pipeline.sync.transform("/app/a.js", "__GREETING__")).toEqual({
+      code: '"hi"',
+      moduleType: "js",
+    });
+    expect(pipeline.sync.load("/app/b.js", () => "__GREETING__ + 1")).toEqual({
+      code: '"hi" + 1',
+      moduleType: "js",
+    });
+    expect(() => pipeline.sync.transform("/app/throws.js", "")).toThrow(
+      /^\[env-runner\] plugin "throws" failed on "\/app\/throws\.js": nope$/,
+    );
+
+    const unhandled = vi.fn();
+    process.on("unhandledRejection", unhandled);
+    try {
+      const rejecting = createPluginPipeline([
+        oxc(),
+        {
+          name: "rejects",
+          load: {
+            filter: { id: /^\0r$/ },
+            async handler() {
+              throw new Error("late");
+            },
+          },
+        },
+      ])!;
+      const code = "const a: number = 1;";
+      expect(() => rejecting.sync.transform("/app/a.ts", code)).toThrow(
+        `[env-runner] plugin "oxc" returned a Promise from \`transform\` for "/app/a.ts": the self runner only supports synchronous plugin hooks.`,
+      );
+      expect(() => rejecting.sync.load("\0r")).toThrow(/plugin "rejects" returned a Promise/);
+      // The async driver runs them.
+      await expect(rejecting.transform("/app/a.ts", code)).resolves.toMatchObject({
+        moduleType: "js",
+      });
+      await new Promise((r) => setTimeout(r, 10));
+      // The ignored Promise's rejection isn't left unhandled.
+      expect(unhandled).not.toHaveBeenCalled();
+    } finally {
+      process.off("unhandledRejection", unhandled);
+    }
   });
 
   it("only runs script modules outside node_modules", () => {

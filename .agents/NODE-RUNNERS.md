@@ -47,10 +47,12 @@ Runner option of node-worker, node-process, bun-process and deno-process (vercel
 - Imports the entry into the host process and calls `entry.fetch()` directly: no worker, no proxy, no server; readiness is a dummy `127.0.0.1:0` address
 - Entry → host messages go through `queueMicrotask()` to avoid synchronous re-entrancy; `ping` is answered internally
 - WebSockets: `entry.websocket` via a lazily created crossws Node adapter (closed with 1001 on reload/close), else `entry.upgrade`. A throwing upgrade destroys the socket itself (no upstream to settle it)
-- `updateVirtualModules()` and `invalidateModule()` throw: the inherited IPC round-trip would leak `update-virtual-modules` into `ipc.onMessage` and hang until the ack timeout
-- A non-empty `data.virtual` closes the runner at construction with a descriptive error (nothing registers hooks in the host process, so a virtual entry would otherwise fail with `ERR_PACKAGE_IMPORT_NOT_DEFINED`)
+- `data.virtual`: registered in the host process before the entry import (`registerOwnedVirtualModules()`, after factories resolve); updates apply in-process via `_applyVirtualUpdates()` (no IPC), to that runner's registration only; `close()` unregisters. Hooks are process-global, Bun's plugin stays installed, and the module cache only grows. See [`VIRTUAL-MODULES.md`](VIRTUAL-MODULES.md#self-runner-host-process)
+- `plugins`: synchronous handlers only. The host registers the plugin loader hooks (`registerPluginHooks()` with `createDirectTransformClient()` → `pipeline.sync`) before its virtual modules (Bun: after), unregistered on `close()`; an async handler on an import or disk module fails it (`returned a Promise from ...`), virtual module transforms stay async. Hooks see every import in the process, and already loaded modules stay cached untransformed. See [`PLUGINS.md`](PLUGINS.md#per-runtime)
+- An entry an earlier self runner in the process imported is imported fresh (`importFreshEntry()`), so it gets its own instance
+- `plugins` close the runner with `Cannot use plugins`
 - A close while the entry is still importing skips `ipc.onOpen` (the runtime is already torn down, so `onClose` would never run)
-- `reloadModule()` uses the shared `reloadEntryModule()` in the host process. So a reload imports through the host's loader (vitest's module runner under test), with the same cache-busting query as the workers
+- `reloadModule()` uses the shared `reloadEntryModule()` in the host process (after pending virtual updates). So a reload imports through the host's loader (vitest's module runner under test, unless imported from `dist`), with the same cache-busting query as the workers
 
 ## Testing
 

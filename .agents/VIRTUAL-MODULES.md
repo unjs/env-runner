@@ -1,11 +1,11 @@
 # Virtual Modules (Node + Bun + Deno + Miniflare runners)
 
-In-memory modules served from a `data.virtual` map (`specifier => source`), in per-module formats (see [Formats](#formats)). Supported by node-worker, node-process, bun-process, deno-process (and vercel/netlify, built on the node-worker worker) via in-worker registration, and by miniflare via a separate host-side path. `self` has no support (a non-empty `data.virtual` closes it with an error; `invalidateModule()` throws).
+In-memory modules served from a `data.virtual` map (`specifier => source`), in per-module formats (see [Formats](#formats)). Supported by node-worker, node-process, bun-process, deno-process (and vercel/netlify, built on the node-worker worker) via in-worker registration, by miniflare via a separate host-side path, and by `self` with the same hooks registered in the host process (see [Self runner](#self-runner-host-process)).
 
-- **`src/common/virtual-modules.ts`** — in-worker registration (`registerVirtualModules()`), updates (`updateVirtualModules()`), per-backend preparation (Deno transforms, CommonJS wrapper), Bun refresh, unregister
+- **`src/common/virtual-modules.ts`** — in-worker registration (`registerVirtualModules()`), updates (`updateVirtualModules()`), per-owner registrations for the host process (`registerOwnedVirtualModules()`), per-backend preparation (Deno transforms, CommonJS wrapper), Bun refresh, unregister
 - **`src/virtual-loader.ts`** — source types and formats (`normalizeVirtualModule()`, `virtualModuleFormat()`), JSON transport (`encodeVirtualModules()`/`decodeVirtualModules()`), ESM code for raw formats (`virtualModuleCode()`), sync ESM resolve/load hooks (path-aware, see [Path keys](#path-keys-node--deno)), factory resolution, transitive-importer expansion, shared TS-strip guard
 
-> See also [`base-runner.ts`](./ARCHITECTURE.md) for the host-side `_resolveVirtualData()` / `_initWithVirtualData()` / `_enqueueVirtualUpdate()` plumbing, and [`worker-utils.ts`](./ARCHITECTURE.md) for `isVirtualSpecifier()` / `_importFresh()` reload handling.
+> See also [`base-runner.ts`](./ARCHITECTURE.md) for the host-side `_resolveVirtualData()` / `_initWithVirtualData()` / `_enqueueVirtualUpdate()` plumbing, and [`worker-utils.ts`](./ARCHITECTURE.md) for `isVirtualSpecifier()` / `importFreshEntry()` reload handling.
 
 ## Core behavior
 
@@ -13,11 +13,11 @@ In-memory modules served from a `data.virtual` map (`specifier => source`), in p
 - **Sources are validated on the host** (`normalizeVirtualModule()`, from `_resolveVirtualData()` and each update): an invalid one closes the runner like a throwing factory (even without factories: `_resolveVirtualData()` then returns a rejected promise), or rejects the update before any change. See [Formats](#formats).
 - Workers `await registerVirtualModules()` **before** importing the entry. The entry itself may be a virtual key (a virtual key overrides a real file with the same path) and may import other virtual modules.
 - **Virtual entry detection** follows the backend:
-  - Workers call `isVirtualEntry()`. Under `registerHooks` (Node/Deno) it is **path-aware**: an absolute path or `file:` entry also matches a path key naming the same file (`findVirtualPathKey()`, the hook's URL match). So `/app/x.mjs` and `file:///app/x.mjs` both find key `file:///app/x.mjs`, and load and reload treat the entry as virtual even when a real file exists there. Reloads went through the resolver anyway, but the flag keeps `resolveEntry()`/`_importFresh()` on the virtual path.
+  - Workers call `isVirtualEntry()`. Under `registerHooks` (Node/Deno) it is **path-aware**: an absolute path or `file:` entry also matches a path key naming the same file (`findVirtualPathKey()`, the hook's URL match). So `/app/x.mjs` and `file:///app/x.mjs` both find key `file:///app/x.mjs`, and load and reload treat the entry as virtual even when a real file exists there. Reloads went through the resolver anyway, but the flag keeps `resolveEntry()`/`importFreshEntry()` on the virtual path.
   - Elsewhere it is an **exact** `isVirtualSpecifier()` match, so `data.entry` should be spelled like its key. Miniflare (host-side) matches the entry like an import (see [Miniflare](#miniflare-host-side-no-in-worker-registration)). On Bun, a differently spelled path entry still loads virtually for path keys with an extension (`onResolve` path match), but a differently spelled `file:` entry reloads stale, because Bun drops a `file:` specifier's query.
 - **Formats** default to the key's extension (`.cjs`, `.ts`, `.json`, `.wasm`, ...), else the source type, and can be set explicitly. See [Formats](#formats).
 - Registrations live for the thread/process, so virtual specifiers survive `reloadModule()`. Map lookups strip `?query` (so `#entry?__envRunnerReload=1` matches `#entry`) while keeping it in the URL for a fresh identity.
-- **Unregister**: `registerVirtualModules()` resolves to an idempotent unregister fn, called by workers on graceful `shutdown` before posting `exit`. Host `close()` kills the worker, which drops it implicitly. For an empty map it registers nothing, and its unregister covers the registration a later update creates.
+- **Unregister**: `registerVirtualModules()` resolves to an idempotent unregister fn, called by workers on graceful `shutdown` before posting `exit`. Host `close()` kills the worker, which drops it implicitly (`self`: `close()` calls it). For an empty map it registers nothing, and its unregister covers the registration a later update creates.
 - **Invalidation** (`invalidateModule(specifier)`): an update setting the key to its current host-side source (see [Runtime updates](#runtime-updates)), so a factory re-runs. Unknown keys reject on the host.
   - It must expand to every module that **transitively imports** the specifier. Otherwise a reloaded entry resolves an intermediate importer to its cached instance, still linked to the old module.
   - `expandVirtualInvalidation()` walks the reverse **importer edges**, plus a quoted-occurrence scan of the virtual sources for each key. The edges are recorded by the `registerHooks` hooks (Node/Deno) or Bun's `onResolve`; miniflare, which doesn't expose resolution, passes edges lexed from the virtual sources instead (see below). Over-matching is harmless (it only forces a re-evaluation).
@@ -37,15 +37,31 @@ In-memory modules served from a `data.virtual` map (`specifier => source`), in p
 
   `reloadModule()` awaits the queue first, so a reload always sees earlier calls.
 
-- **IPC**: `{ event: "update-virtual-modules", id, changes }` (removals as `null`, bytes as base64, see [Transport](#transport-bytes)), acked by `{ event: "virtual-modules-updated", id, error? }`. Workers handle it before `ipc.onMessage`. `handleUpdateVirtualModules()` serializes messages, since creating a registration awaits. Miniflare overrides `_applyVirtualUpdates()` (host-side), and `self` rejects both methods.
+- **IPC**: `{ event: "update-virtual-modules", id, changes }` (removals as `null`, bytes as base64, see [Transport](#transport-bytes)), acked by `{ event: "virtual-modules-updated", id, error? }`. Workers handle it before `ipc.onMessage`. `handleUpdateVirtualModules()` serializes messages, since creating a registration awaits. Miniflare and `self` override `_applyVirtualUpdates()` (host-side, no IPC).
 - **Worker** (`updateVirtualModules()` in `virtual-modules.ts`):
   - A key changes in the registration serving it, and a new key goes to the latest one. With no registration, one is registered with the added keys, then updated like any other, which versions them (their paths may be cached from disk).
   - All sources are prepared (`_prepareVirtualModules()`: Deno transforms, Bun's CommonJS wrapper, JSX checks) before any registration changes, so a failure changes nothing.
   - The changed keys expand into importers in one walk. Removed keys are still in the map then (quoted scan), and path keys also expand from their `file:` URL: disk importers of the file an added key overrides, and the file a removed key uncovers.
-- **Versions** come from one counter per registration, so a key and the disk file it overrides or uncovers never share a `?v=<n>` URL.
+- **Versions** come from one process-wide counter, so a key and the disk file it overrides or uncovers, or the same key in another registration, never share a `?v=<n>` URL.
 - **Entry detection follows updates**: workers call `isVirtualEntry(entry)` after registering and on every reload, which checks the live registrations (`registeredVirtualModules()`).
 - `RunnerManager.updateVirtualModules()` marks the manager dirty, like `invalidateModule()`. `EnvServer` also applies the changes to its own copy of `data.virtual`, which the runners it creates later start with. Without an active runner, it only records them.
 - **Not tracked**: a runner started without `data.virtual` registers on the first update, so disk modules loaded before that have no importer edges (Node/Deno). A disk module that failed to import a key that didn't exist yet is only re-evaluated when something versions it (Node doesn't cache resolution failures, Deno does).
+
+## Self runner (host process)
+
+`SelfEnvRunner` imports the entry into the host process, so it registers the hooks there: `registerOwnedVirtualModules()` (after `_initWithVirtualData()` resolved the factories), then `resolveEntry(entry, isVirtualEntry(entry, owned.modules()))`. Meant for a one-time server start in the host; the caveats below are accepted, not worked around.
+
+- **Ownership**: `_applyVirtualUpdates()` calls `owned.update()`, which changes only that runner's registration (a new key goes to it, not to the latest registration as with `updateVirtualModules()`), registering one on the first added key. `close()` unregisters it. Several self runners can share a process (`RunnerManager` reloads overlap old and new).
+- **Process-global hooks**: keys resolve for every importer in the host, host code included, and between live runners the latest registration wins a key (path keys and `#name` keys alike).
+- **Bun**: `Bun.plugin` can't be removed, so each runner leaves its (detached) plugin behind (see [Bun](#bun-bunplugin-onresolveonload--buildmodule)).
+- **Module cache** is process-wide and never shrinks: every version and reload stays loaded. Fresh identities instead of eviction:
+  - path keys are versioned from the start (`?v=<n>`, also in `import.meta.url`), so a virtual instance never takes the real file's URL (where the host, or a later runner without the key, would get it);
+  - keys an earlier owned registration served are versioned too, and their CommonJS instances evicted;
+  - a later self runner for an entry already imported in the process imports it fresh (`importFreshEntry()`).
+
+  Disk modules stay shared: one an earlier runner loaded keeps its links (and module state) until something versions it.
+
+- **Module runners**: under a host loader that isn't Node's (vitest's module runner), the entry `import()` never reaches the hooks. Tests import the self runner from `dist`, which `vitest.config.ts` externalizes (`server.deps.external`), so its `import()` is native.
 
 ## Formats
 
@@ -216,7 +232,7 @@ Scope and verified behavior:
 
 - **Path keys naming the same file** (`/app/x.mjs` and `file:///app/x.mjs`, or a path with `..` segments): only one can be served. That's the later key on Node, Deno and Bun, an exact spelling first on miniflare, and each spelling verbatim for Bun's extensionless (`build.module()`) keys.
   - `warnVirtualPathCollisions()` (`virtual-loader.ts`) warns once per pair and process, naming both keys. It compares keys by `_virtualKeyURL()`, like the resolver, and never throws.
-  - It runs on the host in `_resolveVirtualData()`, which every runner except `self` goes through before spawning. So all runners warn the same way, and neither each worker nor each hot-reloaded runner repeats it. An update that adds keys runs it again over the updated map (already warned pairs stay quiet).
+  - It runs on the host in `_resolveVirtualData()`, which every runner goes through before spawning (`self`: before importing the entry). So all runners warn the same way, and neither each worker nor each hot-reloaded runner repeats it. An update that adds keys runs it again over the updated map (already warned pairs stay quiet).
 - **Shadowing**: non-path keys match their specifier from every importer, dependencies included. A bare key (`react`) replaces an installed package, and a `#name` key a dependency's own `#name` subpath import (verified on Node, Bun and Deno; miniflare's fallback serves keys before any resolution).
   - Deliberately **no warning**. Overriding a package is the only way to alias or stub it, so a warning would fire on every start for intended overrides and need a new opt-out option.
   - A cheap check wouldn't be reliable either: "installed" depends on the backend (`node_modules`, PnP, Deno's npm cache, workerd built-ins), and dependencies' subpath imports would need a scan of every package.
@@ -264,7 +280,7 @@ Where a failing virtual module is named (verified on Node 24, Deno 2.9.6, Bun 1.
 
 ## Testing
 
-- `test/virtual.test.ts` covers all IPC runners + miniflare (imports, virtual entry, a 1 MiB source beyond env limits, TS/JSON, factories, invalidation incl. via an intermediate importer, reload, shutdown, miniflare-specific rewrite/persistent/exports cases, `SelfEnvRunner` rejection). Attribute-using JSON cases run on Node/Bun only.
+- `test/virtual.test.ts` covers all IPC runners + miniflare (imports, virtual entry, a 1 MiB source beyond env limits, TS/JSON, factories, invalidation incl. via an intermediate importer, reload, shutdown, miniflare-specific rewrite/persistent/exports cases) and `SelfEnvRunner` (imported from `dist`, see [Self runner](#self-runner-host-process); it skips the worker shutdown handshake, the init error messages and the cases that need disk modules no earlier runner in the process loaded). Attribute-using JSON cases run on Node/Bun only.
 - Path key cases use keys under `test/fixtures/virtual-paths/virtual/`, a directory that doesn't exist, next to real fixtures in `test/fixtures/virtual-paths/` (`app.mjs` imports `./config.mjs`; `helper.mjs`). They cover:
   - relative virtual→virtual imports;
   - `file:` keys;
@@ -297,7 +313,9 @@ Where a failing virtual module is named (verified on Node 24, Deno 2.9.6, Bun 1.
   - overriding a real file imported by the disk entry (from a runner started without `data.virtual`), the disk entry itself, and a file overridden from the start, then removing the key to uncover the file;
   - replacing a string source behind relative importers, removing a key (not found), a batch with one ack, TS/JSON additions, a factory set by an update and re-run by `invalidateModule()`;
   - call order behind a slower factory, an update before ready, no leak into `ipc.onMessage`, and the caller's `data.virtual` left untouched;
-  - miniflare `persistent` sharing and eviction, and `SelfEnvRunner` rejection.
+  - miniflare `persistent` sharing and eviction.
+
+  "SelfEnvRunner virtual modules in one process" covers two live self runners updating only their own registration, a key gone after its runner closes, and `invalidateModule()` of an unknown key not reaching `ipc.onMessage`.
 
   `test/manager.test.ts` and `test/server.test.ts` cover the automatic reload, and `EnvServer` restarting from the updated map. On a Bun host, the node-worker/node-process update paths were checked with a script against `dist/`.
 
