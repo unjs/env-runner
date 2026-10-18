@@ -786,6 +786,11 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
             // Zero-config classes need no declaration (no deploy hint).
             configuredExports: Object.keys(zeroConfig ? stubs : declared),
             nodeCompat: !(options.compatibilityFlags as string[]).includes("no_nodejs_compat"),
+            // A dependency of env-runner, which the app may not resolve (pnpm).
+            crosswsServer: (_crosswsServerPath ||= resolveModulePath("crossws/server", {
+              from: import.meta.url,
+              conditions: ["workerd", "import"],
+            })),
           },
         );
         if (skipLocator) {
@@ -1855,6 +1860,9 @@ function _getStripTypeScriptTypes() {
 }
 
 let _cjsLexerReady: Promise<void> | undefined;
+
+// Imported by the wrapper for the entry's `websocket` (see `generateWrapper()`).
+let _crosswsServerPath: string | undefined;
 
 function ensureCjsLexer() {
   if (!_cjsLexerReady) {

@@ -76,6 +76,7 @@ Overview lives in [`../AGENTS.md`](../AGENTS.md); virtual modules on miniflare i
 
 - Mirrors `srvx/cloudflare`'s `CloudflareServer` inline — **no `srvx` import inside workerd**, so it doesn't depend on module resolution or `transformRequest`.
 - Applies `entry.plugins`, `entry.error` (outermost middleware), `entry.middleware`; adds `request.runtime = { name: "cloudflare", cloudflare: { env, context } }`, `request.ip` (`cf-connecting-ip`), `request.waitUntil`. The terminal handler still calls `entry.fetch(request, env, ctx)` for Workers-style entries.
+- `entry.websocket` is handled like the other runners: `crossws/server`'s plugin (`workerd` condition → `crossws/server/cloudflare`) is appended to `entry.plugins`, with `websocket` as its options (hooks, or `resolve` as Nitro exports it; not `{ hooks: websocket }`). The host resolves its path from env-runner (`crosswsServer` wrapper option), since the app may not resolve `crossws` (pnpm); the wrapper imports it via unsafe eval with the entry, only when the entry has `websocket`. It is the one place `srvx` (`srvx/cloudflare`, from crossws's location) loads inside workerd.
 - The entry-visible `env` (args, `request.runtime`, crossws adapter) is a `WeakMap`-cached shallow copy without `__ENV_RUNNER_IPC`/`__ENV_RUNNER_UNSAFE_EVAL__`; the wrapper keeps the raw env.
 - `captureErrors` wraps `server.fetch`, so it only sees errors the entry's `error` handler didn't handle.
 

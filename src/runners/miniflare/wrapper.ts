@@ -26,6 +26,8 @@ export function generateWrapper(
     configuredExports?: string[];
     /** Import `node:process` as the `process` global (needs `nodejs_compat`). Default: `true`. */
     nodeCompat?: boolean;
+    /** `crossws/server` (`workerd` condition), resolved from env-runner (not the entry). Default: the bare specifier. */
+    crosswsServer?: string;
   },
 ): string {
   // Without `nodejs_compat` (`no_nodejs_compat`), `node:process` can't resolve
@@ -72,6 +74,7 @@ const __IPC_PATH = "${IPC_PATH}";
 const __IPC_BINDING = "${IPC_BINDING}";
 const __UNSAFE_EVAL_BINDING = "${UNSAFE_EVAL_BINDING}";
 const __entryPath = ${JSON.stringify(entryPath)};
+const __crosswsServerPath = ${JSON.stringify(opts?.crosswsServer || "crossws/server")};
 let __entryModule;
 let __userEntry;
 let __entryLoading;
@@ -82,6 +85,8 @@ let __serverWs;
 // overlap and streamed bodies outlive fetch(), and unlike \`__serverWs\` the
 // IPC binding works from any request context.
 let __ipcEnv;
+// \`crossws/server\`'s plugin, loaded with the first entry that has \`websocket\`.
+let __crosswsPlugin;
 
 const __userEnvs = new WeakMap();
 
@@ -114,7 +119,10 @@ function __createServer(entry) {
     ready: () => Promise.resolve(server),
     close: () => Promise.resolve(),
   };
-  for (const plugin of entry.plugins || []) {
+  // \`websocket\` as in the other runners: crossws's plugin, with the entry's
+  // \`websocket\` as its options (hooks, or \`resolve\`).
+  const plugins = [...(entry.plugins || []), ...(entry.websocket ? [__crosswsPlugin(entry.websocket)] : [])];
+  for (const plugin of plugins) {
     plugin(server);
   }
   const errorHandler = server.options.error;
@@ -163,7 +171,12 @@ async function __loadEntry(env, path) {
     "loadEntry",
     "path"
   );
-  return importFn(path);
+  const mod = await importFn(path);
+  if ((mod.default || mod).websocket && !__crosswsPlugin) {
+    const crossws = await importFn(__crosswsServerPath);
+    __crosswsPlugin = crossws.plugin;
+  }
+  return mod;
 }
 
 function __setEntry(mod) {
@@ -234,7 +247,6 @@ async function __handleWsMessage(env, data) {
       __entryModule = newModule;
       __userEntry = newEntry;
       __server = newServer;
-      __crosswsAdapter = undefined;
       __ipcInitialized = false;
       if (__userEntry.ipc?.onOpen) {
         __ipcInitialized = true;
@@ -270,19 +282,6 @@ function __runExportsCheck(withTypes) {
       (warnings || exportTypes) && __sendMessage({ event: "worker-exports", warnings, exportTypes }),
     () => {},
   );
-}
-
-let __crosswsAdapter;
-
-async function __initCrossws(env, hooks) {
-  if (__crosswsAdapter) return __crosswsAdapter;
-  const importFn = env.__ENV_RUNNER_UNSAFE_EVAL__.newAsyncFunction(
-    "return await import('crossws/adapters/cloudflare')",
-    "loadCrossws"
-  );
-  const { default: cloudflareAdapter } = await importFn();
-  __crosswsAdapter = cloudflareAdapter({ hooks });
-  return __crosswsAdapter;
 }
 
 export default {
@@ -336,12 +335,6 @@ export default {
     }
 
     __ipcEnv = env;
-
-    // Handle WebSocket upgrade via crossws cloudflare adapter
-    if (__userEntry.websocket && request.headers.get("upgrade") === "websocket") {
-      const adapter = await __initCrossws(env, __userEntry.websocket);
-      return adapter.handleUpgrade(request, __userEnv(env), ctx);
-    }
 
     ${fetchBody}
   }
