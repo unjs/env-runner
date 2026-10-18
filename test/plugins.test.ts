@@ -772,7 +772,9 @@ describe("SelfEnvRunner plugins (synchronous)", () => {
     const dir = mkdtempSync(join(tmpdir(), "env-runner-self-plugins-"));
     const greet = join(dir, "greet.ts");
     writeFileSync(greet, "// @ts-nocheck\nexport const greet: string = __GREETING__;\n");
-    const entry = (kind: string) => `import { greet } from ${JSON.stringify(greet)};
+    // A `file:` URL: Windows absolute paths aren't valid ESM specifiers.
+    const greetURL = JSON.stringify(pathToFileURL(greet).href);
+    const entry = (kind: string) => `import { greet } from ${greetURL};
       enum Kind { Value = ${JSON.stringify(kind)} }
       export default { fetch: () => Response.json([greet, Kind.Value]) };`;
     runner = new SelfEnvRunner({
