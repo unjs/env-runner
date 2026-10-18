@@ -9,6 +9,7 @@ export type {
   WorkerAddress,
   WorkerHooks,
   EnvRunner,
+  ListenOptions,
 } from "./types.ts";
 
 export {
@@ -49,6 +50,7 @@ export { type EnvServerOptions, EnvServer } from "./server.ts";
 export { type RunnerName, type LoadRunnerOptions, loadRunner } from "./loader.ts";
 export {
   toServerOptions,
+  LISTEN_DATA_KEY,
   RESERVED_SERVER_OPTIONS,
   RESERVED_RUNTIME_OPTIONS,
   type AppEntry,

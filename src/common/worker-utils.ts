@@ -1,6 +1,6 @@
 import type { ServerOptions, Server } from "srvx";
 import type { Hooks } from "crossws";
-import type { UpgradeContext } from "../types.ts";
+import type { ListenOptions, UpgradeContext, WorkerAddress } from "../types.ts";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createRequire } from "node:module";
 import { isAbsolute } from "node:path";
@@ -39,7 +39,13 @@ export interface AppEntry extends Omit<ServerOptions, "fetch"> {
   resolveExports?: () => Record<string, unknown> | Promise<Record<string, unknown>>;
 }
 
-/** Worker-owned srvx options: the worker listens on a random loopback port behind the proxy. */
+/** Runner data key of the `listen` runner option (only set with it). */
+export const LISTEN_DATA_KEY = "__envRunnerListen";
+
+/**
+ * Worker-owned srvx options: the worker listens on a random loopback port
+ * behind the proxy, or on the runner's `listen` address.
+ */
 export const RESERVED_SERVER_OPTIONS = [
   "port",
   "hostname",
@@ -60,8 +66,14 @@ export const RESERVED_RUNTIME_OPTIONS = {
   deno: ["port", "hostname", "path", "cert", "key"],
 } as const satisfies Record<"node" | "bun" | "deno", readonly string[]>;
 
-/** Callers add `fetch` (bound lazily so reloads swap it) and the crossws plugin. */
-export function toServerOptions(entry: AppEntry): Omit<ServerOptions, "fetch"> {
+/**
+ * Callers add `fetch` (bound lazily so reloads swap it) and the crossws plugin.
+ * `listen`: the runner's `listen` option (`data[LISTEN_DATA_KEY]`).
+ */
+export function toServerOptions(
+  entry: AppEntry,
+  listen?: ListenOptions,
+): Omit<ServerOptions, "fetch"> {
   const {
     fetch: _fetch,
     upgrade: _upgrade,
@@ -83,6 +95,21 @@ export function toServerOptions(entry: AppEntry): Omit<ServerOptions, "fetch"> {
       }
       options[runtime] = runtimeOptions;
     }
+  }
+  // The host owns signals (`shutdown()`), also with a public listener.
+  if (listen) {
+    // `reusePort` isn't worker-owned: the entry's applies unless `listen` sets it.
+    const { port, hostname, protocol, tls, reusePort = options.reusePort, silent = true } = listen;
+    return {
+      ...options,
+      port,
+      hostname,
+      protocol,
+      tls,
+      reusePort,
+      silent,
+      gracefulShutdown: false,
+    };
   }
   return {
     ...options,
@@ -191,9 +218,54 @@ function _errorLocation(error: any): string | undefined {
   return location && !/^(?:node|ext|native):/.test(location) ? location : undefined;
 }
 
-export function parseServerAddress(server: Server): { host: string; port: number } {
+/**
+ * The address the host reaches the server at: IPv6 hosts unbracketed, and
+ * wildcard ones (a `listen` option on all interfaces) as loopback.
+ */
+export function parseServerAddress(server: Server): WorkerAddress {
   const url = new URL(server.url!);
-  return { host: url.hostname, port: Number(url.port) };
+  const https = url.protocol === "https:";
+  const host = url.hostname.replace(/^\[(.*)\]$/, "$1");
+  return {
+    host: host === "0.0.0.0" ? "127.0.0.1" : host === "::" ? "::1" : host,
+    // Empty for the protocol's default port.
+    port: Number(url.port) || (https ? 443 : 80),
+    ...(https && { protocol: "https" }),
+  };
+}
+
+/**
+ * Graceful shutdown (the `shutdown` message): stop accepting connections and
+ * wait for in-flight requests, then run `ipc.onClose`. Never rejects (errors
+ * are logged), so the worker always replies `exit`.
+ *
+ * `server.close()` also waits for open WebSockets (Node.js, Bun), so with the
+ * host's `timeout` the wait ends halfway through it, leaving `ipc.onClose`
+ * the rest (the host terminates the worker after `exit`).
+ */
+export async function shutdownWorker(
+  server: Server,
+  entry: AppEntry,
+  timeout?: number,
+): Promise<void> {
+  const closed = server.close().catch((error) => {
+    console.error("[env-runner] failed to close the worker server:", error);
+  });
+  if (typeof timeout === "number") {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      closed,
+      new Promise((resolve) => (timer = setTimeout(resolve, timeout / 2))),
+    ]);
+    clearTimeout(timer);
+  } else {
+    await closed;
+  }
+  await Promise.resolve()
+    .then(() => entry.ipc?.onClose?.())
+    .catch((error) => {
+      console.error("[env-runner] `ipc.onClose` failed:", error);
+    });
 }
 
 /** Re-import the user entry (cache-busted) and re-init its IPC hooks. */

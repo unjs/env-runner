@@ -98,6 +98,11 @@ export class EnvServer extends RunnerManager {
     }
   }
 
+  override async shutdown(timeout?: number) {
+    this._stopWatching();
+    await super.shutdown(timeout);
+  }
+
   override async close() {
     this._stopWatching();
     await super.close();
@@ -118,7 +123,8 @@ export class EnvServer extends RunnerManager {
 
   private async _start() {
     await this.reload();
-    if (this._opts.watch) {
+    // Not after a `close()`/`shutdown()` while the runner was being created.
+    if (this._opts.watch && !this.closed) {
       this._startWatching();
     }
     return this;

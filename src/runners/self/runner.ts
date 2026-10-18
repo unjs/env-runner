@@ -82,6 +82,11 @@ export class SelfEnvRunner extends BaseEnvRunner {
     this.#entry?.ipc?.onMessage?.(message);
   }
 
+  /** Same as `close()`, which runs `ipc.onClose` (there is no server to drain). */
+  override async shutdown(): Promise<void> {
+    await this.close();
+  }
+
   // The inherited versions would leak `update-virtual-modules` into
   // `ipc.onMessage` and wait for an ack no worker sends.
   override async updateVirtualModules(_changes: VirtualModuleUpdates): Promise<void> {
@@ -146,6 +151,10 @@ export class SelfEnvRunner extends BaseEnvRunner {
     const entryPath = this._data?.entry as string | undefined;
     if (!entryPath) {
       this.close("self runner requires data.entry");
+      return;
+    }
+    // Requests come from the host's own server.
+    if (this._rejectListen()) {
       return;
     }
     // Nothing registers virtual modules in the host process; fail fast instead

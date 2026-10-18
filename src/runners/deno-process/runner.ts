@@ -1,4 +1,4 @@
-import type { WorkerHooks } from "../../types.ts";
+import type { ListenOptions, WorkerHooks } from "../../types.ts";
 
 import type { ChildProcess } from "node:child_process";
 import { spawn } from "node:child_process";
@@ -22,6 +22,8 @@ export class DenoProcessEnvRunner extends BaseEnvRunner {
     data?: EnvRunnerData;
     /** Host-side transform plugins (see `EnvRunnerPluginOption`). */
     plugins?: EnvRunnerPluginOption[];
+    /** Serve on this public address from the worker (see `ListenOptions`). */
+    listen?: ListenOptions;
     execArgv?: string[];
   }) {
     _defaultEntry ||= fileURLToPath(import.meta.resolve("env-runner/runners/deno-process/worker"));
