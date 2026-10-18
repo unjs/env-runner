@@ -10,6 +10,8 @@ import {
   reloadEntryModule,
 } from "../../common/worker-utils.ts";
 import { registerOwnedVirtualModules } from "../../common/virtual-modules.ts";
+import { createDirectTransformClient } from "../../plugin/channel.ts";
+import { registerPluginHooks } from "../../plugin/hooks.ts";
 import type { OwnedVirtualModules } from "../../common/virtual-modules.ts";
 import type { ResolvedVirtualModule } from "../../virtual-loader.ts";
 
@@ -32,12 +34,17 @@ export class SelfEnvRunner extends BaseEnvRunner {
   #entry?: AppEntry;
   #wsAdapter?: NodeWSAdapter;
   #virtual?: OwnedVirtualModules;
+  #unregisterPlugins?: () => void;
 
   constructor(opts: {
     name: string;
     hooks?: WorkerHooks;
     data?: EnvRunnerData;
-    /** Not supported: the runner closes with an error. */
+    /**
+     * Run in this process's loader hooks, so their handlers must be
+     * synchronous (virtual modules are still transformed before they are
+     * registered, where async handlers work).
+     */
     plugins?: EnvRunnerPluginOption[];
   }) {
     super({ ...opts, workerEntry: "" });
@@ -136,6 +143,7 @@ export class SelfEnvRunner extends BaseEnvRunner {
     await this.#entry?.ipc?.onClose?.();
     this.#entry = undefined;
     this.#virtual?.unregister();
+    this.#unregisterPlugins?.();
   }
 
   // #endregion
@@ -156,11 +164,6 @@ export class SelfEnvRunner extends BaseEnvRunner {
       this.close("self runner requires data.entry");
       return;
     }
-    // Plugin transforms need a worker to block while the host runs them.
-    if (this._plugins) {
-      this.close(new Error("Cannot use plugins: the self runner does not support them"));
-      return;
-    }
     this._initWithVirtualData(() => {
       this.#active = true;
       this.#start(entryPath).catch((error) => {
@@ -172,14 +175,34 @@ export class SelfEnvRunner extends BaseEnvRunner {
 
   async #start(entryPath: string) {
     // Process-global hooks, owned by this runner (its updates change only them).
-    const virtual = await registerOwnedVirtualModules(
-      this._data?.virtual as Record<string, ResolvedVirtualModule> | undefined,
-    );
+    const registerVirtual = () =>
+      registerOwnedVirtualModules(
+        this._data?.virtual as Record<string, ResolvedVirtualModule> | undefined,
+      );
+    // Virtual keys win over the plugin hooks, as in workers
+    // (`registerWorkerHooks()`): the latest `registerHooks` registration runs
+    // first, Bun asks the earliest `onLoad` whose filter matches.
+    const bun = "Bun" in globalThis;
+    const virtualFirst = bun ? await registerVirtual() : undefined;
+    // The plugins run synchronously in the hooks: no worker blocks for them.
+    const unregisterPlugins = this._plugins
+      ? await registerPluginHooks(
+          {
+            prefilters: this._plugins.prefilters,
+            resolvePrefilters: this._plugins.resolvePrefilters,
+          },
+          entryPath,
+          createDirectTransformClient(this._plugins),
+        )
+      : undefined;
+    const virtual = virtualFirst ?? (await registerVirtual());
     if (this.closed) {
       virtual.unregister();
+      unregisterPlugins?.();
       return;
     }
     this.#virtual = virtual;
+    this.#unregisterPlugins = unregisterPlugins;
     const isVirtual = isVirtualEntry(entryPath, virtual.modules());
     // The module cache is process-wide: a later runner for the same entry gets
     // its own instance (and its own virtual modules).

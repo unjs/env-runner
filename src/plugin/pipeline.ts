@@ -19,7 +19,6 @@ import {
 import type {
   PluginModuleType,
   PrefilterMatch,
-  PrefilterTest,
   SerializedFilterExpression,
   SerializedFilterNode,
   SerializedPattern,
@@ -143,12 +142,15 @@ export interface PluginContext {
    * the runner's export conditions: a file path, a builtin (`external`), or
    * `null` when it doesn't resolve. No extensions or directory indexes are
    * tried, as in Node.js.
+   *
+   * A Promise, except in the self runner's synchronous hooks, which get the
+   * result itself (`await` works for both).
    */
   resolve(
     source: string,
     importer?: string,
     options?: PluginContextResolveOptions,
-  ): Promise<PluginResolvedId | null>;
+  ): Promise<PluginResolvedId | null> | PluginResolvedId | null;
   /** Ignored: the runner doesn't watch files (nothing is ever returned). */
   addWatchFile(id: string): void;
   /** Always empty (see `addWatchFile`). */
@@ -406,9 +408,49 @@ export interface PluginPipeline {
     code: string,
     moduleType?: PluginModuleType,
   ): Promise<PluginTransformOutput | undefined>;
+  /**
+   * The same hooks, run synchronously (the self runner's loader hooks run in
+   * the host thread, which can't wait for a Promise): a handler returning one
+   * throws, naming the plugin, hook and id.
+   */
+  sync: SyncPluginPipeline;
+}
+
+/** {@link PluginPipeline} hooks, run synchronously (see {@link PluginPipeline.sync}). */
+export interface SyncPluginPipeline {
+  resolveId(
+    source: string,
+    importer?: string,
+    options?: PluginResolveIdCallOptions,
+  ): PluginResolvedId | undefined;
+  load(
+    id: string,
+    read?: () => string,
+    options?: { resolved?: boolean },
+  ): PluginTransformOutput | undefined;
+  transform(
+    id: string,
+    code: string,
+    moduleType?: PluginModuleType,
+  ): PluginTransformOutput | undefined;
 }
 
 type HookKind = "resolveId" | "load" | "transform";
+
+// A handler call in a hook chain, run by a driver ({@link _runAsync} awaits
+// it, {@link _runSync} rejects a Promise): the chains are generators yielding
+// these, so both drivers share them.
+interface HookCall {
+  name: string;
+  kind: HookKind;
+  /** For error messages: `plugin "x" <what> "<id>"`. */
+  what: string;
+  id: string;
+  code: string;
+  call: () => unknown;
+}
+
+type HookSteps<T> = Generator<HookCall, T, unknown>;
 
 interface NormalizedHook<Handler> {
   name: string;
@@ -418,7 +460,7 @@ interface NormalizedHook<Handler> {
   fallback?: boolean;
   /**
    * The full filter (code-aware for `transform`), see {@link PrefilterMatch}
-   * (`resolved`: see {@link PrefilterTest}).
+   * (`resolved`: see `PrefilterTest` in `filter.ts`).
    */
   match(
     id: string,
@@ -509,14 +551,15 @@ export function createPluginPipeline(
   };
 
   // `this.resolve()` of a handler (`caller`: a `resolveId` hook, skipped with
-  // `skipSelf`, also in nested calls for the same source and importer).
+  // `skipSelf`, also in nested calls for the same source and importer), run
+  // by the driver of the chain that created the context.
   const contextResolve =
-    (caller: NormalizedHook<unknown> | undefined, skip: readonly ResolveSkip[]) =>
-    async (
+    (caller: NormalizedHook<unknown> | undefined, skip: readonly ResolveSkip[], sync: boolean) =>
+    (
       source: string,
       importer?: string,
       options: PluginContextResolveOptions = {},
-    ): Promise<PluginResolvedId | null> => {
+    ): Promise<PluginResolvedId | null> | PluginResolvedId | null => {
       if (typeof source !== "string") {
         throw new TypeError(
           `[env-runner] \`this.resolve()\` needs a string (got ${_describe(source)}).`,
@@ -530,21 +573,32 @@ export function createPluginPipeline(
           .map((entry) => entry.hook),
       );
       const { skipSelf: _, ...rest } = options;
-      return (
-        (await _resolveId(source, importer, rest, skipped, skipping)) ??
-        _resolveLikeRuntime(source, importer, resolveConditions?.()) ??
-        (await _resolveId(source, importer, { ...rest, fallback: true }, skipped, skipping)) ??
-        null
-      );
+      const steps = (function* (): HookSteps<PluginResolvedId | null> {
+        return (
+          (yield* _resolveId(source, importer, rest, skipped, skipping, sync)) ??
+          _resolveLikeRuntime(source, importer, resolveConditions?.()) ??
+          (yield* _resolveId(
+            source,
+            importer,
+            { ...rest, fallback: true },
+            skipped,
+            skipping,
+            sync,
+          )) ??
+          null
+        );
+      })();
+      return sync ? _runSync(steps) : _runAsync(steps);
     };
 
-  const _resolveId = async (
+  const _resolveId = function* (
     source: string,
     importer: string | undefined,
     options: PluginResolveIdCallOptions | undefined,
     skipped: ReadonlySet<NormalizedHook<unknown>>,
     skip: readonly ResolveSkip[],
-  ): Promise<PluginResolvedId | undefined> => {
+    sync: boolean,
+  ): HookSteps<PluginResolvedId | undefined> {
     const matchId = normalizeFilterId(source);
     const extra: PluginResolveIdOptions = {
       isEntry: options?.isEntry ?? false,
@@ -559,10 +613,15 @@ export function createPluginPipeline(
       ) {
         continue;
       }
-      const context = _createContext(hook.name, source, "", contextResolve(hook, skip));
-      const result = await _callHook(hook.name, "failed to resolve", source, "", () =>
-        hook.handler.call(context, source, importer, extra),
-      );
+      const context = _createContext(hook.name, source, "", contextResolve(hook, skip, sync));
+      const result = (yield {
+        name: hook.name,
+        kind: "resolveId",
+        what: "failed to resolve",
+        id: source,
+        code: "",
+        call: () => hook.handler.call(context, source, importer, extra),
+      }) as PluginResolveIdResult;
       if (result == null) {
         continue;
       }
@@ -580,13 +639,12 @@ export function createPluginPipeline(
     return undefined;
   };
 
-  const resolveId = (
-    source: string,
-    importer?: string,
-    options?: PluginResolveIdCallOptions,
-  ): Promise<PluginResolvedId | undefined> => _resolveId(source, importer, options, new Set(), []);
-
-  const load = async (id: string, read?: () => string, options?: { resolved?: boolean }) => {
+  const _load = function* (
+    id: string,
+    read: (() => string) | undefined,
+    options: { resolved?: boolean } | undefined,
+    sync: boolean,
+  ): HookSteps<PluginTransformOutput | undefined> {
     const matchId = normalizeFilterId(id);
     let moduleType = moduleTypeOf(id);
     // Plugin ids (no `read`) have no fallback: every matching hook may load
@@ -597,9 +655,15 @@ export function createPluginPipeline(
       if (!satisfiesMatch(hook.match(matchId, moduleType, undefined, resolved), required)) {
         continue;
       }
-      const result = await _callHook(hook.name, "failed to load", id, "", () =>
-        hook.handler.call(_createContext(hook.name, id, "", contextResolve(undefined, [])), id),
-      );
+      const context = _createContext(hook.name, id, "", contextResolve(undefined, [], sync));
+      const result = (yield {
+        name: hook.name,
+        kind: "load",
+        what: "failed to load",
+        id,
+        code: "",
+        call: () => hook.handler.call(context, id),
+      }) as PluginLoadResult;
       if (result == null) {
         continue;
       }
@@ -615,12 +679,13 @@ export function createPluginPipeline(
       } else if (!KNOWN_MODULE_TYPES.includes(moduleType)) {
         moduleType = "js";
       }
-      return _transform(id, code, moduleType, {
-        resolved,
-        changed: true,
-        map,
-        mappedBy: map ? hook.name : undefined,
-      });
+      return yield* _transform(
+        id,
+        code,
+        moduleType,
+        { resolved, changed: true, map, mappedBy: map ? hook.name : undefined },
+        sync,
+      );
     }
     if (!read) {
       throw new Error(
@@ -630,11 +695,11 @@ export function createPluginPipeline(
     if (!filter(id, undefined, resolved)) {
       return undefined;
     }
-    return _transform(id, read(), moduleType, { resolved, changed: false });
+    return yield* _transform(id, read(), moduleType, { resolved, changed: false }, sync);
   };
 
   // The `transform` hooks, from the code of `id`.
-  const _transform = async (
+  const _transform = function* (
     id: string,
     code: string,
     moduleType: PluginModuleType,
@@ -642,7 +707,8 @@ export function createPluginPipeline(
     // relative to already-mapped code, so both are dropped. Code-only steps
     // keep the current map (they should preserve lines).
     state: { resolved?: boolean; changed: boolean; map?: SourceMapLike; mappedBy?: string },
-  ): Promise<PluginTransformOutput | undefined> => {
+    sync: boolean,
+  ): HookSteps<PluginTransformOutput | undefined> {
     let { changed, map, mappedBy } = state;
     const matchId = normalizeFilterId(id);
     for (const hook of transformHooks) {
@@ -650,14 +716,17 @@ export function createPluginPipeline(
       if (!satisfiesMatch(match, requiredMatch(moduleType))) {
         continue;
       }
-      const result = await _callHook(hook.name, "failed on", id, code, () =>
-        hook.handler.call(
-          _createContext(hook.name, id, code, contextResolve(undefined, [])),
-          code,
-          id,
-          { moduleType },
-        ),
-      );
+      const context = _createContext(hook.name, id, code, contextResolve(undefined, [], sync));
+      const input = code;
+      const meta = { moduleType };
+      const result = (yield {
+        name: hook.name,
+        kind: "transform",
+        what: "failed on",
+        id,
+        code: input,
+        call: () => hook.handler.call(context, input, id, meta),
+      }) as PluginTransformResult;
       const next = typeof result === "string" ? result : (result?.code ?? code);
       if (typeof next !== "string") {
         throw new TypeError(
@@ -714,9 +783,24 @@ export function createPluginPipeline(
     return { code, moduleType: moduleType as "js" | "ts" };
   };
 
-  // Virtual modules, and modules the caller already sent here.
-  const transform = (id: string, code: string, sourceType?: PluginModuleType) =>
-    _transform(id, code, sourceType ?? moduleTypeOf(id), { resolved: true, changed: false });
+  // Entry points, for either driver. `transform`: virtual modules, and
+  // modules the caller already sent here.
+  const steps = (sync: boolean) => ({
+    resolveId: (source: string, importer?: string, options?: PluginResolveIdCallOptions) =>
+      _resolveId(source, importer, options, new Set(), [], sync),
+    load: (id: string, read?: () => string, options?: { resolved?: boolean }) =>
+      _load(id, read, options, sync),
+    transform: (id: string, code: string, sourceType?: PluginModuleType) =>
+      _transform(
+        id,
+        code,
+        sourceType ?? moduleTypeOf(id),
+        { resolved: true, changed: false },
+        sync,
+      ),
+  });
+  const asyncSteps = steps(false);
+  const syncSteps = steps(true);
 
   return {
     names: normalized.map((plugin) => plugin.name),
@@ -725,10 +809,54 @@ export function createPluginPipeline(
     filter,
     resolveFilter: (source, fallback) =>
       (fallback ? fallbackPrefilter : resolvePrefilter)(normalizeFilterId(source), "js", true),
-    resolveId,
-    load,
-    transform,
+    resolveId: (...args) => _runAsync(asyncSteps.resolveId(...args)),
+    load: (...args) => _runAsync(asyncSteps.load(...args)),
+    transform: (...args) => _runAsync(asyncSteps.transform(...args)),
+    sync: {
+      resolveId: (...args) => _runSync(syncSteps.resolveId(...args)),
+      load: (...args) => _runSync(syncSteps.load(...args)),
+      transform: (...args) => _runSync(syncSteps.transform(...args)),
+    },
   };
+}
+
+// Run a hook chain, awaiting each handler.
+async function _runAsync<T>(steps: HookSteps<T>): Promise<T> {
+  let step = steps.next();
+  while (!step.done) {
+    const hook = step.value;
+    let result: unknown;
+    try {
+      result = await hook.call();
+    } catch (error) {
+      throw _hookError(hook, error);
+    }
+    step = steps.next(result);
+  }
+  return step.value;
+}
+
+// Run a hook chain synchronously: a handler returning a Promise throws.
+function _runSync<T>(steps: HookSteps<T>): T {
+  let step = steps.next();
+  while (!step.done) {
+    const hook = step.value;
+    let result: unknown;
+    try {
+      result = hook.call();
+    } catch (error) {
+      throw _hookError(hook, error);
+    }
+    if (typeof (result as PromiseLike<unknown> | undefined)?.then === "function") {
+      // Its outcome is ignored: don't let a rejection go unhandled.
+      Promise.resolve(result).catch(() => {});
+      throw new TypeError(
+        `[env-runner] plugin "${hook.name}" returned a Promise from \`${hook.kind}\` for "${hook.id}": the self runner only supports synchronous plugin hooks.`,
+      );
+    }
+    step = steps.next(result);
+  }
+  return step.value;
 }
 
 // `this.resolve()` without a plugin result: Node.js ESM resolution on the host.
@@ -749,28 +877,18 @@ function _resolveLikeRuntime(
   return path ? { id: normalize(path) + queryOf(source), external: false } : null;
 }
 
-// Run a handler; errors name the plugin and id (`this.error()` messages
-// already do), with the position (`id:line:column`) and code frame of
-// errors with a `loc`, `pos` or `frame`, in `code`.
-async function _callHook<T>(
-  name: string,
-  what: string,
-  id: string,
-  code: string,
-  call: () => T | Promise<T>,
-): Promise<T> {
-  try {
-    return await call();
-  } catch (error: any) {
-    const message = error?.message || String(error);
-    if (message.startsWith("[env-runner]")) {
-      throw error;
-    }
-    const at = `${id}${_formatPosition(code, _logPosition(error, id, code))}`;
-    throw new Error(`[env-runner] plugin "${name}" ${what} "${at}": ${message}${_frame(error)}`, {
-      cause: error,
-    });
+// The error a handler threw, naming the plugin and id (`this.error()` messages
+// already do), with the position (`id:line:column`) and code frame of errors
+// with a `loc`, `pos` or `frame`, in `code`.
+function _hookError({ name, what, id, code }: HookCall, error: any): unknown {
+  const message = error?.message || String(error);
+  if (message.startsWith("[env-runner]")) {
+    return error;
   }
+  const at = `${id}${_formatPosition(code, _logPosition(error, id, code))}`;
+  return new Error(`[env-runner] plugin "${name}" ${what} "${at}": ${message}${_frame(error)}`, {
+    cause: error,
+  });
 }
 
 // Position in `id` of a log or error: `loc` (1-based line, 0-based column;

@@ -19,17 +19,17 @@ src/
 │   ├── ws-proxy.ts          # createRunnerWSProxyPlugin() — runtime-native WS upgrade proxy
 │   └── virtual-modules.ts   # registerVirtualModules() — registerHooks()/Bun.plugin wiring for node/bun/deno workers; registerOwnedVirtualModules() for the self runner (host process)
 ├── plugin/                  # host-side `plugins` runner option (see .agents/PLUGINS.md)
-│   ├── pipeline.ts          # public plugin types + createPluginPipeline() (host: filters, ordering, source maps, `this.resolve()`, `fallback` resolveId phase) + transformVirtualModules()
+│   ├── pipeline.ts          # public plugin types + createPluginPipeline() (host: filters, ordering, source maps, `this.resolve()`, `fallback` resolveId phase; async + `sync` drivers) + transformVirtualModules()
 │   ├── filter.ts            # filter matching shared by host and worker (candidates, serialized filters + expressions, prefilters)
 │   ├── glob.ts              # host: resolveGlob() + globToRegExp() — `id` globs compiled to RegExps for host and workers
 │   ├── hooks.ts             # worker: registerPluginHooks() — registerHooks/Bun.plugin resolve + load hooks that send imports/modules to the runner
-│   └── channel.ts           # sync resolve/load requests: MessagePort (node-worker) / local socket + helper thread (process workers)
+│   └── channel.ts           # sync resolve/load requests: MessagePort (node-worker) / local socket + helper thread (process workers) / direct sync pipeline calls (self)
 ├── runners/
 │   ├── node-worker/         # NodeWorkerEnvRunner + worker (parentPort)
 │   ├── node-process/        # NodeProcessEnvRunner + worker (process.send)
 │   ├── bun-process/         # BunProcessEnvRunner + worker
 │   ├── deno-process/        # DenoProcessEnvRunner + worker
-│   ├── self/                # SelfEnvRunner (in-process, no worker; virtual modules via host-process hooks)
+│   ├── self/                # SelfEnvRunner (in-process, no worker; virtual modules + sync plugins via host-process hooks)
 │   ├── miniflare/           # MiniflareEnvRunner + wrapper.ts (in-memory workerd wrapper) + wrangler.ts (config → Miniflare options) + exports.ts (declared Worker exports) + exports-runtime.ts (lazy DO/entrypoint/workflow stubs, inlined into the wrapper) + dotenv.ts (minimal-reader dev vars)
 │   ├── vercel/              # VercelEnvRunner (extends node-worker) + worker, oidc.ts, queue-dev.ts
 │   └── netlify/             # NetlifyEnvRunner (extends node-worker) + worker
@@ -109,7 +109,7 @@ Details in [`.agents/MINIFLARE.md`](.agents/MINIFLARE.md). In short: the wrapper
 - **Immediate shutdown** — `close()` terminates the worker/process, no graceful handshake
 - **Orphan protection** — node-process/bun-process/deno-process workers call `process.on("disconnect", () => process.exit(0))` before the data handshake and entry import
 - **Data passing** — `workerData` (threads), IPC handshake (processes: worker listens, sends `request-init-data`, host replies `{ event: "init-data", data: "<JSON>" }`; env vars are size-limited, see [`NODE-RUNNERS.md`](.agents/NODE-RUNNERS.md)), direct in-process import (self), in-memory `script` + `unsafeModuleFallbackService` (miniflare)
-- **Host-side plugins** — the `plugins` runner option (not part of `data`) stays on the host (`resolveId`, `load`, `transform` hooks). Worker resolve/load hooks send matching imports and modules over a dedicated sync channel (`Atomics.wait` + `receiveMessageOnPort`, since the runner IPC listener can't run while the loader blocks); virtual modules are transformed on the host before they are sent. `resolveId` hooks with `fallback: true` only get imports the runtime failed to resolve; handlers get `this.resolve()`. See [`PLUGINS.md`](.agents/PLUGINS.md)
+- **Host-side plugins** — the `plugins` runner option (not part of `data`) stays on the host (`resolveId`, `load`, `transform` hooks). Worker resolve/load hooks send matching imports and modules over a dedicated sync channel (`Atomics.wait` + `receiveMessageOnPort`, since the runner IPC listener can't run while the loader blocks); virtual modules are transformed on the host before they are sent. `resolveId` hooks with `fallback: true` only get imports the runtime failed to resolve; handlers get `this.resolve()`. The self runner registers the same hooks in the host and runs the pipeline's sync driver in them (synchronous handlers only, except for virtual modules). See [`PLUGINS.md`](.agents/PLUGINS.md)
 - **Virtual module updates** — `updateVirtualModules()` sets/removes (`null`) keys in one `update-virtual-modules` round trip (miniflare: host-side); `invalidateModule()` is the same update with the current source. The host keeps its own map in sync, see [`VIRTUAL-MODULES.md`](.agents/VIRTUAL-MODULES.md#runtime-updates)
 - **Terminal capabilities** — spawned workers get piped stdout, so `hostEnv()` forwards `FORCE_COLOR`/`COLUMNS` from the host TTY
 - **Stdio forwarding** — all runners forward entry stdout/stderr to the host
