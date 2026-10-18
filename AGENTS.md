@@ -17,7 +17,7 @@ src/
 │   ├── host-env.ts          # hostEnv() — worker/child env: host env + FORCE_COLOR/COLUMNS from the host TTY
 │   ├── process-data.ts      # receiveProcessData() — runner data over IPC for process workers
 │   ├── ws-proxy.ts          # createRunnerWSProxyPlugin() — runtime-native WS upgrade proxy
-│   └── virtual-modules.ts   # registerVirtualModules() — registerHooks()/Bun.plugin wiring for node/bun/deno workers
+│   └── virtual-modules.ts   # registerVirtualModules() — registerHooks()/Bun.plugin wiring for node/bun/deno workers; registerOwnedVirtualModules() for the self runner (host process)
 ├── plugin/                  # host-side `plugins` runner option (see .agents/PLUGINS.md)
 │   ├── pipeline.ts          # public plugin types + createPluginPipeline() (host: filters, ordering, source maps, `this.resolve()`, `fallback` resolveId phase) + transformVirtualModules()
 │   ├── filter.ts            # filter matching shared by host and worker (candidates, serialized filters + expressions, prefilters)
@@ -29,7 +29,7 @@ src/
 │   ├── node-process/        # NodeProcessEnvRunner + worker (process.send)
 │   ├── bun-process/         # BunProcessEnvRunner + worker
 │   ├── deno-process/        # DenoProcessEnvRunner + worker
-│   ├── self/                # SelfEnvRunner (in-process, no worker)
+│   ├── self/                # SelfEnvRunner (in-process, no worker; virtual modules via host-process hooks)
 │   ├── miniflare/           # MiniflareEnvRunner + wrapper.ts (in-memory workerd wrapper) + wrangler.ts (config → Miniflare options) + exports.ts (declared Worker exports) + exports-runtime.ts (lazy DO/entrypoint/workflow stubs, inlined into the wrapper) + dotenv.ts (minimal-reader dev vars)
 │   ├── vercel/              # VercelEnvRunner (extends node-worker) + worker, oidc.ts, queue-dev.ts
 │   └── netlify/             # NetlifyEnvRunner (extends node-worker) + worker

@@ -11,6 +11,13 @@ import { DenoProcessEnvRunner } from "../src/runners/deno-process/runner.ts";
 import * as miniflare from "miniflare";
 import { MiniflareEnvRunner } from "../src/runners/miniflare/runner.ts";
 
+// The self runner registers the hooks in this process. Imported from `dist` (an
+// externalized `.mjs`) so its entry `import()` is native: through the vitest
+// module runner, the entry's imports would never reach the hooks.
+const { SelfEnvRunner } = (await import(
+  "env-runner/runners/self" as string
+)) as typeof import("../src/runners/self/runner.ts");
+
 function hasRuntime(cmd: string): boolean {
   try {
     execFileSync(cmd, ["--version"], { stdio: "ignore" });
@@ -74,9 +81,14 @@ const runners = [
     create: (opts: any) => new MiniflareEnvRunner({ miniflare, ...opts }),
     miniflare: true,
   },
+  {
+    name: "SelfEnvRunner",
+    create: (opts: any) => new SelfEnvRunner(opts),
+    self: true,
+  },
 ];
 
-for (const { name, create, skip, bun, deno, miniflare } of runners) {
+for (const { name, create, skip, bun, deno, miniflare, self } of runners) {
   describe.skipIf(skip ?? false)(`${name} virtual modules`, () => {
     let runner: EnvRunner;
 
@@ -327,8 +339,9 @@ for (const { name, create, skip, bun, deno, miniflare } of runners) {
     });
 
     // Miniflare has no graceful-shutdown handshake/exit event and nothing to
-    // unregister — the fallback-service closure dies with the instance.
-    it.skipIf(miniflare)(
+    // unregister — the fallback-service closure dies with the instance. The
+    // self runner has no worker to shut down: `close()` unregisters.
+    it.skipIf(miniflare || self)(
       "unregisters virtual modules on shutdown without breaking close",
       async () => {
         runner = create({
@@ -557,7 +570,10 @@ for (const { name, create, skip, bun, deno, miniflare } of runners) {
         });
         await runner.waitForReady();
         const expected = { url: pathToFileURL(entry).href, dirname: ghostDir, filename: entry };
-        expect(await (await runner.fetch("http://localhost/")).json()).toEqual(expected);
+        const loaded = await (await runner.fetch("http://localhost/")).json();
+        // The self runner serves path keys versioned (`?v=<n>`) from the start,
+        // so the real file's URL never holds a virtual instance in the host.
+        expect(self ? { ...loaded, url: loaded.url.split("?")[0] } : loaded).toEqual(expected);
         // Reloads add a cache-busting query to the URL (Bun: `?v=<n>`).
         await runner.reloadModule!();
         const reloaded = await (await runner.fetch("http://localhost/")).json();
@@ -583,9 +599,17 @@ for (const { name, create, skip, bun, deno, miniflare } of runners) {
         });
         await runner.waitForReady();
         const { entry, url, stack } = await (await runner.fetch("http://localhost/")).json();
-        expect(entry).toBe("virtual:#entry");
-        expect(url).toBe("virtual:#lib/meta");
-        expect(stack).toMatch(/^ +at virtual:#lib\/meta:2:\d+$/m);
+        if (self) {
+          // Keys an earlier self runner in this process served are versioned
+          // (and the entry imported fresh), so they don't reuse its instances.
+          expect(entry).toMatch(/^virtual:#entry(\?|$)/);
+          expect(url).toMatch(/^virtual:#lib\/meta(\?v=\d+)?$/);
+          expect(stack).toMatch(/^ +at virtual:#lib\/meta(\?v=\d+)?:2:\d+$/m);
+        } else {
+          expect(entry).toBe("virtual:#entry");
+          expect(url).toBe("virtual:#lib/meta");
+          expect(stack).toMatch(/^ +at virtual:#lib\/meta:2:\d+$/m);
+        }
       },
     );
 
@@ -616,13 +640,15 @@ for (const { name, create, skip, bun, deno, miniflare } of runners) {
     });
 
     // Init errors name the failing virtual module (see `formatInitError()`).
+    // The self runner closes with the original error instead (its stack names
+    // the module).
     const initError = async (virtual: Record<string, string>): Promise<string> => {
       runner = create({ name: "virtual-init-error", data: { entry: "#entry", virtual } });
       const error = await runner.waitForReady().catch((error) => error);
       return String(error?.cause?.message);
     };
 
-    it("names the virtual module that throws during init", async () => {
+    it.skipIf(self)("names the virtual module that throws during init", async () => {
       const message = await initError({
         "#entry": `import "#dep";\nexport default { fetch: () => new Response("unreachable") };`,
         "#dep": `export const x = 1;\nthrow new Error("dep failed");`,
@@ -630,7 +656,7 @@ for (const { name, create, skip, bun, deno, miniflare } of runners) {
       expect(message).toMatch(/dep failed \(at (virtual:)?#dep:2:\d+\)/);
     });
 
-    it.skipIf(deno && !denoTypeStripping)(
+    it.skipIf((deno && !denoTypeStripping) || self)(
       "names the virtual TypeScript module that fails to parse",
       async () => {
         const message = await initError({
@@ -724,7 +750,7 @@ for (const { name, create, skip, bun, deno, miniflare } of runners) {
 // both chains import `./shared.mjs`. Each disk module counts its evaluations.
 const importersDir = resolve(_dir, "./fixtures/virtual-importers");
 
-for (const { name, create, skip, bun, miniflare } of runners) {
+for (const { name, create, skip, bun, miniflare, self } of runners) {
   describe.skipIf(skip ?? false)(`${name} virtual modules: disk importers`, () => {
     let runner: EnvRunner;
 
@@ -788,8 +814,10 @@ for (const { name, create, skip, bun, miniflare } of runners) {
       },
     );
 
-    // Same, through a path-keyed virtual entry: key → disk → disk → key.
-    it.skipIf(bun || miniflare)(
+    // Same, through a path-keyed virtual entry: key → disk → disk → key. The
+    // self runner shares the disk modules (and their counters) with earlier
+    // runners in this process.
+    it.skipIf(bun || miniflare || self)(
       "invalidation walks through disk modules up to a virtual entry",
       async () => {
         let counter = 0;
@@ -825,7 +853,7 @@ for (const { name, create, skip, bun, miniflare } of runners) {
 const importOrMissing = (specifier: string, pick = "m.default") =>
   `import(${JSON.stringify(specifier)}).then((m) => String(${pick} ?? "missing"), () => "missing")`;
 
-for (const { name, create, skip, bun, deno, miniflare } of runners) {
+for (const { name, create, skip, bun, deno, miniflare, self } of runners) {
   describe.skipIf(skip ?? false)(`${name} virtual module updates`, () => {
     let runner: EnvRunner;
 
@@ -1012,8 +1040,8 @@ for (const { name, create, skip, bun, deno, miniflare } of runners) {
       });
       await runner.reloadModule!();
       expect(await text()).toBe("AC");
-      // Miniflare applies updates on the host, without IPC.
-      expect(acks).toBe(miniflare ? 0 : 1);
+      // Miniflare and self apply updates on the host, without IPC.
+      expect(acks).toBe(miniflare || self ? 0 : 1);
     });
 
     // Deno pre-transforms sources (see "resolves virtual TypeScript modules").
@@ -1133,7 +1161,9 @@ for (const { name, create, skip, bun, deno, miniflare } of runners) {
     });
 
     // Needs resolve hooks to observe disk importers (see "disk importers").
-    it.skipIf(bun || miniflare)(
+    // Self: an earlier runner in this process left `app.mjs` cached, linked to
+    // its own `config.mjs` override.
+    it.skipIf(bun || miniflare || self)(
       "an added path key reaches disk modules importing the file it overrides",
       async () => {
         const config = resolve(pathsDir, "config.mjs");
@@ -1665,17 +1695,69 @@ describe("MiniflareEnvRunner virtual module updates", () => {
   });
 });
 
-describe("SelfEnvRunner virtual module updates", () => {
-  it("rejects updateVirtualModules instead of leaking the IPC message to the entry", async () => {
-    const { SelfEnvRunner } = await import("../src/runners/self/runner.ts");
-    await using runner = new SelfEnvRunner({
-      name: "self-update",
-      data: { entry: resolve(_dir, "./fixtures/app.mjs") },
+// Process-wide hooks, but each runner updates and unregisters only its own.
+describe("SelfEnvRunner virtual modules in one process", () => {
+  const start = (name: string, virtual: Record<string, string>) =>
+    new SelfEnvRunner({ name, data: { entry: `#${name}-entry`, virtual } });
+  const text = async (runner: EnvRunner) => (await runner.fetch("http://localhost/")).text();
+
+  it("updates only the runner's own registration", async () => {
+    await using a = start("self-a", {
+      "#self-a-entry": `import value from "#self-a-value";
+        export default { fetch: () => new Response(value) };`,
+      "#self-a-value": `export default "a";`,
+    });
+    await using b = start("self-b", {
+      "#self-b-entry": `import value from "#self-b-value";
+        export default { fetch: () => new Response(value) };`,
+      "#self-b-value": `export default "b";`,
+    });
+    await Promise.all([a.waitForReady(), b.waitForReady()]);
+    expect([await text(a), await text(b)]).toEqual(["a", "b"]);
+
+    // A new key goes to the updating runner, not the latest registration.
+    await a.updateVirtualModules({
+      "#self-a-entry": `import value from "#self-a-value"; import extra from "#self-a-extra";
+        export default { fetch: () => new Response(value + extra) };`,
+      "#self-a-extra": `export default "+";`,
+    });
+    await a.reloadModule();
+    await b.close();
+    await a.updateVirtualModules({ "#self-a-value": `export default "a2";` });
+    await a.reloadModule();
+    expect(await text(a)).toBe("a2+");
+  });
+
+  it("unregisters the runner's modules on close", async () => {
+    const a = start("self-gone", {
+      "#self-gone-entry": `export default { fetch: () => new Response("ok") };`,
+      "#self-gone-value": `export default "gone";`,
+    });
+    await a.waitForReady();
+    await a.close();
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await using b = start("self-after", {
+        "#self-after-entry": `import value from "#self-gone-value";
+          export default { fetch: () => new Response(value) };`,
+      });
+      await expect(b.waitForReady()).rejects.toMatchObject({
+        cause: { message: expect.stringContaining("#self-gone-value") },
+      });
+    } finally {
+      error.mockRestore();
+    }
+  });
+
+  it("invalidates a key it doesn't serve without reaching the entry's IPC", async () => {
+    await using runner = start("self-invalidate", {
+      "#self-invalidate-entry": `export default {
+        fetch: () => new Response("ok"),
+        ipc: { onMessage: (message) => { throw new Error("leaked " + JSON.stringify(message)); } },
+      };`,
     });
     await runner.waitForReady();
-    await expect(runner.updateVirtualModules({ "#x": "export default 1;" })).rejects.toThrow(
-      "does not support virtual modules",
-    );
+    await expect(runner.invalidateModule("#x")).rejects.toThrow("not a registered virtual module");
   });
 });
 
@@ -2103,38 +2185,6 @@ describe("MiniflareEnvRunner virtual entry exports", () => {
     } finally {
       await runner.close();
     }
-  });
-});
-
-describe("SelfEnvRunner virtual module limitations", () => {
-  it("rejects invalidateModule instead of leaking the IPC message to the entry", async () => {
-    const { SelfEnvRunner } = await import("../src/runners/self/runner.ts");
-    await using runner = new SelfEnvRunner({
-      name: "self-invalidate",
-      data: { entry: resolve(_dir, "./fixtures/app.mjs") },
-    });
-    await runner.waitForReady();
-    await expect(runner.invalidateModule("#x")).rejects.toThrow("does not support virtual modules");
-  });
-
-  it("closes with a clear error instead of ignoring `data.virtual`", async () => {
-    const { SelfEnvRunner } = await import("../src/runners/self/runner.ts");
-    let closeCause: unknown;
-    await using runner = new SelfEnvRunner({
-      name: "self-virtual",
-      hooks: {
-        onClose: (_runner, cause) => {
-          closeCause = cause;
-        },
-      },
-      data: {
-        entry: "#entry",
-        virtual: { "#entry": `export default { fetch: () => new Response("unreachable") };` },
-      },
-    });
-    expect(runner.closed).toBe(true);
-    expect(String((closeCause as Error)?.message)).toContain("does not support virtual modules");
-    await expect(runner.waitForReady()).rejects.toMatchObject({ cause: closeCause });
   });
 });
 

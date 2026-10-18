@@ -248,7 +248,7 @@ await runner.reloadModule();
 
 #### Virtual Modules
 
-The Node.js runners (`NodeWorkerEnvRunner`, `NodeProcessEnvRunner`, and the runners built on top of them), `BunProcessEnvRunner`, `DenoProcessEnvRunner` (Deno >= 2.8), and `MiniflareEnvRunner` can serve **virtual modules** from an in-memory `specifier => source` map passed via `data.virtual` (`SelfEnvRunner` cannot, and closes with an error when it is set). The entry (and its dependencies) can then `import` them as if they were real files:
+All runners (the Node.js runners `NodeWorkerEnvRunner`, `NodeProcessEnvRunner` and the runners built on top of them, `BunProcessEnvRunner`, `DenoProcessEnvRunner` (Deno >= 2.8), `MiniflareEnvRunner` and `SelfEnvRunner`) can serve **virtual modules** from an in-memory `specifier => source` map passed via `data.virtual`. The entry (and its dependencies) can then `import` them as if they were real files:
 
 ```ts
 import { NodeWorkerEnvRunner } from "env-runner/runners/node-worker";
@@ -324,6 +324,8 @@ Other keys (`#name`, bare names) only match an import specifier equal to the key
 - `MiniflareEnvRunner` supports relative imports and overrides, and treats `file://` keys and imports like their path, but `import.meta.url` is undefined.
 
 On both, a virtual `data.entry` must be written exactly like its key.
+
+`SelfEnvRunner` registers the loader hooks in the **host process**, which suits a one-time server start. They apply to every import in the process (host code included; between live self runners, the latest one wins a key), they stay loaded on Bun (its plugins can't be removed), and the module cache only grows with updates and reloads. Path keys run under their `file:` URL plus a `?v=<n>` query there (also in `import.meta.url`), so the real file's URL never holds a virtual instance. When the host itself runs under a module runner that handles `import()` (such as Vitest's), its imports don't reach the hooks.
 
 Two path keys naming the same file (`/app/x.mjs` and `file:///app/x.mjs`) can't both be served, so the runner logs a warning naming both. Keep a single key per file.
 
