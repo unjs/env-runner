@@ -68,8 +68,9 @@ export function resolveWSProxyTarget(
   if (!address.port) {
     throw new Error("env runner worker is not ready");
   }
-  // `parseServerAddress()` hosts come from `URL.hostname` (already bracketed).
   const host = address.host || "127.0.0.1";
   const authority = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
-  return `ws://${authority}:${address.port}${pathname}${search}`;
+  // A TLS `listen` option (the client must accept the worker's certificate).
+  const scheme = address.protocol === "https" ? "wss" : "ws";
+  return `${scheme}://${authority}:${address.port}${pathname}${search}`;
 }

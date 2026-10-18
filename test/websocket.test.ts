@@ -1,5 +1,5 @@
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { createServer } from "node:http";
 import { fileURLToPath } from "node:url";
@@ -34,6 +34,7 @@ const hasDeno = hasRuntime("deno");
 const _dir = dirname(fileURLToPath(import.meta.url));
 const appWebsocketEntry = resolve(_dir, "./fixtures/app-websocket.mjs");
 const appWebsocketRejectEntry = resolve(_dir, "./fixtures/app-websocket-reject.mjs");
+const appWebsocketResolveEntry = resolve(_dir, "./fixtures/app-websocket-resolve.mjs");
 
 const websocketRunners = [
   { name: "NodeWorkerEnvRunner", create: (opts: any) => new NodeWorkerEnvRunner(opts) },
@@ -398,7 +399,8 @@ describe("MiniflareEnvRunner websocket", () => {
     }
   });
 
-  async function echo(entry: string) {
+  // Front server forwarding upgrades to a miniflare runner for `entry`.
+  async function start(entry: string) {
     runner = new MiniflareEnvRunner({ miniflare, name: "test-ws-miniflare", data: { entry } });
     await runner.waitForReady();
 
@@ -412,8 +414,11 @@ describe("MiniflareEnvRunner websocket", () => {
         resolve({ port: addr.port });
       });
     });
+    return address.port;
+  }
 
-    const ws = new WebSocket(`ws://127.0.0.1:${address.port}/`);
+  async function echo(port: number) {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/`);
     const messages: string[] = [];
     await new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error(`no echo (${messages})`)), 10_000);
@@ -435,25 +440,28 @@ describe("MiniflareEnvRunner websocket", () => {
   }
 
   it("handles WebSocket via crossws hooks", async () => {
-    expect(await echo(appWebsocketEntry)).toEqual(["welcome", "echo:hello"]);
+    expect(await echo(await start(appWebsocketEntry))).toEqual(["welcome", "echo:hello"]);
   });
 
-  // `websocket: { resolve }` (as Nitro exports it), from an entry outside the
-  // project: crossws resolves from env-runner, not from the entry.
   it("handles WebSocket via a crossws `resolve` hook", async () => {
+    expect(await echo(await start(appWebsocketResolveEntry))).toEqual(["welcome", "echo:hello"]);
+  });
+
+  // No `node_modules` next to the entry: crossws resolves from env-runner.
+  it("handles WebSocket for an entry outside the project", async () => {
     tmpDir = mkdtempSync(join(tmpdir(), "env-runner-ws-"));
     const entry = join(tmpDir, "entry.mjs");
-    writeFileSync(
-      entry,
-      /* js */ `const hooks = {
-  open(peer) { peer.send("welcome"); },
-  message(peer, message) { peer.send("echo:" + message.text()); },
-};
-export default {
-  fetch: () => new Response("ok"),
-  websocket: { resolve: () => hooks },
-};`,
-    );
-    expect(await echo(entry)).toEqual(["welcome", "echo:hello"]);
+    writeFileSync(entry, readFileSync(appWebsocketEntry, "utf8"));
+    expect(await echo(await start(entry))).toEqual(["welcome", "echo:hello"]);
+  });
+
+  it("handles WebSocket added by a reload", async () => {
+    tmpDir = mkdtempSync(join(tmpdir(), "env-runner-ws-"));
+    const entry = join(tmpDir, "entry.mjs");
+    writeFileSync(entry, `export default { fetch: () => new Response("ok") };`);
+    const port = await start(entry);
+    writeFileSync(entry, readFileSync(appWebsocketResolveEntry, "utf8"));
+    await runner!.reloadModule!();
+    expect(await echo(port)).toEqual(["welcome", "echo:hello"]);
   });
 });

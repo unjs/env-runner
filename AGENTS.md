@@ -12,7 +12,7 @@ Generic environment runner for Node.js. Ported from the nitro env runner concept
 src/
 ├── common/
 │   ├── base-runner.ts       # BaseEnvRunner abstract class
-│   ├── worker-utils.ts      # AppEntry interface, resolveEntry(), parseServerAddress(), toServerOptions(), formatInitError()
+│   ├── worker-utils.ts      # AppEntry interface, resolveEntry(), parseServerAddress(), toServerOptions() (+ LISTEN_DATA_KEY), shutdownWorker(), formatInitError()
 │   ├── runtime-deps.ts      # resolveRuntimeDep()/resolveRuntimeDepSpecifier() — "module | specifier | false" resolver
 │   ├── host-env.ts          # hostEnv() — worker/child env: host env + FORCE_COLOR/COLUMNS from the host TTY
 │   ├── process-data.ts      # receiveProcessData() — runner data over IPC for process workers
@@ -62,7 +62,7 @@ export default {
 };
 ```
 
-- `toServerOptions()` strips env-runner keys and pins/drops listener options (`RESERVED_SERVER_OPTIONS`, `RESERVED_RUNTIME_OPTIONS` for nested `node`/`bun`/`deno`) since the worker listens on `127.0.0.1:0` behind the runner proxy. Server options are read once at start; `reloadModule()` only swaps `fetch`.
+- `toServerOptions()` strips env-runner keys and pins/drops listener options (`RESERVED_SERVER_OPTIONS`, `RESERVED_RUNTIME_OPTIONS` for nested `node`/`bun`/`deno`) since the worker listens on `127.0.0.1:0` behind the runner proxy, or on the runner's `listen` address (see Key patterns). Server options are read once at start; `reloadModule()` only swaps `fetch`.
 - `websocket` uses `crossws/server`, which picks the adapter matching the host runtime (so node-worker/node-process use native Bun/Deno adapters when the host is Bun/Deno).
 - `ipc.onMessage` receives only user messages (ping/pong/shutdown are filtered); `onOpen` runs before the ready signal.
 - Worker flow: (process workers: receive data over IPC) → import entry → `serve()` + `ready()` → wire `upgrade` → `ipc.onOpen` → post `{ address }`. Any init failure posts `{ event: "init-error", error }` (`formatInitError()`: the message, plus where it was thrown if it doesn't say), logs one `[env-runner] worker init failed: ...` line and exits 1.
@@ -106,7 +106,8 @@ Details in [`.agents/MINIFLARE.md`](.agents/MINIFLARE.md). In short: the wrapper
 
 - **Message-driven readiness** — workers post `{ address }` when ready
 - **WebSocket proxying** — `RunnerManager.wsSrvxPlugin()`: Node host proxies the raw upgrade socket (httpxy); Bun/Deno host terminates with crossws and bridges via a `WebSocket` client. Reads the active runner lazily (survives hot-reload) and awaits readiness
-- **Immediate shutdown** — `close()` terminates the worker/process, no graceful handshake
+- **Immediate close, graceful `shutdown()`** — `close()` terminates the worker/process; `shutdown(timeout)` first sends `shutdown` (worker: `server.close()`, bounded to half the timeout → `ipc.onClose` → `exit`), also on `RunnerManager`/`EnvServer`
+- **Public listener** — the `listen` runner option (node-worker, node-process, bun-process, deno-process) makes the worker's srvx server bind the public address (no proxy hop); sent as `data[LISTEN_DATA_KEY]`, the reported `address` is loopback for wildcards and has `protocol: "https"` with TLS. `self`/miniflare close with an error. See [`NODE-RUNNERS.md`](.agents/NODE-RUNNERS.md#public-listener-listen)
 - **Orphan protection** — node-process/bun-process/deno-process workers call `process.on("disconnect", () => process.exit(0))` before the data handshake and entry import
 - **Data passing** — `workerData` (threads), IPC handshake (processes: worker listens, sends `request-init-data`, host replies `{ event: "init-data", data: "<JSON>" }`; env vars are size-limited, see [`NODE-RUNNERS.md`](.agents/NODE-RUNNERS.md)), direct in-process import (self), in-memory `script` + `unsafeModuleFallbackService` (miniflare)
 - **Host-side plugins** — the `plugins` runner option (not part of `data`) stays on the host (`resolveId`, `load`, `transform` hooks). Worker resolve/load hooks send matching imports and modules over a dedicated sync channel (`Atomics.wait` + `receiveMessageOnPort`, since the runner IPC listener can't run while the loader blocks); virtual modules are transformed on the host before they are sent. `resolveId` hooks with `fallback: true` only get imports the runtime failed to resolve; handlers get `this.resolve()`. The self runner registers the same hooks in the host and runs the pipeline's sync driver in them (synchronous handlers only, except for virtual modules). See [`PLUGINS.md`](.agents/PLUGINS.md)

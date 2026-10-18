@@ -229,8 +229,15 @@ await runner.reloadModule();
 await runner.invalidateModule("#config.json");
 await runner.reloadModule();
 
-// Graceful shutdown happens automatically at the end of the scope
-// (`await using`) — or call `await runner.close()` explicitly
+// Graceful shutdown: the worker stops accepting connections, waits for
+// in-flight requests (half the timeout at most: open WebSockets would keep it
+// waiting) and runs `ipc.onClose`, then the runner closes (after the timeout
+// at the latest)
+await runner.shutdown(5000);
+
+// Or close right away (the worker is terminated); also what happens at the
+// end of the scope (`await using`)
+await runner.close();
 ```
 
 **Available runners:**
@@ -245,6 +252,44 @@ await runner.reloadModule();
 | `MiniflareEnvRunner`   | Cloudflare Workers (miniflare)  | WebSocket pair via `dispatchFetch` |
 | `VercelEnvRunner`      | Worker thread (Vercel context)  | `workerData` / `parentPort`        |
 | `NetlifyEnvRunner`     | Worker thread (Netlify context) | `workerData` / `parentPort`        |
+
+#### Public listener (`listen`)
+
+By default the worker's server listens on a random loopback port, and the host proxies requests to it (`runner.fetch()`, `manager.wsSrvxPlugin()`). In production, that means two HTTP servers per request. With the `listen` option, the worker's server binds the public address instead, and clients (WebSockets included) reach it directly. The host only supervises it: readiness, `shutdown()`, and restarting it when it crashes (`onClose`). Supported by `NodeWorkerEnvRunner`, `NodeProcessEnvRunner`, `BunProcessEnvRunner` and `DenoProcessEnvRunner`; `SelfEnvRunner` and `MiniflareEnvRunner` close with an error when it is set.
+
+```ts
+import { RunnerManager } from "env-runner";
+import { NodeProcessEnvRunner } from "env-runner/runners/node-process";
+
+const manager = new RunnerManager();
+
+const start = () =>
+  manager.reload(
+    new NodeProcessEnvRunner({
+      name: "my-app",
+      data: { entry: "./server.ts" },
+      listen: {
+        port: 3000, // default: `PORT`, then 3000 (`0`: a free port)
+        // hostname: "localhost", // default: `HOST`, then all interfaces
+        // tls: { cert: "./cert.pem", key: "./key.pem" }, // PEM contents or paths: HTTPS
+        // reusePort: true,
+        // silent: false, // print the listening address from the worker
+      },
+    }),
+  );
+
+manager.onReady((_runner, address) => console.log("Listening on", address));
+// Restart a worker that crashed (add a backoff for one failing to start).
+// Not called for runners the manager closes itself (`reload()`, `shutdown()`).
+manager.onClose(() => start());
+await start();
+
+for (const signal of ["SIGINT", "SIGTERM"]) {
+  process.once(signal, () => manager.shutdown());
+}
+```
+
+The options are the srvx ones of the same names (the entry's own listener options stay ignored; its `reusePort` applies unless `listen` sets it). `address` is where the host reaches the worker: a wildcard hostname is reported as loopback (`127.0.0.1` or `::1`), and `protocol` is `"https"` with `tls`. `runner.fetch()` and `runner.upgrade()` keep working for internal requests (over HTTPS without verifying the certificate, which is for the public hostname). A failure to listen (e.g. the port is taken) closes the runner with the error as cause. The worker never handles signals itself: shut it down from the host with `shutdown()`.
 
 #### Virtual Modules
 
@@ -1140,11 +1185,11 @@ export default {
 The built-in worker automatically:
 
 1. Imports your entry module
-2. Starts a [srvx](https://srvx.h3.dev) server on a random port
+2. Starts a [srvx](https://srvx.h3.dev) server on a random loopback port (or the [`listen`](#public-listener-listen) address)
 3. Reports the address back to the runner via IPC
-4. Handles graceful shutdown
+4. Handles graceful shutdown (`runner.shutdown()`)
 
-Every other [srvx `ServerOptions`](https://srvx.h3.dev/guide/options) key exported by the entry (`error`, `maxRequestBodySize`, `trustProxy`, `reusePort`, the runtime-specific `node` / `bun` / `deno` objects, ...) is forwarded to `serve()` unchanged, so one `server.ts` can carry the same options in dev and production. The listener options are owned by the worker, which sits behind the runner's proxy, and are ignored if set: `port`, `hostname`, `protocol`, `tls`, `silent`, `manual` and `gracefulShutdown` — as well as their equivalents nested in `node` (`port`, `host`, `path`, `cert`, `key`, `passphrase`, and `http2`, which srvx only supports with TLS), `bun` (`port`, `hostname`, `unix`, `tls`) and `deno` (`port`, `hostname`, `path`, `cert`, `key`). Custom workers can reuse the same logic via the exported `toServerOptions(entry)` helper.
+Every other [srvx `ServerOptions`](https://srvx.h3.dev/guide/options) key exported by the entry (`error`, `maxRequestBodySize`, `trustProxy`, `reusePort`, the runtime-specific `node` / `bun` / `deno` objects, ...) is forwarded to `serve()` unchanged, so one `server.ts` can carry the same options in dev and production. The listener options are owned by the worker, which sits behind the runner's proxy (or listens where the runner's `listen` option says), and are ignored if set: `port`, `hostname`, `protocol`, `tls`, `silent`, `manual` and `gracefulShutdown` — as well as their equivalents nested in `node` (`port`, `host`, `path`, `cert`, `key`, `passphrase`, and `http2`, which srvx only supports with TLS), `bun` (`port`, `hostname`, `unix`, `tls`) and `deno` (`port`, `hostname`, `path`, `cert`, `key`). Custom workers can reuse the same logic via the exported `toServerOptions(entry, data[LISTEN_DATA_KEY])` helper (the second argument is the runner's `listen` option).
 
 For advanced use cases, you can provide a custom worker entry:
 

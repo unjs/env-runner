@@ -1,4 +1,4 @@
-import type { WorkerHooks } from "../../types.ts";
+import type { ListenOptions, WorkerHooks } from "../../types.ts";
 
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -23,6 +23,8 @@ export class NodeWorkerEnvRunner extends BaseEnvRunner {
     data?: EnvRunnerData;
     /** Host-side transform plugins (see `EnvRunnerPluginOption`). */
     plugins?: EnvRunnerPluginOption[];
+    /** Serve on this public address from the worker (see `ListenOptions`). */
+    listen?: ListenOptions;
   }) {
     _defaultEntry ||= fileURLToPath(import.meta.resolve("env-runner/runners/node-worker/worker"));
     super({ ...opts, workerEntry: opts.workerEntry || _defaultEntry });
@@ -77,6 +79,7 @@ export class NodeWorkerEnvRunner extends BaseEnvRunner {
         name: this._name,
         ...this._data,
         ...plugins,
+        ...this._listenWorkerData(),
       },
       transferList: port ? [port] : undefined,
     }) as Worker & { _exitCode?: number };

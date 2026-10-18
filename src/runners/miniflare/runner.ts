@@ -254,7 +254,16 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
     this.#wranglerConfigPath = opts.wranglerConfigPath;
     this.#wranglerEnvFiles = opts.wranglerEnvFiles;
     this.#compatibilityDate = opts.compatibilityDate;
+    // Requests go through Miniflare's own server.
+    if (this._rejectListen()) {
+      return;
+    }
     this._initWithVirtualData(() => this.#init());
+  }
+
+  /** Same as `close()`, which asks the wrapper to run `ipc.onClose`. */
+  override async shutdown(): Promise<void> {
+    await this.close();
   }
 
   /** Dispose all persistent Miniflare instances from the cache. */
@@ -787,9 +796,11 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
             configuredExports: Object.keys(zeroConfig ? stubs : declared),
             nodeCompat: !(options.compatibilityFlags as string[]).includes("no_nodejs_compat"),
             // A dependency of env-runner, which the app may not resolve (pnpm).
+            // Unresolved (env-runner bundled elsewhere): the bare specifier.
             crosswsServer: (_crosswsServerPath ||= resolveModulePath("crossws/server", {
               from: import.meta.url,
               conditions: ["workerd", "import"],
+              try: true,
             })),
           },
         );

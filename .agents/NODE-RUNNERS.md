@@ -32,6 +32,16 @@ Built-in srvx-worker runners (node-worker, node-process, bun-process, deno-proce
 - `deno run -A --node-modules-dir=auto --no-lock <execArgv> <worker>` via Node `spawn()` with an `"ipc"` stdio slot and `serialization: "json"` — Deno implements Node's IPC channel (`NODE_CHANNEL_FD`, JSON only; verified on Deno 2.9), so messages must be JSON-serializable
 - Same worker shape and orphan protection (`disconnect`) as node-process/bun-process; stdout/stderr are plain logs piped to the host
 
+## Public listener (`listen`)
+
+Runner option of node-worker, node-process, bun-process and deno-process (vercel/netlify inherit it untyped through node-worker's worker). User docs: README "Public listener (`listen`)".
+
+- Sent as `data[LISTEN_DATA_KEY]` (`__envRunnerListen`); the worker passes it to `toServerOptions(entry, listen)`, which then uses its `port`/`hostname`/`protocol`/`tls`/`reusePort` (default: the entry's)/`silent` (default `true`) instead of `127.0.0.1:0`. Entry listener options stay ignored, `gracefulShutdown` stays `false` (the host owns signals: `shutdown()`). Omitted `port`/`hostname` fall back to srvx's defaults, read from the worker's env (`PORT` → 3000, `HOST` → all interfaces)
+- `parseServerAddress()` reports where the host reaches it: brackets stripped (`::1`), wildcards as loopback (`0.0.0.0` → `127.0.0.1`, `::` → `::1`; Node binds `::` dual-stack only when IPv6 exists), the default port when the URL has none, `protocol: "https"` for TLS. The Bun/Deno WS bridge re-brackets IPv6 hosts
+- Host `fetch()`/`upgrade()` still proxy to that address (HTTPS without certificate verification)
+- A listen failure (`EADDRINUSE`; Bun: `Is port ... in use?`, Deno: `Address already in use`) is a `serve()`/`ready()` error, so it goes through `init-error` and closes the runner with it as cause
+- Restart on crash is up to the caller (`RunnerManager.onClose()` + `reload()`, README example)
+
 ## self
 
 - Imports the entry into the host process and calls `entry.fetch()` directly: no worker, no proxy, no server; readiness is a dummy `127.0.0.1:0` address
@@ -49,5 +59,6 @@ Built-in srvx-worker runners (node-worker, node-process, bun-process, deno-proce
 - `test/runners.test.ts` covers all of these (see `AGENTS.md` Testing)
 - `test/runners.test.ts` "reloadModule" (node-worker, node-process, bun-process, deno-process, self): fresh entry content, IPC re-init, and an entry with a relative import whose dependency stays cached
 - `test/runners.test.ts` "runner data" (process runners) — handshake kept out of `ipc.onMessage`/host listeners, data > 128 KiB, serialization errors. `test/virtual.test.ts` serves a 1 MiB virtual module on every runner
+- `test/listen.test.ts` — `listen` on node-worker, node-process, bun-process, deno-process: direct and proxied fetch, wildcard → loopback, `PORT` default, WebSocket on the public address, TLS (a self-signed cert from `openssl`, skipped without it), port in use, `shutdown()` order (in-flight `/slow` responds before `ipc.onClose`), `ipc.onClose` with a WebSocket still open, `RunnerManager.shutdown()` (messages reach manager listeners, a `close()` meanwhile), `toServerOptions()` with `listen`, `EnvServer.shutdown()` while starting; `self`/miniflare reject `listen`
 - `test/host-env.test.ts` — `hostEnv()` precedence plus `FORCE_COLOR`/`COLUMNS` reaching node-worker/node-process workers
 - `test/orphan.test.ts` — SIGKILLs a supervisor subprocess (node-process, bun-process on Node and Bun hosts, deno-process on a Node host), including mid-import via a slow-import entry with marker files. Probes the worker's **port**, not its pid: a killed-but-unreaped zombie still passes `kill(pid, 0)`

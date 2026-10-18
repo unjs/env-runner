@@ -1,4 +1,4 @@
-import type { WorkerHooks, EnvRunner } from "./types.ts";
+import type { WorkerHooks, EnvRunner, ListenOptions } from "./types.ts";
 import type { EnvRunnerData, EnvRunnerPluginOption } from "./common/base-runner.ts";
 
 export type RunnerName =
@@ -18,6 +18,11 @@ export interface LoadRunnerOptions {
   data?: EnvRunnerData;
   /** Host-side transform plugins (see `EnvRunnerPluginOption`). */
   plugins?: EnvRunnerPluginOption[];
+  /**
+   * Serve on this public address from the worker (node-worker, node-process,
+   * bun-process, deno-process; the others close with an error).
+   */
+  listen?: ListenOptions;
   execArgv?: string[];
   /** Runner-specific constructor options (e.g. `miniflare` for the `miniflare` runner). */
   [key: string]: unknown;

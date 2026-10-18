@@ -35,10 +35,35 @@ export interface RunnerRPCHooks {
   offMessage: (listener: RunnerMessageListener) => void;
 }
 
-/** Address reported by the worker once it is ready. */
+/**
+ * Address reported by the worker once it is ready. `host` is reachable from
+ * the host (wildcard listeners report loopback); `protocol` is `https` for a
+ * TLS `listen` option.
+ */
 export type WorkerAddress =
-  | { host?: string; port: number; socketPath?: undefined }
-  | { host?: undefined; port?: undefined; socketPath: string };
+  | { host?: string; port: number; protocol?: "http" | "https"; socketPath?: undefined }
+  | { host?: undefined; port?: undefined; protocol?: undefined; socketPath: string };
+
+/**
+ * The `listen` runner option: the worker's server binds this public address
+ * instead of a random loopback port, so clients reach it directly (no proxy
+ * hop through the host). Like srvx's options of the same names; the values
+ * must be JSON-serializable.
+ */
+export interface ListenOptions {
+  /** Port (default: the `PORT` env var, else `3000`); `0` picks a free one. */
+  port?: number | string;
+  /** Hostname (default: the `HOST` env var, else all interfaces). */
+  hostname?: string;
+  /** `https` when `tls` has a `cert` and `key` (default). */
+  protocol?: "http" | "https";
+  /** PEM contents or file paths. */
+  tls?: { cert?: string; key?: string; passphrase?: string };
+  /** Let several processes bind the same port. */
+  reusePort?: boolean;
+  /** `false` prints the listening address from the worker (default `true`). */
+  silent?: boolean;
+}
 
 /** Lifecycle hooks for observing runner state changes. */
 export interface WorkerHooks {
@@ -94,7 +119,14 @@ export interface EnvRunner extends RunnerRPCHooks, AsyncDisposable {
    */
   invalidateModule?(specifier: string, timeout?: number): Promise<void>;
 
-  /** Gracefully shut down the worker. */
+  /**
+   * Shut down gracefully, then close: the worker runs `ipc.onClose`, stops
+   * accepting connections and waits for in-flight requests (at most
+   * `timeout` ms, default 5000).
+   */
+  shutdown?(timeout?: number): Promise<void>;
+
+  /** Close the runner, terminating the worker immediately. */
   close(): Promise<void>;
 
   /** Alias for `close()`, enabling `await using` (explicit resource management). */

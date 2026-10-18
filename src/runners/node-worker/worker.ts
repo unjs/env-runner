@@ -10,6 +10,8 @@ import {
   toServerOptions,
   formatInitError,
   registerWorkerHooks,
+  shutdownWorker,
+  LISTEN_DATA_KEY,
   type AppEntry,
 } from "../../common/worker-utils.ts";
 import { handleUpdateVirtualModules } from "../../common/virtual-modules.ts";
@@ -27,7 +29,7 @@ try {
   // The entry's own srvx options are forwarded, so `serve()` can throw on a
   // bad option — keep it inside the init-error path for an actionable message.
   server = serve({
-    ...toServerOptions(entry),
+    ...toServerOptions(entry, data[LISTEN_DATA_KEY]),
     fetch: (request) => entry.fetch(request),
     plugins: [...(entry.plugins || []), ...(entry.websocket ? [wsPlugin(entry.websocket)] : [])],
   });
@@ -57,12 +59,10 @@ parentPort?.postMessage({
 
 parentPort?.on("message", async (message) => {
   if (message?.event === "shutdown") {
-    Promise.resolve(entry.ipc?.onClose?.())
-      .then(() => server.close())
-      .then(() => {
-        unregisterHooks();
-        parentPort?.postMessage({ event: "exit" });
-      });
+    shutdownWorker(server, entry, message.timeout).then(() => {
+      unregisterHooks();
+      parentPort?.postMessage({ event: "exit" });
+    });
     return;
   }
 
