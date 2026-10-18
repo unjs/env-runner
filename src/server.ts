@@ -98,6 +98,11 @@ export class EnvServer extends RunnerManager {
     }
   }
 
+  override async shutdown(timeout?: number) {
+    this._stopWatching();
+    await super.shutdown(timeout);
+  }
+
   override async close() {
     this._stopWatching();
     await super.close();

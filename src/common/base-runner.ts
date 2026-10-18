@@ -1,6 +1,12 @@
 import type { IncomingMessage } from "node:http";
 import type { Socket } from "node:net";
-import type { RunnerMessageListener, EnvRunner, WorkerAddress, WorkerHooks } from "../types.ts";
+import type {
+  RunnerMessageListener,
+  EnvRunner,
+  ListenOptions,
+  WorkerAddress,
+  WorkerHooks,
+} from "../types.ts";
 
 import { rm } from "node:fs/promises";
 import { proxyFetch, proxyUpgrade } from "httpxy";
@@ -18,6 +24,7 @@ import type {
   VirtualModuleUpdates,
 } from "../virtual-loader.ts";
 import { hostEnv } from "./host-env.ts";
+import { LISTEN_DATA_KEY } from "./worker-utils.ts";
 import { PLUGINS_DATA_KEY } from "../plugin/hooks.ts";
 import type { PluginWorkerData } from "../plugin/hooks.ts";
 import { createPluginPipeline, transformVirtualModules } from "../plugin/pipeline.ts";
@@ -97,6 +104,8 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
   // The `plugins` option, run on the host.
   protected _plugins?: PluginPipeline;
   protected _transformChannel?: TransformChannelHost;
+  // The `listen` option, sent to the worker as `data[LISTEN_DATA_KEY]`.
+  protected _listen?: ListenOptions;
 
   constructor(opts: {
     name: string;
@@ -112,10 +121,17 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
      * supported by the `self` runner.
      */
     plugins?: EnvRunnerPluginOption[];
+    /**
+     * Serve on this public address from the worker (see {@link ListenOptions}).
+     * Only for runners with a worker server (node-worker, node-process,
+     * bun-process, deno-process).
+     */
+    listen?: ListenOptions;
   }) {
     this._name = opts.name;
     this._workerEntry = opts.workerEntry;
     this._data = opts.data;
+    this._listen = opts.listen;
     // Throws for invalid plugins.
     this._plugins = createPluginPipeline(opts.plugins, {
       resolveConditions: () => this._resolveConditions(),
@@ -142,7 +158,11 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
         status: 503,
       });
     }
-    return proxyFetch(this._address, this._resolveFetchInput(input), init);
+    const request = this._resolveFetchInput(input);
+    if (this._address.protocol === "https") {
+      return proxyFetch(_httpsTarget(this._address), request, init, { ssl: UNVERIFIED_TLS });
+    }
+    return proxyFetch(this._address, request, init);
   }
 
   async upgrade(context: { node: { req: IncomingMessage; socket: Socket; head: any } }) {
@@ -156,8 +176,14 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
       context.node.socket.destroy();
       return;
     }
+    const { req, socket, head } = context.node;
     try {
-      await proxyUpgrade(this._address, context.node.req, context.node.socket, context.node.head);
+      await (this._address.protocol === "https"
+        ? proxyUpgrade(_httpsTarget(this._address), req, socket, head, {
+            ssl: UNVERIFIED_TLS,
+            secure: false,
+          })
+        : proxyUpgrade(this._address, req, socket, head));
     } catch {
       // The worker may reject the upgrade; `proxyUpgrade` already settled the
       // client socket, so swallow (callers are fire-and-forget).
@@ -257,6 +283,21 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
     }, timeout);
   }
 
+  /**
+   * Shut down gracefully, then close: the worker stops accepting connections,
+   * waits for in-flight requests and runs `ipc.onClose`. Closes right away
+   * when the worker isn't ready, and after `timeout` at the latest.
+   */
+  async shutdown(timeout = 5000): Promise<void> {
+    if (this.ready) {
+      await this._request(
+        { event: "shutdown" },
+        { match: (msg) => msg?.event === "exit", timeout, timeoutError: "Shutdown timed out" },
+      ).catch(() => {});
+    }
+    await this.close();
+  }
+
   async close(cause?: unknown) {
     if (this.closed) {
       return;
@@ -334,6 +375,7 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
     if (this._plugins) {
       data = { ...data, ...this._pluginWorkerData("socket") };
     }
+    data = { ...data, ...this._listenWorkerData() };
     try {
       this._processData = JSON.stringify(data);
     } catch (error: any) {
@@ -371,6 +413,25 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
         ...this._transformChannel.channel,
       },
     };
+  }
+
+  /** Runner data entry for the `listen` option (none without it). */
+  protected _listenWorkerData(): { [LISTEN_DATA_KEY]?: ListenOptions } {
+    return this._listen ? { [LISTEN_DATA_KEY]: this._listen } : {};
+  }
+
+  /**
+   * For runners without a worker server: close with an error when the
+   * `listen` option is set (then `true`).
+   */
+  protected _rejectListen(): boolean {
+    if (!this._listen) {
+      return false;
+    }
+    this.close(
+      new Error(`Cannot use listen: the ${this._runtimeType()} runner does not support it`),
+    );
+    return true;
   }
 
   /**
@@ -604,6 +665,15 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
   protected abstract _runtimeType(): string;
 
   // #endregion
+}
+
+// The worker's certificate is for its public hostname, not the loopback
+// address the host connects to.
+const UNVERIFIED_TLS = { rejectUnauthorized: false };
+
+function _httpsTarget(address: WorkerAddress): string {
+  const host = address.host || "127.0.0.1";
+  return `https://${host.includes(":") ? `[${host}]` : host}:${address.port}`;
 }
 
 function closedBeforeReadyError(cause: unknown): Error {

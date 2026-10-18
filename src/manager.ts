@@ -217,17 +217,13 @@ export class RunnerManager implements EnvRunner, AsyncDisposable {
     this._moduleInvalidated = true;
   }
 
+  /** Close, shutting the active runner down gracefully (its `shutdown()`, else `close()`). */
+  async shutdown(timeout?: number) {
+    await this._close((runner) => (runner.shutdown ? runner.shutdown(timeout) : runner.close()));
+  }
+
   async close() {
-    this._closed = true;
-    this._messageQueue.length = 0;
-    // Fail any in-flight `waitForReady()` callers promptly.
-    for (const rejectReady of this._readyRejectors) rejectReady();
-    this._readyRejectors.clear();
-    const runner = this._runner;
-    this._detach();
-    if (runner) {
-      await runner.close();
-    }
+    await this._close((runner) => runner.close());
   }
 
   async [Symbol.asyncDispose]() {
@@ -257,6 +253,19 @@ export class RunnerManager implements EnvRunner, AsyncDisposable {
   // #endregion
 
   // #region Private
+
+  private async _close(closeRunner: (runner: EnvRunner) => Promise<void>) {
+    this._closed = true;
+    this._messageQueue.length = 0;
+    // Fail any in-flight `waitForReady()` callers promptly.
+    for (const rejectReady of this._readyRejectors) rejectReady();
+    this._readyRejectors.clear();
+    const runner = this._runner;
+    this._detach();
+    if (runner) {
+      await closeRunner(runner);
+    }
+  }
 
   private _internalListener: RunnerMessageListener = (message: any) => {
     // Detect ready state from address message

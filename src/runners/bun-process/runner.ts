@@ -1,4 +1,4 @@
-import type { WorkerHooks } from "../../types.ts";
+import type { ListenOptions, WorkerHooks } from "../../types.ts";
 
 import { execSync, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
@@ -68,6 +68,8 @@ export class BunProcessEnvRunner extends BaseEnvRunner {
     data?: EnvRunnerData;
     /** Host-side transform plugins (see `EnvRunnerPluginOption`). */
     plugins?: EnvRunnerPluginOption[];
+    /** Serve on this public address from the worker (see `ListenOptions`). */
+    listen?: ListenOptions;
     execArgv?: string[];
   }) {
     _defaultEntry ||= fileURLToPath(import.meta.resolve("env-runner/runners/bun-process/worker"));
