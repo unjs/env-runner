@@ -1,6 +1,25 @@
 # Changelog
 
 
+## v0.3.5
+
+[compare changes](https://github.com/unjs/env-runner/compare/v0.3.4...v0.3.5)
+
+### 🚀 Enhancements
+
+- `listen` runner option and graceful `shutdown()` ([#80](https://github.com/unjs/env-runner/pull/80))
+- **self:** Support virtual modules and synchronous plugins ([#81](https://github.com/unjs/env-runner/pull/81))
+
+### 🩹 Fixes
+
+- **miniflare:** Handle entry `websocket` with crossws's server plugin ([dce574a](https://github.com/unjs/env-runner/commit/dce574a))
+- **miniflare:** Fall back to bare `crossws/server` when unresolvable ([162f2ea](https://github.com/unjs/env-runner/commit/162f2ea))
+
+### ❤️ Contributors
+
+- Pi0x <x@pi0.io>
+- Pooya Parsa ([@pi0](https://github.com/pi0))
+
 ## v0.3.4
 
 [compare changes](https://github.com/unjs/env-runner/compare/v0.3.3...v0.3.4)
