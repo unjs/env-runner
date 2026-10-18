@@ -787,9 +787,11 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
             configuredExports: Object.keys(zeroConfig ? stubs : declared),
             nodeCompat: !(options.compatibilityFlags as string[]).includes("no_nodejs_compat"),
             // A dependency of env-runner, which the app may not resolve (pnpm).
+            // Unresolved (env-runner bundled elsewhere): the bare specifier.
             crosswsServer: (_crosswsServerPath ||= resolveModulePath("crossws/server", {
               from: import.meta.url,
               conditions: ["workerd", "import"],
+              try: true,
             })),
           },
         );
