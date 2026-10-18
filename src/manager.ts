@@ -13,6 +13,8 @@ import { createRunnerWSProxyPlugin } from "./common/ws-proxy.ts";
 /** Proxies an active `EnvRunner` with hot-reload, auto-restart and message queueing. */
 export class RunnerManager implements EnvRunner, AsyncDisposable {
   private _runner: EnvRunner | undefined;
+  // The runner `close()`/`shutdown()` is closing (no longer `_runner`).
+  private _closingRunner: EnvRunner | undefined;
   private _messageQueue: unknown[] = [];
   private _messageListeners = new Set<RunnerMessageListener>();
   private _closed = false;
@@ -49,6 +51,11 @@ export class RunnerManager implements EnvRunner, AsyncDisposable {
     this._reloading = true;
     try {
       runner ??= await this._createRunner();
+      // Closed meanwhile (e.g. during a slow `_createRunner()`): don't revive it.
+      if (this._closed) {
+        await runner.close();
+        return;
+      }
       const prev = this._runner;
       this._detach();
       this._attach(runner);
@@ -260,10 +267,22 @@ export class RunnerManager implements EnvRunner, AsyncDisposable {
     // Fail any in-flight `waitForReady()` callers promptly.
     for (const rejectReady of this._readyRejectors) rejectReady();
     this._readyRejectors.clear();
-    const runner = this._runner;
-    this._detach();
-    if (runner) {
+    // A `close()` during a `shutdown()` closes the same runner.
+    const runner = this._runner ?? this._closingRunner;
+    if (!runner) {
+      return;
+    }
+    // No longer active, so its close isn't reported to `onClose()` listeners;
+    // message listeners stay until it closed (messages from `ipc.onClose`).
+    this._runner = undefined;
+    this._closingRunner = runner;
+    try {
       await closeRunner(runner);
+    } finally {
+      if (this._closingRunner === runner) {
+        this._closingRunner = undefined;
+      }
+      this._detachListeners(runner);
     }
   }
 
@@ -308,6 +327,10 @@ export class RunnerManager implements EnvRunner, AsyncDisposable {
     const runner = this._runner;
     if (!runner) return;
     this._runner = undefined;
+    this._detachListeners(runner);
+  }
+
+  private _detachListeners(runner: EnvRunner) {
     runner.offMessage(this._internalListener);
     for (const listener of this._messageListeners) {
       runner.offMessage(listener);

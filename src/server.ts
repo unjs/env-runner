@@ -123,7 +123,8 @@ export class EnvServer extends RunnerManager {
 
   private async _start() {
     await this.reload();
-    if (this._opts.watch) {
+    // Not after a `close()`/`shutdown()` while the runner was being created.
+    if (this._opts.watch && !this.closed) {
       this._startWatching();
     }
     return this;

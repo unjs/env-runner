@@ -62,7 +62,7 @@ process.send!({
 
 process.on("message", async (message: any) => {
   if (message?.event === "shutdown") {
-    shutdownWorker(server, entry).then(() => {
+    shutdownWorker(server, entry, message.timeout).then(() => {
       unregisterHooks();
       process.send!({ event: "exit" });
     });

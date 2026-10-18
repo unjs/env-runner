@@ -59,7 +59,7 @@ parentPort?.postMessage({
 
 parentPort?.on("message", async (message) => {
   if (message?.event === "shutdown") {
-    shutdownWorker(server, entry).then(() => {
+    shutdownWorker(server, entry, message.timeout).then(() => {
       unregisterHooks();
       parentPort?.postMessage({ event: "exit" });
     });

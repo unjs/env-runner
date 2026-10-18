@@ -230,8 +230,9 @@ await runner.invalidateModule("#config.json");
 await runner.reloadModule();
 
 // Graceful shutdown: the worker stops accepting connections, waits for
-// in-flight requests (5s at most by default) and runs `ipc.onClose`, then the
-// runner closes
+// in-flight requests (half the timeout at most: open WebSockets would keep it
+// waiting) and runs `ipc.onClose`, then the runner closes (after the timeout
+// at the latest)
 await runner.shutdown(5000);
 
 // Or close right away (the worker is terminated); also what happens at the
@@ -288,7 +289,7 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
 }
 ```
 
-The options are the srvx ones of the same names (entry exports of them stay ignored). `address` is where the host reaches the worker: a wildcard hostname is reported as loopback (`127.0.0.1` or `::1`), and `protocol` is `"https"` with `tls`. `runner.fetch()` and `runner.upgrade()` keep working for internal requests (over HTTPS without verifying the certificate, which is for the public hostname). A failure to listen (e.g. the port is taken) closes the runner with the error as cause. The worker never handles signals itself: shut it down from the host with `shutdown()`.
+The options are the srvx ones of the same names (the entry's own listener options stay ignored; its `reusePort` applies unless `listen` sets it). `address` is where the host reaches the worker: a wildcard hostname is reported as loopback (`127.0.0.1` or `::1`), and `protocol` is `"https"` with `tls`. `runner.fetch()` and `runner.upgrade()` keep working for internal requests (over HTTPS without verifying the certificate, which is for the public hostname). A failure to listen (e.g. the port is taken) closes the runner with the error as cause. The worker never handles signals itself: shut it down from the host with `shutdown()`.
 
 #### Virtual Modules
 

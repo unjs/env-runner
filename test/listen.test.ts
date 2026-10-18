@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import * as miniflare from "miniflare";
 import type { EnvRunner } from "../src/index.ts";
-import { RunnerManager } from "../src/index.ts";
+import { EnvServer, RunnerManager, toServerOptions } from "../src/index.ts";
 import { NodeWorkerEnvRunner } from "../src/runners/node-worker/runner.ts";
 import { NodeProcessEnvRunner } from "../src/runners/node-process/runner.ts";
 import { BunProcessEnvRunner } from "../src/runners/bun-process/runner.ts";
@@ -33,6 +33,7 @@ const _dir = dirname(fileURLToPath(import.meta.url));
 const appEntry = resolve(_dir, "./fixtures/app.mjs");
 const appShutdownEntry = resolve(_dir, "./fixtures/app-shutdown.mjs");
 const appWebSocketEntry = resolve(_dir, "./fixtures/app-websocket.mjs");
+const appShutdownWSEntry = resolve(_dir, "./fixtures/app-shutdown-ws.mjs");
 
 const runners = [
   { name: "NodeWorkerEnvRunner", create: (opts: any) => new NodeWorkerEnvRunner(opts) },
@@ -231,20 +232,83 @@ for (const { name, create, skip } of runners) {
       expect(messages).toEqual(["slow-started", "slow-responded", "ipc-closed"]);
     });
 
-    it("RunnerManager.shutdown() shuts the active runner down", async () => {
-      runner = create({ name: "manager-shutdown", data: { entry: appShutdownEntry } });
-      const manager = new RunnerManager(runner);
+    it("shutdown() runs ipc.onClose with a WebSocket still open", async () => {
+      runner = create({
+        name: "listen-shutdown-ws",
+        data: { entry: appShutdownWSEntry },
+        listen: { port: 0, hostname: "127.0.0.1" },
+      });
       const closed = new Promise<void>((resolve) => {
         runner!.onMessage((message: any) => message?.type === "ipc-closed" && resolve());
       });
+      await runner.waitForReady();
+      const ws = new WebSocket(`ws://127.0.0.1:${runner.address!.port}/`);
+      await new Promise((resolve, reject) => {
+        ws.addEventListener("message", resolve);
+        ws.addEventListener("error", () => reject(new Error("WebSocket error")));
+      });
+
+      let ipcClosed = false;
+      closed.then(() => (ipcClosed = true));
+      await runner.shutdown!(2000);
+      ws.close();
+      expect(ipcClosed).toBe(true);
+    });
+
+    it("RunnerManager.shutdown() shuts the active runner down", async () => {
+      runner = create({ name: "manager-shutdown", data: { entry: appShutdownEntry } });
+      const manager = new RunnerManager(runner);
+      // Through the manager: its listeners stay attached until the runner closed.
+      const messages: string[] = [];
+      manager.onMessage((message: any) => message?.type && messages.push(message.type));
       await manager.waitForReady();
       await manager.shutdown();
-      await closed;
+      expect(messages).toContain("ipc-closed");
       expect(manager.closed).toBe(true);
       expect(runner.closed).toBe(true);
     });
+
+    it("RunnerManager.close() during shutdown() closes the runner", async () => {
+      runner = create({ name: "manager-shutdown-close", data: { entry: appShutdownWSEntry } });
+      const manager = new RunnerManager(runner);
+      await manager.waitForReady();
+      const shutdown = manager.shutdown(60_000);
+      await manager.close();
+      expect(runner.closed).toBe(true);
+      await shutdown;
+    });
   });
 }
+
+describe("toServerOptions() with listen", () => {
+  const fetch = () => new Response("ok");
+
+  it("uses the listen address instead of the loopback one", () => {
+    expect(
+      toServerOptions({ fetch, port: 1, hostname: "203.0.113.1" }, { port: 3000 }),
+    ).toMatchObject({ port: 3000, hostname: undefined, silent: true, gracefulShutdown: false });
+  });
+
+  it("keeps the entry's `reusePort` unless listen sets it", () => {
+    expect(toServerOptions({ fetch, reusePort: true }, { port: 3000 }).reusePort).toBe(true);
+    expect(
+      toServerOptions({ fetch, reusePort: true }, { port: 3000, reusePort: false }).reusePort,
+    ).toBe(false);
+  });
+});
+
+describe("EnvServer shutdown", () => {
+  it("doesn't attach a runner (or watch) when shut down while starting", async () => {
+    const server = new EnvServer({ entry: appEntry, watch: true });
+    const started = server.start();
+    await server.shutdown();
+    await started;
+    expect(server.ready).toBe(false);
+    expect(server.runner?.closed).toBe(true);
+    expect((server as any)._watchers).toHaveLength(0);
+    expect((await server.fetch("/")).status).toBe(503);
+  });
+});
 
 describe("listen on runners without a worker server", () => {
   it("SelfEnvRunner closes with an error", async () => {

@@ -98,7 +98,8 @@ export function toServerOptions(
   }
   // The host owns signals (`shutdown()`), also with a public listener.
   if (listen) {
-    const { port, hostname, protocol, tls, reusePort, silent = true } = listen;
+    // `reusePort` isn't worker-owned: the entry's applies unless `listen` sets it.
+    const { port, hostname, protocol, tls, reusePort = options.reusePort, silent = true } = listen;
     return {
       ...options,
       port,
@@ -237,11 +238,29 @@ export function parseServerAddress(server: Server): WorkerAddress {
  * Graceful shutdown (the `shutdown` message): stop accepting connections and
  * wait for in-flight requests, then run `ipc.onClose`. Never rejects (errors
  * are logged), so the worker always replies `exit`.
+ *
+ * `server.close()` also waits for open WebSockets (Node.js, Bun), so with the
+ * host's `timeout` the wait ends halfway through it, leaving `ipc.onClose`
+ * the rest (the host terminates the worker after `exit`).
  */
-export async function shutdownWorker(server: Server, entry: AppEntry): Promise<void> {
-  await server.close().catch((error) => {
+export async function shutdownWorker(
+  server: Server,
+  entry: AppEntry,
+  timeout?: number,
+): Promise<void> {
+  const closed = server.close().catch((error) => {
     console.error("[env-runner] failed to close the worker server:", error);
   });
+  if (typeof timeout === "number") {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      closed,
+      new Promise((resolve) => (timer = setTimeout(resolve, timeout / 2))),
+    ]);
+    clearTimeout(timer);
+  } else {
+    await closed;
+  }
   await Promise.resolve()
     .then(() => entry.ipc?.onClose?.())
     .catch((error) => {

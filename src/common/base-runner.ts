@@ -285,13 +285,14 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
 
   /**
    * Shut down gracefully, then close: the worker stops accepting connections,
-   * waits for in-flight requests and runs `ipc.onClose`. Closes right away
+   * waits for in-flight requests (for half of `timeout` at most, since open
+   * WebSockets keep it waiting) and runs `ipc.onClose`. Closes right away
    * when the worker isn't ready, and after `timeout` at the latest.
    */
   async shutdown(timeout = 5000): Promise<void> {
     if (this.ready) {
       await this._request(
-        { event: "shutdown" },
+        { event: "shutdown", timeout },
         { match: (msg) => msg?.event === "exit", timeout, timeoutError: "Shutdown timed out" },
       ).catch(() => {});
     }
