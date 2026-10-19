@@ -1,13 +1,18 @@
-import type { WorkerHooks } from "../../types.ts";
+import type { Server } from "srvx";
+import type { Socket } from "node:net";
+import type { ListenOptions, WorkerHooks } from "../../types.ts";
 
 import { BaseEnvRunner } from "../../common/base-runner.ts";
 import type { EnvRunnerData, EnvRunnerPluginOption } from "../../common/base-runner.ts";
 import type { AppEntry } from "../../common/worker-utils.ts";
 import {
+  closeServerGracefully,
   importFreshEntry,
   isVirtualEntry,
+  parseServerAddress,
   resolveEntry,
   reloadEntryModule,
+  toServerOptions,
 } from "../../common/worker-utils.ts";
 import { registerOwnedVirtualModules } from "../../common/virtual-modules.ts";
 import { createDirectTransformClient } from "../../plugin/channel.ts";
@@ -35,6 +40,9 @@ export class SelfEnvRunner extends BaseEnvRunner {
   #wsAdapter?: NodeWSAdapter;
   #virtual?: OwnedVirtualModules;
   #unregisterPlugins?: () => void;
+  // The `listen` option's server, and its Node.js sockets (upgraded ones included).
+  #server?: Server;
+  #sockets = new Set<Socket>();
 
   constructor(opts: {
     name: string;
@@ -46,6 +54,11 @@ export class SelfEnvRunner extends BaseEnvRunner {
      * registered, where async handlers work).
      */
     plugins?: EnvRunnerPluginOption[];
+    /**
+     * Serve the entry on this public address from the host process, with its
+     * srvx options (see {@link ListenOptions}).
+     */
+    listen?: ListenOptions;
   }) {
     super({ ...opts, workerEntry: "" });
     this.#init();
@@ -57,6 +70,10 @@ export class SelfEnvRunner extends BaseEnvRunner {
     }
     const request =
       input instanceof Request ? input : new Request(this._resolveFetchInput(input), init);
+    // Through the server's middleware and plugins, as the worker runners proxy.
+    if (this.#server) {
+      return this.#server.fetch(request) as Promise<Response>;
+    }
     return this.#entry.fetch(request) as Promise<Response>;
   }
 
@@ -97,8 +114,15 @@ export class SelfEnvRunner extends BaseEnvRunner {
     this.#entry?.ipc?.onMessage?.(message);
   }
 
-  /** Same as `close()`, which runs `ipc.onClose` (there is no server to drain). */
-  override async shutdown(): Promise<void> {
+  /**
+   * With `listen`, first stop accepting connections and wait for in-flight
+   * requests (for half of `timeout` at most, since open WebSockets keep it
+   * waiting); then `close()`, which runs `ipc.onClose`.
+   */
+  override async shutdown(timeout = 5000): Promise<void> {
+    if (this.#server && this.ready) {
+      await closeServerGracefully(this.#server, timeout / 2);
+    }
     await this.close();
   }
 
@@ -145,6 +169,16 @@ export class SelfEnvRunner extends BaseEnvRunner {
     this.#active = false;
     this.#wsAdapter?.closeAll(1001, undefined, true);
     this.#wsAdapter = undefined;
+    if (this.#server) {
+      const closed = this.#server.close(true);
+      // `closeAll` leaves upgraded sockets (WebSockets) open on Node.js.
+      for (const socket of this.#sockets) {
+        socket.destroy();
+      }
+      this.#sockets.clear();
+      this.#server = undefined;
+      await closed;
+    }
     await this.#entry?.ipc?.onClose?.();
     this.#entry = undefined;
     this.#virtual?.unregister();
@@ -167,10 +201,6 @@ export class SelfEnvRunner extends BaseEnvRunner {
     const entryPath = this._data?.entry as string | undefined;
     if (!entryPath) {
       this.close("self runner requires data.entry");
-      return;
-    }
-    // Requests come from the host's own server.
-    if (this._rejectListen()) {
       return;
     }
     this._initWithVirtualData(() => {
@@ -223,14 +253,50 @@ export class SelfEnvRunner extends BaseEnvRunner {
     if (this.closed) {
       return;
     }
+    const server = this._listen ? await this.#serve(entry, this._listen) : undefined;
+    if (this.closed) {
+      // Closed before it listened, which `_closeRuntime()` couldn't stop.
+      await server?.close(true);
+      return;
+    }
     this.#entry = entry;
     await entry.ipc?.onOpen?.({
       sendMessage: (message) => {
         queueMicrotask(() => this._handleMessage(message));
       },
     });
-    // Signal ready with a dummy address (fetch is overridden, address unused)
-    this._handleMessage({ address: { host: "127.0.0.1", port: 0 } });
+    // Without `listen`, a dummy address (fetch is overridden, address unused).
+    this._handleMessage({
+      address: server ? parseServerAddress(server) : { host: "127.0.0.1", port: 0 },
+    });
+  }
+
+  /** The `listen` option: serve the entry like the workers do. */
+  async #serve(entry: AppEntry, listen: ListenOptions): Promise<Server> {
+    const [{ serve }, wsPlugin] = await Promise.all([
+      import("srvx"),
+      entry.websocket ? import("crossws/server").then((m) => m.plugin) : undefined,
+    ]);
+    // `this.#entry` follows reloads (it is set once the server is ready).
+    const current = () => this.#entry ?? entry;
+    const server = serve({
+      ...toServerOptions(entry, listen),
+      fetch: (request) => current().fetch(request),
+      plugins: [...(entry.plugins || []), ...(wsPlugin ? [wsPlugin(entry.websocket!)] : [])],
+    });
+    // Before `ready()`, so a close meanwhile closes it.
+    this.#server = server;
+    server.node?.server?.on("connection", (socket: Socket) => {
+      this.#sockets.add(socket);
+      socket.once("close", () => this.#sockets.delete(socket));
+    });
+    if (entry.upgrade) {
+      server.node?.server?.on("upgrade", (req, socket, head) => {
+        current().upgrade?.({ node: { req, socket, head } });
+      });
+    }
+    await server.ready();
+    return server;
   }
 
   // #endregion

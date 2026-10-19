@@ -117,14 +117,15 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
      * for the imports, disk modules and virtual modules their filters match
      * (e.g. compiling TypeScript enums and JSX, or serving generated modules).
      * The worker sends each matching import or module to the runner and uses
-     * the result. Nested arrays are flattened and falsy entries skipped. Not
-     * supported by the `self` runner.
+     * the result. Nested arrays are flattened and falsy entries skipped. The
+     * `self` runner runs them in the host process's loader hooks, so their
+     * handlers must be synchronous there.
      */
     plugins?: EnvRunnerPluginOption[];
     /**
      * Serve on this public address from the worker (see {@link ListenOptions}).
-     * Only for runners with a worker server (node-worker, node-process,
-     * bun-process, deno-process).
+     * Only for runners with a server (node-worker, node-process, bun-process,
+     * deno-process, and self, which serves from the host process).
      */
     listen?: ListenOptions;
   }) {

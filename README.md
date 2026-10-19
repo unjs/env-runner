@@ -255,7 +255,7 @@ await runner.close();
 
 #### Public listener (`listen`)
 
-By default the worker's server listens on a random loopback port, and the host proxies requests to it (`runner.fetch()`, `manager.wsSrvxPlugin()`). In production, that means two HTTP servers per request. With the `listen` option, the worker's server binds the public address instead, and clients (WebSockets included) reach it directly. The host only supervises it: readiness, `shutdown()`, and restarting it when it crashes (`onClose`). Supported by `NodeWorkerEnvRunner`, `NodeProcessEnvRunner`, `BunProcessEnvRunner` and `DenoProcessEnvRunner`; `SelfEnvRunner` and `MiniflareEnvRunner` close with an error when it is set.
+By default the worker's server listens on a random loopback port, and the host proxies requests to it (`runner.fetch()`, `manager.wsSrvxPlugin()`). In production, that means two HTTP servers per request. With the `listen` option, the worker's server binds the public address instead, and clients (WebSockets included) reach it directly. The host only supervises it: readiness, `shutdown()`, and restarting it when it crashes (`onClose`). Supported by `NodeWorkerEnvRunner`, `NodeProcessEnvRunner`, `BunProcessEnvRunner`, `DenoProcessEnvRunner` and `SelfEnvRunner`; `MiniflareEnvRunner` closes with an error when it is set.
 
 ```ts
 import { RunnerManager } from "env-runner";
@@ -290,6 +290,8 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
 ```
 
 The options are the srvx ones of the same names (the entry's own listener options stay ignored; its `reusePort` applies unless `listen` sets it). `address` is where the host reaches the worker: a wildcard hostname is reported as loopback (`127.0.0.1` or `::1`), and `protocol` is `"https"` with `tls`. `runner.fetch()` and `runner.upgrade()` keep working for internal requests (over HTTPS without verifying the certificate, which is for the public hostname). A failure to listen (e.g. the port is taken) closes the runner with the error as cause. The worker never handles signals itself: shut it down from the host with `shutdown()`.
+
+`SelfEnvRunner` starts the server in the host process instead, with the same options: no worker startup and no round trips (to the worker, or for plugin hooks). The entry's srvx options (`middleware`, `plugins`, `error`, `trustProxy`, ...) then also apply to `runner.fetch()`, which calls the server's handler directly, and `reloadModule()` swaps the `fetch` it serves (as on the other runners, the other options are read once at start). `shutdown()` stops accepting connections and waits for in-flight requests (for half the timeout at most) before `ipc.onClose`; `close()` also drops open connections, WebSockets included.
 
 #### Virtual Modules
 

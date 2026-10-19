@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { request as httpsRequest } from "node:https";
 import { createServer, type AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -34,6 +34,7 @@ const appEntry = resolve(_dir, "./fixtures/app.mjs");
 const appShutdownEntry = resolve(_dir, "./fixtures/app-shutdown.mjs");
 const appWebSocketEntry = resolve(_dir, "./fixtures/app-websocket.mjs");
 const appShutdownWSEntry = resolve(_dir, "./fixtures/app-shutdown-ws.mjs");
+const appServerOptionsEntry = resolve(_dir, "./fixtures/app-server-options.mjs");
 
 const runners = [
   { name: "NodeWorkerEnvRunner", create: (opts: any) => new NodeWorkerEnvRunner(opts) },
@@ -48,6 +49,7 @@ const runners = [
     create: (opts: any) => new DenoProcessEnvRunner(opts),
     skip: !hasDeno,
   },
+  { name: "SelfEnvRunner", create: (opts: any) => new SelfEnvRunner(opts) },
 ];
 
 // A self-signed certificate for `127.0.0.1`.
@@ -310,18 +312,71 @@ describe("EnvServer shutdown", () => {
   });
 });
 
-describe("listen on runners without a worker server", () => {
-  it("SelfEnvRunner closes with an error", async () => {
-    const runner = new SelfEnvRunner({
-      name: "self-listen",
-      data: { entry: appEntry },
-      listen: { port: 0 },
-    } as any);
-    await expect(runner.waitForReady()).rejects.toMatchObject({
-      cause: { message: "Cannot use listen: the self runner does not support it" },
-    });
+describe("SelfEnvRunner listen", () => {
+  let runner: EnvRunner | undefined;
+  let tmpDir: string | undefined;
+
+  afterEach(async () => {
+    await runner?.close();
+    runner = undefined;
+    if (tmpDir) {
+      rmSync(tmpDir, { recursive: true, force: true });
+      tmpDir = undefined;
+    }
   });
 
+  it("applies the entry's srvx options, also to runner.fetch()", async () => {
+    runner = new SelfEnvRunner({
+      name: "self-listen-options",
+      data: { entry: appServerOptionsEntry },
+      listen: { port: 0, hostname: "127.0.0.1" },
+    });
+    await runner.waitForReady();
+    const { port } = runner.address!;
+    // The entry's own `port`/`hostname` are ignored.
+    expect(port).not.toBe(1);
+    expect(await (await fetch(`http://127.0.0.1:${port}/throw`)).text()).toBe("handled: boom");
+    expect(await (await runner.fetch("/throw")).text()).toBe("handled: boom");
+  });
+
+  it("serves the reloaded entry on the public address", async () => {
+    tmpDir = mkdtempSync(join(tmpdir(), "env-runner-self-listen-"));
+    const entry = join(tmpDir, "app.mjs");
+    writeFileSync(entry, `export default { fetch: () => new Response("v1") };`);
+    runner = new SelfEnvRunner({
+      name: "self-listen-reload",
+      data: { entry },
+      listen: { port: 0, hostname: "127.0.0.1" },
+    });
+    await runner.waitForReady();
+    const url = `http://127.0.0.1:${runner.address!.port}/`;
+    expect(await (await fetch(url)).text()).toBe("v1");
+    writeFileSync(entry, `export default { fetch: () => new Response("v2") };`);
+    await runner.reloadModule!();
+    expect(await (await fetch(url)).text()).toBe("v2");
+  });
+
+  it("close() drops open WebSockets and stops listening", async () => {
+    runner = new SelfEnvRunner({
+      name: "self-listen-close-ws",
+      data: { entry: appShutdownWSEntry },
+      listen: { port: 0, hostname: "127.0.0.1" },
+    });
+    await runner.waitForReady();
+    const { port } = runner.address!;
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/`);
+    await new Promise((resolve, reject) => {
+      ws.addEventListener("message", resolve);
+      ws.addEventListener("error", () => reject(new Error("WebSocket error")));
+    });
+    const wsClosed = new Promise((resolve) => ws.addEventListener("close", resolve));
+    await runner.close();
+    await wsClosed;
+    await expect(fetch(`http://127.0.0.1:${port}/`)).rejects.toThrow();
+  });
+});
+
+describe("listen on runners without a worker server", () => {
   it("MiniflareEnvRunner closes with an error", async () => {
     const runner = new MiniflareEnvRunner({
       miniflare,

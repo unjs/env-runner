@@ -248,24 +248,29 @@ export async function shutdownWorker(
   entry: AppEntry,
   timeout?: number,
 ): Promise<void> {
-  const closed = server.close().catch((error) => {
-    console.error("[env-runner] failed to close the worker server:", error);
-  });
-  if (typeof timeout === "number") {
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    await Promise.race([
-      closed,
-      new Promise((resolve) => (timer = setTimeout(resolve, timeout / 2))),
-    ]);
-    clearTimeout(timer);
-  } else {
-    await closed;
-  }
+  await closeServerGracefully(server, typeof timeout === "number" ? timeout / 2 : undefined);
   await Promise.resolve()
     .then(() => entry.ipc?.onClose?.())
     .catch((error) => {
       console.error("[env-runner] `ipc.onClose` failed:", error);
     });
+}
+
+/**
+ * Stop accepting connections and wait for in-flight requests (and open
+ * WebSockets), for `timeout` ms at most. Never rejects (errors are logged).
+ */
+export async function closeServerGracefully(server: Server, timeout?: number): Promise<void> {
+  const closed = server.close().catch((error) => {
+    console.error("[env-runner] failed to close the worker server:", error);
+  });
+  if (typeof timeout === "number") {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([closed, new Promise((resolve) => (timer = setTimeout(resolve, timeout)))]);
+    clearTimeout(timer);
+  } else {
+    await closed;
+  }
 }
 
 /** Re-import the user entry (cache-busted) and re-init its IPC hooks. */
