@@ -1,6 +1,18 @@
 # Changelog
 
 
+## v0.3.6
+
+[compare changes](https://github.com/unjs/env-runner/compare/v0.3.5...v0.3.6)
+
+### 🚀 Enhancements
+
+- **self:** Support `listen` option ([0a32290](https://github.com/unjs/env-runner/commit/0a32290))
+
+### ❤️ Contributors
+
+- Pooya Parsa ([@pi0](https://github.com/pi0))
+
 ## v0.3.5
 
 [compare changes](https://github.com/unjs/env-runner/compare/v0.3.4...v0.3.5)
