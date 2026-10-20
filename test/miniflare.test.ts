@@ -10,6 +10,7 @@ const _dir = dirname(fileURLToPath(import.meta.url));
 const workerDoEntry = resolve(_dir, "./fixtures/worker-do.mjs");
 const workerSrvxEntry = resolve(_dir, "./fixtures/worker-srvx.mjs");
 const workerIpcRequestsEntry = resolve(_dir, "./fixtures/worker-ipc-requests.mjs");
+const workerHandlersEntry = resolve(_dir, "./fixtures/worker-handlers.mjs");
 
 describe("MiniflareEnvRunner (custom exports)", () => {
   let runner: EnvRunner | undefined;
@@ -1750,3 +1751,65 @@ function waitForReady(runner: EnvRunner, timeout = 15000): Promise<void> {
     });
   });
 }
+
+describe("MiniflareEnvRunner (non-fetch handlers)", () => {
+  let runner: EnvRunner | undefined;
+
+  afterEach(async () => {
+    await runner?.close();
+    runner = undefined;
+  });
+
+  const calls = async () => (await runner!.fetch("http://localhost/calls")).json();
+
+  it("forwards scheduled events to the entry", async () => {
+    runner = new MiniflareEnvRunner({
+      miniflare,
+      name: "test-handlers-scheduled",
+      data: { entry: workerHandlersEntry },
+      miniflareOptions: { unsafeTriggerHandlers: true },
+    });
+    await runner.waitForReady();
+    const res = await runner.fetch("http://localhost/cdn-cgi/local/scheduled?cron=*+*+*+*+*");
+    expect(res.status).toBe(200);
+    expect(await calls()).toEqual([
+      { handler: "scheduled", cron: "* * * * *", internalBindings: [], waitUntil: "function" },
+    ]);
+  });
+
+  it("forwards queue batches to the entry", async () => {
+    runner = new MiniflareEnvRunner({
+      miniflare,
+      name: "test-handlers-queue",
+      data: { entry: workerHandlersEntry },
+      miniflareOptions: {
+        queueProducers: { QUEUE: "test-queue" },
+        queueConsumers: { "test-queue": { maxBatchTimeout: 0 } },
+      },
+    });
+    await runner.waitForReady();
+    expect(await (await runner.fetch("http://localhost/send")).text()).toBe("sent");
+    await vi.waitFor(async () => {
+      expect(await calls()).toEqual([
+        {
+          handler: "queue",
+          queue: "test-queue",
+          messages: [{ hello: "queue" }],
+          internalBindings: [],
+        },
+      ]);
+    });
+  });
+
+  it("fails a handler the entry does not define", async () => {
+    runner = new MiniflareEnvRunner({
+      miniflare,
+      name: "test-handlers-missing",
+      data: { entry: workerSrvxEntry },
+      miniflareOptions: { unsafeTriggerHandlers: true },
+    });
+    await runner.waitForReady();
+    const res = await runner.fetch("http://localhost/cdn-cgi/local/scheduled");
+    expect(res.status).toBe(500);
+  });
+});
