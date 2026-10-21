@@ -62,7 +62,7 @@ export default {
 };
 ```
 
-- `toServerOptions()` strips env-runner keys and pins/drops listener options (`RESERVED_SERVER_OPTIONS`, `RESERVED_RUNTIME_OPTIONS` for nested `node`/`bun`/`deno`) since the worker listens on `127.0.0.1:0` behind the runner proxy, or on the runner's `listen` address (see Key patterns). Server options are read once at start; `reloadModule()` only swaps `fetch`.
+- `toServerOptions()` strips env-runner keys and pins/drops listener options (`RESERVED_SERVER_OPTIONS`, `RESERVED_RUNTIME_OPTIONS` for nested `node`/`bun`/`deno`) since the worker listens on `127.0.0.1:0` behind the runner proxy, or on the runner's `listen` address (see Key patterns). Behind the proxy, `bun.idleTimeout` defaults to `0` (Bun's 10s default closed slow responses, nitrojs/nitro#4874); `listen` keeps Bun's default. Server options are read once at start; `reloadModule()` only swaps `fetch`.
 - `websocket` uses `crossws/server`, which picks the adapter matching the host runtime (so node-worker/node-process use native Bun/Deno adapters when the host is Bun/Deno).
 - `ipc.onMessage` receives only user messages (ping/pong/shutdown are filtered); `onOpen` runs before the ready signal.
 - Worker flow: (process workers: receive data over IPC) → import entry → `serve()` + `ready()` → wire `upgrade` → `ipc.onOpen` → post `{ address }`. Any init failure posts `{ event: "init-error", error }` (`formatInitError()`: the message, plus where it was thrown if it doesn't say), logs one `[env-runner] worker init failed: ...` line and exits 1.

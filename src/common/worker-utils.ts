@@ -113,6 +113,9 @@ export function toServerOptions(
   }
   return {
     ...options,
+    // Bun closes connections idle for 10s by default, also while a slow
+    // response (cold SSR) is pending. The host proxy owns client timeouts.
+    bun: { idleTimeout: 0, ...options.bun },
     port: 0,
     hostname: "127.0.0.1",
     silent: true,
