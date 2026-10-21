@@ -6,7 +6,7 @@ import { inspect } from "node:util";
 import { fileURLToPath } from "node:url";
 import { resolve, dirname, join } from "node:path";
 import { describe, expect, it, afterEach, beforeAll, afterAll, vi } from "vitest";
-import type { EnvRunner } from "../src/index.ts";
+import { toServerOptions, type EnvRunner } from "../src/index.ts";
 
 function hasRuntime(cmd: string): boolean {
   try {
@@ -731,6 +731,38 @@ for (const { name, create, skip } of serverOptionsRunners) {
     });
   });
 }
+
+describe("toServerOptions() bun idleTimeout", () => {
+  const fetch = () => new Response("ok");
+
+  it("disables Bun's idle timeout behind the proxy unless the entry sets one", () => {
+    expect(toServerOptions({ fetch }).bun).toEqual({ idleTimeout: 0 });
+    expect(toServerOptions({ fetch, bun: { idleTimeout: 30 } }).bun).toEqual({ idleTimeout: 30 });
+  });
+
+  it("keeps Bun's default on a public `listen` address", () => {
+    expect(toServerOptions({ fetch }, { port: 3000 }).bun).toBeUndefined();
+  });
+});
+
+// Bun's default `idleTimeout` (10s) closed slow responses (nitrojs/nitro#4874).
+describe.skipIf(!hasBun)("BunProcessEnvRunner slow response", () => {
+  const appSlowResponseEntry = resolve(_dir, "./fixtures/app-slow-response.mjs");
+  let runner: EnvRunner | undefined;
+
+  afterEach(async () => {
+    await runner?.close();
+    runner = undefined;
+  });
+
+  it("keeps the connection open past Bun's default idle timeout", { timeout: 30_000 }, async () => {
+    runner = new BunProcessEnvRunner({ name: "slow", data: { entry: appSlowResponseEntry } });
+    await waitForReady(runner);
+    const res = await runner.fetch("/?delay=14000");
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("ok after 14000ms");
+  });
+});
 
 // --- process runner data (IPC handshake instead of the size-limited env) ---
 
