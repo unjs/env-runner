@@ -28,6 +28,8 @@ export function generateWrapper(
     nodeCompat?: boolean;
     /** `crossws/server` (`workerd` condition), resolved from env-runner (not the entry). Default: the bare specifier. */
     crosswsServer?: string;
+    /** crossws Cloudflare options set under the entry's `websocket.options.cloudflare` (which wins). */
+    crossws?: { bindingName?: string; instanceName?: string };
   },
 ): string {
   // Without `nodejs_compat` (`no_nodejs_compat`), `node:process` can't resolve
@@ -75,6 +77,7 @@ const __IPC_BINDING = "${IPC_BINDING}";
 const __UNSAFE_EVAL_BINDING = "${UNSAFE_EVAL_BINDING}";
 const __entryPath = ${JSON.stringify(entryPath)};
 const __crosswsServerPath = ${JSON.stringify(opts?.crosswsServer || "crossws/server")};
+const __crosswsCloudflare = ${JSON.stringify(opts?.crossws || null)};
 let __entryModule;
 let __userEntry;
 let __entryLoading;
@@ -102,6 +105,19 @@ function __userEnv(env) {
   return userEnv;
 }
 
+// The entry's \`websocket\` with the runner's \`crossws\` option under its own
+// \`options.cloudflare\`.
+function __websocketOptions(websocket) {
+  if (!__crosswsCloudflare) return websocket;
+  return {
+    ...websocket,
+    options: {
+      ...websocket.options,
+      cloudflare: { ...__crosswsCloudflare, ...websocket.options?.cloudflare },
+    },
+  };
+}
+
 // Mirrors srvx's CloudflareServer (srvx/cloudflare): plugins, then the
 // \`error\` handler as the outermost middleware, then the middleware chain.
 function __createServer(entry) {
@@ -121,7 +137,10 @@ function __createServer(entry) {
   };
   // \`websocket\` as in the other runners: crossws's plugin, with the entry's
   // \`websocket\` as its options (hooks, or \`resolve\`).
-  const plugins = [...(entry.plugins || []), ...(entry.websocket ? [__crosswsPlugin(entry.websocket)] : [])];
+  const plugins = [
+    ...(entry.plugins || []),
+    ...(entry.websocket ? [__crosswsPlugin(__websocketOptions(entry.websocket))] : []),
+  ];
   for (const plugin of plugins) {
     plugin(server);
   }
