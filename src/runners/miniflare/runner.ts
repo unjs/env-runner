@@ -63,6 +63,14 @@ export interface MiniflareModule {
   [key: string]: unknown;
 }
 
+/** crossws Cloudflare adapter options (`websocket.options.cloudflare`) the runner sets. */
+export interface MiniflareCrosswsOptions {
+  /** Durable Object binding handling WebSocket upgrades. crossws default: `"$DurableObject"`. */
+  bindingName?: string;
+  /** Durable Object instance name. crossws default: `"crossws"`. */
+  instanceName?: string;
+}
+
 export interface MiniflareEnvRunnerOptions {
   name: string;
   hooks?: WorkerHooks;
@@ -116,6 +124,12 @@ export interface MiniflareEnvRunnerOptions {
   persistent?: boolean;
   /** Wrap the user's `fetch` in a try/catch that returns structured JSON error responses. Default: `true`. */
   captureErrors?: boolean;
+  /**
+   * crossws Cloudflare adapter options for the entry's `websocket` (e.g. the
+   * Durable Object instance upgrades go to). The entry's own
+   * `websocket.options.cloudflare` values take precedence.
+   */
+  crossws?: MiniflareCrosswsOptions;
   /**
    * Export conditions for the fallback service (default `["workerd", "worker"]`),
    * plus `import` or `require` matching how the module is loaded.
@@ -229,6 +243,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
   #cacheKey?: string;
   #exports: Record<string, MiniflareExportInfo> | boolean | string;
   #captureErrors: boolean;
+  #crossws?: MiniflareCrosswsOptions;
   #exportConditions: string[];
   #wrangler: boolean | string | WranglerInlineConfig;
   #wranglerEnv?: string;
@@ -246,6 +261,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
     this.#persistent = opts.persistent ?? false;
     this.#exports = opts.exports ?? {};
     this.#captureErrors = opts.captureErrors ?? true;
+    this.#crossws = opts.crossws;
     this.#exportConditions = opts.exportConditions ?? ["workerd", "worker"];
     this.#wrangler = opts.wrangler ?? false;
     // Default the wrangler `--env` to the `CLOUDFLARE_ENV` variable.
@@ -795,6 +811,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
             // Zero-config classes need no declaration (no deploy hint).
             configuredExports: Object.keys(zeroConfig ? stubs : declared),
             nodeCompat: !(options.compatibilityFlags as string[]).includes("no_nodejs_compat"),
+            crossws: this.#crossws,
             // A dependency of env-runner, which the app may not resolve (pnpm).
             // Unresolved (env-runner bundled elsewhere): the bare specifier.
             crosswsServer: (_crosswsServerPath ||= resolveModulePath("crossws/server", {
@@ -1357,6 +1374,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
         ...this.#miniflareOptions,
         _exportConditions: this.#exportConditions,
         _exports: this.#exports,
+        _crossws: this.#crossws,
         // Plugins are read from the adopting runner, but change the module rules.
         _plugins: Boolean(this._plugins),
         // The fallback service closure captures the virtual map, so instances

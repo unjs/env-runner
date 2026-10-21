@@ -400,8 +400,16 @@ describe("MiniflareEnvRunner websocket", () => {
   });
 
   // Front server forwarding upgrades to a miniflare runner for `entry`.
-  async function start(entry: string) {
-    runner = new MiniflareEnvRunner({ miniflare, name: "test-ws-miniflare", data: { entry } });
+  async function start(
+    entry: string,
+    opts?: Partial<ConstructorParameters<typeof MiniflareEnvRunner>[0]>,
+  ) {
+    runner = new MiniflareEnvRunner({
+      miniflare,
+      name: "test-ws-miniflare",
+      data: { entry },
+      ...opts,
+    });
     await runner.waitForReady();
 
     server = createServer();
@@ -463,5 +471,104 @@ describe("MiniflareEnvRunner websocket", () => {
     writeFileSync(entry, readFileSync(appWebsocketResolveEntry, "utf8"));
     await runner!.reloadModule!();
     expect(await echo(port)).toEqual(["welcome", "echo:hello"]);
+  });
+
+  // Entry whose Durable Object greets with the instance it was reached as
+  // (`WS_OBJECT`, auto-bound); `websocket` (code) is its crossws options,
+  // whose own hooks answer `fallback`.
+  function writeDurableEntry(websocket = `{ open(peer) { peer.send("fallback"); } }`) {
+    tmpDir = mkdtempSync(join(tmpdir(), "env-runner-ws-"));
+    const entry = join(tmpDir, "entry.mjs");
+    writeFileSync(
+      entry,
+      /* js */ `import { DurableObject } from "cloudflare:workers";
+export class WsObject extends DurableObject {
+  fetch() {
+    const { 0: client, 1: server } = new WebSocketPair();
+    server.accept();
+    const name = ["server", "crossws", "entry"].find((name) =>
+      this.ctx.id.equals(this.env.WS_OBJECT.idFromName(name)),
+    );
+    server.send("do:" + name);
+    return new Response(null, { status: 101, webSocket: client });
+  }
+}
+export default {
+  fetch: () => new Response("ok"),
+  websocket: ${websocket},
+};`,
+    );
+    return entry;
+  }
+
+  async function firstMessage(port: number) {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/`);
+    try {
+      return await new Promise<string>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("no message")), 10_000);
+        ws.addEventListener("message", (event) => {
+          clearTimeout(timer);
+          resolve(String(event.data));
+        });
+      });
+    } finally {
+      ws.close();
+    }
+  }
+
+  it("applies the `crossws` option to the entry's `websocket`", async () => {
+    const port = await start(writeDurableEntry(), {
+      crossws: { bindingName: "WS_OBJECT", instanceName: "server" },
+    });
+    expect(await firstMessage(port)).toBe("do:server");
+  });
+
+  it("prefers the entry's `websocket.options.cloudflare` over `crossws`", async () => {
+    const entry = writeDurableEntry(
+      `{ open() {}, options: { cloudflare: { instanceName: "entry" } } }`,
+    );
+    const port = await start(entry, {
+      crossws: { bindingName: "WS_OBJECT", instanceName: "server" },
+    });
+    expect(await firstMessage(port)).toBe("do:entry");
+  });
+
+  it("ignores `undefined` values of the entry's `websocket.options.cloudflare`", async () => {
+    const entry = writeDurableEntry(
+      `{ open() {}, options: { cloudflare: { instanceName: undefined } } }`,
+    );
+    const port = await start(entry, {
+      crossws: { bindingName: "WS_OBJECT", instanceName: "server" },
+    });
+    expect(await firstMessage(port)).toBe("do:server");
+  });
+
+  // Hooks on a prototype stay visible to crossws (only `options` is shadowed).
+  it("keeps `websocket` hooks of a class instance with `crossws`", async () => {
+    const entry = writeDurableEntry(`new (class { open(peer) { peer.send("fallback"); } })()`);
+    const port = await start(entry, { crossws: { bindingName: "MISSING" } });
+    expect(await firstMessage(port)).toBe("fallback");
+  });
+
+  it("keeps crossws defaults without the `crossws` option", async () => {
+    expect(await firstMessage(await start(writeDurableEntry()))).toBe("fallback");
+  });
+
+  // An instance is only shared while a runner still holds it.
+  it("does not share persistent instances across `crossws` options", async () => {
+    const entry = writeDurableEntry();
+    const opts = (instanceName: string) => ({
+      persistent: true,
+      crossws: { bindingName: "WS_OBJECT", instanceName },
+    });
+    await start(entry, opts("server"));
+    const first = { runner: runner!, server: server! };
+    try {
+      expect(await firstMessage(await start(entry, opts("entry")))).toBe("do:entry");
+    } finally {
+      await first.runner.close();
+      first.server.close();
+      await MiniflareEnvRunner.disposeAll();
+    }
   });
 });

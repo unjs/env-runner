@@ -65,6 +65,7 @@ export {
 export {
   type TransformResult,
   type MiniflareExportInfo,
+  type MiniflareCrosswsOptions,
   type MiniflareEnvRunnerOptions,
   MiniflareEnvRunner,
 } from "./runners/miniflare/runner.ts";
