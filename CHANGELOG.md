@@ -1,6 +1,18 @@
 # Changelog
 
 
+## v0.3.7
+
+[compare changes](https://github.com/unjs/env-runner/compare/v0.3.6...v0.3.7)
+
+### 🚀 Enhancements
+
+- **miniflare:** `crossws` option for crossws Cloudflare options ([#88](https://github.com/unjs/env-runner/pull/88))
+
+### ❤️ Contributors
+
+- Pi0x <x@pi0.io>
+
 ## v0.3.6
 
 [compare changes](https://github.com/unjs/env-runner/compare/v0.3.5...v0.3.6)
