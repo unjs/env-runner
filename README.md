@@ -734,7 +734,7 @@ The entry uses the same `AppEntry` format as the other runners, plus an optional
 
 When you don't set a compatibility date, it defaults to the date supported by the installed `workerd` binary rather than today's date — the binary always lags the calendar slightly, and pinning a future date makes `workerd` refuse to start. Set the runner's `compatibilityDate` option to pin one, or to `"latest"` to use the installed `workerd`'s supported date explicitly (no need to import `miniflare` for `supportedCompatibilityDate`). Precedence: `miniflareOptions.compatibilityDate` > `compatibilityDate` > the wrangler config's `compatibility_date` > the supported date. Whatever the source, a date newer than the installed `workerd` supports falls back to the supported date with a warning (like `wrangler dev`).
 
-An entry's `websocket` is served with crossws's Cloudflare adapter, which hands upgrades to a Durable Object (by default the `crossws` instance of the `$DurableObject` binding, when it exists). Set the runner's `crossws` option to choose them without adding Cloudflare-specific options to the entry; values in the entry's own `websocket.options.cloudflare` take precedence:
+An entry's `websocket` is served with crossws's Cloudflare adapter, which hands upgrades to a Durable Object (by default the `crossws` instance of the `$DurableObject` binding, when it exists). Set the runner's `crossws` option to choose them without adding Cloudflare-specific options to the entry; values the entry sets (not `undefined`) in its own `websocket.options.cloudflare` take precedence:
 
 ```ts
 await using runner = new MiniflareEnvRunner({

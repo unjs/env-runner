@@ -474,8 +474,9 @@ describe("MiniflareEnvRunner websocket", () => {
   });
 
   // Entry whose Durable Object greets with the instance it was reached as
-  // (`WS_OBJECT`, auto-bound); crossws's own hooks answer `fallback`.
-  function writeDurableEntry(cloudflare?: Record<string, string>) {
+  // (`WS_OBJECT`, auto-bound); `websocket` (code) is its crossws options,
+  // whose own hooks answer `fallback`.
+  function writeDurableEntry(websocket = `{ open(peer) { peer.send("fallback"); } }`) {
     tmpDir = mkdtempSync(join(tmpdir(), "env-runner-ws-"));
     const entry = join(tmpDir, "entry.mjs");
     writeFileSync(
@@ -494,10 +495,7 @@ export class WsObject extends DurableObject {
 }
 export default {
   fetch: () => new Response("ok"),
-  websocket: {
-    open(peer) { peer.send("fallback"); },
-    ${cloudflare ? `options: { cloudflare: ${JSON.stringify(cloudflare)} },` : ""}
-  },
+  websocket: ${websocket},
 };`,
     );
     return entry;
@@ -526,13 +524,51 @@ export default {
   });
 
   it("prefers the entry's `websocket.options.cloudflare` over `crossws`", async () => {
-    const port = await start(writeDurableEntry({ instanceName: "entry" }), {
+    const entry = writeDurableEntry(
+      `{ open() {}, options: { cloudflare: { instanceName: "entry" } } }`,
+    );
+    const port = await start(entry, {
       crossws: { bindingName: "WS_OBJECT", instanceName: "server" },
     });
     expect(await firstMessage(port)).toBe("do:entry");
   });
 
+  it("ignores `undefined` values of the entry's `websocket.options.cloudflare`", async () => {
+    const entry = writeDurableEntry(
+      `{ open() {}, options: { cloudflare: { instanceName: undefined } } }`,
+    );
+    const port = await start(entry, {
+      crossws: { bindingName: "WS_OBJECT", instanceName: "server" },
+    });
+    expect(await firstMessage(port)).toBe("do:server");
+  });
+
+  // Hooks on a prototype stay visible to crossws (only `options` is shadowed).
+  it("keeps `websocket` hooks of a class instance with `crossws`", async () => {
+    const entry = writeDurableEntry(`new (class { open(peer) { peer.send("fallback"); } })()`);
+    const port = await start(entry, { crossws: { bindingName: "MISSING" } });
+    expect(await firstMessage(port)).toBe("fallback");
+  });
+
   it("keeps crossws defaults without the `crossws` option", async () => {
     expect(await firstMessage(await start(writeDurableEntry()))).toBe("fallback");
+  });
+
+  // An instance is only shared while a runner still holds it.
+  it("does not share persistent instances across `crossws` options", async () => {
+    const entry = writeDurableEntry();
+    const opts = (instanceName: string) => ({
+      persistent: true,
+      crossws: { bindingName: "WS_OBJECT", instanceName },
+    });
+    await start(entry, opts("server"));
+    const first = { runner: runner!, server: server! };
+    try {
+      expect(await firstMessage(await start(entry, opts("entry")))).toBe("do:entry");
+    } finally {
+      await first.runner.close();
+      first.server.close();
+      await MiniflareEnvRunner.disposeAll();
+    }
   });
 });
