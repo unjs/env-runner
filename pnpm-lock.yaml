@@ -168,10 +168,10 @@ importers:
     dependencies:
       crossws:
         specifier: ^0.4.15
-        version: 0.4.15(srvx@1.0.5)
+        version: 0.4.15(srvx@1.0.6)
       srvx:
-        specifier: ^1.0.5
-        version: 1.0.5
+        specifier: ^1.0.6
+        version: 1.0.6
     devDependencies:
       '@netlify/runtime':
         specifier: ^5.0.8
@@ -228,7 +228,7 @@ importers:
         specifier: ^5.0.5
         version: 5.0.5(@opentelemetry/api@1.9.1)(@types/node@26.6.5)(@vitest/coverage-v8@5.0.5)(vite@8.3.4(@types/node@26.6.5)(esbuild@0.28.2)(jiti@2.7.0))
       wrangler:
-        specifier: ^4.151.0
+        specifier: ^4.151.1
         version: 4.151.1(@types/node@26.6.5)
 
 packages:
@@ -2382,8 +2382,8 @@ packages:
     resolution: {integrity: sha512-KGj/8Y43x35aZVDtt+J4mK1hoLGHULMYfSkODJNQjNDC3oW1PqPoxMwo0pLUsWM/UEGzON/NxeHywEfNXNP3Vw==}
     engines: {node: '>=0.10.0'}
 
-  srvx@1.0.5:
-    resolution: {integrity: sha512-KvSKRpgPG/oaq3cyT614OQ2bAa7DynuGamivCZeoZzIUULOdbQz6wUtnnVuC4+DCx2Zglzo8v5gBYmWIWYhDxA==}
+  srvx@1.0.6:
+    resolution: {integrity: sha512-QeTKgAhk8OSsfeq60bl3wuVs9PmBftzmk7owBInA/F1YQne+TRw0UcPymNpURldAmx8hfmM2PNNGH/zgo3GpLA==}
     engines: {node: '>=20.16.0'}
     hasBin: true
 
@@ -3726,9 +3726,9 @@ snapshots:
       shebang-command: 2.0.0
       which: 2.0.2
 
-  crossws@0.4.15(srvx@1.0.5):
+  crossws@0.4.15(srvx@1.0.6):
     optionalDependencies:
-      srvx: 1.0.5
+      srvx: 1.0.6
 
   debug@4.4.3(supports-color@10.2.2):
     dependencies:
@@ -4301,7 +4301,7 @@ snapshots:
 
   source-map-js@1.2.2: {}
 
-  srvx@1.0.5: {}
+  srvx@1.0.6: {}
 
   std-env@3.10.0: {}
 

@@ -44,7 +44,7 @@
   },
   "dependencies": {
     "crossws": "^0.4.15",
-    "srvx": "^1.0.5"
+    "srvx": "^1.0.6"
   },
   "devDependencies": {
     "@netlify/runtime": "^5.0.8",
@@ -65,7 +65,7 @@
     "oxlint": "^1.88.0",
     "typescript": "^7.0.2",
     "vitest": "^5.0.5",
-    "wrangler": "^4.151.0"
+    "wrangler": "^4.151.1"
   },
   "packageManager": "pnpm@12.14.0"
 }
