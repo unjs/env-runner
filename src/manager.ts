@@ -19,8 +19,8 @@ export interface RunnerReloadOptions {
   /**
    * Keep the previous runner serving the requests and WebSockets it already
    * accepted, and shut it down (`shutdown()`, else `close()`) once they settle.
-   * After `timeout` ms (default `60_000`, `Infinity` for no limit), it is
-   * closed with whatever is still open. New requests and upgrades go to the
+   * After `timeout` ms (default `60_000`, also for `NaN`; `Infinity` for no
+   * limit), it is closed with whatever is still open. New requests and upgrades go to the
    * new runner right away. Without it, the previous runner is closed
    * immediately.
    */
@@ -44,11 +44,10 @@ export class RunnerManager implements EnvRunner, AsyncDisposable {
   private _readyRejectors = new Set<() => void>();
   // Requests (until their body settles) and WebSockets each runner serves.
   private _exchanges = new WeakMap<EnvRunner, number>();
-  // Previous runners draining after `reload()` (until closed), with their retire function.
-  private _draining = new Map<
-    EnvRunner,
-    (close?: (runner: EnvRunner) => Promise<void>) => Promise<void>
-  >();
+  // Previous runners draining after `reload()` (until closed or attached again).
+  private _draining = new Map<EnvRunner, DrainingRunner>();
+  // Runners whose `close()` `_attach()` wrapped (once, even when attached again).
+  private _wrappedRunners = new WeakSet<EnvRunner>();
 
   constructor(runner?: EnvRunner) {
     if (runner) {
@@ -84,6 +83,11 @@ export class RunnerManager implements EnvRunner, AsyncDisposable {
         return;
       }
       const prev = this._runner;
+      // Attached again while draining (e.g. swapping back): it serves again.
+      this._draining.get(runner)?.cancel();
+      if (prev === runner) {
+        return;
+      }
       this._detach();
       this._attach(runner);
       // A fresh runner re-resolves its sources, satisfying any pending invalidation.
@@ -333,7 +337,9 @@ export class RunnerManager implements EnvRunner, AsyncDisposable {
     // Fail any in-flight `waitForReady()` callers promptly.
     for (const rejectReady of this._readyRejectors) rejectReady();
     this._readyRejectors.clear();
-    const draining = Promise.all([...this._draining.values()].map((retire) => retire(closeRunner)));
+    const draining = Promise.all(
+      [...this._draining.values()].map((draining) => draining.retire(closeRunner)),
+    );
     // A `close()` during a `shutdown()` closes the same runner.
     const runner = this._runner ?? this._closingRunner;
     if (!runner) {
@@ -367,39 +373,49 @@ export class RunnerManager implements EnvRunner, AsyncDisposable {
         return;
       }
       this._exchanges.delete(runner);
-      this._draining.get(runner)?.();
+      void this._draining.get(runner)?.retire();
     };
   }
 
   /**
    * Retire a detached runner: shut it down once its exchanges settle, or close
    * it after `timeout`. `_close()` retires it early with its own close
-   * function, and a runner that closes itself meanwhile (crash) just stops
-   * draining.
+   * function, a runner that closes itself meanwhile (crash) just stops
+   * draining, and `reload()` cancels it for a runner attached again.
    */
   private _drain(runner: EnvRunner, timeout: number) {
     let timer: ReturnType<typeof setTimeout> | undefined;
     let retiring: Promise<void> | undefined;
-    const retire = (close = shutdownRunner) => {
-      clearTimeout(timer);
-      // Once shutting down, only an immediate `close()` goes ahead.
-      if (!retiring || (close === closeRunnerNow && !runner.closed)) {
-        retiring = close(runner)
-          .catch((error) => {
-            console.error("[env-runner] Failed to close the drained runner:", error);
-          })
-          .finally(() => {
-            if (this._draining.get(runner) === retire) this._draining.delete(runner);
-          });
-      }
-      return retiring;
+    const draining: DrainingRunner = {
+      retire: (close = shutdownRunner) => {
+        clearTimeout(timer);
+        // Once shutting down, only an immediate `close()` goes ahead.
+        if (!retiring || (close === closeRunnerNow && !runner.closed)) {
+          // Also catches a close function that throws synchronously.
+          retiring = new Promise<void>((resolve) => resolve(close(runner)))
+            .catch((error) => {
+              console.error("[env-runner] Failed to close the drained runner:", error);
+            })
+            .finally(() => {
+              if (this._draining.get(runner) === draining) this._draining.delete(runner);
+            });
+        }
+        return retiring;
+      },
+      cancel: () => {
+        clearTimeout(timer);
+        // Already shutting down: it closes once attached (reported to `onClose()`).
+        if (!retiring) this._draining.delete(runner);
+      },
     };
-    this._draining.set(runner, retire);
+    this._draining.set(runner, draining);
+    // `NaN` (e.g. from an unset env var) is the default, negative values are 0.
+    timeout = Number.isNaN(timeout) ? DRAIN_TIMEOUT : Math.max(timeout, 0);
     if (!this._exchanges.has(runner) || runner.closed) {
-      void retire();
+      void draining.retire();
     } else if (timeout < 2 ** 31) {
       // Beyond `setTimeout()`'s limit (`Infinity` included): no limit.
-      timer = setTimeout(() => retire(closeRunnerNow), timeout);
+      timer = setTimeout(() => draining.retire(closeRunnerNow), timeout);
     }
   }
 
@@ -424,17 +440,21 @@ export class RunnerManager implements EnvRunner, AsyncDisposable {
 
     // Wrap close() to detect when runner exits (works with BaseEnvRunner). Runners
     // close themselves via this wrapper, so forward the cause (`hooks.onClose`,
-    // `waitForReady()` rejections).
-    const originalClose = runner.close.bind(runner) as (cause?: unknown) => Promise<void>;
-    runner.close = async (cause?: unknown) => {
-      await originalClose(cause);
-      // Draining and closed by itself (or its `shutdown()`): nothing left to retire.
-      void this._draining.get(runner)?.(async () => {});
-      if (this._runner === runner) {
-        this._runner = undefined;
-        for (const fn of this._closeListeners) fn(this, cause);
-      }
-    };
+    // `waitForReady()` rejections). Once per runner: a second wrapper would
+    // report its close twice.
+    if (!this._wrappedRunners.has(runner)) {
+      this._wrappedRunners.add(runner);
+      const originalClose = runner.close.bind(runner) as (cause?: unknown) => Promise<void>;
+      runner.close = async (cause?: unknown) => {
+        await originalClose(cause);
+        // Draining and closed by itself (or its `shutdown()`): nothing left to retire.
+        void this._draining.get(runner)?.retire(async () => {});
+        if (this._runner === runner) {
+          this._runner = undefined;
+          for (const fn of this._closeListeners) fn(this, cause);
+        }
+      };
+    }
 
     // If already ready, flush immediately
     if (runner.ready) {
@@ -493,6 +513,14 @@ export class RunnerManager implements EnvRunner, AsyncDisposable {
   // #endregion
 }
 
+/** A runner draining after `reload()`. */
+interface DrainingRunner {
+  /** Close it (`shutdown()` by default); once shutting down, only `close()` goes ahead. */
+  retire(close?: (runner: EnvRunner) => Promise<void>): Promise<void>;
+  /** Stop draining (unless already shutting down), for a runner attached again. */
+  cancel(): void;
+}
+
 function closeRunnerNow(runner: EnvRunner): Promise<void> {
   return runner.close();
 }
@@ -501,18 +529,64 @@ function shutdownRunner(runner: EnvRunner): Promise<void> {
   return runner.shutdown ? runner.shutdown() : runner.close();
 }
 
+/** srvx's `FastResponse` on Node, as its Node adapter reads it (internal API). */
+interface NodeFastResponse extends Response {
+  _toNodeResponse(): { status: number; statusText: string; headers: unknown[]; body?: unknown };
+}
+
 /**
  * `settle` once the response body is read to the end, fails or is canceled.
  * A `FastResponse` builds the native `Response` lazily, and srvx's Node
  * adapter sends it without one.
  */
 function trackResponseBody(response: Response, settle: () => void): Response {
-  if (!response.body) {
+  if (typeof (response as Partial<NodeFastResponse> | undefined)?._toNodeResponse === "function") {
+    return trackNodeFastResponse(response as NodeFastResponse, settle);
+  }
+  if (!response?.body) {
     settle();
     return response;
   }
-  const reader = response.body.getReader();
-  const body = new ReadableStream<Uint8Array>({
+  return new FastResponse(trackStream(response.body, settle), {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  });
+}
+
+/**
+ * A runner's srvx `FastResponse` on Node (e.g. from the `self` runner): read
+ * like srvx's Node adapter does, since `.body` would turn it into a native
+ * `Response` and lose the `content-type`/`content-length` srvx derives from a
+ * string or byte body. Such a buffered body settles right away.
+ */
+function trackNodeFastResponse(response: NodeFastResponse, settle: () => void): Response {
+  const { status, statusText, headers: rawHeaders, body } = response._toNodeResponse();
+  const headers: [string, string][] = [];
+  for (let i = 0; i < rawHeaders.length; i += 2) {
+    headers.push([String(rawHeaders[i]), String(rawHeaders[i + 1])]);
+  }
+  let trackedBody = body;
+  if (body instanceof ReadableStream) {
+    trackedBody = trackStream(body, settle);
+  } else if (typeof (body as NodeJS.ReadableStream | undefined)?.once === "function") {
+    // A Node.js stream: until it is closed (ended, errored or destroyed).
+    const stream = body as NodeJS.ReadableStream & { closed?: boolean };
+    if (stream.closed) settle();
+    else stream.once("close", settle);
+  } else {
+    settle();
+  }
+  return new FastResponse(trackedBody as BodyInit | null | undefined, {
+    status,
+    statusText,
+    headers,
+  });
+}
+
+function trackStream(stream: ReadableStream<Uint8Array>, settle: () => void) {
+  const reader = stream.getReader();
+  return new ReadableStream<Uint8Array>({
     async pull(controller) {
       try {
         const { done, value } = await reader.read();
@@ -531,10 +605,5 @@ function trackResponseBody(response: Response, settle: () => void): Response {
       settle();
       return reader.cancel(reason);
     },
-  });
-  return new FastResponse(body, {
-    status: response.status,
-    statusText: response.statusText,
-    headers: response.headers,
   });
 }

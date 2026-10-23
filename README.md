@@ -149,7 +149,7 @@ manager.onMessage((msg) => console.log("From worker:", msg));
 
 #### Drained reload
 
-By default, `reload()` closes the previous runner right away, cutting off its in-flight requests, streamed responses and WebSockets. With `drain`, new requests and upgrades go to the new runner while the previous one keeps serving what it already accepted, and shuts down (`shutdown()`) once they settle. After the drain timeout (default 60s), it is closed with whatever is still open:
+By default, `reload()` closes the previous runner right away, cutting off its in-flight requests, streamed responses and WebSockets. With `drain`, new requests and upgrades go to the new runner while the previous one keeps serving what it already accepted, and shuts down (`shutdown()`) once they settle. After the drain timeout (default 60s, also used for `NaN`), it is closed with whatever is still open:
 
 ```ts
 await manager.reload(newRunner, { drain: true });
