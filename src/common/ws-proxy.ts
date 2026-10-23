@@ -7,9 +7,13 @@ import type { EnvRunner, WorkerAddress } from "../types.ts";
  * WebSocket proxy to the active runner (`getRunner` is read per upgrade to
  * survive reloads). Node passes the raw socket through, so the worker handshakes
  * end-to-end; Bun/Deno expose no upgrade socket, so crossws terminates and bridges.
+ * `track` is called when a bridged WebSocket connects to the runner's address;
+ * the function it returns runs once that WebSocket closes (Node upgrades are
+ * tracked by `getRunner().upgrade()`).
  */
 export async function createRunnerWSProxyPlugin(
   getRunner: () => EnvRunner | undefined,
+  track?: () => (() => void) | undefined,
 ): Promise<ServerPlugin> {
   const isBun = "Bun" in globalThis;
   const isDeno = "Deno" in globalThis;
@@ -38,6 +42,12 @@ export async function createRunnerWSProxyPlugin(
     ? await import("crossws/server/bun")
     : await import("crossws/server/deno");
 
+  // Open peers, with the `track()` settle function once connected.
+  const peers = new Map<string, (() => void) | undefined>();
+  const settle = (peer: { id: string }) => {
+    peers.get(peer.id)?.();
+    peers.delete(peer.id);
+  };
   const proxy = createWebSocketProxy({
     // Async target (crossws >= 0.4.7) awaits readiness (e.g. mid-reload) while
     // client frames buffer, instead of stalling the handshake.
@@ -45,11 +55,30 @@ export async function createRunnerWSProxyPlugin(
       await getRunner()
         ?.waitForReady?.()
         .catch(() => {});
-      return resolveWSProxyTarget(getRunner()?.address, peer.request.url);
+      const target = resolveWSProxyTarget(getRunner()?.address, peer.request.url);
+      if (track && peers.has(peer.id)) {
+        peers.set(peer.id, track());
+      }
+      return target;
     },
   });
+  const hooks: typeof proxy = {
+    ...proxy,
+    open(peer) {
+      peers.set(peer.id, undefined);
+      return proxy.open?.(peer);
+    },
+    close(peer, details) {
+      settle(peer);
+      return proxy.close?.(peer, details);
+    },
+    error(peer, error) {
+      settle(peer);
+      return proxy.error?.(peer, error);
+    },
+  };
 
-  return plugin({ resolve: () => proxy });
+  return plugin({ resolve: () => (track ? hooks : proxy) });
 }
 
 /** Upstream URL for the Bun/Deno bridge (Deno needs `--unstable-net` for `ws+unix://`). */

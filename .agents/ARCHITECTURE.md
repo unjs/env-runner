@@ -30,6 +30,7 @@ Non-obvious notes on the shared/core modules. Directory map: [`AGENTS.md`](../AG
 ## `RunnerManager` (`src/manager.ts`)
 
 - `reload()` swaps the runner and closes the old one; message/ready/close listeners persist across swaps. With no argument it calls `_createRunner()` (throws on the base class; `EnvServer` overrides). A failed factory keeps the current runner attached
+- **Drained reload** — `reload(runner, { drain: true | { timeout } })` attaches the new runner and returns; the previous one stays in `_draining` (until closed) and retires with `shutdown()` once its exchange count (`_exchanges`, per runner) drops to zero, or at the timeout. `_fetch()` counts from runner selection until the response body ends, errors or is canceled (`trackResponseBody()` re-wraps every body, so it is always on, not only while draining); `upgrade()` until the client socket closes; the Bun/Deno bridge via `createRunnerWSProxyPlugin()`'s `track` (from target resolution until the peer closes). `_close()` retires draining runners with its own close function: `close()` also force-closes one that is already shutting down, a second `shutdown()` waits for the running one. A draining runner that closes itself (crash) just leaves `_draining` (through the `_attach()` close wrapper). Draining runners' message listeners are detached at the swap, as before
 - `sendMessage()` queues until ready, then flushes
 - `waitForReady()` registers via `onMessage()` so it is re-forwarded across reloads (a direct listener add would only resolve on the already-ready short-circuit). It rejects early only when the manager itself closes, not the active runner (a later `reload()` may still bring one up)
 - `_attach()` wraps the runner's `close()` to detect exits; runners close themselves through that wrapper, so it must forward the cause (to the runner's `hooks.onClose`/`waitForReady()` and to `onClose()` listeners)
@@ -43,6 +44,7 @@ Non-obvious notes on the shared/core modules. Directory map: [`AGENTS.md`](../AG
 - `start()` is idempotent and optional: the first `fetch()` auto-starts; a failed start resets so a later call retries. After `close()`, fetch stays 503 and never respawns
 - `runnerOptions` is spread before the derived `name`/`hooks`/`data`/`execArgv` (carries deps like `{ miniflare }`; the CLI passes none)
 - Watch mode: `fs.watch` with 100ms debounce on the entry + `watchPaths`, each change builds a fresh runner via `reload()`
+- The `drain` option is the default `drain` of its `reload()` calls (watch mode included)
 - `updateVirtualModules()` also applies the changes to the server's own copy of `data.virtual` (factories kept, the caller's options untouched), which `_createRunner()` passes to later runners. Without an active runner (before the first start, after close) the changes are only recorded
 
 ## `loadRunner` (`src/loader.ts`)

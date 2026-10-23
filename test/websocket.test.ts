@@ -270,11 +270,10 @@ for (const { name, cmd, args, skip } of bridgeHosts) {
       child = undefined;
     });
 
-    it("terminates the client with crossws and proxies to the worker", async () => {
+    function startBridge() {
       const proc = spawn(cmd, [...args, bridgeFixture], { stdio: ["ignore", "pipe", "pipe"] });
       child = proc;
-
-      const frontUrl = await new Promise<string>((resolve, reject) => {
+      return new Promise<string>((resolve, reject) => {
         let out = "";
         const timer = setTimeout(() => reject(new Error(`bridge did not start:\n${out}`)), 20_000);
         proc.stdout!.on("data", (d) => {
@@ -291,7 +290,10 @@ for (const { name, cmd, args, skip } of bridgeHosts) {
           reject(new Error(`bridge exited (${code}) before ready:\n${out}`));
         });
       });
+    }
 
+    it("terminates the client with crossws and proxies to the worker", async () => {
+      const frontUrl = await startBridge();
       const ws = new WebSocket(frontUrl.replace(/^http/, "ws"));
       const messages: string[] = [];
       const closed = new Promise<void>((resolve) => {
@@ -309,6 +311,24 @@ for (const { name, cmd, args, skip } of bridgeHosts) {
 
       await closed;
       expect(messages).toEqual(["welcome", "echo:hello"]);
+    }, 30_000);
+
+    // `track` (the manager's drain accounting) counts the bridged WebSocket
+    // until it closes.
+    it("tracks bridged WebSockets until they close", async () => {
+      const frontUrl = await startBridge();
+      const tracked = async () => Number(await (await fetch(`${frontUrl}tracked`)).text());
+
+      const ws = new WebSocket(frontUrl.replace(/^http/, "ws"));
+      await new Promise((resolve) => ws.addEventListener("message", resolve, { once: true }));
+      expect(await tracked()).toBe(1);
+
+      ws.close();
+      const start = Date.now();
+      while ((await tracked()) !== 0) {
+        if (Date.now() - start > 5000) throw new Error("WebSocket still tracked");
+        await new Promise((r) => setTimeout(r, 50));
+      }
     }, 30_000);
   });
 }

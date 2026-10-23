@@ -56,6 +56,8 @@ const envServer = new EnvServer({
   entry: "./app.ts",
   watch: true,
   watchPaths: ["./src"],
+  // Let the previous runner finish in-flight requests on reloads (see "Drained reload")
+  drain: true,
   // Runner-specific constructor options, e.g. `{ miniflare }` for `runner: "miniflare"`
   runnerOptions: {},
 });
@@ -144,6 +146,19 @@ manager.onMessage((msg) => console.log("From worker:", msg));
 
 // manager.close() is awaited automatically at the end of the scope (`await using`)
 ```
+
+#### Drained reload
+
+By default, `reload()` closes the previous runner right away, cutting off its in-flight requests, streamed responses and WebSockets. With `drain`, new requests and upgrades go to the new runner while the previous one keeps serving what it already accepted, and shuts down (`shutdown()`) once they settle:
+
+```ts
+await manager.reload(newRunner, { drain: true });
+
+// Shut it down after 30s at the latest
+await manager.reload(newRunner, { drain: { timeout: 30_000 } });
+```
+
+`reload()` resolves once the new runner is attached, without waiting for the drain. A request counts until its response body is read to the end, fails or is canceled, and a WebSocket until it closes (through `manager.fetch()`, `manager.upgrade()` and `manager.wsSrvxPlugin()`). Without a `timeout`, a response body that is never consumed or a WebSocket that stays open keeps the previous runner alive. `close()` and `shutdown()` of the manager also close draining runners. `EnvServer` takes a `drain` option for its reloads (watch mode included).
 
 All runners, `RunnerManager`, and `EnvServer` implement `AsyncDisposable`, so they can be auto-closed with [explicit resource management](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Statements/await_using) (`await using`) — or closed manually with `await runner.close()`.
 

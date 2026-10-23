@@ -27,12 +27,20 @@ const runner = {
   waitForReady: async () => {},
 };
 
+// Bridged WebSockets counted by the plugin's `track` (served at `/tracked`).
+let tracked = 0;
+const track = () => {
+  tracked++;
+  return () => tracked--;
+};
+
 // Front server on this Bun/Deno host carrying the proxy plugin under test.
 const front = serve({
   port: 0,
   hostname: "127.0.0.1",
-  plugins: [await createRunnerWSProxyPlugin(() => runner)],
-  fetch: () => new Response("front"),
+  plugins: [await createRunnerWSProxyPlugin(() => runner, track)],
+  fetch: (request) =>
+    new Response(new URL(request.url).pathname === "/tracked" ? String(tracked) : "front"),
 });
 await front.ready();
 console.log("READY " + front.url);
