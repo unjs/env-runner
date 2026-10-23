@@ -1,4 +1,5 @@
 import type { ServerPlugin } from "srvx";
+import { FastResponse } from "srvx";
 import type {
   EnvRunner,
   RunnerMessageListener,
@@ -10,13 +11,17 @@ import type { VirtualModuleUpdates } from "./virtual-loader.ts";
 
 import { createRunnerWSProxyPlugin } from "./common/ws-proxy.ts";
 
+/** Default `drain` timeout of `RunnerManager.reload()`. */
+const DRAIN_TIMEOUT = 60_000;
+
 /** Options for `RunnerManager.reload()`. */
 export interface RunnerReloadOptions {
   /**
    * Keep the previous runner serving the requests and WebSockets it already
-   * accepted, and shut it down (`shutdown()`, else `close()`) once they settle,
-   * or after `timeout` ms (default: no limit). New requests and upgrades go to
-   * the new runner right away. Without it, the previous runner is closed
+   * accepted, and shut it down (`shutdown()`, else `close()`) once they settle.
+   * After `timeout` ms (default `60_000`, `Infinity` for no limit), it is
+   * closed with whatever is still open. New requests and upgrades go to the
+   * new runner right away. Without it, the previous runner is closed
    * immediately.
    */
   drain?: boolean | { timeout?: number };
@@ -32,7 +37,8 @@ export class RunnerManager implements EnvRunner, AsyncDisposable {
   private _closed = false;
   private _reloading = false;
   private _moduleInvalidated = false;
-  private _pendingModuleReload: Promise<void> | undefined;
+  // The shared `reloadModule()` of `_flushInvalidation()`, for its runner.
+  private _pendingModuleReload: { runner: EnvRunner; promise: Promise<void> } | undefined;
   private _closeListeners = new Set<(runner: EnvRunner, cause?: unknown) => void>();
   private _readyListeners = new Set<(runner: EnvRunner, address?: WorkerAddress) => void>();
   private _readyRejectors = new Set<() => void>();
@@ -83,7 +89,7 @@ export class RunnerManager implements EnvRunner, AsyncDisposable {
       // A fresh runner re-resolves its sources, satisfying any pending invalidation.
       this._moduleInvalidated = false;
       if (prev && opts?.drain) {
-        this._drain(prev, opts.drain === true ? undefined : opts.drain.timeout);
+        this._drain(prev, (opts.drain === true ? undefined : opts.drain.timeout) ?? DRAIN_TIMEOUT);
       } else if (prev) {
         await prev.close();
       }
@@ -102,7 +108,12 @@ export class RunnerManager implements EnvRunner, AsyncDisposable {
   fetch: FetchHandler = (input, init) => this._fetch(input, init);
 
   protected async _fetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
-    const runner = await this._waitForRunner();
+    // Read and count the runner in the same tick, so a drained `reload()` in
+    // between can't retire it as idle.
+    if (!this._runner) {
+      await this._waitForRunner();
+    }
+    const runner = this._runner;
     if (!runner) {
       return new Response("Runner is unavailable", { status: 503 });
     }
@@ -118,20 +129,35 @@ export class RunnerManager implements EnvRunner, AsyncDisposable {
     }
   }
 
-  /** Apply a pending invalidation with one shared reload; a failure retries on the next fetch. */
+  /**
+   * Apply a pending invalidation with one shared reload per runner; a failure
+   * retries on the next fetch. A reload of a runner replaced meanwhile (still
+   * draining) leaves the invalidation of the new one pending.
+   */
   private _flushInvalidation(runner: EnvRunner): Promise<void> {
-    this._pendingModuleReload ??= Promise.resolve(runner.reloadModule?.())
-      .then(() => {
-        this._moduleInvalidated = false;
-      })
-      .finally(() => {
-        this._pendingModuleReload = undefined;
-      });
-    return this._pendingModuleReload;
+    if (this._pendingModuleReload?.runner === runner) {
+      return this._pendingModuleReload.promise;
+    }
+    const pending = {
+      runner,
+      promise: Promise.resolve(runner.reloadModule?.())
+        .then(() => {
+          if (this._runner === runner) this._moduleInvalidated = false;
+        })
+        .finally(() => {
+          if (this._pendingModuleReload === pending) this._pendingModuleReload = undefined;
+        }),
+    };
+    this._pendingModuleReload = pending;
+    return pending.promise;
   }
 
   upgrade: UpgradeHandler = async (context) => {
-    const runner = await this._waitForRunner();
+    // Read and count the runner in the same tick (see `_fetch()`).
+    if (!this._runner) {
+      await this._waitForRunner();
+    }
+    const runner = this._runner;
     if (!runner?.upgrade) {
       // No runner owns the socket (crash/reload gap): destroy to avoid a leak.
       context.node.socket.destroy();
@@ -229,12 +255,13 @@ export class RunnerManager implements EnvRunner, AsyncDisposable {
   }
 
   async reloadModule(timeout?: number): Promise<void> {
-    if (!this._runner?.reloadModule) {
+    const runner = this._runner;
+    if (!runner?.reloadModule) {
       throw new Error("Active runner does not support reloadModule()");
     }
-    await this._runner.reloadModule(timeout);
-    // An explicit reload satisfies any pending invalidation.
-    this._moduleInvalidated = false;
+    await runner.reloadModule(timeout);
+    // An explicit reload satisfies any pending invalidation (of the same runner).
+    if (this._runner === runner) this._moduleInvalidated = false;
   }
 
   /**
@@ -345,17 +372,18 @@ export class RunnerManager implements EnvRunner, AsyncDisposable {
   }
 
   /**
-   * Retire a detached runner once its exchanges settle (or after `timeout`).
-   * `_close()` retires it early with its own close function, and a runner that
-   * closes itself meanwhile (crash) just stops draining.
+   * Retire a detached runner: shut it down once its exchanges settle, or close
+   * it after `timeout`. `_close()` retires it early with its own close
+   * function, and a runner that closes itself meanwhile (crash) just stops
+   * draining.
    */
-  private _drain(runner: EnvRunner, timeout?: number) {
+  private _drain(runner: EnvRunner, timeout: number) {
     let timer: ReturnType<typeof setTimeout> | undefined;
     let retiring: Promise<void> | undefined;
     const retire = (close = shutdownRunner) => {
       clearTimeout(timer);
       // Once shutting down, only an immediate `close()` goes ahead.
-      if (!retiring || close === closeRunnerNow) {
+      if (!retiring || (close === closeRunnerNow && !runner.closed)) {
         retiring = close(runner)
           .catch((error) => {
             console.error("[env-runner] Failed to close the drained runner:", error);
@@ -369,8 +397,9 @@ export class RunnerManager implements EnvRunner, AsyncDisposable {
     this._draining.set(runner, retire);
     if (!this._exchanges.has(runner) || runner.closed) {
       void retire();
-    } else if (timeout !== undefined) {
-      timer = setTimeout(retire, timeout);
+    } else if (timeout < 2 ** 31) {
+      // Beyond `setTimeout()`'s limit (`Infinity` included): no limit.
+      timer = setTimeout(() => retire(closeRunnerNow), timeout);
     }
   }
 
@@ -472,7 +501,11 @@ function shutdownRunner(runner: EnvRunner): Promise<void> {
   return runner.shutdown ? runner.shutdown() : runner.close();
 }
 
-/** `settle` once the response body is read to the end, fails or is canceled. */
+/**
+ * `settle` once the response body is read to the end, fails or is canceled.
+ * A `FastResponse` builds the native `Response` lazily, and srvx's Node
+ * adapter sends it without one.
+ */
 function trackResponseBody(response: Response, settle: () => void): Response {
   if (!response.body) {
     settle();
@@ -499,7 +532,7 @@ function trackResponseBody(response: Response, settle: () => void): Response {
       return reader.cancel(reason);
     },
   });
-  return new Response(body, {
+  return new FastResponse(body, {
     status: response.status,
     statusText: response.statusText,
     headers: response.headers,

@@ -313,20 +313,21 @@ for (const { name, cmd, args, skip } of bridgeHosts) {
       expect(messages).toEqual(["welcome", "echo:hello"]);
     }, 30_000);
 
-    // `track` (the manager's drain accounting) counts the bridged WebSocket
-    // until it closes.
-    it("tracks bridged WebSockets until they close", async () => {
+    // A drained `reload()` retires the previous runner only once the bridged
+    // WebSocket it serves closes.
+    it("drains a bridged WebSocket on a drained reload", async () => {
       const frontUrl = await startBridge();
-      const tracked = async () => Number(await (await fetch(`${frontUrl}tracked`)).text());
+      const get = async (path: string) => (await fetch(frontUrl + path)).text();
 
       const ws = new WebSocket(frontUrl.replace(/^http/, "ws"));
       await new Promise((resolve) => ws.addEventListener("message", resolve, { once: true }));
-      expect(await tracked()).toBe(1);
+      expect(await get("reload")).toBe("reloaded");
+      expect(await get("retired")).toBe("false");
 
       ws.close();
       const start = Date.now();
-      while ((await tracked()) !== 0) {
-        if (Date.now() - start > 5000) throw new Error("WebSocket still tracked");
+      while ((await get("retired")) !== "true") {
+        if (Date.now() - start > 5000) throw new Error("Previous runner not retired");
         await new Promise((r) => setTimeout(r, 50));
       }
     }, 30_000);

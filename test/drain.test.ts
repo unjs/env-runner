@@ -1,6 +1,6 @@
 import { fileURLToPath } from "node:url";
 import { resolve, dirname } from "node:path";
-import { describe, expect, it, afterEach } from "vitest";
+import { describe, expect, it, afterEach, vi } from "vitest";
 import { serve } from "srvx";
 import type { Server } from "srvx";
 import type { EnvRunner } from "../src/index.ts";
@@ -22,8 +22,13 @@ async function waitFor(condition: () => boolean, timeout = 5000) {
   }
 }
 
-/** A runner whose `shutdown()` settles after `shutdownDelay` ms (never when `undefined`). */
-function createFakeRunner(shutdownDelay?: number) {
+/**
+ * A runner logging its calls. `shutdown()` closes it after `shutdownDelay` ms
+ * (never settles when `undefined`), `stream` responses never end.
+ */
+function createFakeRunner(
+  opts: { shutdownDelay?: number; stream?: boolean; reloadModule?: () => Promise<void> } = {},
+) {
   const calls: string[] = [];
   const runner = {
     ready: true,
@@ -32,12 +37,20 @@ function createFakeRunner(shutdownDelay?: number) {
     onMessage() {},
     offMessage() {},
     sendMessage() {},
-    fetch: async () => new Response("fake"),
+    fetch: async () => {
+      calls.push("fetch");
+      return new Response(opts.stream ? new ReadableStream() : "fake");
+    },
+    reloadModule: async () => {
+      calls.push("reloadModule");
+      await opts.reloadModule?.();
+    },
+    invalidateModule: async () => {},
     shutdown: () => {
       calls.push("shutdown");
       return new Promise<void>((resolve) => {
-        if (shutdownDelay !== undefined) {
-          setTimeout(() => runner.close().then(resolve), shutdownDelay);
+        if (opts.shutdownDelay !== undefined) {
+          setTimeout(() => runner.close().then(resolve), opts.shutdownDelay);
         }
       });
     },
@@ -157,7 +170,9 @@ describe("RunnerManager drained reload", () => {
     await manager.reload(runner2, { drain: { timeout: 300 } });
     expect(runner1.closed).toBe(false);
     await waitFor(() => runner1.closed);
+    // Closed at the timeout, without a graceful shutdown waiting for the stream.
     expect(Date.now() - start).toBeGreaterThanOrEqual(250);
+    expect(Date.now() - start).toBeLessThan(1500);
     await expect(stream.rest).rejects.toThrow();
   });
 
@@ -202,11 +217,86 @@ describe("RunnerManager drained reload", () => {
   });
 
   it("shuts a drained runner down only once", async () => {
-    const runner1 = createFakeRunner(100);
+    const runner1 = createFakeRunner({ shutdownDelay: 100 });
     manager = new RunnerManager(runner1);
-    await manager.reload(createFakeRunner(0), { drain: true });
+    await manager.reload(createFakeRunner({ shutdownDelay: 0 }), { drain: true });
     await manager.shutdown();
     expect(runner1.calls).toEqual(["shutdown", "close"]);
+  });
+
+  it("doesn't retire a draining runner that closed itself", async () => {
+    const runner1 = createFakeRunner({ stream: true });
+    manager = new RunnerManager(runner1);
+    await manager.fetch("http://localhost/");
+    await manager.reload(createFakeRunner(), { drain: true });
+    await runner1.close();
+    await manager.close();
+    expect(runner1.calls).toEqual(["fetch", "close"]);
+  });
+
+  it("closes the previous runner after 60s by default", async () => {
+    vi.useFakeTimers();
+    try {
+      const runner1 = createFakeRunner({ stream: true });
+      manager = new RunnerManager(runner1);
+      // The body is never read.
+      await manager.fetch("http://localhost/");
+      await manager.reload(createFakeRunner(), { drain: true });
+      await vi.advanceTimersByTimeAsync(59_000);
+      expect(runner1.calls).toEqual(["fetch"]);
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(runner1.calls).toEqual(["fetch", "close"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("drains without a limit with `timeout: Infinity`", async () => {
+    vi.useFakeTimers();
+    try {
+      const runner1 = createFakeRunner({ stream: true });
+      manager = new RunnerManager(runner1);
+      await manager.fetch("http://localhost/");
+      await manager.reload(createFakeRunner(), { drain: { timeout: Infinity } });
+      await vi.advanceTimersByTimeAsync(24 * 60 * 60_000);
+      expect(runner1.calls).toEqual(["fetch"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("counts a request from the moment it picks the runner", async () => {
+    const runner1 = createFakeRunner({ shutdownDelay: 0 });
+    manager = new RunnerManager(runner1);
+    // `reload()` runs before the request reaches `runner1.fetch()`.
+    const res = manager.fetch("http://localhost/");
+    await manager.reload(createFakeRunner(), { drain: true });
+    expect(await (await res).text()).toBe("fake");
+    await waitFor(() => runner1.closed);
+    expect(runner1.calls).toEqual(["fetch", "shutdown", "close"]);
+  });
+
+  it("keeps the new runner's invalidation when a draining runner's module reload settles", async () => {
+    let finishReload!: () => void;
+    const runner1 = createFakeRunner({
+      reloadModule: () => new Promise<void>((resolve) => (finishReload = resolve)),
+    });
+    const runner2 = createFakeRunner();
+    manager = new RunnerManager(runner1);
+    await manager.invalidateModule("#config");
+    // Reloads `runner1` first (pending until `finishReload()`).
+    const res1 = manager.fetch("http://localhost/");
+    await manager.reload(runner2, { drain: true });
+    await manager.invalidateModule("#config");
+    const res2 = manager.fetch("http://localhost/");
+    finishReload();
+    await (await res1).text();
+    await (await res2).text();
+    expect(runner1.calls).toEqual(["reloadModule", "fetch", "shutdown"]);
+    expect(runner2.calls).toEqual(["reloadModule", "fetch"]);
+    // The invalidation is satisfied: no further reload.
+    await (await manager.fetch("http://localhost/")).text();
+    expect(runner2.calls).toEqual(["reloadModule", "fetch", "fetch"]);
   });
 
   it("keeps a WebSocket of the previous runner open", async () => {
