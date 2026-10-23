@@ -178,7 +178,15 @@ export class RunnerManager implements EnvRunner, AsyncDisposable {
   wsSrvxPlugin(): Promise<ServerPlugin> {
     return createRunnerWSProxyPlugin(
       () => this,
-      () => this._runner && this._beginExchange(this._runner),
+      (address) => {
+        const runner = this._runner;
+        // The target resolved asynchronously (mid-reload) and the runner changed
+        // before crossws dialed: it may be retiring as idle already.
+        if (!runner || runner.address !== address) {
+          throw new Error("The runner changed before the WebSocket connected");
+        }
+        return this._beginExchange(runner);
+      },
     );
   }
 

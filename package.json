@@ -43,7 +43,7 @@
     "typecheck": "tsc --noEmit --skipLibCheck"
   },
   "dependencies": {
-    "crossws": "^0.4.15",
+    "crossws": "^0.4.16",
     "srvx": "^1.0.6"
   },
   "devDependencies": {

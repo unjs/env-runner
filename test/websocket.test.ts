@@ -331,6 +331,30 @@ for (const { name, cmd, args, skip } of bridgeHosts) {
         await new Promise((r) => setTimeout(r, 50));
       }
     }, 30_000);
+
+    // Dialed once the runner is ready (the async target): tracked against it.
+    it("drains a WebSocket bridged while the runner was starting", async () => {
+      const frontUrl = await startBridge();
+      const get = async (path: string) => (await fetch(frontUrl + path)).text();
+
+      expect(await get("reload-starting")).toBe("reloaded");
+      const ws = new WebSocket(frontUrl.replace(/^http/, "ws"));
+      const welcome = new Promise((resolve) =>
+        ws.addEventListener("message", resolve, { once: true }),
+      );
+      await new Promise((resolve) => ws.addEventListener("open", resolve, { once: true }));
+      expect(await get("start")).toBe("started");
+      await welcome;
+
+      expect(await get("reload")).toBe("reloaded");
+      expect(await get("retired?runner=1")).toBe("false");
+      ws.close();
+      const start = Date.now();
+      while ((await get("retired?runner=1")) !== "true") {
+        if (Date.now() - start > 5000) throw new Error("Previous runner not retired");
+        await new Promise((r) => setTimeout(r, 50));
+      }
+    }, 30_000);
   });
 }
 

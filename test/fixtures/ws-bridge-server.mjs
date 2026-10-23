@@ -23,16 +23,26 @@ const backend = serve({
 await backend.ready();
 const backendURL = new URL(backend.url);
 
-// Runners pointing at the backend; `retired` once shut down or closed.
-function createRunner() {
+// Runners pointing at the backend; `retired` once shut down or closed. A
+// `starting` runner reports its address on `start()` (the manager waits for it).
+const runners = [];
+function createRunner(starting = false) {
+  const listeners = new Set();
+  const address = { host: backendURL.hostname, port: Number(backendURL.port) };
   const runner = {
-    address: { host: backendURL.hostname, port: Number(backendURL.port) },
-    ready: true,
+    address: starting ? undefined : address,
+    get ready() {
+      return !runner.closed && !!runner.address;
+    },
     closed: false,
     retired: false,
+    start() {
+      runner.address = address;
+      for (const listener of listeners) listener({ address });
+    },
     waitForReady: async () => {},
-    onMessage() {},
-    offMessage() {},
+    onMessage: (listener) => listeners.add(listener),
+    offMessage: (listener) => listeners.delete(listener),
     sendMessage() {},
     fetch: async () => new Response("runner"),
     shutdown: () => runner.close(),
@@ -40,25 +50,35 @@ function createRunner() {
       runner.retired = runner.closed = true;
     },
   };
+  runners.push(runner);
   return runner;
 }
-const runner = createRunner();
-const manager = new RunnerManager(runner);
+const manager = new RunnerManager(createRunner());
 
-// Front server on this Bun/Deno host carrying the proxy plugin under test.
-// `/reload` swaps in a new runner with `drain`; `/retired` reports the first one.
+// Front server on this Bun/Deno host carrying the proxy plugin under test:
+// - `/reload` swaps in a new runner with `drain`
+// - `/reload-starting` swaps in one that is still starting, `/start` starts it
+// - `/retired?runner=<index>` reports a runner (`0` is the first one)
 const front = serve({
   port: 0,
   hostname: "127.0.0.1",
   plugins: [await manager.wsSrvxPlugin()],
   async fetch(request) {
-    const { pathname } = new URL(request.url);
+    const { pathname, searchParams } = new URL(request.url);
     if (pathname === "/reload") {
       await manager.reload(createRunner(), { drain: true });
       return new Response("reloaded");
     }
+    if (pathname === "/reload-starting") {
+      await manager.reload(createRunner(true));
+      return new Response("reloaded");
+    }
+    if (pathname === "/start") {
+      runners.at(-1).start();
+      return new Response("started");
+    }
     if (pathname === "/retired") {
-      return new Response(String(runner.retired));
+      return new Response(String(runners[Number(searchParams.get("runner") || 0)].retired));
     }
     return new Response("front");
   },
