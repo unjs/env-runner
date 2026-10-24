@@ -6,6 +6,7 @@ import type { VirtualModules, VirtualModuleUpdates } from "./virtual-loader.ts";
 
 import { loadRunner } from "./loader.ts";
 import { RunnerManager } from "./manager.ts";
+import type { RunnerReloadOptions } from "./manager.ts";
 
 export interface EnvServerOptions {
   /** Runner implementation to use (defaults to `"node-worker"`). */
@@ -26,6 +27,11 @@ export interface EnvServerOptions {
   watch?: boolean;
   /** Additional paths to watch (directories or files). */
   watchPaths?: string[];
+  /**
+   * Drain the previous runner on reloads (watch mode, and `reload()` calls
+   * without their own `drain`), see {@link RunnerReloadOptions.drain}.
+   */
+  drain?: RunnerReloadOptions["drain"];
   /** Runner-specific constructor options (e.g. `{ miniflare }`). */
   runnerOptions?: Record<string, unknown>;
 }
@@ -69,9 +75,9 @@ export class EnvServer extends RunnerManager {
   }
 
   /** Replace the active runner; without an argument, create one from the server options. */
-  override async reload(runner?: EnvRunner) {
+  override async reload(runner?: EnvRunner, opts?: RunnerReloadOptions) {
     this.runner = runner ?? (await this._createRunner());
-    await super.reload(this.runner);
+    await super.reload(this.runner, { ...opts, drain: opts?.drain ?? this._opts.drain });
   }
 
   /**

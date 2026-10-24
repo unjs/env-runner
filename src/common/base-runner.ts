@@ -10,6 +10,8 @@ import type {
 
 import { rm } from "node:fs/promises";
 import { proxyFetch, proxyUpgrade } from "httpxy";
+import type { ProxyFetchOptions } from "httpxy";
+import { FastResponse } from "srvx";
 import {
   encodeVirtualModules,
   normalizeVirtualModules,
@@ -160,10 +162,28 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
       });
     }
     const request = this._resolveFetchInput(input);
-    if (this._address.protocol === "https") {
-      return proxyFetch(_httpsTarget(this._address), request, init, { ssl: UNVERIFIED_TLS });
+    // httpxy doesn't forward a `Request`'s signal: without it, a client that
+    // disconnects doesn't abort the worker request.
+    const signal =
+      request instanceof Request && init?.signal === undefined ? request.signal : undefined;
+    if (signal) {
+      init = { ...init, signal };
     }
-    return proxyFetch(this._address, request, init);
+    try {
+      return await (this._address.protocol === "https"
+        ? proxyFetch(_httpsTarget(this._address), request, init, {
+            ...FETCH_OPTIONS,
+            ssl: UNVERIFIED_TLS,
+          })
+        : proxyFetch(this._address, request, init, FETCH_OPTIONS));
+    } catch (error) {
+      // Aborted with the request (e.g. the client is gone): nobody reads the
+      // response, so don't surface it as a fetch handler error.
+      if (signal?.aborted) {
+        return new Response(null, { status: 499, statusText: "Client Closed Request" });
+      }
+      throw error;
+    }
   }
 
   async upgrade(context: { node: { req: IncomingMessage; socket: Socket; head: any } }) {
@@ -672,6 +692,12 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
 // The worker's certificate is for its public hostname, not the loopback
 // address the host connects to.
 const UNVERIFIED_TLS = { rejectUnauthorized: false };
+
+// On Node, the worker's response body stays a Node.js stream (srvx's
+// `FastResponse` pipes it as-is) instead of round-tripping through a web stream.
+// Bun/Deno's `FastResponse` is the native `Response`, which keeps the default.
+const FETCH_OPTIONS: ProxyFetchOptions | undefined =
+  "Bun" in globalThis || "Deno" in globalThis ? undefined : { Response: FastResponse };
 
 function _httpsTarget(address: WorkerAddress): string {
   const host = address.host || "127.0.0.1";

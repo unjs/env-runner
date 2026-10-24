@@ -45,7 +45,7 @@ export {
   type PluginTransformResult,
   BaseEnvRunner,
 } from "./common/base-runner.ts";
-export { RunnerManager } from "./manager.ts";
+export { type RunnerReloadOptions, RunnerManager } from "./manager.ts";
 export { type EnvServerOptions, EnvServer } from "./server.ts";
 export { type RunnerName, type LoadRunnerOptions, loadRunner } from "./loader.ts";
 export {

@@ -270,11 +270,10 @@ for (const { name, cmd, args, skip } of bridgeHosts) {
       child = undefined;
     });
 
-    it("terminates the client with crossws and proxies to the worker", async () => {
+    function startBridge() {
       const proc = spawn(cmd, [...args, bridgeFixture], { stdio: ["ignore", "pipe", "pipe"] });
       child = proc;
-
-      const frontUrl = await new Promise<string>((resolve, reject) => {
+      return new Promise<string>((resolve, reject) => {
         let out = "";
         const timer = setTimeout(() => reject(new Error(`bridge did not start:\n${out}`)), 20_000);
         proc.stdout!.on("data", (d) => {
@@ -291,7 +290,10 @@ for (const { name, cmd, args, skip } of bridgeHosts) {
           reject(new Error(`bridge exited (${code}) before ready:\n${out}`));
         });
       });
+    }
 
+    it("terminates the client with crossws and proxies to the worker", async () => {
+      const frontUrl = await startBridge();
       const ws = new WebSocket(frontUrl.replace(/^http/, "ws"));
       const messages: string[] = [];
       const closed = new Promise<void>((resolve) => {
@@ -309,6 +311,49 @@ for (const { name, cmd, args, skip } of bridgeHosts) {
 
       await closed;
       expect(messages).toEqual(["welcome", "echo:hello"]);
+    }, 30_000);
+
+    // A drained `reload()` retires the previous runner only once the bridged
+    // WebSocket it serves closes.
+    it("drains a bridged WebSocket on a drained reload", async () => {
+      const frontUrl = await startBridge();
+      const get = async (path: string) => (await fetch(frontUrl + path)).text();
+
+      const ws = new WebSocket(frontUrl.replace(/^http/, "ws"));
+      await new Promise((resolve) => ws.addEventListener("message", resolve, { once: true }));
+      expect(await get("reload")).toBe("reloaded");
+      expect(await get("retired")).toBe("false");
+
+      ws.close();
+      const start = Date.now();
+      while ((await get("retired")) !== "true") {
+        if (Date.now() - start > 5000) throw new Error("Previous runner not retired");
+        await new Promise((r) => setTimeout(r, 50));
+      }
+    }, 30_000);
+
+    // Dialed once the runner is ready (the async target): tracked against it.
+    it("drains a WebSocket bridged while the runner was starting", async () => {
+      const frontUrl = await startBridge();
+      const get = async (path: string) => (await fetch(frontUrl + path)).text();
+
+      expect(await get("reload-starting")).toBe("reloaded");
+      const ws = new WebSocket(frontUrl.replace(/^http/, "ws"));
+      const welcome = new Promise((resolve) =>
+        ws.addEventListener("message", resolve, { once: true }),
+      );
+      await new Promise((resolve) => ws.addEventListener("open", resolve, { once: true }));
+      expect(await get("start")).toBe("started");
+      await welcome;
+
+      expect(await get("reload")).toBe("reloaded");
+      expect(await get("retired?runner=1")).toBe("false");
+      ws.close();
+      const start = Date.now();
+      while ((await get("retired?runner=1")) !== "true") {
+        if (Date.now() - start > 5000) throw new Error("Previous runner not retired");
+        await new Promise((r) => setTimeout(r, 50));
+      }
     }, 30_000);
   });
 }

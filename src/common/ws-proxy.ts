@@ -1,5 +1,6 @@
 import type { IncomingMessage, Server as NodeHttpServer } from "node:http";
 import type { Socket } from "node:net";
+import type { Peer } from "crossws";
 import type { ServerPlugin } from "srvx";
 import type { EnvRunner, WorkerAddress } from "../types.ts";
 
@@ -7,9 +8,14 @@ import type { EnvRunner, WorkerAddress } from "../types.ts";
  * WebSocket proxy to the active runner (`getRunner` is read per upgrade to
  * survive reloads). Node passes the raw socket through, so the worker handshakes
  * end-to-end; Bun/Deno expose no upgrade socket, so crossws terminates and bridges.
+ * `track` is called with the address a bridged WebSocket is dialed to (it may
+ * throw to refuse it, closing the client with `1011`); the function it returns
+ * runs once that WebSocket closes. Node upgrades are tracked by
+ * `getRunner().upgrade()`.
  */
 export async function createRunnerWSProxyPlugin(
   getRunner: () => EnvRunner | undefined,
+  track?: (address: WorkerAddress | undefined) => (() => void) | undefined,
 ): Promise<ServerPlugin> {
   const isBun = "Bun" in globalThis;
   const isDeno = "Deno" in globalThis;
@@ -38,15 +44,41 @@ export async function createRunnerWSProxyPlugin(
     ? await import("crossws/server/bun")
     : await import("crossws/server/deno");
 
+  // Per peer: the address its target resolved to, then the `track()` settle function.
+  const addresses = new WeakMap<Peer, WorkerAddress | undefined>();
+  const settles = new WeakMap<Peer, () => void>();
+  const resolveTarget = (peer: Peer) => {
+    const address = getRunner()?.address;
+    addresses.set(peer, address);
+    return resolveWSProxyTarget(address, peer.request.url);
+  };
   const proxy = createWebSocketProxy({
-    // Async target (crossws >= 0.4.7) awaits readiness (e.g. mid-reload) while
-    // client frames buffer, instead of stalling the handshake.
-    target: async (peer) => {
-      await getRunner()
-        ?.waitForReady?.()
-        .catch(() => {});
-      return resolveWSProxyTarget(getRunner()?.address, peer.request.url);
+    // Synchronous when ready, so crossws dials (`onUpstreamConnect()`) in the
+    // same tick the address is read. Otherwise (e.g. mid-reload) the async
+    // target (crossws >= 0.4.7) awaits readiness while client frames buffer,
+    // instead of stalling the handshake.
+    target: (peer) => {
+      const runner = getRunner();
+      if (runner?.ready) {
+        return resolveTarget(peer);
+      }
+      return Promise.resolve(runner?.waitForReady?.())
+        .catch(() => {})
+        .then(() => resolveTarget(peer));
     },
+    // Exactly one `onUpstreamClose()` per `onUpstreamConnect()` (crossws >= 0.4.16).
+    onUpstreamConnect:
+      track &&
+      ((peer) => {
+        const settle = track(addresses.get(peer));
+        if (settle) settles.set(peer, settle);
+      }),
+    onUpstreamClose:
+      track &&
+      ((peer) => {
+        settles.get(peer)?.();
+        settles.delete(peer);
+      }),
   });
 
   return plugin({ resolve: () => proxy });
