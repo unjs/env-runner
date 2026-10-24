@@ -3,6 +3,9 @@ import { generateExportStubs } from "./exports.ts";
 
 const IPC_PATH = "/__env_runner_ipc";
 
+/** Handlers of the entry's default export forwarded besides `fetch`. */
+const HANDLERS = ["scheduled", "queue", "email", "tail", "tailStream", "trace", "test", "connect"];
+
 /** Service binding name used for cross-request IPC (worker → runner). */
 export const IPC_BINDING = "__ENV_RUNNER_IPC";
 
@@ -298,6 +301,18 @@ async function __handleWsMessage(env, data) {
   }
 }
 
+// Non-fetch handlers (cron triggers, queues, email, ...) call the entry's own,
+// loading the entry first when no request did yet.
+async function __forwardHandler(name, arg, env, ctx) {
+  await __ensureEntry(env);
+  __ipcEnv = env;
+  const handler = __userEntry[name];
+  if (typeof handler !== "function") {
+    throw new TypeError("Handler does not export a " + name + "() function.");
+  }
+  return handler.call(__userEntry, arg, __userEnv(env), ctx);
+}
+
 // The host warns (deduped across restarts). \`withTypes\`: also report the
 // entry's classes, which the host restarts for when they change the stubs.
 function __runExportsCheck(withTypes) {
@@ -309,6 +324,11 @@ function __runExportsCheck(withTypes) {
 }
 
 export default {
+${HANDLERS.map(
+  (name) => /* js */ `  ${name}(arg, env, ctx) {
+    return __forwardHandler(${JSON.stringify(name)}, arg, env, ctx);
+  },`,
+).join("\n")}
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
