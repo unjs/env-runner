@@ -563,10 +563,10 @@ function trackResponseBody(response: Response, settle: () => void): Response {
 }
 
 /**
- * A runner's srvx `FastResponse` on Node (e.g. from the `self` runner): read
- * like srvx's Node adapter does, since `.body` would turn it into a native
- * `Response` and lose the `content-type`/`content-length` srvx derives from a
- * string or byte body. Such a buffered body settles right away.
+ * A runner's srvx `FastResponse` on Node (a proxied worker response with its
+ * Node.js stream body, or one from the `self` runner): read like srvx's Node
+ * adapter does, since `.body` would turn it into a native `Response` with a web
+ * stream. A buffered body settles right away.
  */
 function trackNodeFastResponse(response: NodeFastResponse, settle: () => void): Response {
   const { status, statusText, headers: rawHeaders, body } = response._toNodeResponse();

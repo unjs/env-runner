@@ -10,6 +10,8 @@ import type {
 
 import { rm } from "node:fs/promises";
 import { proxyFetch, proxyUpgrade } from "httpxy";
+import type { ProxyFetchOptions } from "httpxy";
+import { FastResponse } from "srvx";
 import {
   encodeVirtualModules,
   normalizeVirtualModules,
@@ -161,9 +163,12 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
     }
     const request = this._resolveFetchInput(input);
     if (this._address.protocol === "https") {
-      return proxyFetch(_httpsTarget(this._address), request, init, { ssl: UNVERIFIED_TLS });
+      return proxyFetch(_httpsTarget(this._address), request, init, {
+        ...FETCH_OPTIONS,
+        ssl: UNVERIFIED_TLS,
+      });
     }
-    return proxyFetch(this._address, request, init);
+    return proxyFetch(this._address, request, init, FETCH_OPTIONS);
   }
 
   async upgrade(context: { node: { req: IncomingMessage; socket: Socket; head: any } }) {
@@ -672,6 +677,12 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
 // The worker's certificate is for its public hostname, not the loopback
 // address the host connects to.
 const UNVERIFIED_TLS = { rejectUnauthorized: false };
+
+// On Node, the worker's response body stays a Node.js stream (srvx's
+// `FastResponse` pipes it as-is) instead of round-tripping through a web stream.
+// Bun/Deno's `FastResponse` is the native `Response`, which keeps the default.
+const FETCH_OPTIONS: ProxyFetchOptions | undefined =
+  "Bun" in globalThis || "Deno" in globalThis ? undefined : { Response: FastResponse };
 
 function _httpsTarget(address: WorkerAddress): string {
   const host = address.host || "127.0.0.1";
