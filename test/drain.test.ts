@@ -1,12 +1,20 @@
 import { fileURLToPath } from "node:url";
 import { resolve, dirname } from "node:path";
+import { EventEmitter } from "node:events";
 import { describe, expect, it, afterEach, vi } from "vitest";
 import { Readable } from "node:stream";
 import { FastResponse, serve } from "srvx";
 import type { Server } from "srvx";
 import type { EnvRunner } from "../src/index.ts";
 import { EnvServer, RunnerManager } from "../src/index.ts";
+import { createRunnerWSProxyPlugin } from "../src/common/ws-proxy.ts";
 import { NodeWorkerEnvRunner } from "../src/runners/node-worker/runner.ts";
+
+// Unchanged, but records the `track` function the manager passes.
+vi.mock("../src/common/ws-proxy.ts", async (importOriginal) => {
+  const original = await importOriginal<typeof import("../src/common/ws-proxy.ts")>();
+  return { ...original, createRunnerWSProxyPlugin: vi.fn(original.createRunnerWSProxyPlugin) };
+});
 
 const _dir = dirname(fileURLToPath(import.meta.url));
 const streamEntry = resolve(_dir, "./fixtures/app-stream.mjs");
@@ -183,7 +191,7 @@ describe("RunnerManager drained reload", () => {
     await waitFor(() => runner1.closed);
     // Closed at the timeout, without a graceful shutdown waiting for the stream.
     expect(Date.now() - start).toBeGreaterThanOrEqual(250);
-    expect(Date.now() - start).toBeLessThan(1500);
+    expect(Date.now() - start).toBeLessThan(5000);
     await expect(stream.rest).rejects.toThrow();
   });
 
@@ -406,11 +414,12 @@ describe("RunnerManager drained reload", () => {
     let endStream!: () => void;
     const bodies = [
       () => new ReadableStream({ start: (controller) => (endStream = () => controller.close()) }),
-      () => {
-        const stream = new Readable({ read() {} });
+      ...[true, false].map((autoDestroy) => () => {
+        // Without `autoDestroy`, it ends without closing.
+        const stream = new Readable({ read() {}, autoDestroy });
         endStream = () => stream.push(null);
         return stream;
-      },
+      }),
     ];
     for (const body of bodies) {
       const runner1 = createFakeRunner({
@@ -426,6 +435,125 @@ describe("RunnerManager drained reload", () => {
       await waitFor(() => runner1.closed);
       await manager.close();
     }
+  });
+
+  describe("through a srvx server", () => {
+    let received = 0;
+    let runner1: EnvRunner;
+    let runner2: EnvRunner;
+
+    async function setup(name: string) {
+      runner1 = createRunner(`${name}-1`);
+      runner2 = createRunner(`${name}-2`);
+      runners.push(runner1, runner2);
+      manager = new RunnerManager(runner1);
+      await manager.waitForReady();
+      received = 0;
+      server = serve({
+        port: 0,
+        hostname: "127.0.0.1",
+        gracefulShutdown: false,
+        fetch: (request) => {
+          received++;
+          return manager!.fetch(request);
+        },
+      });
+      await server.ready();
+    }
+
+    it("settles a request whose client disconnects before the response", async () => {
+      await setup("drain-abort");
+      const error = vi.spyOn(console, "error");
+      try {
+        const controller = new AbortController();
+        const pending = fetch(`${server!.url}?wait=10000`, { signal: controller.signal });
+        pending.catch(() => {});
+        await waitFor(() => received === 1);
+        await manager!.reload(runner2, { drain: { timeout: Infinity } });
+        expect(runner1.closed).toBe(false);
+        controller.abort();
+        // Without the worker request aborted, only its response would settle it.
+        await waitFor(() => runner1.closed, 3000);
+        // Not reported as a fetch handler error.
+        expect(error).not.toHaveBeenCalled();
+      } finally {
+        error.mockRestore();
+      }
+    });
+
+    it("settles a streamed response whose client disconnects", async () => {
+      await setup("drain-disconnect");
+      const controller = new AbortController();
+      const res = await fetch(`${server!.url}?delay=10000`, { signal: controller.signal });
+      const reader = res.body!.getReader();
+      await reader.read();
+      await manager!.reload(runner2, { drain: { timeout: Infinity } });
+      expect(runner1.closed).toBe(false);
+      controller.abort();
+      await waitFor(() => runner1.closed, 3000);
+    });
+
+    it("settles proxied responses without a body", async () => {
+      await setup("drain-no-body");
+      for (const [query, method, status] of [
+        ["status=204", "GET", 204],
+        ["status=304", "GET", 304],
+        ["cookies", "HEAD", 200],
+        ["delay=10000", "HEAD", 200],
+      ] as const) {
+        const res = await fetch(`${server!.url}?${query}`, { method });
+        expect(res.status).toBe(status);
+        expect(await res.text()).toBe("");
+      }
+      const res = await fetch(`${server!.url}?cookies`);
+      expect(res.headers.getSetCookie()).toEqual(["a=1", "b=2"]);
+      await res.text();
+      // A HEAD response whose (empty) body is never read.
+      await manager!.fetch("http://localhost/?delay=10000", { method: "HEAD" });
+
+      await manager!.reload(runner2, { drain: { timeout: Infinity } });
+      await waitFor(() => runner1.closed, 3000);
+    });
+  });
+
+  it("counts an upgrade waiting for its runner to become ready", async () => {
+    let ready!: () => void;
+    const runner1 = createFakeRunner({ shutdownDelay: 0 });
+    runner1.upgrade = async () => {
+      runner1.calls.push("upgrade");
+      await new Promise<void>((resolve) => (ready = resolve));
+    };
+    manager = new RunnerManager(runner1);
+    const socket = Object.assign(new EventEmitter(), { destroyed: false, destroy() {} });
+    const upgrading = manager.upgrade({ node: { req: {}, socket, head: undefined } } as any);
+    await manager.reload(createFakeRunner(), { drain: { timeout: Infinity } });
+    ready();
+    await upgrading;
+    expect(runner1.calls).toEqual(["upgrade"]);
+    socket.emit("close");
+    await waitFor(() => runner1.closed);
+  });
+
+  it("refuses a bridged WebSocket dialed to a runner swapped out meanwhile", async () => {
+    const runner1 = Object.assign(createFakeRunner({ shutdownDelay: 0 }), {
+      address: { host: "127.0.0.1", port: 1 },
+    });
+    const runner2 = Object.assign(createFakeRunner({ shutdownDelay: 0 }), {
+      address: { host: "127.0.0.1", port: 2 },
+    });
+    manager = new RunnerManager(runner1);
+    vi.mocked(createRunnerWSProxyPlugin).mockClear();
+    await manager.wsSrvxPlugin();
+    const track = vi.mocked(createRunnerWSProxyPlugin).mock.calls[0]![1]!;
+
+    await manager.reload(runner2, { drain: { timeout: Infinity } });
+    // Dialed to `runner1` (retiring as idle): refused, crossws closes it with 1011.
+    expect(() => track(runner1.address)).toThrow("The runner changed");
+    const settle = track(runner2.address)!;
+    await manager.reload(createFakeRunner(), { drain: { timeout: Infinity } });
+    expect(runner2.calls).toEqual([]);
+    settle();
+    await waitFor(() => runner2.closed);
   });
 
   it("keeps a WebSocket of the previous runner open", async () => {

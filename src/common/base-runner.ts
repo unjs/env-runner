@@ -162,13 +162,28 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
       });
     }
     const request = this._resolveFetchInput(input);
-    if (this._address.protocol === "https") {
-      return proxyFetch(_httpsTarget(this._address), request, init, {
-        ...FETCH_OPTIONS,
-        ssl: UNVERIFIED_TLS,
-      });
+    // httpxy doesn't forward a `Request`'s signal: without it, a client that
+    // disconnects doesn't abort the worker request.
+    const signal =
+      request instanceof Request && init?.signal === undefined ? request.signal : undefined;
+    if (signal) {
+      init = { ...init, signal };
     }
-    return proxyFetch(this._address, request, init, FETCH_OPTIONS);
+    try {
+      return await (this._address.protocol === "https"
+        ? proxyFetch(_httpsTarget(this._address), request, init, {
+            ...FETCH_OPTIONS,
+            ssl: UNVERIFIED_TLS,
+          })
+        : proxyFetch(this._address, request, init, FETCH_OPTIONS));
+    } catch (error) {
+      // Aborted with the request (e.g. the client is gone): nobody reads the
+      // response, so don't surface it as a fetch handler error.
+      if (signal?.aborted) {
+        return new Response(null, { status: 499, statusText: "Client Closed Request" });
+      }
+      throw error;
+    }
   }
 
   async upgrade(context: { node: { req: IncomingMessage; socket: Socket; head: any } }) {

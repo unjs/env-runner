@@ -1,3 +1,4 @@
+import { finished } from "node:stream";
 import type { ServerPlugin } from "srvx";
 import { FastResponse } from "srvx";
 import type {
@@ -126,7 +127,14 @@ export class RunnerManager implements EnvRunner, AsyncDisposable {
       if (this._moduleInvalidated) {
         await this._flushInvalidation(runner);
       }
-      return trackResponseBody(await runner.fetch(input, init), settle);
+      const response = await runner.fetch(input, init);
+      // A HEAD response is complete with its headers (its body may never be read).
+      const method = init?.method ?? (input instanceof Request ? input.method : "GET");
+      if (method.toUpperCase() === "HEAD") {
+        settle();
+        return response;
+      }
+      return trackResponseBody(response, settle);
     } catch (error) {
       settle();
       throw error;
@@ -424,6 +432,8 @@ export class RunnerManager implements EnvRunner, AsyncDisposable {
     } else if (timeout < 2 ** 31) {
       // Beyond `setTimeout()`'s limit (`Infinity` included): no limit.
       timer = setTimeout(() => draining.retire(closeRunnerNow), timeout);
+      // Doesn't keep the process alive on its own (e.g. `self` runners).
+      (timer as { unref?: () => void }).unref?.();
     }
   }
 
@@ -577,11 +587,9 @@ function trackNodeFastResponse(response: NodeFastResponse, settle: () => void): 
   let trackedBody = body;
   if (body instanceof ReadableStream) {
     trackedBody = trackStream(body, settle);
-  } else if (typeof (body as NodeJS.ReadableStream | undefined)?.once === "function") {
-    // A Node.js stream: until it is closed (ended, errored or destroyed).
-    const stream = body as NodeJS.ReadableStream & { closed?: boolean };
-    if (stream.closed) settle();
-    else stream.once("close", settle);
+  } else if (typeof (body as NodeJS.ReadableStream | undefined)?.pipe === "function") {
+    // A Node.js stream: until it ends, errors or is destroyed.
+    finished(body as NodeJS.ReadableStream, () => settle());
   } else {
     settle();
   }
