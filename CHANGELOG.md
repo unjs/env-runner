@@ -1,6 +1,22 @@
 # Changelog
 
 
+## v0.3.8
+
+[compare changes](https://github.com/unjs/env-runner/compare/v0.3.7...v0.3.8)
+
+### 🚀 Enhancements
+
+- **manager:** Drained reload (`reload(runner, { drain })`) ([#92](https://github.com/unjs/env-runner/pull/92))
+
+### 🩹 Fixes
+
+- **bun:** Disable Bun's idle timeout behind the runner proxy ([#89](https://github.com/unjs/env-runner/pull/89))
+
+### ❤️ Contributors
+
+- Pi0x <x@pi0.io>
+
 ## v0.3.7
 
 [compare changes](https://github.com/unjs/env-runner/compare/v0.3.6...v0.3.7)
