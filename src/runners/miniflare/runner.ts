@@ -1413,12 +1413,21 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
     }
 
     await this.#connect();
-    this.#signalReady();
+    await this.#signalReady();
   }
 
-  /** Signal ready with a dummy address (fetch is overridden). */
-  #signalReady() {
-    this._handleMessage({ address: { host: "127.0.0.1", port: 0 } });
+  /**
+   * Signal ready with workerd's direct socket as the address: `fetch()` is
+   * overridden, but non-Node hosts (`createRunnerWSProxyPlugin()` on Bun/Deno)
+   * dial it to bridge WebSocket upgrades. Read again after each restart, since
+   * workerd may bind a new port.
+   */
+  async #signalReady() {
+    const url = await this.#miniflare.unsafeGetDirectURL();
+    if (this.closed) {
+      return;
+    }
+    this._handleMessage({ address: { host: url.hostname, port: Number(url.port) } });
   }
 
   /**
@@ -1445,7 +1454,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
     }
     this.#pendingRestart = undefined;
     if (!this.closed) {
-      this.#signalReady();
+      await this.#signalReady();
     }
   }
 

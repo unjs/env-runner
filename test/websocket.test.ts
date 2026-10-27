@@ -260,6 +260,7 @@ const bridgeHosts = [
   },
 ];
 const bridgeFixture = resolve(_dir, "./fixtures/ws-bridge-server.mjs");
+const bridgeMiniflareFixture = resolve(_dir, "./fixtures/ws-bridge-miniflare.mjs");
 
 for (const { name, cmd, args, skip } of bridgeHosts) {
   describe.skipIf(skip)(`wsProxy bridge (${name} host)`, () => {
@@ -270,8 +271,8 @@ for (const { name, cmd, args, skip } of bridgeHosts) {
       child = undefined;
     });
 
-    function startBridge() {
-      const proc = spawn(cmd, [...args, bridgeFixture], { stdio: ["ignore", "pipe", "pipe"] });
+    function startBridge(fixture = bridgeFixture) {
+      const proc = spawn(cmd, [...args, fixture], { stdio: ["ignore", "pipe", "pipe"] });
       child = proc;
       return new Promise<string>((resolve, reject) => {
         let out = "";
@@ -292,8 +293,7 @@ for (const { name, cmd, args, skip } of bridgeHosts) {
       });
     }
 
-    it("terminates the client with crossws and proxies to the worker", async () => {
-      const frontUrl = await startBridge();
+    async function echo(frontUrl: string) {
       const ws = new WebSocket(frontUrl.replace(/^http/, "ws"));
       const messages: string[] = [];
       const closed = new Promise<void>((resolve) => {
@@ -310,7 +310,19 @@ for (const { name, cmd, args, skip } of bridgeHosts) {
       });
 
       await closed;
-      expect(messages).toEqual(["welcome", "echo:hello"]);
+      return messages;
+    }
+
+    it("terminates the client with crossws and proxies to the worker", async () => {
+      expect(await echo(await startBridge())).toEqual(["welcome", "echo:hello"]);
+    }, 30_000);
+
+    // The bridge dials the workerd direct socket the miniflare runner reports.
+    it("proxies to a miniflare runner", async () => {
+      expect(await echo(await startBridge(bridgeMiniflareFixture))).toEqual([
+        "welcome",
+        "echo:hello",
+      ]);
     }, 30_000);
 
     // A drained `reload()` retires the previous runner only once the bridged
