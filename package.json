@@ -49,7 +49,7 @@
   "devDependencies": {
     "@netlify/runtime": "^5.0.10",
     "@types/node": "^26.6.5",
-    "@vercel/queue": "^0.9.0",
+    "@vercel/queue": "^0.10.0",
     "@vitest/coverage-v8": "^5.0.5",
     "automd": "^0.4.3",
     "changelogen": "^0.6.2",
