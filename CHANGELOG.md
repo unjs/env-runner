@@ -1,6 +1,19 @@
 # Changelog
 
 
+## v0.3.10
+
+[compare changes](https://github.com/unjs/env-runner/compare/v0.3.9...v0.3.10)
+
+### 🩹 Fixes
+
+- **miniflare:** Serve disk CommonJS as `commonJsModule` with reexported named exports ([8e6cd83](https://github.com/unjs/env-runner/commit/8e6cd83))
+- **miniflare:** Report workerd direct socket as address for Bun/Deno WebSocket bridging ([9c24b45](https://github.com/unjs/env-runner/commit/9c24b45))
+
+### ❤️ Contributors
+
+- Pooya Parsa <pooya@pi0.io>
+
 ## v0.3.9
 
 [compare changes](https://github.com/unjs/env-runner/compare/v0.3.8...v0.3.9)
