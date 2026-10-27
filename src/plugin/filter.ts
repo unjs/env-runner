@@ -94,19 +94,18 @@ export function queryOf(id: string): string {
   return hashIndex === -1 ? id.slice(qIndex) : id.slice(qIndex, hashIndex);
 }
 
-// Query params env-runner adds itself: reload cache-busting, Bun's routing
-// markers (virtual and plugin-loaded modules) and miniflare's CommonJS shims.
+// Query params env-runner adds itself: reload cache-busting and Bun's routing
+// markers (virtual and plugin-loaded modules).
 const INTERNAL_PARAMS: ReadonlySet<string> = new Set([
   "__envRunnerReload",
   "__env_runner_virtual",
   "__env_runner_disk",
   "__env_runner_plugin",
-  "__cjs",
 ]);
 
 /**
  * An id without the query params env-runner adds itself (reload
- * cache-busting, Bun markers, miniflare's CommonJS shims), and without a
+ * cache-busting, Bun markers), and without a
  * virtual module version (`v=<version>`, always the last param) when
  * `version` is given. Other params are kept as written, in order.
  */

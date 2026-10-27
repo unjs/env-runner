@@ -347,7 +347,7 @@ for (const { name, create, skip, cjsOptions, sync } of runners) {
         label: "Ok",
         separate: true,
         dynamic: true,
-        // CommonJS output with a query (miniflare: behind its ESM shim).
+        // CommonJS output with a query (miniflare: a `commonJsModule`).
         cjs: "lib",
         stamp: 1,
       };
@@ -369,7 +369,7 @@ for (const { name, create, skip, cjsOptions, sync } of runners) {
       });
       const entry = fixture("app-query.ts");
       expect(ids.filter((id) => id.startsWith(entry))).toEqual([entry, entry]);
-      const internal = /__env|__cjs|[?&][tv]=/;
+      const internal = /__env|[?&][tv]=/;
       expect(ids.filter((id) => internal.test(id))).toEqual([]);
       expect(seen.filter(([, id]) => internal.test(id))).toEqual([]);
     });
@@ -1403,11 +1403,10 @@ describe("plugin filters", () => {
     expect(stripInternalQuery("/a.ts?raw")).toBe("/a.ts?raw");
     expect(stripInternalQuery("/a.ts?__envRunnerReload=3")).toBe("/a.ts");
     expect(stripInternalQuery("/a.ts?raw&__envRunnerReload=3")).toBe("/a.ts?raw");
-    // Bun markers lead the query, miniflare's CommonJS shim param ends it.
+    // Bun markers lead the query.
     expect(stripInternalQuery("/a.ts?__env_runner_virtual&raw")).toBe("/a.ts?raw");
     expect(stripInternalQuery("/a.ts?__env_runner_disk&x=1&v=2", 2)).toBe("/a.ts?x=1");
     expect(stripInternalQuery("/a.txt?__env_runner_plugin&raw")).toBe("/a.txt?raw");
-    expect(stripInternalQuery("/a.cjs?raw&__cjs")).toBe("/a.cjs?raw");
     // A virtual module version only when given (and last): `v` may be the import's.
     expect(stripInternalQuery("/a.ts?v=2")).toBe("/a.ts?v=2");
     expect(stripInternalQuery("/a.ts?v=2", 3)).toBe("/a.ts?v=2");
@@ -1415,7 +1414,9 @@ describe("plugin filters", () => {
     expect(stripInternalQuery("/a.ts?raw&v=3", 3)).toBe("/a.ts?raw");
     expect(stripInternalQuery("/a.ts?v=3&raw", 3)).toBe("/a.ts?v=3&raw");
     // Names only: other params are kept as written.
-    expect(stripInternalQuery("/a.ts?__cjsx&a=%20&__envRunnerReload")).toBe("/a.ts?__cjsx&a=%20");
+    expect(stripInternalQuery("/a.ts?__envRunnerReloadx&a=%20&__envRunnerReload")).toBe(
+      "/a.ts?__envRunnerReloadx&a=%20",
+    );
     // A resolved id gets a reload's param back.
     expect(restoreInternalQuery("/b.ts", "/a.ts?raw&__envRunnerReload=3")).toBe(
       "/b.ts?__envRunnerReload=3",

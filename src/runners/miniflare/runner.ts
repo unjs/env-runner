@@ -2,7 +2,7 @@ import type { WorkerHooks } from "../../types.ts";
 
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
-import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { resolveModulePath } from "exsolve";
 import { init as initCjsLexer, parse as parseCjs } from "cjs-module-lexer";
@@ -892,9 +892,6 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
         // Read from the live runner: a persistent instance is adopted by later
         // runners, which bring their own plugins.
         const _livePlugins = () => ipc.runner._plugins;
-        // Plugin output of CommonJS modules by id, from the shim request until
-        // its `__cjs` request (so they are transformed once).
-        const _cjsOutput = new Map<string, string>();
         const _exportConditions = this.#exportConditions;
         // `modulePath`: the served module's path, which its relative imports join onto.
         const _applyVirtualVersions = (code: string, modulePath: string | undefined) =>
@@ -913,7 +910,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
             case "commonjs": {
               return {
                 commonJsModule: source,
-                namedExports: commonJSExports(source as string).filter((e) => e !== "default"),
+                namedExports: commonJSExports(source as string),
               };
             }
             case "json": {
@@ -954,7 +951,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
           }
           return {
             commonJsModule: code,
-            namedExports: commonJSExports(code).filter((e) => e !== "default"),
+            namedExports: commonJSExports(code),
           };
         };
         // Ids of served modules that aren't their path (by workerd module
@@ -977,6 +974,8 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
         // Locations redirected to (see below) → what they were resolved to, so
         // workerd's re-request doesn't run the resolution (and plugins) again.
         const _redirects = new Map<string, { path: string; id?: string }>();
+        // Lexed CommonJS files under node_modules, for the named exports of their reexporters.
+        const _lexedCommonJS = new Map<string, LexedCommonJS | undefined>();
         const _lexersReady = Promise.all([ensureCjsLexer(), initEsmLexer]);
         options.unsafeModuleFallbackService = async (request: Request) => {
           await _lexersReady;
@@ -1048,7 +1047,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
             (cleanSpecifier.startsWith("/") ? cleanSpecifier.slice(1) : cleanSpecifier) + rawQuery;
 
           // The import's own query, as plugins see it: without a reload's
-          // param, the CommonJS shim's, or a (removed) virtual key's version.
+          // param or a (removed) virtual key's version.
           const versionedKey = _virtual.versionedKeyOf(cleanRaw || cleanSpecifier, referrerPath);
           const version =
             versionedKey === undefined ? undefined : _virtual.versions.get(versionedKey);
@@ -1299,12 +1298,9 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
             // Missing: maybe a plugin loads it.
           }
           const _plugins = _livePlugins();
-          // The shim's request for the CommonJS module (the param goes last).
-          const cjsRequest = /[?&]__cjs$/.test(specifier);
           const id = resolvedId ?? resolvedPath + query;
-          const cachedCJS = cjsRequest && _cjsOutput.has(id);
-          const pluginFile = !cachedCJS && _plugins?.filter(id, undefined, pluginResolved);
-          if (contents === undefined && !cachedCJS && !pluginFile) {
+          const pluginFile = _plugins?.filter(id, undefined, pluginResolved);
+          if (contents === undefined && !pluginFile) {
             return new Response(null, { status: 404 });
           }
           // Track the real path so relative imports from this module resolve correctly
@@ -1314,10 +1310,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
           }
 
           let transformed: string | undefined;
-          if (cachedCJS) {
-            transformed = _cjsOutput.get(id);
-            _cjsOutput.delete(id);
-          } else if (pluginFile) {
+          if (pluginFile) {
             try {
               const file = resolvedPath;
               const result = await _plugins!.load(
@@ -1349,11 +1342,10 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
           if (transformed === undefined) {
             contents = contents!;
             // Detect module type: .mjs is always ESM, .cjs is always CJS,
-            // otherwise check for ESM syntax indicators
+            // otherwise check for ESM syntax (comments and strings don't count)
             isESM =
               resolvedPath.endsWith(".mjs") ||
-              (!resolvedPath.endsWith(".cjs") &&
-                /\b(import\s|import\(|export\s|export\{|import\.meta\b)/.test(contents));
+              (!resolvedPath.endsWith(".cjs") && hasModuleSyntax(contents));
           } else {
             contents = transformed;
             isESM = transformedFormat(resolvedPath, contents) === "module";
@@ -1364,17 +1356,17 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
               esModule: _applyVirtualVersions(contents, resolvedPath),
             });
           }
-          // Importers expect ESM: serve raw CJS under a suffixed name behind an ESM shim.
-          if (cjsRequest) {
-            return Response.json({ name, commonJsModule: contents });
-          }
-          if (transformed !== undefined) {
-            _cjsOutput.set(id, transformed);
-          }
-          const shimSpecifier =
-            "./" + basename(resolvedPath) + (query ? `${query}&` : "?") + "__cjs";
-          const esModule = createCjsEsmShim(shimSpecifier, contents);
-          return Response.json({ name, esModule });
+          // One module for `import` and `require()`, so workerd resolves require cycles like Node.
+          return Response.json({
+            name,
+            commonJsModule: contents,
+            namedExports: commonJSFileExports(
+              resolvedPath,
+              contents,
+              [..._exportConditions, "require"],
+              _lexedCommonJS,
+            ),
+          });
         };
       }
     }
@@ -1919,12 +1911,129 @@ function ensureCjsLexer() {
   return _cjsLexerReady;
 }
 
-/** Named exports of CommonJS code (cjs-module-lexer, like Node); none if it can't be lexed. */
+/**
+ * `namedExports` of CommonJS code (cjs-module-lexer, like Node), without
+ * `default` and `__esModule`; none if it can't be lexed.
+ */
 function commonJSExports(contents: string): string[] {
   try {
-    return parseCjs(contents).exports;
+    return toNamedExports(parseCjs(contents).exports);
   } catch {
     return [];
+  }
+}
+
+function toNamedExports(names: Iterable<string>): string[] {
+  return [...names].filter((e) => e !== "default" && e !== "__esModule");
+}
+
+/** A lexed CommonJS file: its own export names and the CommonJS files it reexports. */
+interface LexedCommonJS {
+  exports: string[];
+  reexports: string[];
+}
+
+/**
+ * `namedExports` of a CommonJS file, with the names of the CommonJS files it reexports
+ * (`module.exports = require(...)`, `__exportStar(require(...), exports)`), like Node.
+ * Reexports resolve like workerd's `require()` here (`conditions`). `cache` keeps the
+ * lexed files under `node_modules` (others may change between reloads).
+ */
+function commonJSFileExports(
+  path: string,
+  contents: string,
+  conditions: string[],
+  cache: Map<string, LexedCommonJS | undefined>,
+): string[] {
+  const names = new Set<string>();
+  const seen = new Set<string>();
+  const visit = (file: string, lexed: LexedCommonJS | undefined) => {
+    seen.add(file);
+    for (const name of lexed?.exports || []) {
+      names.add(name);
+    }
+    for (const target of lexed?.reexports || []) {
+      if (!seen.has(target)) {
+        visit(target, lexCommonJSFile(target, conditions, cache));
+      }
+    }
+  };
+  visit(path, lexCommonJS(path, contents, conditions));
+  return toNamedExports(names);
+}
+
+function lexCommonJS(
+  path: string,
+  contents: string,
+  conditions: string[],
+): LexedCommonJS | undefined {
+  let lexed: ReturnType<typeof parseCjs>;
+  try {
+    lexed = parseCjs(contents);
+  } catch {
+    return undefined;
+  }
+  const reexports: string[] = [];
+  for (const specifier of lexed.reexports) {
+    const resolved = resolveCommonJSReexport(specifier, path, conditions);
+    if (resolved && isAbsolute(resolved) && /\.c?js$/.test(resolved)) {
+      reexports.push(resolved);
+    }
+  }
+  return { exports: lexed.exports, reexports };
+}
+
+/** A reexported file, lexed when it is CommonJS. */
+function lexCommonJSFile(
+  path: string,
+  conditions: string[],
+  cache: Map<string, LexedCommonJS | undefined>,
+): LexedCommonJS | undefined {
+  if (cache.has(path)) {
+    return cache.get(path);
+  }
+  let lexed: LexedCommonJS | undefined;
+  try {
+    const source = readFileSync(path, "utf8");
+    if (path.endsWith(".cjs") || !hasModuleSyntax(source)) {
+      lexed = lexCommonJS(path, source, conditions);
+    }
+  } catch {
+    // Unreadable: no names.
+  }
+  if (/[/\\]node_modules[/\\]/.test(path)) {
+    cache.set(path, lexed);
+  }
+  return lexed;
+}
+
+/**
+ * Resolves a reexported `require()` like the fallback service: bare specifiers
+ * with exsolve and the export conditions, relative ones like Node.
+ */
+function resolveCommonJSReexport(
+  specifier: string,
+  from: string,
+  conditions: string[],
+): string | undefined {
+  try {
+    if (!specifier.startsWith(".") && !isAbsolute(specifier)) {
+      const resolved = resolveModulePath(specifier, { from, conditions, try: true });
+      if (resolved) {
+        return resolved;
+      }
+    }
+    return createRequire(from).resolve(specifier);
+  } catch {
+    return undefined;
+  }
+}
+
+function hasModuleSyntax(contents: string): boolean {
+  try {
+    return parseEsm(contents)[3];
+  } catch {
+    return /\b(import\s|import\(|export\s|export\{|import\.meta\b)/.test(contents);
   }
 }
 
@@ -1946,18 +2055,6 @@ function createNodeRequireShim(specifier: string): string {
     `export default __default__;`,
     ``,
   ].join("\n");
-}
-
-function createCjsEsmShim(cjsSpecifier: string, contents: string): string {
-  const namedExports = commonJSExports(contents).filter(
-    (e) => e !== "default" && e !== "__esModule",
-  );
-  const quoted = JSON.stringify(cjsSpecifier);
-  let shim = `import __cjs_mod__ from ${quoted};\nexport default __cjs_mod__;\n`;
-  for (const name of namedExports) {
-    shim += `export var ${name} = __cjs_mod__["${name}"];\n`;
-  }
-  return shim;
 }
 
 // #endregion

@@ -488,6 +488,121 @@ describe("MiniflareEnvRunner (node_modules resolution)", () => {
     expect(await res.json()).toEqual({ local: "local.js", dir: "lib/util.js" });
   });
 
+  it("detects the module format of .js files from their syntax, not their comments", async () => {
+    const dir = writeFiles({
+      "node_modules/cjs-pkg/package.json": JSON.stringify({ name: "cjs-pkg", main: "index.js" }),
+      "node_modules/cjs-pkg/index.js": [
+        `// Avoids the export names of some package types`,
+        `/* import { x } from "y" */`,
+        `exports.format = "commonjs";`,
+      ].join("\n"),
+      "node_modules/esm-pkg/package.json": JSON.stringify({ name: "esm-pkg", main: "index.js" }),
+      "node_modules/esm-pkg/index.js": `export const format = "module";`,
+      "app.mjs": [
+        `import cjs from "cjs-pkg";`,
+        `import { format } from "esm-pkg";`,
+        `export default { fetch: () => Response.json({ cjs: cjs.format, esm: format }) };`,
+      ].join("\n"),
+    });
+
+    runner = new MiniflareEnvRunner({
+      miniflare,
+      name: "test-cjs-comments",
+      data: { entry: join(dir, "app.mjs") },
+    });
+    await waitForReady(runner);
+
+    const res = await runner.fetch("http://localhost/");
+    expect(await res.json()).toEqual({ cjs: "commonjs", esm: "module" });
+  });
+
+  it("exposes reexported names of CommonJS packages as named exports", async () => {
+    const exportStar = `var __exportStar = (m, e) => { for (var k in m) if (k !== "default") e[k] = m[k]; };`;
+    const dir = writeFiles({
+      "node_modules/cjs-pkg/package.json": JSON.stringify({ name: "cjs-pkg", main: "index.js" }),
+      "node_modules/cjs-pkg/index.js": [
+        exportStar,
+        `__exportStar(require("./trace"), exports);`,
+        `exports.own = "own";`,
+      ].join("\n"),
+      "node_modules/cjs-pkg/trace/index.js": [
+        exportStar,
+        `__exportStar(require("./attributes"), exports);`,
+      ].join("\n"),
+      "node_modules/cjs-pkg/trace/attributes.js": `exports.ATTR = "attr";`,
+      "app.mjs": [
+        `import { ATTR, own } from "cjs-pkg";`,
+        `export default { fetch: () => Response.json({ ATTR, own }) };`,
+      ].join("\n"),
+    });
+
+    runner = new MiniflareEnvRunner({
+      miniflare,
+      name: "test-cjs-reexports",
+      data: { entry: join(dir, "app.mjs") },
+    });
+    await waitForReady(runner);
+
+    const res = await runner.fetch("http://localhost/");
+    expect(await res.json()).toEqual({ ATTR: "attr", own: "own" });
+  });
+
+  it("follows CommonJS reexports with the export conditions", async () => {
+    const dir = writeFiles({
+      "node_modules/cjs-pkg/package.json": JSON.stringify({ name: "cjs-pkg", main: "index.js" }),
+      "node_modules/cjs-pkg/index.js": `module.exports = require("cond-pkg");`,
+      "node_modules/cond-pkg/package.json": JSON.stringify({
+        name: "cond-pkg",
+        exports: { workerd: "./workerd.js", default: "./node.js" },
+      }),
+      "node_modules/cond-pkg/workerd.js": `exports.runtime = "workerd";`,
+      "node_modules/cond-pkg/node.js": `exports.nodeOnly = "node";`,
+      "app.mjs": [
+        `import { runtime } from "cjs-pkg";`,
+        `export default { fetch: () => Response.json({ runtime }) };`,
+      ].join("\n"),
+    });
+
+    runner = new MiniflareEnvRunner({
+      miniflare,
+      name: "test-cjs-reexport-conditions",
+      data: { entry: join(dir, "app.mjs") },
+    });
+    await waitForReady(runner);
+
+    const res = await runner.fetch("http://localhost/");
+    expect(await res.json()).toEqual({ runtime: "workerd" });
+  });
+
+  it("resolves circular require() in CommonJS packages", async () => {
+    const dir = writeFiles({
+      "node_modules/cjs-pkg/package.json": JSON.stringify({ name: "cjs-pkg", main: "a.js" }),
+      "node_modules/cjs-pkg/a.js": [
+        `exports.name = "a";`,
+        `exports.fromB = require("./b.js").seenA;`,
+      ].join("\n"),
+      "node_modules/cjs-pkg/b.js": [
+        `exports.name = "b";`,
+        `exports.seenA = require("./a").name;`,
+      ].join("\n"),
+      "app.mjs": [
+        `import a from "cjs-pkg";`,
+        `import { name } from "./node_modules/cjs-pkg/b.js";`,
+        `export default { fetch: () => Response.json({ ...a, b: name }) };`,
+      ].join("\n"),
+    });
+
+    runner = new MiniflareEnvRunner({
+      miniflare,
+      name: "test-cjs-cycle",
+      data: { entry: join(dir, "app.mjs") },
+    });
+    await waitForReady(runner);
+
+    const res = await runner.fetch("http://localhost/");
+    expect(await res.json()).toEqual({ name: "a", fromB: "a", b: "b" });
+  });
+
   it("serves a file a plugin resolves a CommonJS require() to under its path", async () => {
     const dir = writeFiles({
       "polyfill/node/process.mjs": `import { nextTick } from "../_internal/utils.mjs";\nexport default { nextTick };`,
