@@ -462,6 +462,32 @@ describe("MiniflareEnvRunner (node_modules resolution)", () => {
     });
   });
 
+  it("resolves extensionless and directory require() in CommonJS packages", async () => {
+    const dir = writeFiles({
+      "node_modules/cjs-pkg/package.json": JSON.stringify({ name: "cjs-pkg", main: "index.js" }),
+      "node_modules/cjs-pkg/index.js": [
+        `exports.local = require("./local").value;`,
+        `exports.dir = require("./lib").value;`,
+      ].join("\n"),
+      "node_modules/cjs-pkg/local.js": `exports.value = "local.js";`,
+      // Relative to `lib/`, not the package root
+      "node_modules/cjs-pkg/lib/index.js": `exports.value = require("./util").value;`,
+      "node_modules/cjs-pkg/lib/util.js": `exports.value = "lib/util.js";`,
+      "node_modules/cjs-pkg/util.js": `exports.value = "wrong";`,
+      "app.mjs": `import cjs from "cjs-pkg";\nexport default { fetch: () => Response.json(cjs) };`,
+    });
+
+    runner = new MiniflareEnvRunner({
+      miniflare,
+      name: "test-cjs-extensionless",
+      data: { entry: join(dir, "app.mjs") },
+    });
+    await waitForReady(runner);
+
+    const res = await runner.fetch("http://localhost/");
+    expect(await res.json()).toEqual({ local: "local.js", dir: "lib/util.js" });
+  });
+
   it("serves a file a plugin resolves a CommonJS require() to under its path", async () => {
     const dir = writeFiles({
       "polyfill/node/process.mjs": `import { nextTick } from "../_internal/utils.mjs";\nexport default { nextTick };`,

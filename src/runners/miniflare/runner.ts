@@ -1,6 +1,6 @@
 import type { WorkerHooks } from "../../types.ts";
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -1212,6 +1212,17 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
             const raw = cleanRaw || cleanSpecifier;
             if (raw.startsWith(".")) {
               resolvedPath = resolve(referrerDir, raw);
+              // `require()` adds extensions and finds directory indexes
+              // (`require("./lib")` → `lib/index.js`): served under the real
+              // path (see the redirect below) for its own relative requires.
+              if (method === "require" && !_isFile(resolvedPath)) {
+                try {
+                  resolvedPath = createRequire(referrerReal).resolve(raw);
+                  bareResolved = true;
+                } catch {
+                  // Not found: keep the joined path (a plugin or a 404).
+                }
+              }
             } else if (cleanRaw && isAbsolute(cleanRaw) && !cleanRaw.startsWith("/")) {
               // Windows absolute path, e.g. the wrapper's entry import
               resolvedPath = cleanRaw;
@@ -1694,6 +1705,14 @@ function wranglerPersistRoot(configFile?: string, explicitPath?: string): string
 }
 
 /** Entry might not exist yet (e.g. generated at build time). */
+function _isFile(path: string): boolean {
+  try {
+    return statSync(path).isFile();
+  } catch {
+    return false;
+  }
+}
+
 function _tryReadFile(path: string): string | undefined {
   try {
     return readFileSync(path, "utf8");
