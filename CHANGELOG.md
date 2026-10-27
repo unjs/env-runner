@@ -1,6 +1,18 @@
 # Changelog
 
 
+## v0.3.9
+
+[compare changes](https://github.com/unjs/env-runner/compare/v0.3.8...v0.3.9)
+
+### 🩹 Fixes
+
+- **miniflare:** Resolve extensionless and directory relative `require()` ([#96](https://github.com/unjs/env-runner/pull/96))
+
+### ❤️ Contributors
+
+- Pi0x <x@pi0.io>
+
 ## v0.3.8
 
 [compare changes](https://github.com/unjs/env-runner/compare/v0.3.7...v0.3.8)
