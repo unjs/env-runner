@@ -355,10 +355,13 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
 
   // #region Protected methods
 
-  /** Briefly back off (~3s total) while the worker is still starting. */
+  /**
+   * Wait up to ~3s for a starting worker, then `fetch()` answers 503. Wait on the address
+   * message, not a poll. A poll answers only at its next tick, at 100, 300 or 700 ms. See #104.
+   */
   protected async _waitForAddress() {
-    for (let i = 0; i < 5 && !this._address && !this.closed; i++) {
-      await new Promise((r) => setTimeout(r, 100 * Math.pow(2, i)));
+    if (!this._address && !this.closed) {
+      await this.waitForReady(3100).catch(() => {});
     }
   }
 

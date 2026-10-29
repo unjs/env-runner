@@ -293,6 +293,27 @@ for (const runnerDef of runners) {
       expect(res.status).toBe(503);
     });
 
+    // Self and Miniflare runners have their own `fetch()` without the address wait
+    it.skipIf(name === "SelfEnvRunner" || name === "MiniflareEnvRunner")(
+      "answers the first fetch on the worker address, not on a timer",
+      async () => {
+        const realSetTimeout = setTimeout;
+        runner = create(opts("test-first-fetch"));
+        vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+        try {
+          const res = await Promise.race([
+            runner.fetch("http://localhost/"),
+            new Promise<never>((_, reject) =>
+              realSetTimeout(() => reject(new Error("fetch waited on a timer")), 5000),
+            ),
+          ]);
+          expect(res.status).toBe(200);
+        } finally {
+          vi.useRealTimers();
+        }
+      },
+    );
+
     it("ipc.onOpen sends message on ready", async () => {
       runner = create(opts("test-ipc-open"));
       // Register listener before ready since onOpen fires before the address message
