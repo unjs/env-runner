@@ -705,5 +705,15 @@ function _httpsTarget(address: WorkerAddress): string {
 }
 
 function closedBeforeReadyError(cause: unknown): Error {
-  return new Error("Runner closed before becoming ready", cause ? { cause } : undefined);
+  const message = "Runner closed before becoming ready";
+  if (!cause) return new Error(message);
+  const reason = _causeMessage(cause);
+  return new Error(reason ? `${message}: ${reason}` : message, { cause });
+}
+
+// Never throws (runs inside `close()`), so non-string messages are skipped.
+function _causeMessage(cause: unknown): string {
+  if (typeof cause === "string") return cause;
+  const message = (cause as { message?: unknown }).message;
+  return typeof message === "string" ? message : "";
 }

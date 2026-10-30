@@ -348,13 +348,16 @@ for (const runnerDef of runners) {
         runner = r;
         const cause = new Error("closed early");
         const rejected = expect(r.waitForReady(60_000)).rejects.toMatchObject({
-          message: "Runner closed before becoming ready",
+          message: "Runner closed before becoming ready: closed early",
           cause,
         });
         await r.close(cause);
         await rejected;
         // Later calls on the closed runner report the cause too.
-        await expect(r.waitForReady()).rejects.toMatchObject({ cause });
+        await expect(r.waitForReady()).rejects.toMatchObject({
+          message: "Runner closed before becoming ready: closed early",
+          cause,
+        });
       },
     );
 
@@ -366,7 +369,8 @@ for (const runnerDef of runners) {
         }),
       );
       const error = await runner.waitForReady(60_000).catch((error) => error);
-      expect(error?.message).toBe("Runner closed before becoming ready");
+      expect(error?.message).toMatch(/^Runner closed before becoming ready: /);
+      expect(error?.message).toContain("does-not-exist");
       expect(String(error?.cause?.message)).toContain("does-not-exist");
     });
 
