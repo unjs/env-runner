@@ -14,6 +14,7 @@ src/
 │   ├── base-runner.ts       # BaseEnvRunner abstract class
 │   ├── worker-utils.ts      # AppEntry interface, resolveEntry(), parseServerAddress(), toServerOptions() (+ LISTEN_DATA_KEY), shutdownWorker(), formatInitError()
 │   ├── runtime-deps.ts      # resolveRuntimeDep()/resolveRuntimeDepSpecifier() — "module | specifier | false" resolver
+│   ├── errors.ts            # errorWithCause()/closedBeforeReadyError() — `<message>: <cause message>` errors (`waitForReady()` rejections)
 │   ├── host-env.ts          # hostEnv() — worker/child env: host env + FORCE_COLOR/COLUMNS from the host TTY
 │   ├── process-data.ts      # receiveProcessData() — runner data over IPC for process workers
 │   ├── ws-proxy.ts          # createRunnerWSProxyPlugin() — runtime-native WS upgrade proxy

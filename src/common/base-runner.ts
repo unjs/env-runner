@@ -25,6 +25,7 @@ import type {
   VirtualModuleSource,
   VirtualModuleUpdates,
 } from "../virtual-loader.ts";
+import { closedBeforeReadyError } from "./errors.ts";
 import { hostEnv } from "./host-env.ts";
 import { LISTEN_DATA_KEY } from "./worker-utils.ts";
 import { PLUGINS_DATA_KEY } from "../plugin/hooks.ts";
@@ -702,18 +703,4 @@ const FETCH_OPTIONS: ProxyFetchOptions | undefined =
 function _httpsTarget(address: WorkerAddress): string {
   const host = address.host || "127.0.0.1";
   return `https://${host.includes(":") ? `[${host}]` : host}:${address.port}`;
-}
-
-function closedBeforeReadyError(cause: unknown): Error {
-  const message = "Runner closed before becoming ready";
-  if (!cause) return new Error(message);
-  const reason = _causeMessage(cause);
-  return new Error(reason ? `${message}: ${reason}` : message, { cause });
-}
-
-// Never throws (runs inside `close()`), so non-string messages are skipped.
-function _causeMessage(cause: unknown): string {
-  if (typeof cause === "string") return cause;
-  const message = (cause as { message?: unknown }).message;
-  return typeof message === "string" ? message : "";
 }

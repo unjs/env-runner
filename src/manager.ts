@@ -10,6 +10,7 @@ import type {
 } from "./types.ts";
 import type { VirtualModuleUpdates } from "./virtual-loader.ts";
 
+import { closedBeforeReadyError, errorWithCause } from "./common/errors.ts";
 import { createRunnerWSProxyPlugin } from "./common/ws-proxy.ts";
 
 /** Default `drain` timeout of `RunnerManager.reload()`. */
@@ -43,6 +44,9 @@ export class RunnerManager implements EnvRunner, AsyncDisposable {
   private _closeListeners = new Set<(runner: EnvRunner, cause?: unknown) => void>();
   private _readyListeners = new Set<(runner: EnvRunner, address?: WorkerAddress) => void>();
   private _readyRejectors = new Set<() => void>();
+  // Why the active runner closed itself, until another one is attached
+  // (the reason `waitForReady()` rejections report).
+  private _runnerCloseCause: unknown;
   // Requests (until their body settles) and WebSockets each runner serves.
   private _exchanges = new WeakMap<EnvRunner, number>();
   // Previous runners draining after `reload()` (until closed or attached again).
@@ -218,7 +222,9 @@ export class RunnerManager implements EnvRunner, AsyncDisposable {
 
   waitForReady(timeout = 15_000): Promise<void> {
     if (this.ready) return Promise.resolve();
-    if (this._closed) return Promise.reject(new Error("Runner closed before becoming ready"));
+    if (this._closed) {
+      return Promise.reject(closedBeforeReadyError(this._runnerCloseCause));
+    }
     return new Promise((resolve, reject) => {
       const cleanup = () => {
         clearTimeout(timer);
@@ -227,7 +233,7 @@ export class RunnerManager implements EnvRunner, AsyncDisposable {
       };
       const timer = setTimeout(() => {
         cleanup();
-        reject(new Error("Runner did not become ready in time"));
+        reject(errorWithCause("Runner did not become ready in time", this._runnerCloseCause));
       }, timeout);
       const listener = (message: any) => {
         if (message?.address || this.ready) {
@@ -239,7 +245,7 @@ export class RunnerManager implements EnvRunner, AsyncDisposable {
       // caller wait out the full timeout on a manager that will never be ready.
       const onClose = () => {
         cleanup();
-        reject(new Error("Runner closed before becoming ready"));
+        reject(closedBeforeReadyError(this._runnerCloseCause));
       };
       // Via `onMessage` so the listener follows the active runner across reloads.
       this.onMessage(listener);
@@ -447,6 +453,7 @@ export class RunnerManager implements EnvRunner, AsyncDisposable {
 
   private _attach(runner: EnvRunner) {
     this._runner = runner;
+    this._runnerCloseCause = undefined;
 
     // Listen for address/ready messages internally
     runner.onMessage(this._internalListener);
@@ -464,6 +471,11 @@ export class RunnerManager implements EnvRunner, AsyncDisposable {
       this._wrappedRunners.add(runner);
       const originalClose = runner.close.bind(runner) as (cause?: unknown) => Promise<void>;
       runner.close = async (cause?: unknown) => {
+        // Recorded before closing, so a manager close or `waitForReady()` timeout
+        // while the runner closes still reports it.
+        if (this._runner === runner && !runner.closed) {
+          this._runnerCloseCause = cause;
+        }
         await originalClose(cause);
         // Draining and closed by itself (or its `shutdown()`): nothing left to retire.
         void this._draining.get(runner)?.retire(async () => {});

@@ -140,6 +140,55 @@ describe("RunnerManager", () => {
     expect(await managerCause).toBe(error.cause);
   });
 
+  it("waitForReady reports why the active runner closed", async () => {
+    const runner = new NodeWorkerEnvRunner({
+      name: "wait-ready-close-cause",
+      workerEntry,
+      data: { entry: resolve(_dir, "./fixtures/does-not-exist.mjs") },
+    });
+    runners.push(runner);
+    manager = new RunnerManager(runner);
+    const cause = await new Promise((resolve) => {
+      manager!.onClose((_runner, cause) => resolve(cause));
+    });
+
+    // Still waits for a `reload()`, then times out with the reason.
+    const timedOut = await manager.waitForReady(100).catch((error) => error);
+    expect(timedOut).toMatchObject({
+      message: `Runner did not become ready in time: ${(cause as Error).message}`,
+      cause,
+    });
+
+    // Closing the manager mid-wait, and calls after it, report it too.
+    const pending = manager.waitForReady(15_000).catch((error) => error);
+    await manager.close();
+    const closedError = {
+      message: `Runner closed before becoming ready: ${(cause as Error).message}`,
+      cause,
+    };
+    expect(await pending).toMatchObject(closedError);
+    await expect(manager.waitForReady()).rejects.toMatchObject(closedError);
+  });
+
+  it("waitForReady forgets the close cause once another runner is attached", async () => {
+    const failing = new NodeWorkerEnvRunner({
+      name: "wait-ready-close-cause-reload",
+      workerEntry,
+      data: { entry: resolve(_dir, "./fixtures/does-not-exist.mjs") },
+    });
+    runners.push(failing);
+    manager = new RunnerManager(failing);
+    await new Promise((resolve) => manager!.onClose(resolve));
+
+    const runner = createRunner("wait-ready-close-cause-reloaded");
+    runners.push(runner);
+    await manager.reload(runner);
+    await manager.close();
+    const error = await manager.waitForReady().catch((error) => error);
+    expect(error?.message).toBe("Runner closed before becoming ready");
+    expect(error?.cause).toBeUndefined();
+  });
+
   it("fires onReady hook", async () => {
     const runner = createRunner("on-ready");
     runners.push(runner);
