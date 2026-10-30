@@ -26,8 +26,15 @@ export class NodeWorkerEnvRunner extends BaseEnvRunner {
     /** Serve on this public address from the worker (see `ListenOptions`). */
     listen?: ListenOptions;
   }) {
-    _defaultEntry ||= fileURLToPath(import.meta.resolve("env-runner/runners/node-worker/worker"));
-    super({ ...opts, workerEntry: opts.workerEntry || _defaultEntry });
+    super({
+      ...opts,
+      // Resolved lazily: an explicit `workerEntry` must not depend on the default resolving
+      workerEntry:
+        opts.workerEntry ||
+        (_defaultEntry ||= fileURLToPath(
+          import.meta.resolve("env-runner/runners/node-worker/worker"),
+        )),
+    });
     // Resolve factory-valued `data.virtual` sources before spawning, since
     // functions can't be passed via `workerData`. Stays synchronous otherwise.
     this._initWithVirtualData(() => this.#initWorker());

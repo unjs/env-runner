@@ -29,8 +29,13 @@ export class VercelEnvRunner extends NodeWorkerEnvRunner {
     /** Host-side transform plugins (see `EnvRunnerPluginOption`). */
     plugins?: EnvRunnerPluginOption[];
   }) {
-    _defaultEntry ||= fileURLToPath(import.meta.resolve("env-runner/runners/vercel/worker"));
-    super({ ...opts, workerEntry: opts.workerEntry || _defaultEntry });
+    super({
+      ...opts,
+      // Resolved lazily: an explicit `workerEntry` must not depend on the default resolving
+      workerEntry:
+        opts.workerEntry ||
+        (_defaultEntry ||= fileURLToPath(import.meta.resolve("env-runner/runners/vercel/worker"))),
+    });
     warnIfVercelOidcTokenInvalid();
   }
 

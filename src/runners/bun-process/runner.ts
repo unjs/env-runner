@@ -72,8 +72,15 @@ export class BunProcessEnvRunner extends BaseEnvRunner {
     listen?: ListenOptions;
     execArgv?: string[];
   }) {
-    _defaultEntry ||= fileURLToPath(import.meta.resolve("env-runner/runners/bun-process/worker"));
-    super({ ...opts, workerEntry: opts.workerEntry || _defaultEntry });
+    super({
+      ...opts,
+      // Resolved lazily: an explicit `workerEntry` must not depend on the default resolving
+      workerEntry:
+        opts.workerEntry ||
+        (_defaultEntry ||= fileURLToPath(
+          import.meta.resolve("env-runner/runners/bun-process/worker"),
+        )),
+    });
     this._initWithVirtualData(() => this.#initProcess(opts.execArgv));
   }
 

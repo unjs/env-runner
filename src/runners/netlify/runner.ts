@@ -27,11 +27,13 @@ export interface NetlifyEnvRunnerOptions {
 
 export class NetlifyEnvRunner extends NodeWorkerEnvRunner {
   constructor(opts: NetlifyEnvRunnerOptions) {
-    _defaultEntry ||= fileURLToPath(import.meta.resolve("env-runner/runners/netlify/worker"));
     const netlifyRuntime = resolveNetlifyRuntime(opts.netlifyRuntime);
     super({
       ...opts,
-      workerEntry: opts.workerEntry || _defaultEntry,
+      // Resolved lazily: an explicit `workerEntry` must not depend on the default resolving
+      workerEntry:
+        opts.workerEntry ||
+        (_defaultEntry ||= fileURLToPath(import.meta.resolve("env-runner/runners/netlify/worker"))),
       data: netlifyRuntime === undefined ? opts.data : { ...opts.data, netlifyRuntime },
     });
   }

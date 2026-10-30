@@ -26,8 +26,15 @@ export class NodeProcessEnvRunner extends BaseEnvRunner {
     listen?: ListenOptions;
     execArgv?: string[];
   }) {
-    _defaultEntry ||= fileURLToPath(import.meta.resolve("env-runner/runners/node-process/worker"));
-    super({ ...opts, workerEntry: opts.workerEntry || _defaultEntry });
+    super({
+      ...opts,
+      // Resolved lazily: an explicit `workerEntry` must not depend on the default resolving
+      workerEntry:
+        opts.workerEntry ||
+        (_defaultEntry ||= fileURLToPath(
+          import.meta.resolve("env-runner/runners/node-process/worker"),
+        )),
+    });
     // Resolve factory-valued `data.virtual` sources before spawning, since
     // functions can't survive `JSON.stringify`. Stays synchronous otherwise.
     this._initWithVirtualData(() => this.#initProcess(opts.execArgv));
