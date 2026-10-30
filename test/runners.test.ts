@@ -314,6 +314,23 @@ for (const runnerDef of runners) {
       },
     );
 
+    it.skipIf(name === "SelfEnvRunner" || name === "MiniflareEnvRunner")(
+      "answers 503 when onReady closes the runner",
+      async () => {
+        runner = create(
+          opts("test-ready-close", {
+            hooks: {
+              onReady: (r: any) => {
+                r.close();
+              },
+            },
+          }),
+        );
+        const res = await runner.fetch("http://localhost/");
+        expect(res.status).toBe(503);
+      },
+    );
+
     it("ipc.onOpen sends message on ready", async () => {
       runner = create(opts("test-ipc-open"));
       // Register listener before ready since onOpen fires before the address message

@@ -157,7 +157,8 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
 
   async fetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
     await this._waitForAddress();
-    if (!this._address) {
+    // A close keeps the address until the worker stops, so check `closed` too.
+    if (!this._address || this.closed) {
       return new Response(`${this._runtimeType()} env runner is unavailable`, {
         status: 503,
       });
