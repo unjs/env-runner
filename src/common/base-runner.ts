@@ -171,6 +171,9 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
       init = { ...init, signal };
     }
     try {
+      if (this._address.socketPath && "Bun" in globalThis) {
+        return await _bunUnixFetch(this._address.socketPath, request, init);
+      }
       return await (this._address.protocol === "https"
         ? proxyFetch(_httpsTarget(this._address), request, init, {
             ...FETCH_OPTIONS,
@@ -699,6 +702,22 @@ const UNVERIFIED_TLS = { rejectUnauthorized: false };
 // Bun/Deno's `FastResponse` is the native `Response`, which keeps the default.
 const FETCH_OPTIONS: ProxyFetchOptions | undefined =
   "Bun" in globalThis || "Deno" in globalThis ? undefined : { Response: FastResponse };
+
+// Bun's `node:http` client rejects with `EPIPE` instead of returning the
+// response when the worker answers a streamed request body early over a unix
+// socket (e.g. a `413`), so use Bun's native fetch there (unjs/env-runner#97).
+// `redirect` and `decompress` keep the worker response as-is (like proxyFetch).
+function _bunUnixFetch(
+  socketPath: string,
+  input: string | URL | Request,
+  init?: RequestInit,
+): Promise<Response> {
+  return fetch(new Request(input, init), {
+    redirect: "manual",
+    decompress: false,
+    unix: socketPath,
+  } as RequestInit);
+}
 
 function _httpsTarget(address: WorkerAddress): string {
   const host = address.host || "127.0.0.1";
