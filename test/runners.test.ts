@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import { writeFileSync, mkdtempSync, rmSync } from "node:fs";
 import { request as httpRequest } from "node:http";
 import { randomBytes } from "node:crypto";
+import { tmpdir } from "node:os";
 import { inspect } from "node:util";
 import { fileURLToPath } from "node:url";
 import { resolve, dirname, join } from "node:path";
@@ -765,6 +766,24 @@ describe.skipIf(!hasBun)("BunProcessEnvRunner slow response", () => {
     const res = await runner.fetch("/?delay=14000");
     expect(res.status).toBe(200);
     expect(await res.text()).toBe("ok after 14000ms");
+  });
+});
+
+// Bun's `node:http` client rejected with `EPIPE` instead of returning an early
+// response to a streamed body over a unix socket (unjs/env-runner#97).
+describe.skipIf(!hasBun)("NodeWorkerEnvRunner unix socket worker (Bun host)", () => {
+  it("returns the worker's early response to a streamed body", { timeout: 30_000 }, () => {
+    const dir = mkdtempSync(join(tmpdir(), "env-runner-unix-"));
+    try {
+      const out = execFileSync(
+        "bun",
+        [resolve(_dir, "./fixtures/bun-unix-host.mjs"), join(dir, "worker.sock")],
+        { encoding: "utf8", timeout: 20_000 },
+      );
+      expect(out).toContain("STATUS 413 200");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
