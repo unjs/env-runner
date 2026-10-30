@@ -1,6 +1,20 @@
 # Changelog
 
 
+## v0.3.11
+
+[compare changes](https://github.com/unjs/env-runner/compare/v0.3.10...v0.3.11)
+
+### 🩹 Fixes
+
+- Resolve default worker entry only when `workerEntry` is not passed ([44a0887](https://github.com/unjs/env-runner/commit/44a0887))
+- Include close cause in `waitForReady()` rejection message ([850a5ef](https://github.com/unjs/env-runner/commit/850a5ef))
+- **manager:** Include the active runner's close cause in `waitForReady()` rejections ([b12538e](https://github.com/unjs/env-runner/commit/b12538e))
+
+### ❤️ Contributors
+
+- Pooya Parsa ([@pi0](https://github.com/pi0))
+
 ## v0.3.10
 
 [compare changes](https://github.com/unjs/env-runner/compare/v0.3.9...v0.3.10)
