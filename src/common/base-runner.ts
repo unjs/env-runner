@@ -174,9 +174,10 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
       return await (this._address.protocol === "https"
         ? proxyFetch(_httpsTarget(this._address), request, init, {
             ...FETCH_OPTIONS,
+            agent: false,
             ssl: UNVERIFIED_TLS,
           })
-        : proxyFetch(this._address, request, init, FETCH_OPTIONS));
+        : proxyFetch(this._address, request, init, { ...FETCH_OPTIONS, agent: false }));
     } catch (error) {
       // Aborted with the request (e.g. the client is gone): nobody reads the
       // response, so don't surface it as a fetch handler error.
