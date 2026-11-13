@@ -216,7 +216,7 @@ await using runner = new NodeProcessEnvRunner({
   execArgv: ["--inspect"], // Node.js flags (process-based runners)
 });
 
-// Proxy HTTP requests (retries with exponential backoff)
+// Proxy HTTP requests (waits up to ~3s for a starting worker to report its address)
 // Relative URLs are resolved against a placeholder origin
 const response = await runner.fetch("/api");
 
