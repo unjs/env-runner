@@ -311,11 +311,9 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
   }
 
   override async fetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
-    // Match BaseEnvRunner.fetch: wait with exponential backoff while init is
-    // still in flight (the address is set at the end of #initAsync).
-    for (let i = 0; i < 5 && !this._address && !this.closed; i++) {
-      await new Promise((r) => setTimeout(r, 100 * Math.pow(2, i)));
-    }
+    // Match BaseEnvRunner.fetch: wait while init is still in flight (the
+    // address is set at the end of #initAsync).
+    await this._waitForAddress();
     if (!this.#miniflare || this.closed) {
       return new Response("miniflare env runner is unavailable", { status: 503 });
     }

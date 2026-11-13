@@ -355,11 +355,27 @@ export abstract class BaseEnvRunner implements EnvRunner, AsyncDisposable {
 
   // #region Protected methods
 
-  /** Briefly back off (~3s total) while the worker is still starting. */
-  protected async _waitForAddress() {
-    for (let i = 0; i < 5 && !this._address && !this.closed; i++) {
-      await new Promise((r) => setTimeout(r, 100 * Math.pow(2, i)));
+  /** Wait (up to `timeout`) while the worker is still starting: until its address arrives or the runner closes. */
+  protected async _waitForAddress(timeout = 3100): Promise<void> {
+    if (this._address || this.closed) {
+      return;
     }
+    await new Promise<void>((resolve) => {
+      const done = () => {
+        clearTimeout(timer);
+        this._messageListeners.delete(onMessage);
+        this._pendingRequests.delete(done);
+        resolve();
+      };
+      const onMessage = () => {
+        if (this._address) {
+          done();
+        }
+      };
+      const timer = setTimeout(done, timeout);
+      this._messageListeners.add(onMessage);
+      this._pendingRequests.add(done);
+    });
   }
 
   /** Placeholder origin for relative inputs; requests go to the worker address regardless. */
