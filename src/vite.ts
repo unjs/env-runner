@@ -2,6 +2,8 @@ import type { RunnerRPCHooks } from "./types.ts";
 
 /** Vite HotChannel-compatible interface (avoids hard dependency on vite types). */
 export interface ViteHotChannel {
+  /** Tells Vite to skip `server.fs` checks: the channel is runner IPC, not exposed over the network. */
+  skipFsCheck?: boolean;
   send: (data: any) => void;
   on: (event: string, handler: (...args: any[]) => void) => void;
   off: (event: string, handler: (...args: any[]) => void) => void;
@@ -17,6 +19,7 @@ export interface ViteTransport {
 export function createViteHotChannel(hooks: RunnerRPCHooks, envName: string): ViteHotChannel {
   const listeners = new WeakMap<(...args: any[]) => void, (data: unknown) => void>();
   return {
+    skipFsCheck: true,
     send: (data) => hooks.sendMessage({ ...data, viteEnv: envName }),
     on: (event: string, handler: any) => {
       if (event === "connection") return;

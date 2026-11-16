@@ -1114,6 +1114,8 @@ const runner = new ModuleRunner({
 
 Messages are namespaced by environment name, so multiple Vite environments can share a single runner's IPC channel.
 
+The channel sets `skipFsCheck: true`, like Vite's own server channel: it carries runner IPC, not network traffic, so modules outside `server.fs.allow` (for example linked packages) still load in the worker.
+
 **Miniflare + Vite** — combine `MiniflareEnvRunner.transformRequest` with Vite helpers for a full Cloudflare Workers dev environment with HMR and on-the-fly transforms:
 
 ```ts
