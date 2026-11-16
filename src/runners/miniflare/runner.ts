@@ -1334,6 +1334,9 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
               return new Response(null, { status: 404 });
             }
           }
+          if (transformed === undefined && resolvedPath.endsWith(".json")) {
+            return Response.json({ name, json: contents });
+          }
           // workerd compiles WebAssembly modules only (never bytes at runtime).
           if (transformed === undefined && resolvedPath.endsWith(".wasm")) {
             return Response.json({ name, wasm: Array.from(readFileSync(resolvedPath)) });
