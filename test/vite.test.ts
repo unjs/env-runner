@@ -18,6 +18,11 @@ function createMockHooks(): RunnerRPCHooks & {
 }
 
 describe("createViteHotChannel", () => {
+  it("skips Vite's server.fs checks (runner IPC is not exposed over the network)", () => {
+    const channel = createViteHotChannel(createMockHooks(), "ssr");
+    expect(channel.skipFsCheck).toBe(true);
+  });
+
   it("send namespaces messages with viteEnv", () => {
     const hooks = createMockHooks();
     const channel = createViteHotChannel(hooks, "ssr");
