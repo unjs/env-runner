@@ -488,6 +488,32 @@ describe("MiniflareEnvRunner (node_modules resolution)", () => {
     expect(await res.json()).toEqual({ local: "local.js", dir: "lib/util.js" });
   });
 
+  it("loads require() of a .json file as JSON", async () => {
+    const dir = writeFiles({
+      "node_modules/cjs-pkg/package.json": JSON.stringify({
+        name: "cjs-pkg",
+        version: "1.2.3",
+        main: "index.js",
+      }),
+      "node_modules/cjs-pkg/index.js": [
+        `exports.version = require("./package.json").version;`,
+        `exports.data = require("./data.json");`,
+      ].join("\n"),
+      "node_modules/cjs-pkg/data.json": JSON.stringify({ list: [1, 2] }),
+      "app.mjs": `import cjs from "cjs-pkg";\nexport default { fetch: () => Response.json(cjs) };`,
+    });
+
+    runner = new MiniflareEnvRunner({
+      miniflare,
+      name: "test-cjs-require-json",
+      data: { entry: join(dir, "app.mjs") },
+    });
+    await waitForReady(runner);
+
+    const res = await runner.fetch("http://localhost/");
+    expect(await res.json()).toEqual({ version: "1.2.3", data: { list: [1, 2] } });
+  });
+
   it("detects the module format of .js files from their syntax, not their comments", async () => {
     const dir = writeFiles({
       "node_modules/cjs-pkg/package.json": JSON.stringify({ name: "cjs-pkg", main: "index.js" }),
