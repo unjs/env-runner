@@ -671,6 +671,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
 
     const userFlags = (this.#miniflareOptions.compatibilityFlags as string[]) || [];
     const wranglerFlags = (wranglerOptions?.compatibilityFlags as string[]) || [];
+    const compatibilityFlags = resolveCompatibilityFlags(wranglerFlags, userFlags);
     const userDirectSockets = (this.#miniflareOptions.unsafeDirectSockets as unknown[]) || [];
     const options: Record<string, unknown> = {
       modules: true,
@@ -696,7 +697,7 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
         ],
         supportedCompatibilityDate,
       ),
-      compatibilityFlags: resolveCompatibilityFlags(wranglerFlags, userFlags),
+      compatibilityFlags,
       // Expose a direct socket so we can proxy WebSocket upgrades via workerd
       unsafeDirectSockets: [{ host: "127.0.0.1", port: 0 }, ...userDirectSockets],
     };
@@ -715,6 +716,18 @@ export class MiniflareEnvRunner extends BaseEnvRunner {
 
     // Generate in-memory wrapper module with IPC support
     if (entryPath && !options.script && !options.scriptPath) {
+      // The wrapper loads the entry through unsafe eval and uses the legacy
+      // fallback service protocol. Keep that registry when workerd would
+      // otherwise switch defaults, without changing the compatibility date.
+      if (
+        typeof options.compatibilityDate === "string" &&
+        options.compatibilityDate >= "2026-11-17" &&
+        !compatibilityFlags.includes("new_module_registry") &&
+        !compatibilityFlags.includes("legacy_module_registry")
+      ) {
+        options.compatibilityFlags = [...compatibilityFlags, "legacy_module_registry"];
+      }
+
       // A virtual entry is matched like the fallback service matches imports:
       // verbatim (don't resolve "#entry" against cwd), or by path for path keys.
       const entryKey = virtual.keyOf(entryPath) ?? virtual.keyOf(resolve(entryPath));
