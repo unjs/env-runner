@@ -1478,6 +1478,33 @@ describe("wrangler config loading", () => {
     );
   });
 
+  it("uses the legacy module registry without lowering the compatibility date", async () => {
+    const date = "2026-11-17";
+    const entryPath = join(dir, "worker.mjs");
+    writeFileSync(entryPath, OK_ENTRY);
+    let captured: Record<string, unknown> | undefined;
+    runner = new MiniflareEnvRunner({
+      name: "registry-compat",
+      data: { entry: entryPath },
+      compatibilityDate: "latest",
+      miniflare: {
+        ...capturingMiniflare((options) => {
+          captured = options;
+          // The test suite also runs with workerd builds predating the default switch.
+          return { ...options, compatibilityDate: supportedCompatibilityDate };
+        }),
+        supportedCompatibilityDate: date,
+      },
+    });
+
+    await runner.waitForReady();
+    expect(captured).toMatchObject({
+      compatibilityDate: date,
+      compatibilityFlags: ["nodejs_compat", "legacy_module_registry"],
+    });
+    expect(await (await runner.fetch("http://localhost/")).json()).toEqual({ ok: true });
+  });
+
   describe("`no_nodejs_compat`", () => {
     it(
       "does not force `nodejs_compat` when a wrangler config opts out",
